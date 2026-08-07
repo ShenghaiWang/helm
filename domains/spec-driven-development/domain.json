@@ -1,0 +1,4 @@
+{
+  "inferable": false,
+  "applies_to": "Deciding whether a change needs a written spec before it is coded, and working against that spec when it does. Composed, not selected: the work still resolves to its own domain."
+}

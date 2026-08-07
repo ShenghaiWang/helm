@@ -18,6 +18,7 @@ extends:
   - definition-of-done
   - branch-isolation
   - change-sizing
+  - spec-driven-development
   - pull-request-lifecycle
   - code-review
   - verification
@@ -49,6 +50,7 @@ receives all of them; extend any single one when only that piece applies.
 | `definition-of-done` | what finished means |
 | `branch-isolation` | keeping concurrent work from contaminating itself |
 | `change-sizing` | shaping a diff a reviewer can actually review |
+| `spec-driven-development` | when behaviour is agreed in writing before it is coded, and working against it |
 | `code-review` | the reviewer is a different agent from the author; the bounded loop |
 | `verification` | whether observed behaviour is required, and proving it |
 | `agent-messaging` | delivering a message between agents so it arrives |

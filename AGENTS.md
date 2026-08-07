@@ -159,8 +159,13 @@ a worker agent the coordinator spawns for that task.
   the user defeats delegation as surely as guessing on a protected action does.
 - **Triage every approval request; escalate only a genuine protected action.**
   Most “approval” a worker asks for is not one: writing files in its worktree,
-  running tests, and committing to its own task branch are the work. Answer
-  those and let it continue. What remains is the protected list — merge, push,
+  running tests, and committing to its own task branch are the work. So is
+  removing or renaming a file *inside* that worktree — a file the change
+  replaces, or a temporary one the task made once what it decided is recorded
+  durably. Protected deletion means deletion reaching outside the assigned task
+  worktree: an external resource, a worktree, a branch, coordinator or user
+  state, another project, or any path outside the worktree. Answer the first
+  kind and let it continue. What remains is the protected list — merge, push,
   publish, delete, other destructive/external actions — and for those, check
   `helm approval check <action> --project <id>` first. A live standing grant is
   the user's own decision, made in advance: act on it and say which grant

@@ -13,8 +13,14 @@ Guidance, not a description of Helm's current behaviour.
   requirements, non-functional requirements, or tech guidance are ambiguous,
   underspecified, or contradictory — stop and ask. "Keep going" starts at
   implementation, not before it.
-- **Wait for explicit approval before implementing.** Do not proceed on silence,
-  assumed approval, or a default path chosen without stating why.
+- **The assigned brief is the authority to implement.** Do not hold for a
+  further approval before working in your assigned worktree — editing,
+  building, testing, and committing to the task branch are the work you were
+  given. What still needs a human is a protected action (merge, push, publish,
+  delete, any other destructive or external action), a missing credential, and
+  anything outside the brief's scope; for those, silence is never approval.
+- **Do not take a default path without stating why.** Choosing between two
+  acceptable approaches is yours; choosing silently is not.
 - **A requirement with no work mapped to it blocks the plan.** Fix the
   breakdown rather than proceeding with a gap.
 - **Fix the plan before continuing when implementation proves it wrong.** Do not

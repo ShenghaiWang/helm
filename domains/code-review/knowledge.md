@@ -53,6 +53,12 @@ A reviewer that finds nothing says so explicitly and says what it checked.
 "Looks good" is not a review; it is indistinguishable from a review that never
 ran.
 
+When the change was specced first, the spec is the contract the diff is read
+against — see the composed `spec-driven-development` domain. Read it before
+the diff and check both directions: does the change do what the spec says,
+and does the spec still describe what the change does. A spec that is wrong
+is a finding like any other, reported rather than quietly worked around.
+
 ## What the reviewer checks
 
 Correctness first. Then whether the tests were kept in sync with the change,

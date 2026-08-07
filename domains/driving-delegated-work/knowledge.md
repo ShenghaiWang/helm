@@ -39,6 +39,23 @@ its own approach against.
 Size the task so one agent can finish it. Two agents on one task is not
 parallelism; it is a merge conflict with extra steps.
 
+Decide at this moment, before the coder starts, whether the behavior has to
+be agreed in writing first — the rubric and what such a document covers are
+in the composed `spec-driven-development` domain. It is the driver's call and
+a routine one: no human approves it and no task waits on it.
+
+Then write the decision into the brief itself, not only into the project
+record. The record is not in the worker's context, so a verdict kept there
+reaches your own history and never reaches the coder. The brief carries the
+verdict, the one-line reason, and — when a spec is called for — which
+convention the repository already uses and where it lives, or that it has
+none and finding a compliant location is part of the task. "No spec,
+mechanical rename, no behavior change" is a complete entry; silence is not.
+Record it in progress reporting as well, for whoever drives this next.
+
+When the document exists, name its path as the task goes to review, so the
+reviewer reads the contract rather than inferring one.
+
 ## Drive it, because a worker that stopped will not tell you
 
 A delegated worker fails in ways that look identical to progress from

@@ -462,6 +462,92 @@ The native agent may read and apply existing domain files; creating or changing
 policy/domain files is itself a scoped change requiring the same review
 boundary.
 
+### Deciding when a change needs a spec first
+
+Some changes should have their behavior agreed in writing before anyone codes
+them, and most should not. That judgement is knowledge, so it ships as the
+`spec-driven-development` domain rather than as a Helm feature: **Helm has no
+spec command, no spec state, and no spec gate.** Nothing in a task's lifecycle
+changes, and no task waits on a human because of it.
+
+The domain is composed into the three places the decision is acted on, so it
+arrives without any project asking for it:
+
+| Composed into | Reaches | What it does there |
+| --- | --- | --- |
+| `driving-delegated-work` | a project's foreman | decide at brief time, before a coder starts |
+| `software-delivery` | the author of a change | write the document, implement against it |
+| `code-review` | the independent reviewer | read the behavior against the contract |
+
+The rubric asks for a spec when the behavior is ambiguous, when the change
+alters a contract other components depend on, on auth and security boundaries,
+where data loss is possible, for billing or publishing, for user-facing
+workflows, when review keeps relitigating the same tradeoff, or when the work
+already needs multiple rounds. It says to skip it for narrow, well-understood,
+low-risk mechanical changes — spec-gating a typo trains everyone to skim the
+spec that mattered.
+
+**No behavior change outranks every trigger above.** The rubric asks what the
+change does, not which directory it lands in: a typo in publishing copy or a
+mechanical rename in billing code is not specced because the area matched a
+keyword. The one reversal is doubt — a "rename" that moves a serialized name,
+a public symbol, or a config key is a contract change, and it gets the spec.
+
+The foreman decides and **writes the verdict, its one-line reason, and any
+convention or path the coder needs into the task brief**, as well as recording
+it in progress reporting. The brief is the part that matters for the handoff: a
+worker's context is its brief plus composed domain and project knowledge, and
+the project's progress record is not in it, so a decision kept only there never
+reaches the coder. It is a coordination call either way: not a commander
+approval, and not a new task status.
+
+**The spec follows the managed project's conventions, never Helm's.** The
+worker reads the repository's own files first, and a repository that already
+has a spec convention keeps it — OpenSpec, Spec Kit, and BMAD are named in the
+domain purely as examples a driver should recognize, and Helm depends on none
+of them. Where no convention exists, the worker writes a short plain document
+in the repository's existing documentation location, covering problem, desired
+behavior, non-goals, acceptance criteria, verification, open questions and
+action items, and follow-ups created.
+
+Installing, initializing, or scaffolding a framework is a scope decision, so
+the guardrails rule it out **as a step in doing something else**. It stays
+possible when adopting one is itself the brief — explicitly scoped as its own
+task, with whatever human authority its protected parts need already obtained.
+Never as a side effect.
+
+A repository with nowhere obvious to put the document does not get one invented
+for it. The worker infers a home from the repository's own naming and
+contributing norms where it can; where it cannot, it writes a clearly
+task-local file in the task worktree, reports it with `--type artifact --path`,
+and says the location is temporary. Proposing a permanent convention is a
+recorded follow-up, not a side effect of the change that noticed the gap.
+
+A temporary file has an end, and it falls before approval. Keep it through
+review — it is what the findings refer to — then capture its decisions, closed
+questions, and follow-ups in the task result and the project record, and delete
+it so the worktree is clean. A task worktree must be clean to be approved,
+untracked files included, and that check is not the thing to loosen. If the
+document turns out to be worth keeping, it was never temporary: commit it into
+the repository as part of the change instead.
+
+The document lives on the task branch in the task worktree, and is part of the
+change where the repository keeps that kind of document. A spec change, a
+blocking open question, or an unmeetable acceptance criterion is reported as an
+intermediate outcome to the foreman and to Helm rather than saved for the final
+result. Resolution is always stated: nothing reads a document's prose to
+conclude that its open questions have been settled.
+
+**The reviewer is told what the author produced, structurally.** A reviewer
+reads a diff, so anything the author did not commit is invisible to it — which
+is exactly the case for a spec written where the repository keeps no such file.
+Relying on the foreman to mention the path works until it forgets, so the
+reviewer brief Helm generates now lists the author task's recorded artifact
+paths and descriptions. This is generic to artifacts rather than special-cased
+for specs: every artifact message already validated its path against the
+author's workspace and stored it workspace-relative, so the handoff adds no new
+state and no new trust, and a task that reported none gets no paragraph.
+
 ## Worker protocol and approval boundary
 
 Workers push their own progress; the coordinator does not poll them, and
@@ -584,9 +670,11 @@ Two documents reach a foreman, and the split is deliberate. `FOREMAN_RULES` in
 do. That has to be code, because a domain file cannot be allowed to define
 authority. The `driving-delegated-work` domain is the **craft**: how to brief a
 worker, when to answer instead of escalating, what a review is worth. It
-`extends` `code-review`, so the coder/reviewer independence rules arrive
-composed rather than restated — and because it lives in `domains/`, it is
-versioned, reviewable, and reusable by anything else that drives agents.
+`extends` `code-review` and `spec-driven-development`, so the coder/reviewer
+independence rules and the rubric for [when a change needs a spec
+first](#deciding-when-a-change-needs-a-spec-first) arrive composed rather than
+restated — and because it lives in `domains/`, it is versioned, reviewable, and
+reusable by anything else that drives agents.
 
 Its authority is narrower than the coordinator's, and narrower in code rather
 than in prose. Every agent Helm starts inherits `HELM_WORKER_ID`, so `helm`
