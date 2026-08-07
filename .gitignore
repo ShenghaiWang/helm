@@ -1,0 +1,27 @@
+# Helm root content. The .gitkeep files are tracked defaults; everything else
+# is local content and must stay out of this repository.
+/projects/*
+!/projects/.gitkeep
+# Domain knowledge is Helm repository content and is committed, so it travels
+# with the repo and is shared through GitHub rather than living only on one
+# machine. Nothing under /domains/ is ignored: keep private or company-specific
+# knowledge in a project's own .helm/knowledge.md, which is not tracked.
+/agents/*
+!/agents/.gitkeep
+/state/*
+!/state/.gitkeep
+# Defensive coverage for worktrees if a caller places them at the root.
+/worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# macOS
+.DS_Store

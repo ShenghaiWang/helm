@@ -1,0 +1,4 @@
+{
+  "inferable": false,
+  "applies_to": "Keeping concurrent pieces of work from contaminating each other."
+}

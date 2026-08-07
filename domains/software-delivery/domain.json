@@ -1,0 +1,17 @@
+{
+  "extends": [
+    "work-decomposition",
+    "agent-autonomy",
+    "model-selection",
+    "progress-reporting",
+    "definition-of-done",
+    "branch-isolation",
+    "change-sizing",
+    "pull-request-lifecycle",
+    "code-review",
+    "verification",
+    "agent-messaging",
+    "implementation-notes"
+  ],
+  "applies_to": "Any task that writes, changes, or reviews code: features, bug fixes, refactors, tests, and the review that follows. Not for research, writing, or media production."
+}
