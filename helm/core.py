@@ -3475,6 +3475,18 @@ class Coordinator:
                         project_id,
                         f"{source}: task {task_id} [{task_status}] {summary}",
                     )
+                action_item = (
+                    self._action_item_from_payload(payload)
+                    or self._action_item_from_summary(summary)
+                )
+                if action_item:
+                    with contextlib.suppress(HelmError, OSError):
+                        self.record_project_action_item(
+                            project_id,
+                            action_item,
+                            source=source,
+                            task_id=task_id,
+                        )
         if terminal:
             # Preserve terminal output as evidence before a later cleanup or
             # provider teardown can remove its pane/log.
@@ -3547,6 +3559,18 @@ class Coordinator:
                         project["id"],
                         f"{source}: task {task['id']} [{task['status']}] {summary}",
                     )
+                action_item = (
+                    self._action_item_from_payload(payload)
+                    or self._action_item_from_summary(summary)
+                )
+                if action_item:
+                    with contextlib.suppress(HelmError, OSError):
+                        self.record_project_action_item(
+                            project["id"],
+                            action_item,
+                            source=source,
+                            task_id=task["id"],
+                        )
 
     def poll_worker(self, worker_id: str) -> dict[str, Any]:
         with self.store.locked() as data:
@@ -4070,12 +4094,13 @@ class Coordinator:
     def _load_status(self, project_id: str) -> dict[str, Any]:
         path = self._status_path(project_id)
         if not path.exists():
-            return {"situation": [], "history": [], "evidence": {}}
+            return {"situation": [], "action_items": [], "history": [], "evidence": {}}
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"situation": [], "history": [], "evidence": {}}
+            return {"situation": [], "action_items": [], "history": [], "evidence": {}}
         loaded.setdefault("situation", [])
+        loaded.setdefault("action_items", [])
         loaded.setdefault("history", [])
         loaded.setdefault("evidence", {})
         return loaded
@@ -4128,6 +4153,79 @@ class Coordinator:
         self._save_status(project_id, status)
         return status["situation"][-1]
 
+    def record_project_action_item(
+        self,
+        project_id: str,
+        text: str,
+        *,
+        source: str = "helm",
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record commander-visible follow-up that needs a decision or task.
+
+        Situation lines say what happened. Action items say what still needs a
+        human or a new piece of work. Keeping those separate prevents a
+        non-blocking review caveat from being buried inside a long outcome.
+        """
+        summary = _safe_text(text).strip()
+        if not summary:
+            raise HelmError("an action item is required")
+        if len(summary) > self.SITUATION_LINE_LIMIT:
+            raise HelmError(
+                f"an action item must be concise: {len(summary)} characters given, "
+                f"limit {self.SITUATION_LINE_LIMIT}"
+            )
+        status = self._load_status(project_id)
+        task = _safe_text(task_id).strip() if task_id else None
+        prefix = _safe_text(source).strip() or "helm"
+        for item in status["action_items"]:
+            if (
+                item.get("status", "open") == "open"
+                and item.get("text") == summary
+                and item.get("task_id") == task
+                and item.get("source") == prefix
+            ):
+                return item
+        item = {
+            "id": new_id("i"),
+            "at": now(),
+            "text": summary,
+            "source": prefix,
+            "task_id": task,
+            "status": "open",
+        }
+        status["action_items"].append(item)
+        self._save_status(project_id, status)
+        return item
+
+    @staticmethod
+    def _action_item_from_summary(text: str) -> str | None:
+        summary = _safe_text(text).strip()
+        lowered = summary.lower()
+        markers = (
+            "follow-up needed",
+            "needs follow-up",
+            "requires follow-up",
+            "action required",
+            "needs commander decision",
+            "needs human decision",
+        )
+        return summary if any(marker in lowered for marker in markers) else None
+
+    @staticmethod
+    def _action_item_from_payload(payload: dict[str, Any] | None) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        for key in ("action_item", "follow_up", "followup"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return _safe_text(value).strip()
+        if payload.get("needs_action") is True or payload.get("action_required") is True:
+            value = payload.get("summary") or payload.get("text")
+            if isinstance(value, str) and value.strip():
+                return _safe_text(value).strip()
+        return None
+
     @staticmethod
     def _summary_payload(payload: dict[str, Any] | None) -> bool:
         if not isinstance(payload, dict):
@@ -4157,10 +4255,16 @@ class Coordinator:
         if not summary:
             raise HelmError("progress summary is required")
         prefix = _safe_text(source).strip() or "helm"
-        return self.record_situation(
+        entry = self.record_situation(
             project["id"],
             f"{prefix}: task {task_id} [{task['status']}] {summary}",
         )
+        action_item = self._action_item_from_summary(summary)
+        if action_item:
+            self.record_project_action_item(
+                project["id"], action_item, source=prefix, task_id=task_id
+            )
+        return entry
 
     def capture_evidence(self, worker_id: str) -> dict[str, Any] | None:
         """Snapshot why a worker failed, before anything that holds it closes.
@@ -4239,6 +4343,10 @@ class Coordinator:
             ],
             "grants": [g for g in self.list_approval_grants()
                        if g["project_id"] in (None, project_id)],
+            "action_items": [
+                e for e in status.get("action_items", [])
+                if e.get("status", "open") == "open"
+            ],
             "situation": [e for e in status["situation"] if not e.get("superseded_by")],
             "evidence": list(pruned.values()),
             "history_entries": len(status["history"]),
@@ -4273,12 +4381,27 @@ class Coordinator:
         limit = max(1, limit_per_project)
         for project in sorted(projects, key=lambda p: p["id"]):
             status = self._load_status(project["id"])
+            action_items = [
+                entry
+                for entry in status.get("action_items", [])
+                if entry.get("status", "open") == "open" and not entry.get("surfaced_at")
+            ]
+            for entry in action_items:
+                updates.append({
+                    "project_id": project["id"],
+                    "project_name": project.get("name", project["id"]),
+                    "glyph": project_glyph(project.get("color", "")),
+                    "id": entry["id"],
+                    "at": entry.get("at"),
+                    "text": f"ACTION REQUIRED: {entry.get('text', '')}",
+                    "kind": "action",
+                })
             pending = [
                 entry
                 for entry in status.get("situation", [])
                 if not entry.get("superseded_by") and not entry.get("surfaced_at")
             ]
-            if not pending:
+            if not pending and not action_items:
                 continue
             shown = pending[-limit:]
             hidden = len(pending) - len(shown)
@@ -4293,6 +4416,7 @@ class Coordinator:
                         f"{hidden} older project update(s) marked surfaced; "
                         f"showing latest {len(shown)}"
                     ),
+                    "kind": "situation",
                 })
             for entry in shown:
                 updates.append({
@@ -4302,8 +4426,11 @@ class Coordinator:
                     "id": entry["id"],
                     "at": entry.get("at"),
                     "text": entry.get("text", ""),
+                    "kind": "situation",
                 })
             if mark_seen:
+                for entry in action_items:
+                    entry["surfaced_at"] = seen_at
                 for entry in pending:
                     entry["surfaced_at"] = seen_at
                 self._save_status(project["id"], status)

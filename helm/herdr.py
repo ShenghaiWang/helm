@@ -1307,8 +1307,9 @@ class HerdrAdapter:
 
         Reviewer tasks carry `reviews`, the id of what they review, so a
         reviewer is discoverable without parsing its brief. Only a *running*
-        worker counts: a settled one is history, and the next round is
-        deliberately a fresh reviewer task rather than a reopened session.
+        worker counts here; the review loop may reopen its own completed
+        reviewer for the next round, but a second driver must not infer that
+        stale settled history is live.
         """
         reviewing = {
             candidate["id"]

@@ -2373,6 +2373,56 @@ class HelmCoordinatorTests(unittest.TestCase):
         # mark_seen=False is useful for previews and must not consume it.
         self.assertEqual(len(self.coordinator.project_updates_for_watch()), 1)
 
+    def test_follow_up_summary_becomes_project_action_item(self) -> None:
+        root = self.repo("followup")
+        project = self.coordinator.register_project("Follow", str(root), project_id="followup")
+        task = self.coordinator.create_task(project["id"], "change the code")
+
+        self.coordinator.record_task_progress_summary(
+            task["id"],
+            "rotation watcher follow-up needed if it must stay warm across every token refresh",
+            source="Review loop",
+        )
+
+        status = self.coordinator.project_status(project["id"])
+        self.assertEqual(len(status["action_items"]), 1)
+        self.assertIn("follow-up needed", status["action_items"][0]["text"])
+        updates = self.coordinator.project_updates_for_watch()
+        self.assertTrue(any("ACTION REQUIRED" in update["text"] for update in updates))
+        self.assertEqual(self.coordinator.project_updates_for_watch(), [])
+
+    def test_project_action_command_records_commander_visible_item(self) -> None:
+        helm_root = self._helm_root("action-root")
+        project_root = self.repo("action-project")
+        destination = helm_root / "projects" / "action"
+        shutil.move(str(project_root), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "action")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                cli.main([
+                    "--root",
+                    str(helm_root),
+                    "project",
+                    "action",
+                    project["id"],
+                    "decide whether to open a follow-up task",
+                    "--source",
+                    "review",
+                ]),
+                0,
+            )
+        self.assertIn("Recorded action", output.getvalue())
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(["--root", str(helm_root), "project", "status", project["id"]]), 0)
+        text = output.getvalue()
+        self.assertIn("action items:", text)
+        self.assertIn("decide whether to open a follow-up task", text)
+
     def test_watch_surfaces_latest_project_updates_and_consumes_backlog(self) -> None:
         root = self.repo("surface-backlog")
         project = self.coordinator.register_project(

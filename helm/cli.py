@@ -388,6 +388,11 @@ def _print_project_status(status: dict[str, Any]) -> None:
     print(f"{p['glyph']} {p['name']} ({p['id']})")
     counts = " ".join(f"{k}={v}" for k, v in status["counts"].items())
     print(f"  tasks: {counts or 'none'}")
+    if status["action_items"]:
+        print("  action items:")
+        for entry in status["action_items"]:
+            task = f" task={entry['task_id']}" if entry.get("task_id") else ""
+            print(f"    {entry['at'][:10]} {entry['text']} ({entry['source']}{task})")
     if status["situation"]:
         print("  situation:")
         for entry in status["situation"]:
@@ -938,6 +943,13 @@ def _build_parser() -> argparse.ArgumentParser:
     note_cmd.add_argument("project_id")
     note_cmd.add_argument("text")
     note_cmd.add_argument("--supersedes", default="")
+    action_cmd = project_commands.add_parser(
+        "action", help="record one commander-visible follow-up or decision item"
+    )
+    action_cmd.add_argument("project_id")
+    action_cmd.add_argument("text")
+    action_cmd.add_argument("--source", default="helm")
+    action_cmd.add_argument("--task", dest="task_id")
     domain_cmd = project_commands.add_parser(
         "domain", help="set the default domain every task on this project resolves to"
     )
@@ -1439,6 +1451,14 @@ def main(argv: list[str] | None = None) -> int:
                     args.project_id, args.text, supersedes=args.supersedes
                 )
                 print(f"Recorded {entry['id']}: {entry['text']}")
+            elif args.project_command == "action":
+                entry = coordinator.record_project_action_item(
+                    args.project_id,
+                    args.text,
+                    source=args.source,
+                    task_id=args.task_id,
+                )
+                print(f"Recorded action {entry['id']}: {entry['text']}")
             elif args.project_command == "add":
                 project = coordinator.register_project(
                     args.name,

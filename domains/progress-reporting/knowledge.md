@@ -21,6 +21,14 @@ immediately**. One line each; the point is the timeline, not the prose.
 itself a signal.** Treat it as a prompt to check whether something is stuck, not
 as evidence that things are fine.
 
+## Promote follow-ups to action items
+
+A progress line can say what happened, but a required decision or follow-up
+must also be recorded as an action item. Use `helm project action <project>
+"..."`, or include an `action_item` / `follow_up` payload on a summary worker
+message. A phrase like "follow-up needed" is also promoted automatically, but
+explicit payloads are clearer and survive wording changes.
+
 ## Diagnose failures by class
 
 A failed verification is either a **coding bug** — fix, re-review, re-verify —

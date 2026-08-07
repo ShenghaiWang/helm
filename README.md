@@ -755,7 +755,7 @@ and isolation checks. Details belong in the optional
 ```text
 helm init [ROOT]
 helm run PROJECT [TASK] [--domain DOMAIN] [--agent PROFILE] [--no-herdr] [--async]
-helm project add|list|status|note|domain
+helm project add|list|status|note|action|domain
 helm agent list|check
 helm task create|allocate|inspect|approve|merge|deliver|pr|pr-status|pr-sync|outcome
 helm task cleanup TASK_ID [--delete-branch]
