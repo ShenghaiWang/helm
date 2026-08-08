@@ -20,7 +20,6 @@ from unittest import mock
 from helm import cli, runtimes
 from helm.core import (
     project_glyph,
-    _color_for,
     _COLOR_PALETTE,
     CORE_SAFETY_RULES,
     FOREMAN_RULES,
@@ -2022,7 +2021,7 @@ class HelmCoordinatorTests(unittest.TestCase):
         # It went to the project, never into the shared domain.
         self.assertNotIn("iPhone 17", (domain / "knowledge.md").read_text(encoding="utf-8"))
 
-    def test_each_project_gets_a_glyph_no_other_project_is_using(self) -> None:
+    def test_all_palette_colours_map_to_unique_nonempty_glyphs(self) -> None:
         # Several projects report into one session and a line without its
         # project is ambiguous, so the glyph is the separator. The palette held
         # eight colours that collapsed to five squares -- three blue, two
@@ -2036,20 +2035,49 @@ class HelmCoordinatorTests(unittest.TestCase):
             "every palette colour must map to its own glyph",
         )
 
-        glyphs = []
-        for index in range(len(_COLOR_PALETTE)):
-            name = f"p{index}"
+    def test_fourteen_registered_projects_get_unique_glyphs_and_the_fifteenth_reuses_stably(
+        self,
+    ) -> None:
+        # The product requirement is a fixed number -- at least 14 concurrently
+        # registered projects get a distinct glyph before any project has to
+        # reuse one -- so this proves it against that literal number through
+        # the public registration path, not against whatever `_COLOR_PALETTE`
+        # happens to hold today.
+        glyphs = {}
+        for index in range(14):
+            name = f"glyph-{index}"
             project = self.coordinator.register_project(
                 name, str(self.repo(name)), project_id=name
             )
-            glyphs.append(project_glyph(project["color"]))
-        self.assertEqual(len(set(glyphs)), len(glyphs), f"glyph collision: {glyphs}")
+            glyphs[name] = project_glyph(project["color"])
+        self.assertEqual(len(glyphs), 14)
+        self.assertEqual(
+            len(set(glyphs.values())), 14, f"glyph collision among first 14: {glyphs}"
+        )
 
-    def test_palette_covers_at_least_fourteen_projects_before_reuse(self) -> None:
-        # A palette that runs out at seven forces the eighth concurrently
-        # registered project to share a glyph with one already on screen,
-        # which is exactly the ambiguity the glyph exists to remove.
-        self.assertGreaterEqual(len(_COLOR_PALETTE), 14)
+        # Reload before registering the 15th: the allocator must see the same
+        # claimed colours a fresh process would load from disk, not whatever a
+        # single in-memory Coordinator happens to still be holding.
+        reloaded = Coordinator(StateStore(self.state.directory))
+        fifteenth = reloaded.register_project(
+            "glyph-14", str(self.repo("glyph-14")), project_id="glyph-14"
+        )
+        fifteenth_glyph = project_glyph(fifteenth["color"])
+        self.assertIn(
+            fifteenth_glyph,
+            set(glyphs.values()),
+            "the 15th project must reuse one of the 14 glyphs already in use",
+        )
+
+        # Reload again and confirm the reused glyph did not drift -- the
+        # colour a human already learned to recognise for this project keeps
+        # meaning this project.
+        reloaded_again = Coordinator(StateStore(self.state.directory))
+        stored = next(
+            p for p in reloaded_again.list_projects() if p["id"] == "glyph-14"
+        )
+        self.assertEqual(stored["color"], fifteenth["color"])
+        self.assertEqual(project_glyph(stored["color"]), fifteenth_glyph)
 
     def test_legacy_palette_colours_keep_their_exact_square(self) -> None:
         # These seven colours and their squares predate the wider palette.
@@ -2069,27 +2097,40 @@ class HelmCoordinatorTests(unittest.TestCase):
         for color, glyph in legacy_squares.items():
             self.assertEqual(project_glyph(color), glyph)
 
-    def test_fifteenth_project_registers_and_deterministically_reuses_a_glyph(self) -> None:
-        glyphs_by_color = {}
-        for index in range(len(_COLOR_PALETTE) + 1):
-            name = f"reuse-{index}"
-            project = self.coordinator.register_project(
-                name, str(self.repo(name)), project_id=name
-            )
-            glyphs_by_color[project["id"]] = (project["color"], project_glyph(project["color"]))
+    def test_uppercase_palette_hex_and_circle_glyph_survive_established_consumers(
+        self,
+    ) -> None:
+        from helm.herdr import _paint_command
 
-        # The (len+1)th project still registers -- reuse, not a refusal.
-        self.assertEqual(len(glyphs_by_color), len(_COLOR_PALETTE) + 1)
-        glyphs = [glyph for _, glyph in glyphs_by_color.values()]
-        self.assertEqual(len(set(glyphs)), len(_COLOR_PALETTE), "the last project should reuse a taken glyph")
+        # A palette lookup must not be case-sensitive: a colour is free-form
+        # user/config input in practice, and the exact-match lookup added to
+        # widen the palette keys off the lower-cased hex digits.
+        circle_color = "#3b82f6"
+        circle_glyph = project_glyph(circle_color)
+        self.assertTrue(circle_glyph)
+        self.assertEqual(project_glyph(circle_color.upper()), circle_glyph)
+        # It is really a distinct glyph from the legacy square of the same
+        # hue, not a coincidental match through the generic hue fallback.
+        self.assertNotEqual(circle_glyph, project_glyph("#2563eb"))
 
-        # Picking a colour is a pure function of the project id and the
-        # already-claimed glyphs, so re-deriving it is deterministic.
-        last_id = f"reuse-{len(_COLOR_PALETTE)}"
-        taken = [
-            color for pid, (color, _) in glyphs_by_color.items() if pid != last_id
-        ]
-        self.assertEqual(_color_for(last_id, taken), glyphs_by_color[last_id][0])
+        # A glyph is a character, so unlike an escape sequence it must survive
+        # the same established output paths a square glyph always has.
+        command = _paint_command(circle_color, "status: harvest done")
+        self.assertIn(circle_glyph, command)
+        self.assertNotIn("\x1b", command)
+
+        label = cli._project_label({"id": "media", "name": "Media", "color": circle_color})
+        self.assertIn(circle_glyph, label)
+
+        project = self.coordinator.register_project(
+            "circle-project", str(self.repo("circle-project")), project_id="circle-project",
+            color=circle_color,
+        )
+        task = self.coordinator.create_task(project["id"], "the work", no_domain=True)
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.assertIn(circle_glyph, herdr.workspaces[0][1])
 
     def test_custom_colour_keeps_generic_hue_fallback(self) -> None:
         # A colour outside the built-in palette -- set explicitly, or hashed
