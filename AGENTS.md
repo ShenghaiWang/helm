@@ -136,12 +136,18 @@ a worker agent the coordinator spawns for that task.
   approval-needed task keeps its space because a human still has to look.
   `HELM_KEEP_SPACES=1` keeps every space.
 - **A worker result is not final delivery.** The result is a milestone that
-  Helm must act on and record. Local-delivery work is final at `merged` after
-  the task branch lands in the project's base worktree, with local artifacts
-  delivered when needed. PR-delivery work is final at `pr-merged`; `pr-open`
-  stays visible for comment/check monitoring. Keep outcomes in worktrees,
-  branches, PR records, artifacts, project status, messages and logs — not by
-  keeping stale agent sessions alive.
+  Helm must act on and record. For local delivery, use Helm's task merge
+  path — `helm task merge` — never a raw Git merge, because that path
+  fast-forwards the task branch and copies declared build outputs into the base
+  worktree according to the project's `deliver` configuration. After merge,
+  verify that all expected delivery results are present in the base worktree
+  before reporting the task final; missing or conflicting outputs must remain
+  visible and unresolved for action. Local-delivery work is final at `merged`
+  when the branch is fast-forwarded into the project's base worktree and
+  artifacts are copied and verified. PR-delivery work is final at `pr-merged`;
+  `pr-open` stays visible for comment/check monitoring. Keep outcomes in
+  worktrees, branches, PR records, artifacts, project status, messages and
+  logs — not by keeping stale agent sessions alive.
 - **Drive the worker on the user's behalf.** Helm's job is to supply the goal
   and the right knowledge, then keep the work moving without relaying every
   detail to the user. When a worker pushes a `question`, answer it from the task
