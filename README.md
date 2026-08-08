@@ -842,42 +842,94 @@ and only the user writes it.
 ### A paused task, and how it starts again
 
 `approval-needed` is a gate, not an ending. A worker that reaches a protected
-action names it and stops:
+action names exactly which one and stops:
 
 ```sh
 helm worker message <worker-id> --type approval-needed --action publish \
   --text "ready to publish the rendered file"
 ```
 
-The task moves to `approval-needed` and records a *hold* — what was asked for,
-which session asked, and where the work stood. The worker stays `running`,
-because it is waiting rather than finished: it can still be answered, it can
-still report, `helm watch` shows it as `awaiting-approval`, and its pane and the
-project's space are kept because a human still has to look.
+The action is required and `merge` is refused here: no worker performs Helm's
+merge, so a worker finishes and reports, and the branch is reviewed through
+`helm task approve`. The task moves to `approval-needed` and records a *hold* —
+which action, which session asked, and an exact snapshot of what the request is
+about. The worker stays `running`, because it is waiting rather than finished:
+it can still be answered, it can still report, `helm watch` shows it as
+`awaiting-approval`, and its pane and the project's space are kept because a
+human still has to look. The request is written to the project's own record and
+raised as a commander action item, on both intake paths.
 
-Once the human decides, one command authorizes that exact action and lets the
-same session carry on:
+What the snapshot binds, by content: the revision and tree, the index, the whole
+tracked diff against HEAD (staged and unstaged, binary included), every
+untracked path by digest, every artifact the task declared by id/path/digest,
+and everything under the project's declared delivery directories — which is
+where ignored build outputs live. Workspace identity is verified first, and
+anything unreadable is a refusal, not an empty binding.
+
+Then the decision, and the two steps that follow it:
 
 ```sh
-helm approval release <task-id> --action publish --confirm --note "agreed"
-helm approval release <task-id> --action publish --grant <grant-id>
+helm approval release <task-id> --action publish --confirm      # or --grant <id>
+helm worker action-start <worker-id>                            # the worker runs this
 ```
 
-Releasing binds the authorization to the branch tip and worktree state it was
-given for, puts the task back to `running`, and delivers the go-ahead into the
-worker's own session (recorded either way, so a missing Herdr changes only
-where it is shown). The worker then acts and reports its `result` normally, and
-that outcome is written to the project's status record.
+`release` records the authorization against the snapshot the request was made
+for. It does not resume anything: if the work moved between the request and the
+decision, it refuses and nothing is authorized. If it moved after, `action-start`
+refuses. The task stays paused at `approval-needed` until the worker itself runs
+`action-start`, which is both the acknowledgement that the go-ahead arrived in
+that live session and the one-use gate immediately before the side effect. Only
+then does the task go to `running`. The worker acts, reports its `result` with
+any receipt in `--payload`, and those receipts are recorded as outcome data —
+never compared against the pre-action snapshot, so a publish that writes its own
+receipt does not invalidate the approval it just used. The outcome reaches the
+project's record and the commander's action item is closed.
 
-Three boundaries hold this together. It is the human's command, held at the
-root: an agent that ran it would be approving the action it just asked for, so
-Helm refuses it for workers and foremen alike. It authorizes the action that
-was asked for and no other. And it is not `helm task approve` — that gates a
-*reviewed branch* on its way to a merge and requires a finished worker and a
-clean tree, so `merge` is refused here and stays on its own path. If the
-worktree moves after the authorization, the binding is invalidated when the
-result arrives: the task goes back to `approval-needed` rather than completing
-on an agreement to something the human never saw.
+Delivery is a separate fact from the decision. If the authorization cannot be
+delivered — no Herdr, a pane the provider says is gone — `helm approval release`
+reports `NOT delivered` and exits non-zero, the hold stays
+`authorized-pending-delivery`, the task stays paused, and the escalation stays
+open. Running the same command again is a delivery retry, not a second
+authorization: the same ticket, no new decision recorded.
+
+**Same-session resume needs an interactive session.** A worker started by the
+plain process launcher runs in print mode with no input channel, so nothing can
+hand it a go-ahead; `helm approval release` refuses such a worker outright
+rather than spending an authorization nobody can receive. That is a limitation
+of that mode, not a presentation difference. A task stranded that way — and a
+task carrying an approval request from an older Helm, whose worker was recorded
+as failed — is recovered with:
+
+```sh
+helm approval repair <task-id>
+```
+
+Repair is evidence-led. It reconstructs a waiting hold and revives that same
+worker only when the provider says its session is live and the recorded request
+names an unambiguous action; it asks a live worker to restate an unusable
+request rather than inventing one; and when the session is gone it abandons the
+hold and marks the task `failed`, so it can be cleaned up or retried instead of
+sitting in permanent `approval-needed` residue.
+
+Authorization is enforced in core, not in command dispatch. `helm approval
+release`, `repair`, `task approve`, `task merge`, `task pr`, `approval
+grant/revoke` and the learning approvals all require an authority object that
+only the root can obtain, so an agent gains nothing by importing `Coordinator`
+directly. The caller is identified from evidence it does not own: the marker
+every agent inherits, plus process lineage — clearing `HELM_WORKER_ID` no longer
+makes a worker's own command look like the root. Optionally, bind those commands
+to a capability this root holds:
+
+```sh
+helm authority init      # writes the secret 0600 and never prints it
+helm authority status
+```
+
+With one configured, a protected command also requires `HELM_AUTHORITY` to match
+it. No agent Helm starts can inherit it: the worker environment is an allowlist,
+and the value is never written into a context document, prompt, or log. Without
+one, the session-role boundary is all there is, and each approval record says
+which of the two actually verified the human (`authority.mode`).
 
 ### Delivery lifecycle
 

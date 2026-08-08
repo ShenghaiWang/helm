@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
+    AUTHORITY_ENV,
     PROTECTED_ACTIONS,
     Coordinator,
     HelmError,
@@ -816,7 +818,10 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--text", default="")
     report.add_argument(
         "--action",
-        choices=sorted(PROTECTED_ACTIONS),
+        # `merge` is deliberately absent: no worker performs Helm's merge, so it
+        # is not something a worker can ask to be authorized for. It finishes,
+        # reports, and the branch is reviewed with helm task approve.
+        choices=sorted(PROTECTED_ACTIONS - {"merge"}),
         help="with --type approval-needed: the exact protected action being asked for",
     )
     report.add_argument("--status", choices=("running", "completed", "blocked", "failed", "approval-needed"))
@@ -830,6 +835,12 @@ def _build_parser() -> argparse.ArgumentParser:
     stop.add_argument(
         "--reason", default="", help="why it was stopped; recorded on the task"
     )
+
+    action_start = worker_commands.add_parser(
+        "action-start",
+        help="a worker's own pre-action gate: validate and spend one authorization",
+    )
+    action_start.add_argument("worker_id")
 
     answer = worker_commands.add_parser(
         "answer", help="answer a worker's question from the task goal and let it continue"
@@ -988,18 +999,43 @@ def _build_parser() -> argparse.ArgumentParser:
     release_hold.add_argument(
         "--action",
         required=True,
-        choices=sorted(PROTECTED_ACTIONS),
+        # Same list a worker may ask for. Merging is reviewed and performed
+        # through helm task approve / helm task merge, never authorized here.
+        choices=sorted(PROTECTED_ACTIONS - {"merge"}),
         help="the exact action being authorized; it must match what was asked for",
     )
     release_hold.add_argument("--note", default="", help="why this was authorized")
-    release_hold.add_argument(
+    # Exactly one authority, stated. Allowing both let --confirm silently
+    # discard a named grant, and allowing neither auto-selected one.
+    authority_choice = release_hold.add_mutually_exclusive_group(required=True)
+    authority_choice.add_argument(
         "--confirm", action="store_true", help="the commander is authorizing it now"
     )
-    release_hold.add_argument(
-        "--grant", dest="grant_id", help="authorize under a standing approval instead"
+    authority_choice.add_argument(
+        "--grant", dest="grant_id", help="authorize under one standing approval instead"
     )
     release_hold.add_argument(
         "--text", default="", help="what to say to the worker (default: a plain go-ahead)"
+    )
+    repair_hold = approval_commands.add_parser(
+        "repair",
+        help="recover a task stranded on an approval, including one from an older Helm",
+    )
+    repair_hold.add_argument("task_id")
+    repair_hold.add_argument(
+        "--note", default="", help="why it is being repaired; recorded on the task"
+    )
+
+    authority = commands.add_parser(
+        "authority",
+        help="configure the capability this root's protected commands require",
+    )
+    authority_commands = authority.add_subparsers(dest="authority_command", required=True)
+    authority_commands.add_parser(
+        "init", help="generate this root's authorization capability (the value is never printed)"
+    )
+    authority_commands.add_parser(
+        "status", help="report whether protected commands require a capability here"
     )
     learning = commands.add_parser(
         "learning", aliases=["learn"], help="propose, review, and apply domain learnings"
@@ -1330,8 +1366,12 @@ _ROOT_ONLY_COMMANDS = frozenset({
     ("approval", "grant"),
     ("approval", "revoke"),
     # Releasing a hold *is* the authorization the worker asked for. An agent
-    # that could run it would be approving its own protected action.
+    # that could run it would be approving its own protected action. This list
+    # is now a fast, readable refusal only: the enforced boundary is in core,
+    # because an agent that imports Coordinator never reaches CLI dispatch.
     ("approval", "release"),
+    ("approval", "repair"),
+    ("authority", None),
     ("learning", "approve"),
     ("learning", "reject"),
     ("learning", "apply"),
@@ -1661,6 +1701,13 @@ def main(argv: list[str] | None = None) -> int:
                     payload["path"] = args.path
                 if args.action:
                     payload["action"] = args.action
+                if args.type == "approval-needed" and not args.action:
+                    # Refused at the edge as well as in core, so the worker gets
+                    # the usable form rather than a validation error.
+                    raise HelmError(
+                        "--type approval-needed needs --action naming exactly what "
+                        "you would do: push, publish, delete, or external"
+                    )
                 task = coordinator.record_worker_message(
                     args.worker_id,
                     args.type,
@@ -1685,11 +1732,16 @@ def main(argv: list[str] | None = None) -> int:
                     released = adapter.close_project_space_if_finished(task["project_id"])
                 print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
                 if args.type == "approval-needed":
-                    hold = task.get("hold") or {}
+                    hold = coordinator.task_hold(task) or {}
                     print(
                         "  The task is paused, not finished; this session stays open. "
                         "A human authorizes it with: helm approval release "
                         f"{task['id']} --action {hold.get('action') or '<action>'} --confirm"
+                    )
+                    print(
+                        "  When told it is approved, run helm worker action-start "
+                        f"{args.worker_id} immediately before acting; it checks the "
+                        "approval against this exact state and spends it once."
                     )
                 if told_foreman:
                     print("  Told the project's foreman; it is theirs to act on")
@@ -1722,6 +1774,20 @@ def main(argv: list[str] | None = None) -> int:
                         stopped["project_id"]
                     ):
                         print(f"Closed the Herdr space for project {stopped['project_id']}")
+            elif args.worker_command == "action-start":
+                started = coordinator.start_authorized_action(args.worker_id)
+                print(
+                    f"Authorized: {started['action']} for task {started['task_id']} "
+                    f"[{started['status']}]"
+                )
+                if started.get("note"):
+                    print(f"  Commander's note: {started['note']}")
+                print(
+                    "  This authorization is now spent. Act, then report the outcome "
+                    "with --type result and any receipt in --payload."
+                )
+                with contextlib.suppress(HelmError, OSError):
+                    HerdrAdapter(coordinator).route_worker_messages(args.worker_id)
             elif args.worker_command == "answer":
                 # Record first: the answer is part of the task's audit trail
                 # whether or not a presentation surface can deliver it.
@@ -2019,36 +2085,103 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 hold = task.get("hold") or {}
                 authorization = hold.get("authorization") or {}
-                binding = authorization.get("binding") or {}
+                snapshot = authorization.get("snapshot") or hold.get("snapshot") or {}
                 worker_id = hold.get("worker_id", "")
-                # The decision is recorded whether or not the session can be
-                # reached, and then delivered into it -- in that order, because
-                # a presentation surface must never decide what was authorized.
                 message = args.text or (
                     f"Approved: {args.action}. The commander authorized exactly this"
                     + (f" ({args.note})" if args.note else "")
-                    + ". Carry it out now, then push your result. If anything about the"
-                    " change moved since you asked, stop and report instead."
+                    + ". Run `helm worker action-start "
+                    f"{worker_id}` immediately before you act -- it checks the approval "
+                    "against the state that was approved and spends it once -- then do "
+                    "it and report the outcome with --type result."
                 )
+                # Delivery is its own fact. The decision is already recorded and
+                # the task stays paused until the session itself acknowledges by
+                # spending the ticket, so a failed delivery is a retry rather
+                # than an authorization nobody received.
                 delivered = False
                 with contextlib.suppress(HelmError, OSError):
-                    coordinator.record_worker_message(worker_id, "answer", message)
-                    delivered = HerdrAdapter(coordinator).answer_worker(worker_id, message)
+                    adapter = HerdrAdapter(coordinator)
+                    if adapter.session_reachable(worker_id):
+                        delivered = adapter.answer_worker(worker_id, message)
+                if delivered:
+                    # Recorded only when it actually arrived, so the escalation
+                    # stays open while nobody has been told.
+                    with contextlib.suppress(HelmError, OSError):
+                        coordinator.record_worker_message(worker_id, "answer", message)
+                    with contextlib.suppress(HelmError, OSError):
+                        coordinator.mark_hold_delivered(args.task_id, delivered=True)
                 print(
-                    f"Released {args.action} for task {task['id']} [{task['status']}] "
+                    f"Authorized {args.action} for task {task['id']} [{task['status']}] "
                     f"worker={worker_id} "
-                    f"[{'delivered' if delivered else 'recorded only'}]"
+                    f"[{'delivered' if delivered else 'NOT delivered'}]"
                 )
                 if authorization.get("grant_id"):
                     print(f"  Authority: standing grant {authorization['grant_id']}")
-                if binding:
+                else:
                     print(
-                        f"  Bound to {binding.get('branch')} @ "
-                        f"{(binding.get('revision') or '')[:12]}; a change to this "
-                        "worktree invalidates it and asks again"
+                        f"  Authority: explicit confirmation "
+                        f"({(authorization.get('authority') or {}).get('mode', 'session')})"
+                    )
+                if snapshot.get("scope") == "workspace":
+                    print(
+                        f"  Bound to {snapshot.get('branch')} @ "
+                        f"{(snapshot.get('revision') or '')[:12]} plus its index, "
+                        f"working tree, {len(snapshot.get('untracked', []))} untracked "
+                        f"and {len(snapshot.get('artifacts', []))} declared artifact(s); "
+                        "any change refuses at action-start"
                     )
                 else:
-                    print("  No branch to bind to; the authorization stands on the record alone")
+                    print("  No worktree to bind: this task holds no branch of its own")
+                if delivered:
+                    print(
+                        "  The task stays paused until the worker spends it with "
+                        f"helm worker action-start {worker_id}"
+                    )
+                else:
+                    print(
+                        "  Nothing was delivered and nothing is spent. Retry with the "
+                        f"same command (helm approval release {args.task_id} --action "
+                        f"{args.action} --confirm), or repair the task with "
+                        f"helm approval repair {args.task_id} if its session is gone."
+                    )
+                    return 1
+            elif args.approval_command == "repair":
+                # Provider evidence, gathered here: core never talks to a
+                # presentation service and must not guess a session is alive.
+                live = False
+                with contextlib.suppress(HelmError, OSError):
+                    adapter = HerdrAdapter(coordinator)
+                    hold = coordinator.hold_worker_id(args.task_id)
+                    live = bool(hold) and adapter.session_reachable(hold)
+                repaired = coordinator.repair_task_hold(
+                    args.task_id, session_live=live, note=args.note
+                )
+                print(
+                    f"Repaired task {repaired['task_id']}: {repaired['outcome']}"
+                    + (
+                        f" (hold {repaired['hold']['id']} waiting on "
+                        f"{repaired['hold']['action']})"
+                        if repaired.get("hold")
+                        else ""
+                    )
+                )
+                if repaired["outcome"] == "abandoned":
+                    print(
+                        "  Its session is gone, so nothing could be authorized into it. "
+                        "The task is failed: its log is the evidence, and it can now be "
+                        f"cleaned up with helm task cleanup {repaired['task_id']}."
+                    )
+                elif repaired["outcome"] == "restate-requested":
+                    print(
+                        "  The recorded request named no usable action. The live worker "
+                        "has been asked to re-report it with --action."
+                    )
+                else:
+                    print(
+                        "  Authorize it with: helm approval release "
+                        f"{repaired['task_id']} --action {repaired['hold']['action']} --confirm"
+                    )
             elif args.approval_command == "check":
                 covering = coordinator.approval_grant_for(args.action, args.project_id)
                 scope = args.project_id or "all projects"
@@ -2061,6 +2194,35 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 _print_approval_grants(coordinator, include_revoked=args.include_revoked)
+            return 0
+        if args.command == "authority":
+            if args.authority_command == "init":
+                # Generated here, written 0600, and never printed: a capability
+                # read out into a transcript has already left the machine.
+                path = coordinator.configure_authority(secrets.token_urlsafe(48))
+                print("This root now requires an authorization capability.")
+                print(f"  Written to {path} (0600). Its value is never printed.")
+                print(f'  Load it into your own shell: export {AUTHORITY_ENV}="$(cat {path})"')
+                print(
+                    "  Then remove the file if you like. No agent Helm starts can "
+                    "inherit it: the worker environment is an allowlist."
+                )
+            else:
+                configured = bool(coordinator._authority_hash())
+                present = bool(os.environ.get(AUTHORITY_ENV))
+                print(
+                    "Protected commands here require a capability"
+                    if configured
+                    else "Protected commands here are guarded by session role only"
+                )
+                print(f"  capability configured: {'yes' if configured else 'no'}")
+                print(f"  capability present in this session: {'yes' if present else 'no'}")
+                if not configured:
+                    print(
+                        "  Set one up with helm authority init. Without it, a process "
+                        "that is neither marked nor descended from a worker is treated "
+                        "as the root."
+                    )
             return 0
         if args.command == "review":
             outcome = HerdrAdapter(coordinator).run_review_cycle(

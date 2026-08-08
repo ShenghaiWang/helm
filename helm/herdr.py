@@ -1759,6 +1759,39 @@ class HerdrAdapter:
         send_keys(pane, "Enter")
         return True
 
+    def session_reachable(self, worker_id: str) -> bool:
+        """Whether something can actually be said to this worker's session now.
+
+        Asked before an authorization is delivered, because the record alone is
+        not evidence: a pane the user closed leaves a worker recorded as running,
+        and delivering into it silently succeeds at nothing. A worker whose pane
+        the provider says is gone is reconciled here, so the next read of the
+        record agrees with the world.
+        """
+        data = self.coordinator.store.load()
+        worker = data.get("workers", {}).get(worker_id)
+        if worker is None or worker.get("status") != "running":
+            return False
+        if worker.get("execution") != "herdr":
+            # No pane and no input channel Helm owns. Presentation cannot
+            # invent one, and saying otherwise is how an authorization was
+            # spent on a session that could never hear it.
+            return False
+        if not self.client.available():
+            return False
+        layout = self._herdr_state(data)["workers"].get(worker_id)
+        if not layout or not layout.get("pane_id"):
+            return False
+        alive = self._provider_worker_alive(worker)
+        if alive is False:
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                self.coordinator.mark_worker_lost(
+                    worker_id,
+                    "Herdr pane or session disappeared before an authorization could be delivered",
+                )
+            return False
+        return True
+
     def route_worker_messages(self, worker_id: str) -> bool:
         """Deliver a worker's newly pushed messages without polling its process.
 

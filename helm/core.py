@@ -27,7 +27,11 @@ from typing import Any, Iterator, Sequence
 from . import runtimes
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+#: Versions this build can open. An older document is migrated on load rather
+#: than refused: the state that most needs repairing is the state written by
+#: the build with the bug in it.
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 DELIVERY_POLICIES = {"local", "pr"}
 
 # This text is intentionally in Helm core rather than in a user-editable
@@ -236,7 +240,89 @@ _TERMINAL_WORKER_TASK_STATES = {
 #: one thing a worker can never do for itself, and a pause is not an outcome:
 #: the session that asked stays live, because the whole point is to tell it to
 #: continue once a human has decided.
-HOLD_STATUSES = frozenset({"waiting", "authorized", "closed", "invalidated", "abandoned"})
+#:
+#: `authorized-pending-delivery` exists because a decision and its arrival are
+#: different events. Collapsing them let an undelivered authorization resume the
+#: task and close the escalation while no worker had been told anything.
+HOLD_STATUSES = frozenset({
+    "waiting",
+    "authorized-pending-delivery",
+    "in-flight",
+    "closed",
+    "invalidated",
+    "abandoned",
+})
+#: A hold in one of these is still somebody's business.
+HOLD_OPEN_STATUSES = frozenset({"waiting", "authorized-pending-delivery", "in-flight"})
+#: The whole transition table, as data. Every hold movement in Helm goes through
+#: `_move_hold`, so a route that is not written here cannot be reached -- which
+#: is the only way an invariant like "a failed task has no live hold" survives
+#: contact with five call sites that each looked locally correct.
+HOLD_TRANSITIONS: dict[tuple[str, str], str] = {
+    # The commander decided. Delivery has not happened yet, so the task stays
+    # paused and the escalation stays open.
+    ("waiting", "authorize"): "authorized-pending-delivery",
+    # Re-running release is a delivery retry, not a second authorization.
+    ("authorized-pending-delivery", "authorize"): "authorized-pending-delivery",
+    # The worker itself consumed the one-use ticket immediately before acting.
+    # This is the only route to acting, and the only place the precondition is
+    # checked while it can still prevent the side effect.
+    ("authorized-pending-delivery", "consume"): "in-flight",
+    ("authorized-pending-delivery", "invalidate"): "invalidated",
+    ("in-flight", "invalidate"): "invalidated",
+    # The action happened; its receipts are outcome data, not a precondition.
+    ("in-flight", "outcome"): "closed",
+    ("waiting", "abandon"): "abandoned",
+    ("authorized-pending-delivery", "abandon"): "abandoned",
+    ("in-flight", "abandon"): "abandoned",
+    # A repeat of the same unanswered request is the worker restating itself.
+    ("waiting", "restate"): "waiting",
+}
+#: The task status each open hold state implies. A paused task is paused in one
+#: place, so nothing has to remember to keep the two in step.
+HOLD_TASK_STATUS = {
+    "waiting": "approval-needed",
+    "authorized-pending-delivery": "approval-needed",
+    "in-flight": "running",
+    "invalidated": "approval-needed",
+}
+
+
+def _migrate_state(data: dict[str, Any], version: int) -> dict[str, Any]:
+    """Bring an older state document up to this build's schema, conservatively.
+
+    v1 -> v2 moves each task's single `hold` into the `holds` history and
+    downgrades any authorization it carried. A v1 `authorized` hold cannot say
+    whether it was ever delivered, consumed, or acted on, and the safe reading
+    of an unknown authorization is that it is not one: it becomes `invalidated`,
+    so the commander is asked again rather than a stale agreement being spent.
+    """
+    if version >= 2:
+        return data
+    downgrade = {
+        "waiting": "waiting",
+        "authorized": "invalidated",
+        "closed": "closed",
+        "invalidated": "invalidated",
+        "abandoned": "abandoned",
+    }
+    for task in data.get("tasks", {}).values():
+        if not isinstance(task, dict):
+            continue
+        holds = task.get("holds")
+        if not isinstance(holds, list):
+            holds = []
+        legacy = task.pop("hold", None)
+        if isinstance(legacy, dict) and legacy.get("id"):
+            legacy["status"] = downgrade.get(str(legacy.get("status")), "invalidated")
+            legacy["migrated_from_schema"] = version
+            if not any(
+                isinstance(entry, dict) and entry.get("id") == legacy["id"] for entry in holds
+            ):
+                holds.append(legacy)
+        task["holds"] = holds
+    data["version"] = SCHEMA_VERSION
+    return data
 LEARNING_PROPOSAL_STATUSES = {"proposed", "approved", "rejected", "applied"}
 #: One colour per glyph `project_glyph` can produce. The palette used to hold
 #: eight colours that collapsed to five squares -- three of them blue, two
@@ -900,6 +986,72 @@ def worker_environment(source: dict[str, str] | None = None) -> dict[str, str]:
     return result
 
 
+#: The environment variable that carries the root's authorization capability.
+#: Deliberately absent from `worker_environment`'s allowlist above, so no agent
+#: Helm starts can inherit it, and never written into a worker's context
+#: document, prompt, or reporting command.
+AUTHORITY_ENV = "HELM_AUTHORITY"
+
+
+class Authority:
+    """Proof that a protected action was authorized by the root, not an agent.
+
+    Helm used to decide this in CLI dispatch, from the *absence* of a worker
+    marker in the environment. A worker owns the environment of the commands it
+    starts, so `env -u HELM_WORKER_ID helm approval release ...` was accepted,
+    and importing `Coordinator` skipped the check altogether. Absence of
+    evidence is not authority: an object of this type is required by every
+    protected core operation, and only `Coordinator.authority()` can build one.
+
+    `mode` records which boundary actually held, because an audit that cannot
+    distinguish a capability-backed decision from a session-role one is telling
+    the reader less than it appears to.
+    """
+
+    __slots__ = ("mode", "actor")
+
+    def __init__(self, mode: str, actor: str) -> None:
+        if mode not in {"capability", "session"}:
+            raise SafetyError(f"unknown authority mode: {mode}")
+        self.mode = mode
+        self.actor = actor
+
+    def record(self) -> dict[str, str]:
+        return {"mode": self.mode, "actor": self.actor}
+
+
+def _process_parents(pid: int) -> list[int]:
+    """The pid chain above `pid`, oldest last, or [] when it cannot be read.
+
+    Ancestry is the part of an agent's identity it cannot edit. A worker can
+    unset a variable; it cannot make itself not be the child of the runner Helm
+    started for it.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    parents: dict[int, int] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            parents[int(fields[0])] = int(fields[1])
+    chain: list[int] = []
+    current = parents.get(pid)
+    seen: set[int] = set()
+    while current and current > 1 and current not in seen:
+        seen.add(current)
+        chain.append(current)
+        current = parents.get(current)
+    return chain
+
+
 def _parse_frontmatter(text: str) -> dict[str, Any]:
     """Read a small YAML-ish frontmatter block: scalars and simple lists.
 
@@ -1213,13 +1365,22 @@ class StateStore:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise HelmError(f"cannot read state {self.state_file}: {exc}") from exc
-        if not isinstance(data, dict) or data.get("version") != SCHEMA_VERSION:
+        if not isinstance(data, dict) or data.get("version") not in SUPPORTED_SCHEMA_VERSIONS:
             raise HelmError(f"unsupported or corrupt Helm state: {self.state_file}")
         for key in ("projects", "tasks", "workers", "messages", "artifacts", "learning_proposals"):
             data.setdefault(key, {} if key in {"projects", "tasks", "workers"} else [])
         data.setdefault("approval_grants", {})
         data.setdefault("config", {})
         data.setdefault("integrations", {})
+        # Migration on read, so a root written by the build that had the bug
+        # opens here instead of being refused as corrupt. The upgraded document
+        # is persisted by the next save; reading alone changes nothing on disk.
+        version = int(data.get("version") or 1)
+        if version != SCHEMA_VERSION:
+            data = _migrate_state(data, version)
+        for task in data.get("tasks", {}).values():
+            if isinstance(task, dict) and not isinstance(task.get("holds"), list):
+                task["holds"] = []
         return data
 
     def configured_root(self) -> Path | None:
@@ -3277,8 +3438,13 @@ class Coordinator:
             # asked for, so it is shown in the usage rather than left to prose.
             "usage_approval": (
                 f"{shlex.join(command)} --type approval-needed"
-                " --action <merge|push|publish|delete|external>"
+                " --action <push|publish|delete|external>"
                 " --text '<exactly what you would do, and to what>'"
+            ),
+            # The pre-action gate. One use, checked against the exact state the
+            # commander approved, and the only route from approved to acting.
+            "usage_action_start": shlex.join(
+                [*command[:-3], "worker", "action-start", command[-1]]
             ),
             "types": [
                 "status", "result", "blocker", "failure", "approval-needed", "artifact", "question",
@@ -3298,10 +3464,19 @@ class Coordinator:
                 " actions, and missing credentials still need a human.",
                 "A protected action is asked for with --type approval-needed AND"
                 " --action, naming exactly what you would do. That pauses the task;"
-                " it does not end it. Stay in your session: Helm replies there when"
-                " a human has decided, and you then carry the action out and report"
-                " the outcome like any other work. Do not exit, and do not do it"
-                " anyway while you wait.",
+                " it does not end it. Stay in your session and do not exit: Helm"
+                " replies there when a human has decided.",
+                "When you are told it is approved, run the action-start command in"
+                " this document IMMEDIATELY BEFORE you act. It checks the approval"
+                " against the exact state the human approved and spends it once. If"
+                " it refuses, do not act. Then perform the action and report the"
+                " outcome with --type result, putting remote ids, URLs or tracker"
+                " refs in --payload '{\"receipt\": ...}'. Acting without it leaves"
+                " Helm no evidence the approval still held, and the record will say"
+                " so.",
+                "Never merge. Merging is Helm's own operation: finish, report your"
+                " result, and the branch is reviewed and merged outside your"
+                " session.",
                 "The coordinator does not watch your process; an unreported worker is"
                 " indistinguishable from a dead one.",
                 "Report each file you produce with --type artifact AND --path."
@@ -4002,121 +4177,221 @@ class Coordinator:
     #: The one worker message that pauses a task instead of ending it.
     HOLD_MESSAGE_KIND = "approval-needed"
 
-    def _hold_binding(self, task: dict[str, Any]) -> dict[str, Any] | None:
-        """What a hold's answer is bound to, or None when there is nothing to bind.
-
-        An authorization covers one state of one worktree. Committed history
-        alone is not that state: a worker paused mid-task usually has
-        uncommitted edits, and a binding that ignored them would call an edited
-        worktree unchanged. A foreman has no checkout at all, and binding is
-        simply not applicable there -- "where applicable" is this method
-        returning None.
-        """
-        branch = task.get("branch")
-        workspace = canonical(task["workspace"]) if task.get("workspace") else None
-        if not branch or workspace is None or not workspace.is_dir():
-            return None
-        revision = _git(workspace, "rev-parse", "HEAD", check=False).strip()
-        tree = _git(workspace, "rev-parse", "HEAD^{tree}", check=False).strip()
-        if not revision or not tree:
-            return None
-        porcelain = _git(
-            workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False
-        )
-        return {
-            "branch": branch,
-            "branch_tip": _git(
-                workspace, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
-                check=False,
-            ).strip(),
-            "revision": revision,
-            "tree": tree,
-            "worktree": hashlib.sha256(porcelain.encode("utf-8")).hexdigest(),
-        }
-
-    def _open_hold(
-        self,
-        task: dict[str, Any],
-        worker: dict[str, Any],
-        message: dict[str, Any],
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Record the pause a worker's `approval-needed` message opened.
-
-        The worker named an action it cannot take; Helm records which one, who
-        asked, and where the work stood, so a human can answer that exact
-        request rather than a paraphrase of it. A payload naming something
-        outside the protected list leaves the action unspecified: a worker's
-        message is data, and data does not get to widen what may be authorized.
-        """
-        requested = payload.get("action")
-        action = requested if requested in PROTECTED_ACTIONS else ""
-        hold = {
-            "id": new_id("h"),
-            "status": "waiting",
-            "action": action,
-            "worker_id": worker["id"],
-            "message_id": message["id"],
-            "text": _safe_text(message.get("text", ""))[:900],
-            "requested_at": now(),
-            "requested_binding": self._hold_binding(task),
-            "authorization": None,
-        }
-        task["hold"] = hold
-        return hold
-
     @staticmethod
-    def _abandon_hold(task: dict[str, Any]) -> None:
-        """Close an open hold nobody can act on any more.
+    def _content_digest(path: Path) -> str:
+        """A stable digest of one path's bytes, or a refusal.
 
-        A task that ends blocked or failed leaves its question unanswerable,
-        and an open hold left behind reads as a decision still worth making.
+        Fail-closed on purpose. A snapshot that quietly recorded "unreadable"
+        would compare equal to the next unreadable reading, which is exactly
+        how an unbound file becomes an unbound authorization.
         """
-        hold = task.get("hold")
-        if hold and hold.get("status") in {"waiting", "authorized"}:
-            hold["status"] = "abandoned"
-            hold["closed_at"] = now()
+        try:
+            if path.is_symlink():
+                return "symlink:" + hashlib.sha256(
+                    os.readlink(path).encode("utf-8")
+                ).hexdigest()
+            if path.is_dir():
+                return "dir"
+            if not path.exists():
+                return "absent"
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+            return f"sha256:{digest.hexdigest()}"
+        except OSError as exc:
+            raise SafetyError(f"cannot bind {path}: {exc}") from exc
 
-    def _settle_hold(
+    def _snapshot(
         self, data: dict[str, Any], project: dict[str, Any], task: dict[str, Any]
-    ) -> None:
-        """Close an authorized hold on the worker's result, or reopen the gate.
+    ) -> dict[str, Any]:
+        """Exactly what an authorization is about, by content, or an exception.
 
-        The authorization was bound to one tree. If the worker changed that
-        tree after the human answered -- another commit, another edit -- then
-        what it did is not what was approved, so the task goes back to the gate
-        with the binding invalidated instead of completing quietly.
+        The previous binding hashed the *text* of `git status --porcelain`,
+        which is path/status pairs. Rewriting every byte of an already-untracked
+        render left that text identical, so the authorization to publish one
+        file silently covered a different one -- the common publish case this is
+        for. Ignored build outputs were not in it at all.
+
+        So this binds content: the committed revision and tree, the index, the
+        full tracked diff against HEAD (staged and unstaged, binary included),
+        every untracked path by digest, and every artifact this task declared --
+        by artifact id, path and digest -- plus whatever sits under the
+        project's declared delivery directories, which is where ignored outputs
+        live. Workspace identity is verified first, through the same isolation
+        check every other operation uses, so a swapped or missing worktree is a
+        refusal rather than an empty binding.
         """
-        hold = task.get("hold")
-        if not hold or hold.get("status") != "authorized":
-            return
-        authorization = hold.get("authorization") or {}
-        bound = authorization.get("binding")
-        current = self._hold_binding(task)
-        if bound and current != bound:
-            hold["status"] = "invalidated"
-            hold["invalidated_at"] = now()
-            task["status"] = "approval-needed"
+        if task.get("role") in WORKTREELESS_ROLES:
+            # No checkout and no branch. There is no content to bind, and
+            # pretending otherwise would be a fiction; the scope says so
+            # explicitly instead of returning nothing and being read as absent.
+            root = canonical(project["root"])
+            return {
+                "scope": "project",
+                "project_root": str(root),
+                "revision": _git(root, "rev-parse", "HEAD"),
+            }
+        workspace = self._verify_workspace_record(data, project, task)
+        branch = task.get("branch")
+        if not branch:
+            raise SafetyError(
+                f"task {task['id']} has no branch to bind an authorization to"
+            )
+        head = _git(workspace, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        if head != branch:
+            raise SafetyError(
+                f"task worktree is on {head}, not its own branch {branch}; "
+                "refusing to bind an authorization to it"
+            )
+        untracked = [
+            entry
+            for entry in _git(
+                workspace, "ls-files", "--others", "--exclude-standard", "-z"
+            ).split("\0")
+            if entry
+        ]
+        artifacts = sorted(
+            (
+                {
+                    "id": artifact["id"],
+                    "path": artifact["path"],
+                    "digest": self._content_digest(workspace / artifact["path"]),
+                }
+                for artifact in data.get("artifacts", [])
+                if artifact.get("task_id") == task["id"] and artifact.get("path")
+            ),
+            key=lambda entry: entry["id"],
+        )
+        delivered: list[dict[str, str]] = []
+        for folder in self._discovery_settings(canonical(project["root"])).get("deliver", []):
+            source = workspace / folder
+            if not source.is_dir():
+                continue
+            for found in sorted(source.rglob("*")):
+                if found.is_file():
+                    delivered.append({
+                        "path": found.relative_to(workspace).as_posix(),
+                        "digest": self._content_digest(found),
+                    })
+        return {
+            "scope": "workspace",
+            "workspace": str(workspace),
+            "branch": branch,
+            "branch_tip": _git(workspace, "rev-parse", f"refs/heads/{branch}").strip(),
+            "revision": _git(workspace, "rev-parse", "HEAD").strip(),
+            "tree": _git(workspace, "rev-parse", "HEAD^{tree}").strip(),
+            "index": hashlib.sha256(
+                _git(workspace, "ls-files", "--stage", "-z").encode("utf-8")
+            ).hexdigest(),
+            # Content, not status: every tracked byte that differs from HEAD,
+            # staged or not, in one comparable digest.
+            "diff": hashlib.sha256(
+                _git(workspace, "diff", "HEAD", "--binary").encode(
+                    "utf-8", errors="surrogateescape"
+                )
+            ).hexdigest(),
+            "untracked": [
+                {"path": path, "digest": self._content_digest(workspace / path)}
+                for path in sorted(untracked)
+            ],
+            "artifacts": artifacts,
+            "delivered": delivered,
+        }
+
+    def _hold_history(self, task: dict[str, Any]) -> list[dict[str, Any]]:
+        holds = task.get("holds")
+        if not isinstance(holds, list):
+            holds = []
+            task["holds"] = holds
+        return holds
+
+    def task_hold(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """The task's open hold, or None. History is never overwritten."""
+        for hold in reversed(self._hold_history(task)):
+            if hold.get("status") in HOLD_OPEN_STATUSES:
+                return hold
+        return None
+
+    def latest_hold(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        history = self._hold_history(task)
+        return history[-1] if history else None
+
+    def _move_hold(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        hold: dict[str, Any],
+        event: str,
+        *,
+        detail: str = "",
+        payload: dict[str, Any] | None = None,
+        worker: dict[str, Any] | None = None,
+        message_kind: str = "",
+    ) -> dict[str, Any]:
+        """The only way a hold changes state, and the only place task status follows.
+
+        Every route is in `HOLD_TRANSITIONS`. A movement that is not written
+        there is a bug in the caller, not a state to fall into: five call sites
+        each doing their own local update is how a failed task kept a live hold
+        that could then be released back into `running`.
+        """
+        current = str(hold.get("status"))
+        target = HOLD_TRANSITIONS.get((current, event))
+        if target is None:
+            raise SafetyError(
+                f"hold {hold.get('id')} cannot {event} from {current}"
+            )
+        hold["status"] = target
+        hold.setdefault("history", []).append(
+            {"at": now(), "event": event, "from": current, "to": target, "detail": detail}
+        )
+        if target not in HOLD_OPEN_STATUSES:
+            hold["closed_at"] = now()
+        implied = HOLD_TASK_STATUS.get(target)
+        if implied:
+            task["status"] = implied
+        if message_kind:
             self._message(
                 data,
                 project,
                 task,
-                None,
-                "approval-invalidated",
-                (
-                    "Worktree changed after the authorization was given; the "
-                    f"approval for {hold.get('action') or 'the requested action'} "
-                    "no longer covers this work and must be given again"
-                ),
-                {
-                    "hold_id": hold["id"],
-                    "authorized_revision": bound.get("revision"),
-                    "current_revision": (current or {}).get("revision"),
-                },
+                worker,
+                message_kind,
+                detail,
+                {"hold_id": hold["id"], "hold_status": target, **(payload or {})},
             )
+        return hold
+
+    def _abandon_open_hold(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Let go of a hold nobody can act on, whatever ended the task.
+
+        Keyed on the task no longer being answerable rather than on how it said
+        so: abandonment used to depend on the message *kind*, so `--status
+        failed` left a waiting hold behind that a later release resurrected
+        into `running`.
+        """
+        hold = self.task_hold(task)
+        if hold is None:
             return
-        hold["status"] = "closed"
-        hold["closed_at"] = now()
+        self._move_hold(
+            data, project, task, hold, "abandon",
+            detail=f"Approval hold abandoned: {reason}",
+            message_kind="approval-abandoned",
+        )
+        if task["status"] == "approval-needed":
+            # Nothing is waiting on a human any more, and a task parked in
+            # `approval-needed` with no answerable hold is residue: cleanup
+            # refuses it and no round can reopen it. Failed is the honest,
+            # cleanable, retryable state, and its log is still the evidence.
+            task["status"] = "failed"
 
     def _record_artifact(
         self,
@@ -4157,37 +4432,150 @@ class Coordinator:
         }
         data["artifacts"].append(artifact)
 
-    def _record_worker_message_locked(
+    #: Worker message kinds Helm accepts, on either intake path.
+    WORKER_MESSAGE_KINDS = frozenset({
+        "status", "result", "blocker", "failure", "approval-needed", "artifact",
+        "question", "answer",
+    })
+
+    @staticmethod
+    def _receipts(payload: dict[str, Any]) -> list[Any]:
+        """Post-action evidence a worker reported: remote ids, URLs, tracker refs.
+
+        Deliberately outcome data. It is recorded beside the hold and never
+        compared against the pre-action snapshot -- a publish that writes its own
+        receipt used to invalidate the very authorization it had just satisfied.
+        """
+        for key in ("receipt", "receipts"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [_safe_text(entry)[:300] if isinstance(entry, str) else entry for entry in value]
+            if value not in (None, "", {}, []):
+                return [_safe_text(value)[:300] if isinstance(value, str) else value]
+        return []
+
+    def _hold_request(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        message: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Open, or restate, the pause a worker's `approval-needed` push asks for.
+
+        Every hold names an exact action. An unspecified request used to be
+        stored as an empty string, and release then accepted whichever action
+        the commander happened to type -- a request for nothing authorizing a
+        `delete`. `merge` is refused here rather than at release, because a
+        worker cannot perform Helm's merge at all: it finishes and reports, and
+        the branch is reviewed through `helm task approve`.
+
+        A repeat of the same unanswered request restates it. Anything else while
+        a hold is open is refused, so a live authorization cannot be replaced by
+        a different request and lose its state and outcome linkage.
+        """
+        action = payload.get("action")
+        if action not in PROTECTED_ACTIONS:
+            raise HelmError(
+                "an approval request must name the exact protected action with "
+                f"--action (one of {', '.join(sorted(PROTECTED_ACTIONS - {'merge'}))})"
+            )
+        if action == "merge":
+            raise HelmError(
+                "merging is Helm's own operation and no worker performs it: "
+                "finish and report your result, and the branch is reviewed with "
+                "helm task approve before Helm merges it"
+            )
+        snapshot = self._snapshot(data, project, task)
+        open_hold = self.task_hold(task)
+        if open_hold is not None:
+            if open_hold["status"] != "waiting" or open_hold["action"] != action:
+                raise HelmError(
+                    f"task {task['id']} already has a {open_hold['status']} hold for "
+                    f"{open_hold['action']} ({open_hold['id']}); resolve it before "
+                    "asking for something else"
+                )
+            if open_hold.get("snapshot") == snapshot:
+                # The same unanswered request, unchanged. One thing for the
+                # commander to decide, not two.
+                return self._move_hold(
+                    data, project, task, open_hold, "restate",
+                    detail=f"Approval request restated: {action}",
+                    worker=worker,
+                )
+            # Same action, different work. Refreshing the old hold in place
+            # would let a request the commander is already reading change
+            # underneath them, so the old one is superseded visibly and this
+            # becomes a new request with its own id and its own snapshot.
+            self._move_hold(
+                data, project, task, open_hold, "abandon",
+                detail=(
+                    f"Superseded: the {action} request was restated for different "
+                    "work, so the earlier one no longer describes anything"
+                ),
+                worker=worker,
+                message_kind="approval-abandoned",
+            )
+        hold = {
+            "id": new_id("h"),
+            "status": "waiting",
+            "action": action,
+            "worker_id": worker["id"],
+            "message_id": message["id"],
+            "text": _safe_text(message.get("text", ""))[:900],
+            "requested_at": now(),
+            # The exact state being asked about. Bound now, compared later, and
+            # never silently replaced: this is what the commander is deciding.
+            "snapshot": snapshot,
+            "authorization": None,
+            "delivery": {"attempts": 0, "delivered_at": None, "acknowledged_at": None},
+            "outcome": {"started_at": None, "receipts": [], "reported_at": None},
+            "history": [{"at": now(), "event": "request", "from": None, "to": "waiting",
+                         "detail": f"Approval requested: {action}"}],
+        }
+        self._hold_history(task).append(hold)
+        task["status"] = "approval-needed"
+        return hold
+
+    def _ingest_worker_event(
         self,
         data: dict[str, Any],
         worker: dict[str, Any],
         kind: str,
         text: str,
-        payload: dict[str, Any] | None = None,
-        requested_status: str | None = None,
+        payload: dict[str, Any],
+        requested_status: str | None,
     ) -> dict[str, Any]:
+        """Record one worker event and move everything it moves. Call under lock.
+
+        The single intake point for both paths: a `helm worker message` push and
+        a JSON protocol line parsed out of a worker's stdout. They used to be
+        two copies with different behavior, which is why the process fallback
+        silently skipped hold settlement, the approval action item, evidence,
+        and the project's own record. Returns the metadata the unlocked
+        side-effect pass needs, so nothing has to be recomputed or remembered.
+        """
         task = self._task(data, worker["task_id"])
         project = self._project(data, worker["project_id"])
         message = self._message(
             data, project, task, worker, kind, text, payload, status=requested_status
         )
+        receipts = self._receipts(payload)
+        hold_event = ""
         if kind == "artifact":
-            self._record_artifact(data, project, task, worker, payload or {})
+            self._record_artifact(data, project, task, worker, payload)
+        elif kind == self.HOLD_MESSAGE_KIND:
+            hold = self._hold_request(data, project, task, worker, message, payload)
+            hold_event = "request"
         else:
             self._transition_from_message(task, kind, requested_status)
-            if kind == self.HOLD_MESSAGE_KIND:
-                self._open_hold(task, worker, message, payload or {})
-            elif task["status"] == "completed":
-                # An authorized hold is bound to the tree the human saw. If
-                # that moved, this is not the thing they approved, and
-                # completing the task here would let the change through on an
-                # agreement to something else. Keyed on the task reaching
-                # `completed` rather than on the message being a `result`, so a
-                # status push carrying `--status completed` cannot route around
-                # the binding.
-                self._settle_hold(data, project, task)
-            elif kind in {"blocker", "failure"}:
-                self._abandon_hold(task)
+            hold = self.task_hold(task)
+            if hold is not None:
+                hold_event = self._resolve_hold_on_event(
+                    data, project, task, worker, hold, kind, receipts
+                )
         if kind in self._TERMINAL_MESSAGE_TASK_STATE:
             # The message is terminal even when the provider process or pane
             # stays open. Mark only the worker/task lifecycle here; approval,
@@ -4196,7 +4584,176 @@ class Coordinator:
             worker["status"] = "completed" if kind == "result" else "failed"
             worker["exit_code"] = 0 if kind == "result" else 1
             worker["ended_at"] = now()
-        return task
+        worker["last_reported_at"] = now()
+        latest = self.latest_hold(task)
+        return self._event_metadata(
+            task, worker, kind, text, payload, hold_event, latest
+        )
+
+    def _resolve_hold_on_event(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        hold: dict[str, Any],
+        kind: str,
+        receipts: list[Any],
+    ) -> str:
+        """What one non-approval event does to the open hold. Keyed on outcome."""
+        if task["status"] in {"blocked", "failed"}:
+            self._abandon_open_hold(
+                data, project, task, f"task ended {task['status']} with the hold open"
+            )
+            return "abandon"
+        if hold["status"] == "in-flight" and (kind == "result" or receipts):
+            # The authorized action ran and this is its outcome. Receipts are
+            # recorded as outcome data; they are never a precondition.
+            hold["outcome"]["receipts"] = list(hold["outcome"].get("receipts", [])) + list(receipts)
+            hold["outcome"]["reported_at"] = now()
+            self._move_hold(
+                data, project, task, hold, "outcome",
+                detail=f"Authorized {hold['action']} reported complete",
+                payload={"receipts": hold["outcome"]["receipts"]},
+                worker=worker,
+                message_kind="approval-outcome",
+            )
+            if kind == "result":
+                task["status"] = "completed"
+            return "outcome"
+        if receipts and hold["status"] != "in-flight":
+            # An action reported without the one-use ticket ever being consumed.
+            # Helm has no evidence the precondition held when it happened, so
+            # the authorization is spent and a human has to look.
+            self._move_hold(
+                data, project, task, hold, "invalidate",
+                detail=(
+                    f"Reported acting on {hold['action']} without consuming the "
+                    "authorization; it must be approved again"
+                ),
+                worker=worker,
+                message_kind="approval-invalidated",
+            )
+            return "invalidate"
+        if kind == "result":
+            # It finished without ever using the authorization. That is not a
+            # failure and not an approved action either; the record says so
+            # rather than closing the hold as if it had been used.
+            self._abandon_open_hold(
+                data, project, task, "worker finished without using the authorization"
+            )
+            task["status"] = "completed"
+            return "abandon"
+        return ""
+
+    def _event_metadata(
+        self,
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        kind: str,
+        text: str,
+        payload: dict[str, Any],
+        hold_event: str,
+        hold: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Everything the unlocked side-effect pass needs, computed once."""
+        role = task.get("role")
+        summary = _safe_text(text).strip()[:900]
+        source = (
+            "Approval request"
+            if kind == self.HOLD_MESSAGE_KIND
+            else "Foreman report"
+            if role == "foreman"
+            else "Worker summary"
+        )
+        worth_recording = bool(summary) and (
+            (role == "foreman" and kind in {"result", "blocker", "failure", "approval-needed"})
+            or (kind == "status" and self._summary_payload(payload))
+            # A gate opening or resolving is the one thing nobody should have to
+            # go looking for, on either intake path.
+            or hold_event in {"request", "outcome", "invalidate", "abandon"}
+        )
+        action_item = None
+        if worth_recording:
+            action_item = (
+                self._action_item_from_payload(payload)
+                or self._action_item_from_summary(summary)
+            )
+            if kind == self.HOLD_MESSAGE_KIND and not action_item:
+                # A task paused on the commander is the definition of a
+                # follow-up item; it must not depend on the worker having
+                # phrased its request with a marker word.
+                action_item = f"Authorize or refuse: {summary}"
+        return {
+            "kind": kind,
+            "task_id": task["id"],
+            "project_id": task["project_id"],
+            "worker_id": worker["id"],
+            "role": role,
+            "task_status": task.get("status"),
+            "hold_id": (hold or {}).get("id"),
+            "hold_status": (hold or {}).get("status"),
+            "hold_event": hold_event,
+            "terminal": kind in self._TERMINAL_MESSAGE_TASK_STATE,
+            "situation": (
+                f"{source}: task {task['id']} [{task.get('status')}] {summary}"
+                if worth_recording
+                else None
+            ),
+            "source": source,
+            "action_item": action_item,
+            # The commander's attention item is keyed to the hold, so resolving
+            # it is possible at all: an unkeyed "Authorize or refuse" line stayed
+            # open forever after the action succeeded.
+            "action_item_key": (hold or {}).get("id"),
+            "resolve_key": (
+                (hold or {}).get("id")
+                if hold_event in {"outcome", "invalidate", "abandon"}
+                else None
+            ),
+            "capture_evidence": (
+                kind in self._TERMINAL_MESSAGE_TASK_STATE or hold_event == "request"
+            ),
+            "learning": kind == "result",
+        }
+
+    def _apply_event_effects(self, event: dict[str, Any]) -> None:
+        """The durable, unlocked half of one worker event.
+
+        Runs outside the state lock because it writes the project's own record
+        and can raise learning proposals, which take the lock themselves.
+        """
+        project_id = event["project_id"]
+        if event["situation"]:
+            with contextlib.suppress(HelmError, OSError):
+                self.record_situation(project_id, event["situation"])
+        if event["action_item"]:
+            with contextlib.suppress(HelmError, OSError):
+                self.record_project_action_item(
+                    project_id,
+                    event["action_item"],
+                    source=event["source"],
+                    task_id=event["task_id"],
+                    key=event["action_item_key"],
+                )
+        if event["resolve_key"]:
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_project_action_items(project_id, event["resolve_key"])
+        if event["capture_evidence"]:
+            # Preserve terminal output as evidence before a later cleanup or
+            # provider teardown can remove its pane/log. A pause is captured
+            # too: what the session was doing when it stopped to ask is exactly
+            # what the person deciding needs to see.
+            with contextlib.suppress(HelmError, OSError):
+                self.capture_evidence(event["worker_id"])
+        if event["learning"]:
+            # A finished task is the evidence the learning flow wants, and
+            # asking a coordinator to remember to harvest it made knowledge
+            # depend on memory -- which is the failure every other rule here
+            # was moved into code to avoid. Proposals are inert: they still
+            # cannot approve, apply, or teach anything by themselves.
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                self.generate_learning_proposals(event["task_id"])
 
     def record_worker_message(
         self,
@@ -4210,13 +4767,15 @@ class Coordinator:
         # "question" lets a worker ask instead of guessing or stopping: the
         # coordinator answers from the goal and the work continues.  "answer" is
         # the coordinator's reply, recorded so the exchange stays auditable.
-        allowed = {
-            "status", "result", "blocker", "failure", "approval-needed", "artifact",
-            "question", "answer",
-        }
-        if kind not in allowed:
+        if kind not in self.WORKER_MESSAGE_KINDS:
             raise HelmError(f"unsupported worker message type: {kind}")
-        terminal = kind in self._TERMINAL_MESSAGE_TASK_STATE
+        if requested_status == "approval-needed":
+            # The status route could never name an action, so it created a
+            # paused task with no hold and nothing to release.
+            raise HelmError(
+                "a pause is asked for with --type approval-needed --action <action>, "
+                "not with --status approval-needed"
+            )
         payload = payload or {}
         with self.store.locked() as data:
             worker = data["workers"].get(worker_id)
@@ -4224,83 +4783,11 @@ class Coordinator:
                 raise HelmError(f"unknown worker: {worker_id}")
             if worker["status"] != "running":
                 raise HelmError("worker is no longer running")
-            before = (
-                (data.get("tasks", {}).get(worker["task_id"]) or {}).get("hold") or {}
-            ).get("status")
-            task = self._record_worker_message_locked(
+            event = self._ingest_worker_event(
                 data, worker, kind, text, payload, requested_status
             )
-            task_id = task["id"]
-            project_id = task["project_id"]
-            role = task.get("role")
-            task_status = task.get("status")
-            # True only for the push that resolved an authorization, read
-            # inside the lock because that same push is what moves the hold.
-            settled_hold = before == "authorized" and (task.get("hold") or {}).get(
-                "status"
-            ) in {"closed", "invalidated"}
-            # Stamped here, on the worker's own push path, so the health check
-            # cannot mistake Helm's "Worker launched" lifecycle message for the
-            # worker having said something. Keep it even on a terminal push for
-            # an auditable final report timestamp.
-            worker["last_reported_at"] = now()
-        if (
-            (role == "foreman" and kind in {"result", "blocker", "failure", "approval-needed"})
-            or (kind == "status" and self._summary_payload(payload))
-            # The outcome of an action a human authorized is the one report
-            # nobody should have to go looking for: they decided, and the
-            # answer to "what happened then" belongs in the project's record.
-            or settled_hold
-            or kind == self.HOLD_MESSAGE_KIND
-        ):
-            source = (
-                "Approval request"
-                if kind == self.HOLD_MESSAGE_KIND
-                else "Foreman report"
-                if role == "foreman"
-                else "Worker summary"
-            )
-            summary = _safe_text(text).strip()[:900]
-            if summary:
-                with contextlib.suppress(HelmError, OSError):
-                    self.record_situation(
-                        project_id,
-                        f"{source}: task {task_id} [{task_status}] {summary}",
-                    )
-                action_item = (
-                    self._action_item_from_payload(payload)
-                    or self._action_item_from_summary(summary)
-                )
-                if kind == self.HOLD_MESSAGE_KIND and not action_item:
-                    # A task paused on the commander is the definition of a
-                    # follow-up item. It must not depend on the worker having
-                    # happened to phrase its request with a marker word.
-                    action_item = f"Authorize or refuse: {summary}"
-                if action_item:
-                    with contextlib.suppress(HelmError, OSError):
-                        self.record_project_action_item(
-                            project_id,
-                            action_item,
-                            source=source,
-                            task_id=task_id,
-                        )
-        if terminal or kind == self.HOLD_MESSAGE_KIND:
-            # Preserve terminal output as evidence before a later cleanup or
-            # provider teardown can remove its pane/log. A pause is captured
-            # too: what the session was doing when it stopped to ask is exactly
-            # what the person deciding needs to see.
-            with contextlib.suppress(HelmError, OSError):
-                self.capture_evidence(worker_id)
-        if kind == "result":
-            # A finished task is the evidence the learning flow wants, and
-            # asking a coordinator to remember to harvest it made knowledge
-            # depend on memory -- which is the failure every other rule here
-            # was moved into code to avoid. Proposals are inert: they still
-            # cannot approve, apply, or teach anything by themselves, so
-            # raising them automatically costs nothing and losing the evidence
-            # costs the learning.
-            with contextlib.suppress(HelmError, SafetyError, OSError):
-                self.generate_learning_proposals(task["id"])
+            task = dict(self._task(data, worker["task_id"]))
+        self._apply_event_effects(event)
         return task
 
     def _parse_output_line(
@@ -4310,7 +4797,7 @@ class Coordinator:
         task: dict[str, Any],
         worker: dict[str, Any],
         line: str,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         # A line that is not a protocol push is terminal output, and terminal
         # output is not state. The runner already writes every byte of it to
         # the worker's own log, which is what `helm tail` reads and what
@@ -4322,18 +4809,16 @@ class Coordinator:
         # document, every one of them paid to serialise all the ones before it.
         stripped = line.rstrip("\r\n")
         if not stripped:
-            return
+            return None
         try:
             item = json.loads(stripped)
         except json.JSONDecodeError:
-            return
+            return None
         if not isinstance(item, dict) or item.get("helm") != 1:
-            return
+            return None
         kind = item.get("type")
-        if kind not in {
-            "status", "result", "blocker", "failure", "approval-needed", "artifact", "question",
-        }:
-            return
+        if kind not in self.WORKER_MESSAGE_KINDS or kind == "answer":
+            return None
         text = _safe_text(item.get("text", item.get("message", "")))
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         if kind == "artifact":
@@ -4345,33 +4830,25 @@ class Coordinator:
             if "description" not in payload and "description" in item:
                 payload["description"] = item["description"]
         requested = item.get("status") if isinstance(item.get("status"), str) else None
-        task = self._record_worker_message_locked(data, worker, kind, text, payload, requested)
-        if (
-            (task.get("role") == "foreman" and kind in {"result", "blocker", "failure", "approval-needed"})
-            or (kind == "status" and self._summary_payload(payload))
-        ):
-            summary = _safe_text(text).strip()[:900]
-            if summary:
-                source = "Foreman report" if task.get("role") == "foreman" else "Worker summary"
-                with contextlib.suppress(HelmError, OSError):
-                    self.record_situation(
-                        project["id"],
-                        f"{source}: task {task['id']} [{task['status']}] {summary}",
-                    )
-                action_item = (
-                    self._action_item_from_payload(payload)
-                    or self._action_item_from_summary(summary)
-                )
-                if action_item:
-                    with contextlib.suppress(HelmError, OSError):
-                        self.record_project_action_item(
-                            project["id"],
-                            action_item,
-                            source=source,
-                            task_id=task["id"],
-                        )
+        if requested == "approval-needed":
+            requested = None
+        # Same intake as a direct push, so a stdout protocol line gets the hold,
+        # the record, the action item and the evidence a push would have got.
+        # A malformed request is the worker's error to see in its own log, not a
+        # reason to abandon the rest of the line processing.
+        try:
+            return self._ingest_worker_event(
+                data, worker, kind, text, payload, requested
+            )
+        except (HelmError, SafetyError) as exc:
+            self._message(
+                data, project, task, worker, "protocol-rejected",
+                f"Rejected {kind} from worker output: {exc}", {},
+            )
+            return None
 
     def poll_worker(self, worker_id: str) -> dict[str, Any]:
+        events: list[dict[str, Any]] = []
         with self.store.locked() as data:
             worker = data["workers"].get(worker_id)
             if worker is None:
@@ -4387,7 +4864,9 @@ class Coordinator:
                 lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
             start = int(worker.get("processed_lines", 0))
             for line in lines[start:]:
-                self._parse_output_line(data, project, task, worker, line)
+                event = self._parse_output_line(data, project, task, worker, line)
+                if event is not None:
+                    events.append(event)
             worker["processed_lines"] = len(lines)
 
             exit_path = Path(worker["exit_file"])
@@ -4419,7 +4898,6 @@ class Coordinator:
                 worker["ended_at"] = now()
                 if exit_code != 0:
                     task["status"] = "failed"
-                    self._abandon_hold(task)
                     self._message(
                         data,
                         project,
@@ -4428,6 +4906,9 @@ class Coordinator:
                         "failure",
                         f"Worker exited with code {exit_code}",
                         {"exit_code": exit_code},
+                    )
+                    self._abandon_open_hold(
+                        data, project, task, f"its session exited with code {exit_code}"
                     )
                 elif task["status"] in {"created", "allocated", "running"}:
                     task["status"] = "completed"
@@ -4440,13 +4921,18 @@ class Coordinator:
                         "Worker completed; explicit approval is still required before merge",
                         {"status": "completed"},
                     )
-                    # A process that exits cleanly finishes the task the same
-                    # way a result does, so an authorized hold is checked
-                    # against the tree it was bound to here too. After the
-                    # completion message, so the record reads in the order it
-                    # happened.
-                    self._settle_hold(data, project, task)
-            return worker
+                # A session that has ended cannot answer or act on anything, so
+                # no hold survives it -- including the one belonging to a task
+                # sitting in `approval-needed`, which is the state that used to
+                # be permanently unreleasable and uncleanable.
+                self._abandon_open_hold(
+                    data, project, task,
+                    "its session ended before the authorization was used",
+                )
+            settled = dict(worker)
+        for event in events:
+            self._apply_event_effects(event)
+        return settled
 
     @staticmethod
     def _reap_child(pid: int | None) -> None:
@@ -4614,11 +5100,10 @@ class Coordinator:
             # call it stalled or reported -- and neither says the thing the
             # commander has to act on.
             task_record = data.get("tasks", {}).get(worker["task_id"]) or {}
-            hold = task_record.get("hold") or {}
+            hold = self.task_hold(task_record) or {}
             held = (
-                task_record.get("status") == "approval-needed"
-                and hold.get("status") == "waiting"
-                and hold.get("worker_id") == worker["id"]
+                hold.get("worker_id") == worker["id"]
+                and hold.get("status") in {"waiting", "authorized-pending-delivery"}
             )
             stale_output = output_idle is not None and output_idle > threshold
             stale_reports = last_message is None or (
@@ -4661,12 +5146,15 @@ class Coordinator:
                     f"its output reports failure and it has not reported: {broke[-1]}",
                 )
             elif held:
+                pending = hold.get("status") == "authorized-pending-delivery"
                 verdict, detail = (
-                    "awaiting-approval",
+                    "authorized-undelivered" if pending else "awaiting-approval",
                     (
-                        "paused on a protected action"
-                        + (f" ({hold['action']})" if hold.get("action") else "")
-                        + "; the commander authorizes it with helm approval release"
+                        f"{hold.get('action')} was authorized and has not reached it; "
+                        "re-deliver with helm approval release"
+                        if pending
+                        else f"paused on {hold.get('action')}; the commander authorizes "
+                        "it with helm approval release"
                     ),
                 )
             elif awaiting:
@@ -4940,6 +5428,29 @@ class Coordinator:
             self._status_path(project_id), json.dumps(payload, indent=2) + "\n"
         )
 
+    @contextlib.contextmanager
+    def _status_transaction(self, project_id: str) -> Iterator[dict[str, Any]]:
+        """Read, change and write a project's record without losing a concurrent write.
+
+        The state file has a lock; this file did not, and every writer here was
+        a read-modify-write. A release and a result landing together could each
+        load the same record and save over the other's change -- the authorized
+        decision or its outcome vanishing with nothing to say it had. Its own
+        lock, because it is its own file: taking the state lock instead would
+        invert the order these are already acquired in elsewhere.
+        """
+        path = self._status_path(project_id)
+        lock_path = path.with_suffix(".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                payload = self._load_status(project_id)
+                yield payload
+                self._save_status(project_id, payload)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def record_situation(self, project_id: str, line: str, *, supersedes: str = "") -> dict[str, Any]:
         """Append one line of context Helm cannot derive.
 
@@ -4966,22 +5477,22 @@ class Coordinator:
                 "to do next in another -- or write the detail into the project's "
                 "own files and reference it from here."
             )
-        status = self._load_status(project_id)
-        for entry in status["situation"]:
-            if supersedes and entry.get("id") == supersedes:
-                entry["superseded_by"] = now()
-        status["situation"].append({"id": new_id("s"), "at": now(), "text": text})
-        live = [e for e in status["situation"] if not e.get("superseded_by")]
-        if len(live) > self.SITUATION_KEPT:
-            excess = len(live) - self.SITUATION_KEPT
-            rolled = live[:excess]
-            status["history"].extend(rolled)
-            rolled_ids = {e["id"] for e in rolled}
-            status["situation"] = [
-                e for e in status["situation"] if e["id"] not in rolled_ids
-            ]
-        self._save_status(project_id, status)
-        return status["situation"][-1]
+        with self._status_transaction(project_id) as status:
+            for entry in status["situation"]:
+                if supersedes and entry.get("id") == supersedes:
+                    entry["superseded_by"] = now()
+            status["situation"].append({"id": new_id("s"), "at": now(), "text": text})
+            live = [e for e in status["situation"] if not e.get("superseded_by")]
+            if len(live) > self.SITUATION_KEPT:
+                excess = len(live) - self.SITUATION_KEPT
+                rolled = live[:excess]
+                status["history"].extend(rolled)
+                rolled_ids = {e["id"] for e in rolled}
+                status["situation"] = [
+                    e for e in status["situation"] if e["id"] not in rolled_ids
+                ]
+            recorded = status["situation"][-1]
+        return recorded
 
     def record_project_action_item(
         self,
@@ -4990,6 +5501,7 @@ class Coordinator:
         *,
         source: str = "helm",
         task_id: str | None = None,
+        key: str | None = None,
     ) -> dict[str, Any]:
         """Record commander-visible follow-up that needs a decision or task.
 
@@ -5005,28 +5517,53 @@ class Coordinator:
                 f"an action item must be concise: {len(summary)} characters given, "
                 f"limit {self.SITUATION_LINE_LIMIT}"
             )
-        status = self._load_status(project_id)
         task = _safe_text(task_id).strip() if task_id else None
         prefix = _safe_text(source).strip() or "helm"
-        for item in status["action_items"]:
-            if (
-                item.get("status", "open") == "open"
-                and item.get("text") == summary
-                and item.get("task_id") == task
-                and item.get("source") == prefix
-            ):
-                return item
-        item = {
-            "id": new_id("i"),
-            "at": now(),
-            "text": summary,
-            "source": prefix,
-            "task_id": task,
-            "status": "open",
-        }
-        status["action_items"].append(item)
-        self._save_status(project_id, status)
+        marker = _safe_text(key).strip() if key else None
+        with self._status_transaction(project_id) as status:
+            for item in status["action_items"]:
+                if item.get("status", "open") != "open":
+                    continue
+                # Keyed items are one per key: the same hold asking twice is one
+                # thing for the commander to decide, not two.
+                if marker and item.get("key") == marker:
+                    return item
+                if (
+                    item.get("text") == summary
+                    and item.get("task_id") == task
+                    and item.get("source") == prefix
+                ):
+                    return item
+            item = {
+                "id": new_id("i"),
+                "at": now(),
+                "text": summary,
+                "source": prefix,
+                "task_id": task,
+                # What this item is *about*, so it can be closed when that thing
+                # resolves. An unkeyed "Authorize or refuse" line had no way
+                # back: it stayed open after the action it asked about succeeded.
+                "key": marker,
+                "status": "open",
+            }
+            status["action_items"].append(item)
         return item
+
+    def resolve_project_action_items(
+        self, project_id: str, key: str, *, outcome: str = "resolved"
+    ) -> list[dict[str, Any]]:
+        """Close the commander's items for one thing that has now resolved."""
+        marker = _safe_text(key).strip()
+        if not marker:
+            return []
+        closed: list[dict[str, Any]] = []
+        with self._status_transaction(project_id) as status:
+            for item in status["action_items"]:
+                if item.get("key") == marker and item.get("status", "open") == "open":
+                    item["status"] = outcome
+                    item["resolved_at"] = now()
+                    closed.append(dict(item))
+        return closed
 
     @staticmethod
     def _action_item_from_summary(text: str) -> str | None:
@@ -5127,9 +5664,8 @@ class Coordinator:
                 and m.get("kind") in {"blocker", "failure", "result"}
             ][-3:],
         }
-        status = self._load_status(worker["project_id"])
-        status["evidence"][worker_id] = entry
-        self._save_status(worker["project_id"], status)
+        with self._status_transaction(worker["project_id"]) as status:
+            status["evidence"][worker_id] = entry
         return entry
 
     def project_status(self, project_id: str) -> dict[str, Any]:
@@ -5141,18 +5677,33 @@ class Coordinator:
         """
         data = self.store.load()
         project = self._project(data, project_id)
-        status = self._load_status(project_id)
         tasks = [t for t in data.get("tasks", {}).values() if t["project_id"] == project_id]
-        resolved = {"merged", "pr-merged"}
-        pruned = {
-            worker_id: entry
-            for worker_id, entry in status["evidence"].items()
-            if (data.get("tasks", {}).get(entry["task_id"], {}).get("status") or "")
-            not in resolved
-        }
-        if pruned != status["evidence"]:
+
+        def still_worth_keeping(entry: dict[str, Any]) -> bool:
+            """Attention is derived from the live record, never accumulated.
+
+            A diagnosis for finished work is clutter, and so is the pane capture
+            from a pause that has since been decided and acted on: it was listed
+            as an unresolved item after the authorized action succeeded, which
+            trains the reader to skip the list.
+            """
+            task = data.get("tasks", {}).get(entry.get("task_id")) or {}
+            state = task.get("status") or ""
+            if state in {"merged", "pr-merged"}:
+                return False
+            if state in {"failed", "blocked"}:
+                return True
+            return self.task_hold(task) is not None
+
+        with self._status_transaction(project_id) as status:
+            pruned = {
+                worker_id: entry
+                for worker_id, entry in status["evidence"].items()
+                if still_worth_keeping(entry)
+            }
             status["evidence"] = pruned
-            self._save_status(project_id, status)
+            status_snapshot = json.loads(json.dumps(status))
+        status = status_snapshot
         health = [h for h in self.worker_health() if h["project_id"] == project_id]
         return {
             "project": {"id": project_id, "name": project.get("name"),
@@ -5210,60 +5761,61 @@ class Coordinator:
         seen_at = now()
         limit = max(1, limit_per_project)
         for project in sorted(projects, key=lambda p: p["id"]):
-            status = self._load_status(project["id"])
-            action_items = [
-                entry
-                for entry in status.get("action_items", [])
-                if entry.get("status", "open") == "open" and not entry.get("surfaced_at")
-            ]
-            for entry in action_items:
-                updates.append({
+            # One transaction per project: this marks what it surfaced, so a
+            # concurrent release writing the same record cannot lose either
+            # change.
+            with self._status_transaction(project["id"]) as status:
+                action_items = [
+                    entry
+                    for entry in status.get("action_items", [])
+                    if entry.get("status", "open") == "open" and not entry.get("surfaced_at")
+                ]
+                pending = [
+                    entry
+                    for entry in status.get("situation", [])
+                    if not entry.get("superseded_by") and not entry.get("surfaced_at")
+                ]
+                if not pending and not action_items:
+                    continue
+                label = {
                     "project_id": project["id"],
                     "project_name": project.get("name", project["id"]),
                     "glyph": project_glyph(project.get("color", "")),
-                    "id": entry["id"],
-                    "at": entry.get("at"),
-                    "text": f"ACTION REQUIRED: {entry.get('text', '')}",
-                    "kind": "action",
-                })
-            pending = [
-                entry
-                for entry in status.get("situation", [])
-                if not entry.get("superseded_by") and not entry.get("surfaced_at")
-            ]
-            if not pending and not action_items:
-                continue
-            shown = pending[-limit:]
-            hidden = len(pending) - len(shown)
-            if hidden:
-                updates.append({
-                    "project_id": project["id"],
-                    "project_name": project.get("name", project["id"]),
-                    "glyph": project_glyph(project.get("color", "")),
-                    "id": f"{project['id']}:surface-backlog",
-                    "at": shown[0].get("at"),
-                    "text": (
-                        f"{hidden} older project update(s) marked surfaced; "
-                        f"showing latest {len(shown)}"
-                    ),
-                    "kind": "situation",
-                })
-            for entry in shown:
-                updates.append({
-                    "project_id": project["id"],
-                    "project_name": project.get("name", project["id"]),
-                    "glyph": project_glyph(project.get("color", "")),
-                    "id": entry["id"],
-                    "at": entry.get("at"),
-                    "text": entry.get("text", ""),
-                    "kind": "situation",
-                })
-            if mark_seen:
+                }
                 for entry in action_items:
-                    entry["surfaced_at"] = seen_at
-                for entry in pending:
-                    entry["surfaced_at"] = seen_at
-                self._save_status(project["id"], status)
+                    updates.append({
+                        **label,
+                        "id": entry["id"],
+                        "at": entry.get("at"),
+                        "text": f"ACTION REQUIRED: {entry.get('text', '')}",
+                        "kind": "action",
+                    })
+                shown = pending[-limit:]
+                hidden = len(pending) - len(shown)
+                if hidden:
+                    updates.append({
+                        **label,
+                        "id": f"{project['id']}:surface-backlog",
+                        "at": shown[0].get("at"),
+                        "text": (
+                            f"{hidden} older project update(s) marked surfaced; "
+                            f"showing latest {len(shown)}"
+                        ),
+                        "kind": "situation",
+                    })
+                for entry in shown:
+                    updates.append({
+                        **label,
+                        "id": entry["id"],
+                        "at": entry.get("at"),
+                        "text": entry.get("text", ""),
+                        "kind": "situation",
+                    })
+                if mark_seen:
+                    for entry in action_items:
+                        entry["surfaced_at"] = seen_at
+                    for entry in pending:
+                        entry["surfaced_at"] = seen_at
         return updates
 
     def foreman_brief(self, project_id: str) -> str:
@@ -5363,26 +5915,110 @@ class Coordinator:
                 return dict(worker)
         return None
 
-    def caller_role(self) -> str:
-        """Who is running this command: the root, a foreman, or a worker.
+    def caller_identity(self) -> dict[str, str]:
+        """Who is running this command, from evidence the caller does not own.
 
-        Every agent Helm starts inherits ``HELM_WORKER_ID``, so its authority
-        is a fact Helm can check rather than a rule it has to hope the agent
-        read and obeyed. Prose in a context document is guidance; this is the
-        boundary. Anything without the marker is the root -- the coordinator,
-        or the human at the terminal.
+        Two signals, and the least privileged answer wins. The marker every
+        agent Helm starts inherits is the first, and it is the one an agent can
+        edit: `env -u HELM_WORKER_ID` used to be enough to be read as the root.
+        So the second is process ancestry -- a worker cannot make itself not be
+        a descendant of the runner Helm started for it, and a command it spawns
+        inherits that lineage whatever it does to its environment.
+
+        Returns the role, the worker id it was attributed to, and which signal
+        decided it, so a refusal can say what identified the caller.
         """
-        worker_id = os.environ.get("HELM_WORKER_ID", "").strip()
-        if not worker_id:
-            return "root"
         data = self.store.load()
-        worker = data.get("workers", {}).get(worker_id)
-        if worker is None:
-            # A marker naming no worker Helm knows is not authority; the least
-            # privileged reading is the safe one.
-            return "worker"
-        task = data.get("tasks", {}).get(worker.get("task_id"))
-        return "foreman" if (task or {}).get("role") == "foreman" else "worker"
+
+        def role_for(worker_id: str) -> str:
+            worker = data.get("workers", {}).get(worker_id)
+            if worker is None:
+                # A marker naming no worker Helm knows is not authority; the
+                # least privileged reading is the safe one.
+                return "worker"
+            task = data.get("tasks", {}).get(worker.get("task_id"))
+            return "foreman" if (task or {}).get("role") == "foreman" else "worker"
+
+        marked = os.environ.get("HELM_WORKER_ID", "").strip()
+        if marked:
+            return {"role": role_for(marked), "worker_id": marked, "evidence": "marker"}
+        recorded = {
+            worker["pid"]: worker_id
+            for worker_id, worker in data.get("workers", {}).items()
+            if isinstance(worker.get("pid"), int)
+        }
+        if recorded:
+            # Only pay for the process table when there is something to match:
+            # a root with no launched worker cannot be one.
+            lineage = {os.getpid(), *_process_parents(os.getpid())}
+            with contextlib.suppress(OSError):
+                lineage.add(os.getpgid(0))
+            for pid in lineage:
+                if pid in recorded:
+                    worker_id = recorded[pid]
+                    return {
+                        "role": role_for(worker_id),
+                        "worker_id": worker_id,
+                        "evidence": "ancestry",
+                    }
+        return {"role": "root", "worker_id": "", "evidence": "unmarked"}
+
+    def caller_role(self) -> str:
+        """The calling agent's role: the root, a foreman, or a worker."""
+        return self.caller_identity()["role"]
+
+    def _authority_hash(self) -> str:
+        configured = self.store.load().get("config", {}).get("authority_hash")
+        return str(configured or "")
+
+    def configure_authority(self, secret: str) -> Path:
+        """Record the hash of the root's capability and store the secret 0600.
+
+        The secret itself is never printed, logged, or put in state: only its
+        hash is, which is what makes the check possible without Helm holding a
+        credential it could leak. The file exists so a human can export it into
+        their own shell; the value never crosses this process's output.
+        """
+        secret = str(secret or "")
+        if len(secret) < 32:
+            raise SafetyError("an authority capability must be at least 32 characters")
+        digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        with self.store.locked() as data:
+            data.setdefault("config", {})["authority_hash"] = digest
+        path = _private_dir(self.store.directory / "private") / "authority.secret"
+        _write_private_text(path, secret + "\n")
+        return path
+
+    def authority(self, action: str, project_id: str | None = None) -> Authority:
+        """Build the capability a protected core operation requires, or refuse.
+
+        This is the boundary. It is here, in core, rather than in CLI dispatch,
+        because an agent that can import `Coordinator` bypasses dispatch
+        entirely -- and the actions on the other side of this line cannot be
+        undone by deleting a branch.
+        """
+        action = _safe_text(action).strip() or "this action"
+        identity = self.caller_identity()
+        if identity["role"] != "root":
+            raise SafetyError(
+                f"{action} is the human's, held at the Helm root. This caller was "
+                f"identified as {identity['role']} {identity['worker_id']} by "
+                f"{identity['evidence']}; an agent cannot authorize it for itself."
+            )
+        expected = self._authority_hash()
+        if not expected:
+            # No capability configured for this root. The session-role boundary
+            # is all there is, and the record says so rather than implying a
+            # stronger check than the one that ran.
+            return Authority("session", "root")
+        presented = os.environ.get(AUTHORITY_ENV, "")
+        if not presented or hashlib.sha256(presented.encode("utf-8")).hexdigest() != expected:
+            raise SafetyError(
+                f"{action} requires this root's authorization capability in "
+                f"{AUTHORITY_ENV}; it is missing or does not match. No agent Helm "
+                "starts can inherit it."
+            )
+        return Authority("capability", "root")
 
     def reflection_evidence(self, since_hours: float = 24.0) -> dict[str, Any]:
         """Assemble what actually happened, for an agent to reflect on.
@@ -5753,7 +6389,9 @@ class Coordinator:
             worker["exit_code"] = 1
             worker["ended_at"] = now()
             task["status"] = "failed"
-            self._abandon_hold(task)
+            self._abandon_open_hold(
+                data, project, task, f"its session is gone: {detail}"
+            )
             # A task abandoned on purpose and a task whose provider vanished
             # are both failures, and the record should not pretend otherwise
             # -- but it should say which one happened, because only one of
@@ -5784,6 +6422,7 @@ class Coordinator:
         action, and neither can a worker message.
         """
         action = _validate_protected_action(action)
+        self.authority(f"granting a standing approval for {action}")
         note = _safe_text(note).strip()
         if not note:
             # A grant outlives the conversation that created it. Without a
@@ -5809,6 +6448,7 @@ class Coordinator:
             return dict(grant)
 
     def revoke_approval_grant(self, grant_id: str, note: str = "") -> dict[str, Any]:
+        self.authority("revoking a standing approval")
         with self.store.locked() as data:
             grant = data["approval_grants"].get(grant_id)
             if grant is None:
@@ -5910,91 +6550,387 @@ class Coordinator:
         without the review that gate exists for.
         """
         action = _validate_protected_action(action)
+        if confirm and grant_id:
+            raise HelmError(
+                "authorize either by explicit confirmation or under one standing "
+                "grant, not both: --confirm and --grant say different things about "
+                "who decided"
+            )
         if action == "merge":
             raise SafetyError(
                 "merging is Helm's own gated operation, not something a worker "
                 "performs: review the branch with helm task approve, then land it "
                 "with helm task merge"
             )
+        authority = self.authority(f"authorizing {action}")
         with self.store.locked() as data:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
-            hold = task.get("hold")
-            if not hold or hold.get("status") != "waiting":
-                state = (hold or {}).get("status", "none")
+            hold = self.task_hold(task)
+            if hold is None or hold["status"] not in {"waiting", "authorized-pending-delivery"}:
+                state = (hold or self.latest_hold(task) or {}).get("status", "none")
                 raise HelmError(
                     f"task {task_id} is not waiting on an approval (hold: {state})"
                 )
-            requested = hold.get("action")
-            if requested and requested != action:
+            if hold["action"] != action:
                 # The commander answers the question that was asked. Releasing
                 # a different action would authorize something nobody reviewed.
                 raise SafetyError(
-                    f"task {task_id} asked for {requested}, not {action}; "
+                    f"task {task_id} asked for {hold['action']}, not {action}; "
                     "authorize the action that was asked for"
                 )
             worker = data.get("workers", {}).get(hold.get("worker_id"))
             if worker is None or worker.get("status") != "running":
                 raise HelmError(
                     f"the session that asked ({hold.get('worker_id')}) is no longer "
-                    "running, so there is nothing to release; its work is on "
-                    f"{task.get('branch') or 'no branch'} and a new task is the way forward"
+                    "running, so an authorization cannot reach it; repair the task "
+                    f"with helm approval repair {task_id}"
+                )
+            if not self._resumable_session(worker):
+                # A print-mode process worker has no input channel, so nothing
+                # can hand it the go-ahead. Refusing here leaves the hold
+                # untouched: a spent authorization nobody could deliver is worse
+                # than an honest refusal.
+                raise SafetyError(
+                    f"worker {worker['id']} runs as a plain process with no input "
+                    "channel, so same-session resume is not available; it cannot be "
+                    f"told. Repair the task with helm approval repair {task_id} and "
+                    "run the work in an interactive session"
                 )
             grant = None
             if not confirm:
                 grant = self._authorizing_grant(data, action, project["id"], grant_id)
-            binding = self._hold_binding(task)
-            hold["action"] = action
-            hold["status"] = "authorized"
-            hold["authorization"] = {
-                "authorized_at": now(),
-                "action": action,
-                "note": _safe_text(note),
-                "worker_id": worker["id"],
-                # Which authority answered: a person confirming now, or a
-                # standing grant they wrote earlier. The binding is identical.
-                "grant_id": grant["id"] if grant else None,
-                "grant_note": grant["note"] if grant else "",
-                "binding": binding,
-            }
-            task["status"] = "running"
-            self._message(
-                data,
-                project,
-                task,
-                worker,
-                "approval",
-                (
-                    f"Authorized {action} under standing grant {grant['id']}"
-                    if grant
-                    else f"Authorized {action} on an explicit confirmation"
+            # The precondition is the state the commander was shown, not
+            # whatever the worktree has become since. Rebinding here silently
+            # authorized a revision nobody had read.
+            current = self._snapshot(data, project, task)
+            recorded = hold.get("snapshot")
+            if recorded and current != recorded:
+                self._move_hold(
+                    data, project, task, hold, "abandon",
+                    detail=(
+                        "The work changed after the approval was requested; the "
+                        "commander was shown a different state. Ask again from the "
+                        "state that exists now."
+                    ),
+                    payload={
+                        "requested_revision": recorded.get("revision"),
+                        "current_revision": current.get("revision"),
+                    },
+                    worker=worker,
+                    message_kind="approval-invalidated",
                 )
-                + (" for the current worker revision" if binding else ""),
-                {
-                    "hold_id": hold["id"],
+                self.store.save(data)
+                raise SafetyError(
+                    f"task {task_id} changed after it asked: the request was for "
+                    f"{recorded.get('revision')} and the worktree is now "
+                    f"{current.get('revision')}. Nothing was authorized; have the "
+                    "worker request approval for the state it is actually in."
+                )
+            first_release = hold["status"] == "waiting"
+            authorization = hold.get("authorization") or {}
+            self._move_hold(
+                data, project, task, hold, "authorize",
+                detail=(
+                    (
+                        f"Authorized {action} under standing grant {grant['id']}"
+                        if grant
+                        else f"Authorized {action} on an explicit confirmation"
+                    )
+                    if first_release
+                    else f"Re-delivering the existing authorization for {action}"
+                ),
+                payload={"action": action, "note": note, "authority": authority.mode},
+                worker=worker,
+                message_kind="approval" if first_release else "",
+            )
+            if first_release:
+                hold["authorization"] = {
+                    "authorized_at": now(),
                     "action": action,
-                    "note": note,
+                    "note": _safe_text(note),
                     "worker_id": worker["id"],
+                    # Which authority answered: a person confirming now, or a
+                    # standing grant they wrote earlier, and which boundary
+                    # actually verified them.
                     "grant_id": grant["id"] if grant else None,
-                    "revision": (binding or {}).get("revision"),
-                    "tree": (binding or {}).get("tree"),
-                },
-            )
+                    "grant_note": grant["note"] if grant else "",
+                    "authority": authority.record(),
+                    # One use, spent by the worker's own action-start call
+                    # immediately before it acts.
+                    "ticket": new_id("k"),
+                    "ticket_consumed_at": None,
+                    "snapshot": recorded,
+                }
+            else:
+                hold["authorization"] = authorization
+            hold["delivery"]["attempts"] = int(hold["delivery"].get("attempts", 0)) + 1
             released = dict(task)
-        # The commander's decision belongs in the project's own record, not
-        # only in this conversation: whoever takes the project over next has to
-        # be able to see what was authorized without reading a transcript.
-        with contextlib.suppress(HelmError, OSError):
-            self.record_situation(
-                project["id"],
-                f"Commander authorized {action} for task {task_id}"
-                + (f": {_safe_text(note).strip()[:200]}" if note else ""),
-            )
+            released["hold"] = dict(hold)
+        if first_release:
+            # The commander's decision belongs in the project's own record, not
+            # only in this conversation: whoever takes the project over next has
+            # to be able to see what was authorized without reading a transcript.
+            with contextlib.suppress(HelmError, OSError):
+                self.record_situation(
+                    project["id"],
+                    f"Commander authorized {action} for task {task_id} "
+                    f"(awaiting delivery to {released['hold']['worker_id']})"
+                    + (f": {_safe_text(note).strip()[:200]}" if note else ""),
+                )
         return released
+
+    @staticmethod
+    def _resumable_session(worker: dict[str, Any]) -> bool:
+        """Whether anything can be said to this worker's session.
+
+        A Herdr pane hosts an interactive agent that reads what is sent to it. A
+        worker started by the plain process launcher runs in print mode with its
+        stdio detached, so there is no channel at all -- and pretending
+        otherwise is what let an authorization be spent on a session that could
+        never hear it.
+        """
+        return worker.get("execution") != "process"
+
+    def mark_hold_delivered(self, task_id: str, *, delivered: bool) -> dict[str, Any]:
+        """Record whether the authorization actually reached the worker's session.
+
+        Delivery is a separate fact from the decision. Recording it here keeps
+        the retry honest: an undelivered authorization stays pending, the task
+        stays paused, and the escalation stays open, so `helm approval release`
+        can be run again for the same hold without a second decision.
+        """
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            hold = self.task_hold(task)
+            if hold is None or hold["status"] != "authorized-pending-delivery":
+                raise HelmError(f"task {task_id} has no authorization awaiting delivery")
+            if delivered:
+                hold["delivery"]["delivered_at"] = now()
+            return dict(hold)
+
+    def hold_worker_id(self, task_id: str) -> str:
+        """Which session a task's open hold belongs to, or "" when there is none.
+
+        Exists so a caller can gather provider evidence about that exact session
+        before asking core to act on it.
+        """
+        data = self.store.load()
+        hold = self.task_hold(self._task(data, task_id))
+        if hold is None:
+            # A legacy request has no hold yet; name the session that asked, so
+            # repair can still check whether it is alive.
+            requests = [
+                message
+                for message in data.get("messages", [])
+                if message.get("task_id") == task_id
+                and message.get("kind") == self.HOLD_MESSAGE_KIND
+            ]
+            return str((requests[-1].get("worker_id") if requests else "") or "")
+        return str(hold.get("worker_id") or "")
+
+    def start_authorized_action(self, worker_id: str) -> dict[str, Any]:
+        """The worker's own gate, immediately before it performs the action.
+
+        This is where an authorization is validated and spent, and it is the
+        only route from "approved" to "acting". Checking at result time was
+        bookkeeping: the side effect had already happened, so an authorization
+        that had gone stale could not be stopped, and a publish that wrote its
+        own receipt invalidated itself for succeeding.
+
+        Consuming the ticket here also *is* the delivery acknowledgement --
+        only the live session that received the go-ahead can make this call --
+        which is why the task stays paused until it happens.
+        """
+        with self.store.locked() as data:
+            worker = data["workers"].get(worker_id)
+            if worker is None:
+                raise HelmError(f"unknown worker: {worker_id}")
+            if worker["status"] != "running":
+                raise HelmError("worker is no longer running")
+            task = self._task(data, worker["task_id"])
+            project = self._project(data, worker["project_id"])
+            hold = self.task_hold(task)
+            if hold is None:
+                raise HelmError(
+                    f"task {task['id']} has no approval hold; ask for one with "
+                    "--type approval-needed --action <action>"
+                )
+            if hold["worker_id"] != worker_id:
+                raise SafetyError(
+                    f"hold {hold['id']} belongs to worker {hold['worker_id']}"
+                )
+            if hold["status"] == "in-flight":
+                raise SafetyError(
+                    f"the authorization for {hold['action']} has already been used; "
+                    "report the outcome, and ask again if you need to act twice"
+                )
+            if hold["status"] != "authorized-pending-delivery":
+                raise SafetyError(
+                    f"{hold['action']} is not authorized (hold: {hold['status']}); "
+                    "wait for the commander's decision and do not act"
+                )
+            authorization = hold.get("authorization") or {}
+            if authorization.get("ticket_consumed_at"):
+                raise SafetyError("this authorization has already been spent")
+            current = self._snapshot(data, project, task)
+            approved = authorization.get("snapshot") or hold.get("snapshot")
+            if approved and current != approved:
+                self._move_hold(
+                    data, project, task, hold, "invalidate",
+                    detail=(
+                        "The work changed after the commander approved it; the "
+                        f"authorization for {hold['action']} no longer covers it"
+                    ),
+                    payload={
+                        "approved_revision": approved.get("revision"),
+                        "current_revision": current.get("revision"),
+                    },
+                    worker=worker,
+                    message_kind="approval-invalidated",
+                )
+                self.store.save(data)
+                raise SafetyError(
+                    "do not act: the work changed since the commander approved it, "
+                    "so the authorization was invalidated and must be given again"
+                )
+            authorization["ticket_consumed_at"] = now()
+            hold["delivery"]["acknowledged_at"] = now()
+            hold["outcome"]["started_at"] = now()
+            self._move_hold(
+                data, project, task, hold, "consume",
+                detail=f"Authorized {hold['action']} started by worker {worker_id}",
+                payload={"action": hold["action"]},
+                worker=worker,
+                message_kind="approval-consumed",
+            )
+            return {
+                "task_id": task["id"],
+                "hold_id": hold["id"],
+                "action": hold["action"],
+                "note": authorization.get("note", ""),
+                "authorized_at": authorization.get("authorized_at"),
+                "status": hold["status"],
+            }
+
+    def repair_task_hold(
+        self, task_id: str, *, session_live: bool, note: str = ""
+    ) -> dict[str, Any]:
+        """Recover a task stranded on an approval, including one from an older build.
+
+        A pre-change root has the shape this whole change came from: an
+        `approval-needed` message, no hold, and a worker already marked failed.
+        Nothing could release it and nothing could report against it, so the
+        session that prompted all of this stayed mute after upgrading.
+
+        Repair is evidence-led, never inventive. `session_live` is supplied by
+        the caller from provider evidence, because core does not talk to a
+        presentation service and must not guess. With a live session and an
+        unambiguous action, the hold is reconstructed from the state that exists
+        now and that same worker is revived. Otherwise the hold is abandoned so
+        the task can be retried or cleaned up, and an ambiguous request is
+        handed back to the worker to restate rather than filled in by Helm.
+        """
+        self.authority("repairing an approval hold")
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            project = self._project(data, task["project_id"])
+            open_hold = self.task_hold(task)
+            legacy = [
+                message
+                for message in data.get("messages", [])
+                if message.get("task_id") == task_id
+                and message.get("kind") == self.HOLD_MESSAGE_KIND
+            ]
+            if open_hold is None and not legacy:
+                raise HelmError(
+                    f"task {task_id} has no approval request to repair"
+                )
+            request = legacy[-1] if legacy else None
+            worker_id = (
+                open_hold["worker_id"] if open_hold else str((request or {}).get("worker_id") or "")
+            )
+            worker = data.get("workers", {}).get(worker_id)
+            action = (
+                open_hold["action"]
+                if open_hold
+                else ((request or {}).get("payload") or {}).get("action")
+            )
+            if not session_live or worker is None:
+                if open_hold is not None:
+                    self._abandon_open_hold(
+                        data, project, task,
+                        note or "its session is gone; repaired so the task can be retried",
+                    )
+                else:
+                    task["status"] = "failed"
+                    self._message(
+                        data, project, task, worker, "approval-abandoned",
+                        "Legacy approval request abandoned: its session is gone. "
+                        "The task is failed so it can be cleaned up or retried.",
+                        {"message_id": (request or {}).get("id")},
+                    )
+                return {"task_id": task_id, "outcome": "abandoned", "hold": None}
+            if action not in PROTECTED_ACTIONS or action == "merge":
+                # Never invent the action. An unusable request is handed back to
+                # the live worker to restate in the supported form.
+                self._message(
+                    data, project, task, worker, "answer",
+                    "Your approval request did not name a usable protected action. "
+                    "Re-report it as: --type approval-needed --action "
+                    f"<{'|'.join(sorted(PROTECTED_ACTIONS - {'merge'}))}> with what "
+                    "you would do.",
+                    {"repair": "restate"},
+                )
+                return {"task_id": task_id, "outcome": "restate-requested", "hold": None}
+            if worker.get("status") != "running":
+                # Provider evidence says this session is alive, so the record is
+                # what is wrong. Only this same worker is revived, and only here.
+                worker["status"] = "running"
+                worker["exit_code"] = None
+                worker["ended_at"] = None
+                self._message(
+                    data, project, task, worker, "status",
+                    "Worker revived on provider evidence that its session is live",
+                    {"repair": "revive"},
+                )
+            if open_hold is None:
+                hold = {
+                    "id": new_id("h"),
+                    "status": "waiting",
+                    "action": action,
+                    "worker_id": worker["id"],
+                    "message_id": (request or {}).get("id"),
+                    "text": _safe_text((request or {}).get("text", ""))[:900],
+                    "requested_at": now(),
+                    "snapshot": self._snapshot(data, project, task),
+                    "authorization": None,
+                    "delivery": {"attempts": 0, "delivered_at": None, "acknowledged_at": None},
+                    "outcome": {"started_at": None, "receipts": [], "reported_at": None},
+                    "history": [{
+                        "at": now(), "event": "repair", "from": None, "to": "waiting",
+                        "detail": "Hold reconstructed from a legacy approval request",
+                    }],
+                }
+                self._hold_history(task).append(hold)
+                task["status"] = "approval-needed"
+                self._message(
+                    data, project, task, worker, "approval-repaired",
+                    f"Reconstructed the {action} approval hold from the recorded "
+                    "request, bound to the work as it stands now",
+                    {"hold_id": hold["id"], "action": action},
+                )
+                open_hold = hold
+            return {
+                "task_id": task_id,
+                "outcome": "reconstructed",
+                "hold": dict(open_hold),
+            }
 
     def approve_task(
         self, task_id: str, note: str = "", *, grant_id: str | None = None
     ) -> dict[str, Any]:
+        authority = self.authority("approving a reviewed branch")
         with self.store.locked() as data:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
@@ -6041,6 +6977,10 @@ class Coordinator:
                 # binding to revision and tree is identical either way.
                 "grant_id": grant["id"] if grant else None,
                 "grant_note": grant["note"] if grant else "",
+                # Which boundary verified the human: a configured capability, or
+                # this session's role alone. An audit that cannot tell them apart
+                # claims more than was checked.
+                "authority": authority.record(),
             }
             task["status"] = "approved"
             self._message(
@@ -6159,6 +7099,7 @@ class Coordinator:
         explicit confirmation or a standing `push` grant -- never as a side
         effect of finishing work.
         """
+        self.authority("pushing a task branch")
         data = self.store.load()
         task = self._task(data, task_id)
         project = self._project(data, task["project_id"])
@@ -6449,6 +7390,7 @@ class Coordinator:
         return not status and not unresolved
 
     def merge_task(self, task_id: str) -> dict[str, Any]:
+        self.authority("merging a task branch")
         with self.store.locked() as data:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
@@ -7328,6 +8270,7 @@ class Coordinator:
         *,
         actor: str = "user",
     ) -> dict[str, Any]:
+        self.authority("approving a learning")
         with self.store.locked() as data:
             proposal = next(
                 (item for item in data.get("learning_proposals", []) if item.get("id") == proposal_id),
@@ -7363,6 +8306,7 @@ class Coordinator:
         *,
         actor: str = "user",
     ) -> dict[str, Any]:
+        self.authority("rejecting a learning")
         with self.store.locked() as data:
             proposal = next(
                 (item for item in data.get("learning_proposals", []) if item.get("id") == proposal_id),
@@ -7459,6 +8403,7 @@ class Coordinator:
         actor: str = "user",
         scope: str = "domain",
     ) -> dict[str, Any]:
+        self.authority("applying a learning")
         with self.store.locked() as data:
             proposal = next(
                 (item for item in data.get("learning_proposals", []) if item.get("id") == proposal_id),
