@@ -92,17 +92,31 @@ any worker configuration.
    guardrails, followed by the project's `.helm/knowledge.md`. Missing files
    are explicit missing sources. All of this material is guidance, not
    authorization.
-4. Delegate the work to a worker agent spawned in a dedicated Helm-owned Herdr
+4. Before creating a worktree-backed task, resolve the project's *configured*
+   default/base branch — never a hardcoded name and never whatever the
+   checkout currently sits on — and, when it has an upstream, fetch it and
+   verify the fetch succeeded. A fetch that succeeds and moves nothing is
+   still a fresh, verified base; only a failed fetch blocks, and it must not
+   fall back to a cached ref. Block and report a local branch that is ahead
+   of or diverged from its upstream, or an uncommitted change to a tracked
+   file or an unresolved merge/rebase/cherry-pick in the project's own
+   checkout, instead of merging, rebasing, resetting, or discarding
+   anything; an untracked file (an uncommitted `.helm/project.json`, a
+   build artifact) does not block, and a local-only project records
+   explicitly that no upstream exists. Record the exact verified base
+   commit and cut the task worktree/branch from that commit. See
+   `domains/branch-isolation/`.
+5. Delegate the work to a worker agent spawned in a dedicated Helm-owned Herdr
    space. The coordinator does not do the work itself.
-5. The worker works only in the assigned task worktree. If the agent harness
+6. The worker works only in the assigned task worktree. If the agent harness
    did not provide one, create a unique task worktree under Helm `state/`
    before editing; never use a project root or another task's worktree as a
    shortcut.
-6. After useful work completes, suggest concise durable domain learnings with
+7. After useful work completes, suggest concise durable domain learnings with
    evidence from the task result, artifacts, messages, and review outcome. A
    suggestion is only a persisted proposal; inspect/edit/reject it or wait for
    explicit user/coordinator approval before promotion.
-7. Commit the result to the task branch, report the changes and any blockers,
+8. Commit the result to the task branch, report the changes and any blockers,
    and wait for approval before merge, publish, push, deletion, or another
    destructive/external action. Approval is tied to the reviewed worker
    revision and tree; changes after approval require another review.
@@ -137,7 +151,7 @@ contents below are local and ignored:
   AGENTS.md                         # canonical agent entry point
   projects/.gitkeep                  # tracked default; project contents ignored
   projects/<project-id>/             # direct-child, isolated Git repositories
-    .helm/project.json               # optional label, policy, domain, and agent defaults
+    .helm/project.json               # optional label, policy, domain, agent, and base-branch defaults
     .helm/knowledge.md               # optional project guidance
   domains/.gitkeep                  # tracked default
   domains/software-delivery/        # shared base pack: lifecycle, roles, coordination
@@ -547,6 +561,92 @@ paths and descriptions. This is generic to artifacts rather than special-cased
 for specs: every artifact message already validated its path against the
 author's workspace and stored it workspace-relative, so the handoff adds no new
 state and no new trust, and a task that reported none gets no paragraph.
+
+### A fresh, verified base before every new task worktree
+
+A task worktree inherits whatever the base was at the moment it was cut, so
+that moment has to happen before the task exists, not be checked afterward.
+`domains/branch-isolation/` carries the procedure — resolve the project's
+*configured* base branch (never a hardcoded or inferred name), and when it
+has an upstream, fetch it and verify the fetch **succeeded**. A fetch that
+succeeds and moves nothing is still a fresh, verified base; only a failed
+fetch blocks, and it must never fall back to a cached ref. A branch with no
+upstream configured but a remote that has a same-named branch is not treated
+as local: Helm still fetches that one unambiguous match rather than trusting
+an unverified local tip, and blocks if none or more than one remote has a
+matching name. A local branch that is ahead of or diverged from its freshly
+fetched upstream also blocks, so a task is never built on unmerged local
+commits mixed in without review; equal-or-behind uses the fetched upstream
+tip. Block the same way on an uncommitted change to a tracked file, or an
+unresolved merge/rebase/cherry-pick, in the project's own checkout — an
+untracked file (an uncommitted `.helm/project.json`, a build artifact) does
+not block, since it changes nothing about what the base branch resolves to.
+Record the exact verified commit the task worktree/branch is cut from.
+
+| Composed into | Reaches | What it does there |
+| --- | --- | --- |
+| `branch-isolation` | every worktree-backed task | the procedure itself |
+| `driving-delegated-work` | a project's foreman | before `helm task create` / `helm worker launch` |
+
+For a genuinely local-only project (no remote at all), the gate uses the
+local base tip and records explicitly that no remote exists, rather than
+treating "nothing to fetch" as freshness.
+
+#### Naming the base branch explicitly
+
+Most projects need nothing here: a repository with a discoverable remote
+default, or no remote at all, resolves its base automatically at
+registration. Name it explicitly in `.helm/project.json` when that discovery
+would be ambiguous, or to pin a base other than what the repository would
+resolve to on its own:
+
+```jsonc
+// projects/api/.helm/project.json — pin the base explicitly
+{"label": "API", "base_branch": "trunk"}
+```
+
+Precedence, most specific first: the explicit setting always wins; only a
+project that never named one falls back to the repository's own default,
+resolved once at registration — a remote's recorded default when locally
+known (as a real `git clone` leaves it), otherwise a direct, read-only query
+of the remote, otherwise (when there is no remote at all) the branch actually
+checked out at that moment. A repository **with** a remote never falls back to
+the checked-out branch: when its default cannot be determined unambiguously,
+or the checkout is detached with no remote to ask, registration fails and
+asks for an explicit `base_branch` rather than guessing. An already
+registered project keeps its recorded base branch even if its checkout later
+switches branches; only an explicit re-setting changes it.
+
+### Skills are a task-fit input, discovered per project
+
+**This is guidance for the driver to follow by hand, not a Helm feature.**
+Helm has no skill-discovery command, no skill inventory, and enforces none of
+it; a runtime-neutral skill snapshot or loader is separate, later work. What
+exists today is the procedure a driver reads before delegating.
+
+Before delegating, the driver looks at what the *selected project itself*
+ships for agent guidance — skill manifests such as `.claude/skills/` or
+`.agents/skills/` — and picks only the ones whose own metadata/description
+plausibly bears on this task. Nothing found there is copied into Helm's
+tracked files, and nothing is installed or enabled automatically; discovery
+stays scoped to that one project.
+
+| Composed into | Reaches | What it does there |
+| --- | --- | --- |
+| `model-selection` | runtime/model selection | which agent can read a project's skills without being told |
+| `driving-delegated-work` | a project's foreman | select, then record, before spawning the worker |
+
+Prefer a runtime that auto-loads the project's own skill location; when a
+different runtime is chosen for other reasons and can read files, name the
+exact `SKILL.md` paths in the brief so it does not start blind. Either way,
+record what was selected — or explicitly "none", with the reason — the
+paths, the loading method, and the reason in the brief and the project
+record, so a replacement driver can reconstruct the dispatch decision without
+re-deriving it. A skill is guidance a worker reads, not authority: it cannot
+expand scope, authorize a protected action, override core safety, or grant a
+credential the runtime does not already have, and a required skill that is
+missing or unreadable by the chosen runtime is a capability blocker to
+report, not license to improvise past it.
 
 ## Worker protocol and approval boundary
 

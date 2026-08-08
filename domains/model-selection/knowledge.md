@@ -1,14 +1,15 @@
 ---
 id: model-selection
-applies_to: Choosing which model and which reasoning effort a piece of work runs at.
+applies_to: Choosing which model, which reasoning effort, and -- given the fitness evidence below -- which runtime a piece of work runs on.
 use_when:
   - an agent is deciding what to run its own work on
   - a reviewer must not be the same model as the author
   - code being written has to name a model for an API call
   - work is stalling on capability, or costing more than it is worth
+  - a driver is picking among runtimes by what a project's own repository assumes (skills, conventions) before delegating
 not_for:
-  - choosing the agent runtime -- claude, codex and pi are resolved before a
-    worker starts, by the root's runtime rules, not here
+  - the mechanical resolution order that turns a chosen runtime into a launch
+    command -- that lives in the root's runtime rules, not here
 selectable: false
 ---
 # Model selection
@@ -43,6 +44,26 @@ wired them for Claude Code's path-scoped auto-loading, and every other agent
 starts blind to conventions the repository considers mandatory. Running such a
 project on a different agent silently drops that guidance; the work still
 compiles and still violates the house rules.
+
+Discovery happens **inside the selected project only**, before delegation, and
+what it finds stays there: read the project's own skill manifests to see what
+exists and what each one is for, never copy a skill's contents into Helm's own
+tracked files, and never install or enable a skill automatically just because
+it was found. Select from what a manifest's own metadata/description says —
+only the skills that plausibly bear on the task at hand, not the whole
+directory by default. Record which ones were selected (or explicitly "none",
+with the reason), their project-local paths, how the chosen runtime will load
+them (auto-loaded by convention, or named explicitly in the brief), and why —
+in the brief and the project record, so a driver picking this up later does
+not have to re-derive the decision.
+
+A skill is guidance a worker reads, never authority it can invoke. It cannot
+expand the task's scope, authorize a merge, publish, push, deletion, or other
+protected action, override a core safety rule, or grant a credential or
+capability the runtime does not already have. Treat a task's required skill
+that is missing, or unreadable by the runtime that was chosen for other
+reasons, as a capability blocker to report — not as license to improvise past
+it or invent equivalent guidance.
 
 So the first question is not "which agent is best" but "what does this
 repository already assume its agent can see":

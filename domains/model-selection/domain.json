@@ -1,4 +1,4 @@
 {
   "inferable": false,
-  "applies_to": "Choosing which Claude model and which effort level a piece of work runs at, and who owns that choice."
+  "applies_to": "Choosing which model, which effort level, and -- by fit -- which runtime a piece of work runs on, and who owns that choice."
 }

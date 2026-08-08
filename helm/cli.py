@@ -355,7 +355,12 @@ def _print_outcome(outcome: dict[str, Any]) -> None:
         print(f"  {message['kind']}: {message['text'][:300]}")
     if outcome["workspace_exists"]:
         print(f"  open it:  cd {outcome['workspace']}")
-        print(f"  full diff: git -C {outcome['workspace']} diff {outcome['base_branch']}...HEAD")
+        # The pinned revision, not the movable branch name: `base_branch`
+        # can have advanced since this task was created, and diffing
+        # against it would pull in commits nobody on this task wrote --
+        # the same defect `task_outcome()` itself already avoids.
+        diff_base = outcome.get("base_revision") or outcome["base_branch"]
+        print(f"  full diff: git -C {outcome['workspace']} diff {diff_base}...HEAD")
 
 
 def _print_delivery(delivered: list[dict[str, Any]]) -> None:

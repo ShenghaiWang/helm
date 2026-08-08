@@ -82,6 +82,3 @@ whatever the project actually uses.
 ## Approved learning: suggested remedies
 - Fact: Treat a reporter suggested remedy as evidence of intent, not as the requirement. Build to the observed symptom; if the suggested mechanism would not produce the desired result, say so and record why.
 - Rationale: A user may describe the mechanism they expect rather than the invariant they need. Verify the mechanism against the actual code before implementing it literally.
-## Approved learning: fresh branch base
-- Fact: Fetch and branch from the current REMOTE base before starting a ticket: git fetch origin, then cut the task branch from origin/<base-branch> -- never from whatever the local checkout happens to be sitting on, and never from a HEAD carrying commits that have not merged.
-- Rationale: Branching from a stale local checkout can mix unrelated work into a task branch, send reviewers through someone else's diff, and force late rebases that invalidate earlier review.

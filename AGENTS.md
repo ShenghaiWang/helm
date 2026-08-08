@@ -315,15 +315,15 @@ Detection stays the fallback for when nothing distinguishes the candidates, not
 the default that skips the decision.
 
 Fitness is mostly about what the repository assumes its agent can read. A
-project whose skills live only in `.claude/skills/` has wired them for Claude
-Code's auto-loading, and any other agent starts blind to conventions the repo
-treats as mandatory — `desktop-app-example` has 23 such skills and no `.agents/skills/`
-mirror, so its work wants `claude` unless a brief names the `SKILL.md` paths
-outright. `ios-app-example` and `android-app-example` mirror theirs into
-`.agents/skills/`, so any agent can serve them. After that it comes down to
-model breadth (a reviewer that must not be the author's model wants a
-gateway-backed agent), harness shape (subagents and skills belong to the agent,
-not the model), and cost. The `model-selection` domain carries the detail.
+project whose skills live only under one agent's own skill directory (for
+example `.claude/skills/`) has wired them for that agent's auto-loading, and
+any other agent starts blind to conventions the repo treats as mandatory
+unless a brief names the exact `SKILL.md` paths outright. A project that
+mirrors the same skills into a portable location such as `.agents/skills/`
+can be served by any agent. After that it comes down to model breadth (a
+reviewer that must not be the author's model wants a gateway-backed agent),
+harness shape (subagents and skills belong to the agent, not the model), and
+cost. The `model-selection` domain carries the detail.
 
 Two bounds that do not bend: an agent is available only when its **executable is
 on `PATH`** — Herdr integrating an agent means Herdr can recognize or control it

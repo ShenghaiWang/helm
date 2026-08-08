@@ -1,5 +1,5 @@
 {
-  "extends": ["spec-driven-development", "code-review"],
+  "extends": ["spec-driven-development", "code-review", "branch-isolation", "model-selection"],
   "inferable": false,
   "applies_to": "Driving work you delegate to other agents rather than doing it: creating the task, launching the worker, keeping it moving, handing the result to an independent reviewer, and reporting the outcome."
 }

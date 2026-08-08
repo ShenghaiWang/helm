@@ -1627,8 +1627,16 @@ class HerdrAdapter:
             # after four days, so the merge-base against it put 425 commits,
             # 3,222 files and 172,000 lines in front of a reviewer asked to
             # judge a four-file change. The change is going to be merged into
-            # the remote branch, so that is the thing to measure against.
-            for candidate in (f"origin/{task['base_branch']}", task["base_branch"]):
+            # the remote branch, so that is the thing to measure against --
+            # and the recorded `base_upstream` names it exactly, rather than
+            # assuming a remote called `origin`, which is wrong for any
+            # project tracking a differently named remote.
+            candidates = []
+            recorded_upstream = str(task.get("base_upstream") or "").strip()
+            if recorded_upstream:
+                candidates.append(recorded_upstream)
+            candidates.append(task["base_branch"])
+            for candidate in candidates:
                 base = _git(
                     root, "merge-base", candidate, task["branch"], check=False
                 ).strip()

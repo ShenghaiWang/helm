@@ -1,4 +1,4 @@
 {
   "inferable": false,
-  "applies_to": "Keeping concurrent pieces of work from contaminating each other."
+  "applies_to": "Keeping concurrent pieces of work from contaminating each other, and resolving a fresh, verified base before any worktree-backed task is created."
 }

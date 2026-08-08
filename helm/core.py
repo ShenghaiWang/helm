@@ -336,6 +336,15 @@ class SafetyError(HelmError):
     """An operation was refused by an isolation or approval guard."""
 
 
+class _StaleBaseResolution(Exception):
+    """Internal signal: the project's base config changed during a fetch.
+
+    Never surfaced to a caller directly -- `create_task` catches this and
+    retries resolution against the project's current configuration, bounded
+    so a genuinely racing writer cannot spin it forever.
+    """
+
+
 def now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -428,9 +437,431 @@ def _has_head(path: Path) -> bool:
     return bool(_git(path, "rev-parse", "--verify", "HEAD", check=False))
 
 
-def _base_branch(path: Path) -> str:
-    branch = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-    return branch or "main"
+def _bounded_ls_remote(
+    root: Path, *args: str, timeout: float = 15
+) -> subprocess.CompletedProcess[str] | None:
+    """Run `git ls-remote` against one remote, bounded and noninteractive.
+
+    Returns `None` when the probe itself could not complete at all -- a
+    timeout, a missing `git`, a transport error before anything answered --
+    so a caller can tell "the probe never got an answer" apart from "it
+    answered no". `GIT_TERMINAL_PROMPT=0` keeps a missing credential from
+    turning into a hang the timeout would otherwise still have to catch.
+    Never fetches objects or touches the working tree.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), "ls-remote", *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=timeout, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _remote_symbolic_default(path: Path, remote: str) -> str | None:
+    """Ask a remote which branch its own HEAD points to, read-only.
+
+    `ls-remote --symref` lists refs; it never fetches objects or touches the
+    working tree, so it is safe to run even for a remote nothing has been
+    fetched from yet. Bounded so an unreachable remote cannot hang
+    registration. Returns `None` on any failure, timeout, or a remote that
+    has no answer (an empty remote reports no symref at all) -- the caller
+    treats that the same as disagreement, never as permission to guess.
+    """
+    result = _bounded_ls_remote(path, "--symref", remote, "HEAD")
+    if result is None or result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("ref:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
+                return parts[1][len("refs/heads/"):]
+    return None
+
+
+def _remote_has_branch(root: Path, remote: str, branch: str) -> bool | None:
+    """Whether `remote` has a branch named `branch`, read-only and bounded.
+
+    `None` means the probe itself did not complete -- a timeout, a hung
+    transport, a credential prompt refused non-interactively -- and is
+    deliberately distinct from a clean "no such branch" answer (`False`). A
+    caller must not treat the two the same: an unreachable remote that
+    would have matched must not be silently skipped in favor of one that
+    plainly does not have the branch, which is exactly as wrong as never
+    checking at all.
+    """
+    result = _bounded_ls_remote(root, "--exit-code", "--heads", remote, branch)
+    if result is None:
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 2:
+        # `--exit-code` reports 2 specifically for "no matching refs" -- a
+        # clean, reachable "no", not a transport failure.
+        return False
+    return None
+
+
+def _repository_default_branch(path: Path) -> str:
+    """Resolve a repository's own default branch without hardcoding a name.
+
+    A repository with no remote at all has only its own checkout to go by,
+    so the branch actually checked out is the answer there. A repository
+    with a remote is different: the checked-out branch is a feature or
+    worker branch, not evidence of the project's base, so it is never used
+    as a fallback once a remote exists. The remote's own default is read
+    locally when something already recorded it (a `git clone` does; so does
+    `git remote set-head <remote> -a`); when nothing was recorded, a single
+    read-only `ls-remote --symref` query asks the remote directly without
+    fetching or touching the checkout. Only when every remote that answered
+    agrees is the result unambiguous; anything else -- no remote answered,
+    or two disagreed -- must be configured explicitly rather than guessed.
+    """
+    remotes = [line for line in _git(path, "remote", check=False).splitlines() if line]
+    if not remotes:
+        current = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+        if current:
+            return current
+        raise HelmError(
+            "cannot resolve a default base branch: the checkout is detached and "
+            'the project has no remote; set an explicit "base_branch" in '
+            ".helm/project.json"
+        )
+    candidates: set[str] = set()
+    for remote in remotes:
+        symbolic = _git(
+            path, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD", check=False
+        )
+        prefix = f"{remote}/"
+        if symbolic.startswith(prefix):
+            candidates.add(symbolic[len(prefix):])
+            continue
+        queried = _remote_symbolic_default(path, remote)
+        if queried:
+            candidates.add(queried)
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    # A remote exists but no single default could be determined from it. The
+    # branch currently checked out is deliberately NOT used here: blessing
+    # it silently is exactly the failure this setting exists to prevent --
+    # a plain `git init` plus `remote add`, registered while a feature
+    # branch happens to be checked out, must not record that feature as the
+    # project's base.
+    raise HelmError(
+        "cannot resolve a default base branch: this project has a remote but no "
+        "unambiguous default branch could be determined from it; set an "
+        'explicit "base_branch" in .helm/project.json'
+    )
+
+
+def _resolve_base_branch(project_root: Path, settings: dict[str, Any]) -> str:
+    """The project's configured base branch, or the repository's own default.
+
+    An explicit `base_branch` in `.helm/project.json` always wins -- it is
+    already validated as a usable branch name by `_discovery_settings`. Only
+    a project that never named one falls through to repository inspection,
+    and that inspection runs once, at registration; it is not re-guessed on
+    every later discovery pass.
+    """
+    explicit = settings.get("base_branch")
+    if explicit:
+        return explicit
+    return _repository_default_branch(project_root)
+
+
+def _project_checkout_conflict(root: Path) -> str | None:
+    """Describe a dirty or mid-operation project checkout, or None if clean.
+
+    This reads the *project's own* working tree, not a task's future
+    worktree -- Helm is about to pin a commit as a task's base, and a
+    checkout with uncommitted changes to tracked files or an unresolved
+    merge/rebase/cherry-pick is exactly the state where quietly trusting
+    "whatever the ref says" hides work the user has not finished dealing
+    with. Reporting it is the whole of the response: nothing here stashes,
+    resets, or otherwise touches the checkout to make it look clean.
+
+    Untracked files are deliberately not part of this check. An untracked
+    `.helm/project.json`, a build artifact, or a local scratch file is
+    ordinary and does not change what `refs/heads/<base_branch>` resolves
+    to; treating every untracked file as a block would make Helm unusable
+    for exactly the project layout its own settings file expects.
+    """
+    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
+        located = _git(root, "rev-parse", "--git-path", marker, check=False)
+        if located and (root / located).exists():
+            return f"an unresolved {marker.replace('_HEAD', '').replace('-', ' ').lower()} is in progress"
+    dirty = _git(root, "status", "--porcelain=v1", "--untracked-files=no", check=False)
+    if dirty:
+        return "the checkout has uncommitted changes to tracked files"
+    return None
+
+
+def _advance_tracking_ref_without_rewinding(
+    root: Path, ref: str, new_value: str, *, attempts: int = 3
+) -> str | None:
+    """Best-effort, race-safe advance of a remote-tracking ref to `new_value`.
+
+    Never rewinds it: the ref is only ever moved when its current value is
+    behind (a strict ancestor of) `new_value`, and the write itself is a
+    compare-and-swap against the value just read
+    (`git update-ref <ref> <new> <old>`), so a concurrent fetch that landed
+    between the read and the write cannot be silently overwritten by an
+    older snapshot -- the CAS simply fails and this retries against
+    whatever is there now. If the current value is already equal to, ahead
+    of, or diverged from `new_value`, the ref is left alone rather than
+    guessed at.
+
+    Returns `None` on success or when nothing needed to change, or a short
+    description of why the ref was left alone otherwise. Never raises: a
+    task's own resolved `base_revision` does not depend on this shared ref
+    being current, only on the private fetch this is called after.
+    """
+    for _ in range(attempts):
+        current = _git(root, "rev-parse", "--verify", "--quiet", ref, check=False)
+        if current == new_value:
+            return None
+        if current:
+            merge_base = _git(root, "merge-base", current, new_value, check=False)
+            if merge_base != current:
+                # `current` is not behind `new_value`: either a concurrent
+                # fetch already advanced it past this one, or the two have
+                # diverged. Neither case is this call's to resolve.
+                return None
+        result = subprocess.run(
+            ["git", "-C", str(root), "update-ref", ref, new_value, current],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        if result.returncode == 0:
+            return None
+        # Either the compare-and-swap lost a race between the read above
+        # and this write, or update-ref failed outright (permissions, a
+        # concurrent lock). Loop and re-evaluate against whatever is
+        # actually there now rather than assuming which one happened.
+    return (
+        f"could not advance {ref} to {new_value}: update-ref did not "
+        f"succeed within {attempts} attempts"
+    )
+
+
+def _delete_ref(root: Path, ref: str) -> str | None:
+    """Delete a ref, reporting a failed deletion instead of leaving it unremoved."""
+    result = subprocess.run(
+        ["git", "-C", str(root), "update-ref", "-d", ref],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode == 0:
+        return None
+    detail = result.stderr.strip() or result.stdout.strip() or "update-ref -d failed"
+    return f"could not delete temporary ref {ref}: {detail}"
+
+
+def _resolve_task_base(root: Path, base_branch: str, *, fetch: bool) -> dict[str, Any]:
+    """Resolve the immutable commit a new task's baseline is cut from.
+
+    Reads refs directly and, when `fetch` is true, fetches a configured
+    upstream -- it never switches, resets, rebases, merges, force-updates, or
+    otherwise touches the user-owned project checkout. Call this before the
+    task record is written, and call it outside Helm's state lock: a fetch is
+    a network call, and that lock is what every worker's protocol message
+    waits on next.
+
+    `fetch` is false for worktreeless roles (foreman, reviewer): they produce
+    no worktree and no commits of their own, so neither a network round trip
+    nor the configured branch actually resolving is a precondition for them
+    -- a renamed or deleted base branch must not stop a foreman from driving
+    or a reviewer from reviewing an already-pinned author task.
+    """
+    ref = f"refs/heads/{base_branch}"
+    if not fetch:
+        local_sha = _git(root, "rev-parse", "--verify", "--quiet", ref, check=False)
+        return {
+            "base_branch": base_branch,
+            "base_revision": local_sha or None,
+            "base_source": (
+                "local (fetch skipped for this task's role)"
+                if local_sha
+                else "unresolved (fetch skipped for this task's role; configured "
+                "base branch does not currently resolve)"
+            ),
+            "base_upstream": None,
+            "base_fetched": False,
+            "base_resolved_at": now(),
+            "base_notes": [],
+        }
+    local_sha = _git(root, "rev-parse", "--verify", "--quiet", ref, check=False)
+    if not local_sha:
+        raise HelmError(f"configured base branch does not exist in the project: {base_branch}")
+    conflict = _project_checkout_conflict(root)
+    if conflict:
+        raise HelmError(
+            f"refusing to start a task from a dirty project checkout: {conflict}. "
+            "Resolve or commit it yourself -- Helm will not merge, rebase, reset, "
+            "or discard anything to clear it."
+        )
+    remotes = [line for line in _git(root, "remote", check=False).splitlines() if line]
+    upstream_short = _git(root, "for-each-ref", "--format=%(upstream:short)", ref, check=False)
+    upstream_remote = _git(root, "for-each-ref", "--format=%(upstream:remotename)", ref, check=False)
+    if upstream_short and upstream_remote and upstream_remote != ".":
+        # The ordinary case: the branch already names its own upstream.
+        remote = upstream_remote
+        remote_branch = upstream_short[len(remote) + 1:]
+        upstream_label = upstream_short
+    elif remotes:
+        # A remote exists but this branch was never told to track one.
+        # Trusting the local tip here would be exactly the "unverified
+        # local state passed off as fresh" this whole gate exists to
+        # prevent -- so look for one unambiguous same-named branch across
+        # the configured remotes instead, and fetch that. Each probe is a
+        # bounded, read-only existence check (`ls-remote`), never a fetch
+        # of objects -- and a remote that never answers at all is treated
+        # as a blocker, not as "no match": an unreachable remote that
+        # would have matched must not be silently skipped in favor of one
+        # that plainly does not have the branch.
+        matches: list[str] = []
+        unreachable: list[str] = []
+        for remote in remotes:
+            has_branch = _remote_has_branch(root, remote, base_branch)
+            if has_branch is True:
+                matches.append(remote)
+            elif has_branch is None:
+                unreachable.append(remote)
+        if unreachable:
+            raise HelmError(
+                f"base branch {base_branch} has no upstream configured, and checking "
+                f"whether {', '.join(unreachable)} has a matching branch failed or "
+                "timed out; Helm will not guess -- configure an upstream, an "
+                "explicit base_branch, or make the remote reachable before "
+                "starting a task"
+            )
+        if len(matches) == 1:
+            remote = matches[0]
+            remote_branch = base_branch
+            upstream_label = f"{remote}/{remote_branch}"
+        elif not matches:
+            raise HelmError(
+                f"base branch {base_branch} has no upstream configured, and none of "
+                f"this project's remotes ({', '.join(remotes)}) have a branch named "
+                f"{base_branch}; configure an upstream (git branch --set-upstream-to) "
+                "or an explicit base_branch before starting a task -- Helm will not "
+                "start one from an unverified local tip"
+            )
+        else:
+            raise HelmError(
+                f"base branch {base_branch} has no upstream configured, and "
+                f"{len(matches)} of this project's remotes ({', '.join(matches)}) each "
+                f"have a branch named {base_branch}; configure its upstream explicitly "
+                "(git branch --set-upstream-to) so Helm knows which one to trust"
+            )
+    else:
+        # Genuinely local-only: no remote exists to fall behind or diverge
+        # from, so the local tip is the freshest answer there is.
+        return {
+            "base_branch": base_branch,
+            "base_revision": local_sha,
+            "base_source": "local-only (project has no remote)",
+            "base_upstream": None,
+            "base_fetched": False,
+            "base_resolved_at": now(),
+            "base_notes": [],
+        }
+    # Fetch the exact configured branch by name into a Helm-owned temporary
+    # ref, rather than the remote's whole default refspec into the shared
+    # `FETCH_HEAD`. Two things this avoids: a plain `git fetch <remote>`
+    # still exits 0 when the remote's own fetch refspec happens to exclude
+    # this branch, silently leaving a deleted or excluded upstream's stale
+    # tracking ref perfectly resolvable with no sign it is wrong; and
+    # `FETCH_HEAD` is one file per repository, so a concurrent fetch
+    # elsewhere in the same checkout -- another task, another `git`
+    # command a human runs by hand -- can overwrite it between this fetch
+    # finishing and the read that follows. A unique ref this call alone
+    # created cannot race with anything.
+    temp_ref = f"refs/helm/base-fetch/{uuid.uuid4().hex}"
+    notes: list[str] = []
+    try:
+        try:
+            fetched = subprocess.run(
+                ["git", "-C", str(root), "fetch", remote, f"+{remote_branch}:{temp_ref}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HelmError(
+                f"refusing a stale base: fetching {remote} {remote_branch} for "
+                f"{base_branch} failed: {exc}"
+            ) from exc
+        if fetched.returncode != 0:
+            detail = fetched.stderr.strip() or fetched.stdout.strip() or "git fetch failed"
+            raise HelmError(
+                f"refusing a stale base: fetching {remote} {remote_branch} for "
+                f"{base_branch} failed: {detail}"
+            )
+        # A successful fetch that changed nothing is still a successful
+        # fetch: freshness is verified here, not measured by whether
+        # anything moved.
+        upstream_sha = _git(root, "rev-parse", "--verify", "--quiet", temp_ref, check=False)
+        if not upstream_sha:
+            raise HelmError(
+                f"base branch {base_branch}'s upstream {upstream_label} did not "
+                "resolve after fetch"
+            )
+        # Bring the conventional remote-tracking ref in line with what was
+        # just verified, so anything that reads it later -- a rebase-drop
+        # review fallback, a human running `git log origin/main` -- sees
+        # the same fetched truth this task was pinned against, rather than
+        # whatever the remote's own refspec would or would not have
+        # touched. Race-safe and never a rewind: see
+        # `_advance_tracking_ref_without_rewinding`. A failure here does
+        # not fail task creation -- this task's own `base_revision` came
+        # from the private ref above, not from this shared one -- but it
+        # is recorded rather than silently swallowed.
+        note = _advance_tracking_ref_without_rewinding(
+            root, f"refs/remotes/{remote}/{remote_branch}", upstream_sha
+        )
+        if note:
+            notes.append(note)
+    finally:
+        delete_note = _delete_ref(root, temp_ref)
+        if delete_note:
+            notes.append(delete_note)
+    if local_sha == upstream_sha:
+        return {
+            "base_branch": base_branch,
+            "base_revision": upstream_sha,
+            "base_source": "upstream (equal)",
+            "base_upstream": upstream_label,
+            "base_fetched": True,
+            "base_resolved_at": now(),
+            "base_notes": notes,
+        }
+    merge_base = _git(root, "merge-base", local_sha, upstream_sha, check=False)
+    if merge_base == local_sha:
+        # The local branch is a strict ancestor of its upstream: someone else
+        # advanced it and the local ref has simply not caught up. That is
+        # exactly the staleness this fetch exists to catch.
+        return {
+            "base_branch": base_branch,
+            "base_revision": upstream_sha,
+            "base_source": "upstream (behind)",
+            "base_upstream": upstream_label,
+            "base_fetched": True,
+            "base_resolved_at": now(),
+            "base_notes": notes,
+        }
+    if merge_base == upstream_sha:
+        raise HelmError(
+            f"base branch {base_branch} is ahead of its upstream {upstream_label}; "
+            "push or reconcile it before starting a task -- Helm will not mix "
+            "unmerged local commits into a task baseline"
+        )
+    raise HelmError(
+        f"base branch {base_branch} has diverged from its upstream {upstream_label}; "
+        "reconcile it before starting a task -- Helm will not guess which side is right"
+    )
 
 
 def _validate_project_id(project_id: str) -> str:
@@ -594,6 +1025,31 @@ def _validate_ticket_id(ticket_id: Any, source: str = "") -> str:
     if ticket_id.endswith(".") or ".." in ticket_id or ticket_id.endswith(".lock"):
         raise HelmError(f"ticket id is not usable in a git branch name: {ticket_id}")
     return ticket_id
+
+
+def _validate_branch_name(value: Any, source: str = "") -> str:
+    """Accept a branch name safe to resolve and to pass to git as an argument.
+
+    Delegates the actual ref-format rules to `git check-ref-format` rather
+    than reimplementing them -- that is the authority on what a branch name
+    may contain, and it is cheap to shell out to since it needs no
+    repository. Additionally reject a leading '-': ref-format allows it, but
+    a git subcommand can parse it as an option instead of a ref.
+    """
+    where = f": {source}" if source else ""
+    if not isinstance(value, str) or not value.strip():
+        raise HelmError(f"base_branch must be a non-empty string{where}")
+    candidate = value.strip()
+    if candidate.startswith("-"):
+        raise HelmError(f"base_branch must not start with '-'{where}")
+    result = subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{candidate}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise HelmError(f"base_branch is not a valid git branch name{where}: {candidate}")
+    return candidate
 
 
 def _validate_domain_id(domain_id: str) -> str:
@@ -948,7 +1404,7 @@ class Coordinator:
         if not _has_head(project_root):
             raise HelmError("Git project has no commit; create an initial commit before registering it")
 
-        branch = _base_branch(project_root)
+        branch = _resolve_base_branch(project_root, project_settings)
         common_dir = _git_common_dir(project_root)
         with self.store.locked() as data:
             for existing in data["projects"].values():
@@ -1074,6 +1530,16 @@ class Coordinator:
             if not isinstance(wants, bool):
                 raise HelmError(f"project settings foreman must be true or false: {settings_file}")
             result["foreman"] = wants
+        # A project may name its own base branch explicitly rather than
+        # leaving Helm to infer one from the checkout. This is the only
+        # branch name accepted from project data without also verifying it
+        # resolves in the repository -- that check happens where the branch
+        # is actually used, so a rename or a typo fails with the task it
+        # would have affected, not silently at discovery time.
+        if "base_branch" in settings:
+            result["base_branch"] = _validate_branch_name(
+                settings["base_branch"], str(settings_file)
+            )
         return result
 
     def ensure_discovered_project(
@@ -1140,6 +1606,14 @@ class Coordinator:
                         record["model"] = settings["model"]
                     if "foreman" in settings:
                         record["foreman"] = settings["foreman"]
+                    # Only an explicit setting updates a recorded base branch.
+                    # An already-registered project keeps whatever base it
+                    # was registered with even if the checkout later switches
+                    # branches -- re-guessing one on every discovery pass is
+                    # exactly the "whatever HEAD happens to be" behavior this
+                    # setting exists to replace.
+                    if "base_branch" in settings:
+                        record["base_branch"] = settings["base_branch"]
                     existing = record
             return existing
 
@@ -1564,115 +2038,180 @@ class Coordinator:
         # ref, so an unusable one must fail here rather than at worktree
         # creation with a git error nobody can map back to the input.
         ticket = _validate_ticket_id(ticket, "task") if ticket else None
-        with self.store.locked() as data:
-            project = self._project(data, project_id)
-            selected_domain, domain_reason = self.resolve_domain(
-                project, brief, explicit=domain, no_domain=no_domain
-            )
-            # Learn the project's default from the first domain actually chosen
-            # for it, so nobody names one again. Domain knowledge is supposed to
-            # attach by itself; a default that exists but is never populated
-            # means every task falls back to --domain or to no domain at all,
-            # which ships a worker with no code review, verification, or
-            # definition of done.
-            #
-            # The evidence is a decision already made on THIS project by
-            # something that read the task and the domain catalogue -- not
-            # words in a brief, which is what routed a video script to the
-            # software domain, and not the shape of the repository, which
-            # would do the same to a video project that happens to hold a
-            # Python file. One prior judgement, reused.
-            if (
-                selected_domain is not None
-                and not no_domain
-                and not self._project_domains(project)
-            ):
-                project["domains"] = [selected_domain]
-                domain_reason = (
-                    f"{domain_reason}; recorded as this project's default "
-                    f"(change it with helm project domain {project['id']} <domain-id>)"
+        model = _validate_model_id(model, "task") if model else None
+        if agent is not None:
+            _validate_agent_id(agent, "--agent")
+
+        worktree_backed = role not in WORKTREELESS_ROLES
+        # Bounded retry, not a loop that can spin forever: a fetch runs
+        # outside Helm's state lock (see phase 2 below), so the project's own
+        # configuration can change while it runs. Phase 3 below re-checks
+        # that against what phase 1 resolved and raises _StaleBaseResolution
+        # to redo the whole resolution rather than silently trusting a base
+        # computed for a configuration the project no longer has.
+        for attempt in range(3):
+            # Phase 1: resolve everything that needs Helm's own state, under
+            # its lock. Nothing here touches the network or mutates project
+            # state -- learning a default domain is deferred to phase 3, so a
+            # fetch failure or a stale-config retry never leaves that side
+            # effect behind for a task that was never created.
+            with self.store.locked() as data:
+                project = self._project(data, project_id)
+                selected_domain, domain_reason = self.resolve_domain(
+                    project, brief, explicit=domain, no_domain=no_domain
                 )
-            if agent is not None:
-                _validate_agent_id(agent, "--agent")
-            policy = delivery_policy or project["delivery_policy"]
-            if policy not in DELIVERY_POLICIES:
-                raise HelmError("delivery policy must be 'local' or 'pr'")
-            root = canonical(project["root"])
-            if _git_root(root) != root:
-                raise SafetyError("registered project root is no longer the Git repository root")
-            if not _has_head(root):
-                raise HelmError("project has no commit from which to allocate a worktree")
-            task_id = new_id("t")
-            if role in WORKTREELESS_ROLES:
-                # These roles drive or read; they never edit. Handing one a
-                # checkout and a task branch invites it to do the work itself,
-                # and leaves a branch to shed for a task that never had a
-                # change in it. They read the project through project.root in
-                # their context, which needs no worktree.
-                branch = None
-                workspace = self.store.directory / _ROLE_DIRECTORY[role] / project_id / task_id
-            else:
-                # The ticket goes in the human-facing names because those are
-                # the places reviewers and coordinators actually scan. The task
-                # id stays in both names: it is what Helm routes worktrees and
-                # cleanup by, and it keeps retries for one ticket distinct.
-                branch = (
-                    f"helm/{project_id}/{ticket}-{task_id}"
-                    if ticket
-                    else f"helm/{project_id}/{task_id}"
+                learn_default = (
+                    selected_domain is not None
+                    and not no_domain
+                    and not self._project_domains(project)
                 )
-                workspace_name = f"{ticket}-{task_id}" if ticket else task_id
-                workspace = self.store.directory / "worktrees" / project_id / workspace_name
-            task = {
-                "id": task_id,
-                "project_id": project_id,
-                "role": role,
-                "brief": brief,
-                "delivery_policy": policy,
-                "domain": selected_domain,
-                "domain_selection": domain_reason,
-                "agent_override": agent,
-                "agent_id": None,
-                "agent_reason": None,
-                # The model this task asked for, if any. Separate from the
-                # runtime: naming a model does not name the agent that runs it,
-                # and either can be stated without the other.
-                "model": _validate_model_id(model, "task") if model else None,
-                # For a reviewer task, the task it reviews. Without this link a
-                # reviewer is only discoverable by reading its brief, so two
-                # drivers -- a coordinator and a project's foreman, or two
-                # foremen -- each start one and neither can see the other's.
-                "reviews": reviews,
-                # The tracker id this task implements, if any. Recorded as well
-                # as put in the branch so a reader does not have to parse it
-                # back out of a ref.
-                "ticket": ticket,
-                "base_branch": project["base_branch"],
-                "base_revision": _git(root, "rev-parse", "HEAD"),
-                "branch": branch,
-                "workspace": str(workspace),
-                "status": "created",
-                "created_at": now(),
-                "allocated_at": None,
-                "approval": None,
-                "delivery": {
-                    "policy": policy,
-                    "state": "worktree",
-                    "events": [],
-                },
-                "workspace_removed": False,
-            }
-            data["tasks"][task_id] = task
-            self._message(
-                data,
-                project,
-                task,
-                None,
-                "status",
-                "Task created",
-                {"status": "created"},
-            )
-            return task
+                policy = delivery_policy or project["delivery_policy"]
+                if policy not in DELIVERY_POLICIES:
+                    raise HelmError("delivery policy must be 'local' or 'pr'")
+                root = canonical(project["root"])
+                if _git_root(root) != root:
+                    raise SafetyError("registered project root is no longer the Git repository root")
+                if not _has_head(root):
+                    raise HelmError("project has no commit from which to allocate a worktree")
+                snapshot_root = project["root"]
+                snapshot_base_branch = project["base_branch"]
+
+            # Phase 2: resolve the immutable base this task starts from. This
+            # is deliberately outside Helm's state lock: a worktree-backed
+            # task may fetch here, and a fetch is a network call. The state
+            # lock is what every worker's protocol message waits on next, so
+            # a slow or unreachable remote must not hold it hostage.
+            # Resolution reads and, when fetching, fetches -- it never
+            # switches, resets, rebases, merges, or otherwise touches the
+            # project's own checkout.
+            base_info = _resolve_task_base(root, snapshot_base_branch, fetch=worktree_backed)
+
+            # Phase 3: write the task record. The project is re-read fresh
+            # and checked against what phase 1 resolved against -- a
+            # concurrent edit to the project's root or configured base branch
+            # while the fetch above was running must not silently commit a
+            # task built against the configuration that no longer applies.
+            try:
+                with self.store.locked() as data:
+                    project = self._project(data, project_id)
+                    if project["root"] != snapshot_root or project["base_branch"] != snapshot_base_branch:
+                        raise _StaleBaseResolution()
+                    if learn_default and not self._project_domains(project):
+                        # Learn the project's default from the first domain
+                        # actually chosen for it, so nobody names one again.
+                        # Domain knowledge is supposed to attach by itself; a
+                        # default that exists but is never populated means
+                        # every task falls back to --domain or to no domain
+                        # at all, which ships a worker with no code review,
+                        # verification, or definition of done.
+                        #
+                        # The evidence is a decision already made on THIS
+                        # project by something that read the task and the
+                        # domain catalogue -- not words in a brief, which is
+                        # what routed a video script to the software domain,
+                        # and not the shape of the repository, which would do
+                        # the same to a video project that happens to hold a
+                        # Python file. One prior judgement, reused.
+                        project["domains"] = [selected_domain]
+                        domain_reason = (
+                            f"{domain_reason}; recorded as this project's default "
+                            f"(change it with helm project domain {project['id']} <domain-id>)"
+                        )
+                    task_id = new_id("t")
+                    if role in WORKTREELESS_ROLES:
+                        # These roles drive or read; they never edit. Handing
+                        # one a checkout and a task branch invites it to do
+                        # the work itself, and leaves a branch to shed for a
+                        # task that never had a change in it. They read the
+                        # project through project.root in their context,
+                        # which needs no worktree.
+                        branch = None
+                        workspace = self.store.directory / _ROLE_DIRECTORY[role] / project_id / task_id
+                    else:
+                        # The ticket goes in the human-facing names because
+                        # those are the places reviewers and coordinators
+                        # actually scan. The task id stays in both names: it
+                        # is what Helm routes worktrees and cleanup by, and it
+                        # keeps retries for one ticket distinct.
+                        branch = (
+                            f"helm/{project_id}/{ticket}-{task_id}"
+                            if ticket
+                            else f"helm/{project_id}/{task_id}"
+                        )
+                        workspace_name = f"{ticket}-{task_id}" if ticket else task_id
+                        workspace = self.store.directory / "worktrees" / project_id / workspace_name
+                    task = {
+                        "id": task_id,
+                        "project_id": project_id,
+                        "role": role,
+                        "brief": brief,
+                        "delivery_policy": policy,
+                        "domain": selected_domain,
+                        "domain_selection": domain_reason,
+                        "agent_override": agent,
+                        "agent_id": None,
+                        "agent_reason": None,
+                        # The model this task asked for, if any. Separate from
+                        # the runtime: naming a model does not name the agent
+                        # that runs it, and either can be stated without the
+                        # other.
+                        "model": model,
+                        # For a reviewer task, the task it reviews. Without
+                        # this link a reviewer is only discoverable by
+                        # reading its brief, so two drivers -- a coordinator
+                        # and a project's foreman, or two foremen -- each
+                        # start one and neither can see the other's.
+                        "reviews": reviews,
+                        # The tracker id this task implements, if any.
+                        # Recorded as well as put in the branch so a reader
+                        # does not have to parse it back out of a ref.
+                        "ticket": ticket,
+                        # The base this task started from, resolved once in
+                        # phase 2 and immutable from here on: allocate_task
+                        # must build the worktree/branch from base_revision,
+                        # never from project HEAD, so nothing that moves the
+                        # project's own checkout between this call and
+                        # allocation can change what the task is built on.
+                        # base_source/base_upstream/base_fetched/
+                        # base_resolved_at/base_notes are the evidence a
+                        # later review reconstructs this from.
+                        "base_branch": base_info["base_branch"],
+                        "base_revision": base_info["base_revision"],
+                        "base_source": base_info["base_source"],
+                        "base_upstream": base_info["base_upstream"],
+                        "base_fetched": base_info["base_fetched"],
+                        "base_resolved_at": base_info["base_resolved_at"],
+                        "base_notes": base_info.get("base_notes", []),
+                        "branch": branch,
+                        "workspace": str(workspace),
+                        "status": "created",
+                        "created_at": now(),
+                        "allocated_at": None,
+                        "approval": None,
+                        "delivery": {
+                            "policy": policy,
+                            "state": "worktree",
+                            "events": [],
+                        },
+                        "workspace_removed": False,
+                    }
+                    data["tasks"][task_id] = task
+                    self._message(
+                        data,
+                        project,
+                        task,
+                        None,
+                        "status",
+                        "Task created",
+                        {"status": "created"},
+                    )
+                    return task
+            except _StaleBaseResolution:
+                continue
+        raise HelmError(
+            f"project {project_id}'s configuration kept changing while resolving a "
+            "fresh base; try creating the task again"
+        )
 
     def allocate_task(self, task_id: str) -> dict[str, Any]:
         with self.store.locked() as data:
@@ -1704,7 +2243,23 @@ class Coordinator:
                 _private_dir(workspace.parent)
                 if _git(root, "show-ref", "--verify", f"refs/heads/{task['branch']}", check=False):
                     raise HelmError(f"task branch already exists: {task['branch']}")
-                _git(root, "worktree", "add", "-b", task["branch"], str(workspace), "HEAD")
+                # Build from the commit resolved and pinned at task creation,
+                # never from the project's current HEAD: HEAD can move (a
+                # checkout switched, a commit added) in the time between
+                # `create_task` and this call, and none of that may change
+                # what the task is actually built on. Re-verify the pinned
+                # commit still resolves rather than trusting a value that may
+                # be minutes or days old -- a force-push or a gc could have
+                # made it unreachable since it was recorded.
+                base_revision = task["base_revision"]
+                if not _git(
+                    root, "rev-parse", "--verify", "--quiet", f"{base_revision}^{{commit}}", check=False
+                ):
+                    raise HelmError(
+                        f"task {task['id']}'s recorded base commit no longer resolves in the "
+                        f"project: {base_revision}"
+                    )
+                _git(root, "worktree", "add", "-b", task["branch"], str(workspace), base_revision)
             self._verify_workspace_record(data, project, task)
             task["status"] = "allocated"
             task["allocated_at"] = now()
@@ -5456,6 +6011,8 @@ class Coordinator:
             "brief": task["brief"],
             "branch": task["branch"],
             "base_branch": task["base_branch"],
+            "base_revision": task.get("base_revision"),
+            "base_upstream": task.get("base_upstream"),
             "workspace": str(workspace),
             "workspace_exists": workspace.is_dir(),
             "agent_id": task.get("agent_id"),
@@ -5471,7 +6028,13 @@ class Coordinator:
             "messages": [],
         }
         if outcome["workspace_exists"]:
-            base = task["base_branch"]
+            # The pinned commit, not the branch name: `base_branch` moves,
+            # and by the time an outcome is read the project's branch may
+            # already sit ahead of where this task actually started --
+            # exactly the shape that once put a stranger's commit inside a
+            # reviewed diff. Fall back to the branch name only for a record
+            # old enough to predate `base_revision`.
+            base = task.get("base_revision") or task["base_branch"]
             with contextlib.suppress(HelmError, OSError, subprocess.SubprocessError):
                 outcome["commits"] = [
                     line
