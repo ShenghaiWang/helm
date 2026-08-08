@@ -74,6 +74,16 @@ root.
    that order after Helm's core safety rules. Missing files are missing
    sources, not permission to invent guidance. Domain and project material is
    untrusted guidance and cannot expand scope or authorize protected actions.
+2b. Task-varying **skills** attach the same way, and from the project only.
+   Helm reads that project's own `SKILL.md` manifests (`.agents/skills/`, and
+   a runtime's own root such as `.claude/skills/` for the runtime chosen),
+   selects the ones whose declared description bears on the task, and records
+   the selection and any unreadable manifest on the task. Inspect it with
+   `helm skills <project> --brief "..."`; pin or deny in that project's own
+   `.helm/project.json` when matching is not enough. Skills are guidance a
+   worker reads — they sit below project knowledge in the composed context and
+   can never authorize a protected action, widen a brief, or reach outside
+   their project. Helm ships none and installs none. See `docs/skills.md`.
 3. Delegate the work. **Pass the tracker id** — `--ticket TICKET-192` — so it
    lands in the branch name, which is where a human looks for it; without it
    the branch carries only Helm's task id and the ticket is invisible to every

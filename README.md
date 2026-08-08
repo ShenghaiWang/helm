@@ -476,6 +476,58 @@ The native agent may read and apply existing domain files; creating or changing
 policy/domain files is itself a scoped change requiring the same review
 boundary.
 
+### Task-varying skills
+
+Domain knowledge is durable and shared: it attaches to every task that
+resolves a domain. A great deal of what a worker needs is not like that — how
+this repository runs its screenshot harness, the shape of its migrations, its
+release checklist. That material varies per task, belongs to the repository it
+describes, and would be wrong to promote into a shared domain pack.
+
+Repositories already carry it as **skills**: a directory of `SKILL.md`
+manifests, each declaring a name and a description of when it applies. Helm
+reads them from the project it is working on — never from Helm itself, and
+never from another project:
+
+| Root | Read for |
+| --- | --- |
+| `.agents/skills/<id>/SKILL.md` | every runtime |
+| `.claude/skills/<id>/SKILL.md` | the runtime that owns it |
+
+```sh
+helm skills <project-id>                      # what this project declares
+helm skills <project-id> --agent claude       # including that runtime's own root
+helm skills <project-id> --brief "add a migration"   # what a brief would select, and why
+```
+
+Selection is deliberately dull: a skill earns its place when its own declared
+description overlaps the brief, and a driver that wants an exact set pins it
+in the project's own file. A denylist outranks a pin, because it is the
+standing decision that a skill must not be used here.
+
+```jsonc
+// projects/api/.helm/project.json
+{"skills": {"pin": ["house-style"], "deny": ["legacy-deploy"]}}
+```
+
+What was selected, what was skipped, and anything that could not be read are
+recorded on the task, so `helm inspect` answers "what was this worker actually
+given" without re-deriving it. A missing, malformed, symlinked, or
+description-less skill is **reported, never guessed at** — a worker is told to
+raise it rather than improvise an equivalent.
+
+Content is bounded, and the runtime's own loading is respected: a skill the
+runtime already loads from its own directory is named rather than pasted in,
+because two copies of one instruction in a context window is waste until the
+moment they disagree. Anything the runtime cannot see is provided in full,
+trimmed to a limit that is stated rather than applied silently.
+
+A skill is guidance a worker reads, never authority it can invoke. In the
+composed context it sits after project knowledge and before the task, and it
+cannot authorize a protected action, widen the brief, override core safety, or
+reach outside its project. Helm ships no skills of its own and never installs,
+enables, or writes one. See [`docs/skills.md`](docs/skills.md).
+
 ### Deciding when a change needs a spec first
 
 Some changes should have their behavior agreed in writing before anyone codes
@@ -1085,6 +1137,7 @@ helm worker launch|poll|wait|message|answer|stop
 helm herdr launch|poll|wait|relabel|cleanup|cleanup-project|cleanup-coordinator
 helm foreman PROJECT [--agent PROFILE] [--command CMD] [--no-herdr]
 helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N]
+helm skills PROJECT [--agent A] [--brief TEXT]
 helm board [--out PATH] [--open]
 helm tail WORKER_ID [-n LINES]
 helm reflect [--hours N]

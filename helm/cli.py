@@ -915,6 +915,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "list", help="show every domain and the work it applies to"
     )
 
+    skills_cmd = commands.add_parser(
+        "skills", help="show a project's task-varying skills and what is wrong with any"
+    )
+    skills_cmd.add_argument("project_id")
+    skills_cmd.add_argument(
+        "--agent", dest="agent", default=None,
+        help="the runtime the work would run on, which decides the runtime-specific root read",
+    )
+    skills_cmd.add_argument(
+        "--brief", dest="brief", default=None,
+        help="try a brief and show which skills it would select, and why",
+    )
+
     status = commands.add_parser("status", help="show active tasks and recent results")
     status.add_argument("--project", dest="project_id")
 
@@ -1936,6 +1949,37 @@ def main(argv: list[str] | None = None) -> int:
             _discover_if_configured(coordinator, helm_root)
             _print_status(coordinator, args.project_id)
             return 0
+
+        if args.command == "skills":
+            project = coordinator.get_project(args.project_id)
+            if args.brief is not None:
+                selection = coordinator.select_skills(
+                    project, {"id": "-", "brief": args.brief}, args.agent
+                )
+                print(selection["reason"])
+                for skill in selection["selected"]:
+                    print(f"  {skill['id']}  {skill['path']}")
+                    print(f"    because: {skill['reason']}")
+                    print(f"    delivery: {skill['delivery']}")
+                for entry in selection["skipped"]:
+                    print(f"  - {entry['id']}: {entry['reason']}")
+                problems = selection["problems"]
+            else:
+                found = coordinator.discover_skills(project, args.agent)
+                print(f"Roots read: {', '.join(found['roots'])}")
+                if not found["skills"]:
+                    print("No readable skills in this project.")
+                for skill in found["skills"]:
+                    print(f"  {skill['id']}  {skill['path']}")
+                    print(f"    {skill['description'][:200]}")
+                    if skill["duplicate_of"]:
+                        print(f"    also present at {skill['duplicate_of']}")
+                problems = found["problems"]
+            for problem in problems:
+                # Reported rather than skipped in silence: a skill that cannot
+                # be read is the case most likely to matter.
+                print(f"  ! {problem.get('id') or '(root)'}: {problem['problem']}")
+            return 1 if problems else 0
 
         if args.command == "domain":
             projects = coordinator.list_projects()

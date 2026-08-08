@@ -41,21 +41,22 @@ inherits, silently.
   line is written. The composed `branch-isolation` domain carries the full
   procedure; do it before calling `helm task create` / `helm worker launch`,
   not after.
-- **The right skills are in view.** Discover the selected project's own
-  skill manifests (for example `.claude/skills/`, `.agents/skills/`) and pick
-  only the ones whose metadata/description matches this task -- inside that
-  one project, never copied into Helm or installed automatically. Prefer a
-  runtime that auto-loads the project's skill location; if a different
-  runtime is chosen and can read files, name the exact `SKILL.md` paths in
-  the brief so it does not start blind. The composed `model-selection`
-  domain carries the runtime-fit detail behind this choice. Write what was
-  selected (or explicitly "none, because ...") plus the paths, the
-  loading method, and the reason into the brief and the project record, so a
-  replacement driver can reconstruct the decision without you. A skill is
-  guidance a worker reads, not authority: it cannot expand the task's scope,
-  authorize a protected action, or override core safety, and a required skill
-  that is missing or unreadable by the chosen runtime is a capability
-  blocker to report -- not something to improvise around.
+- **The right skills are in view.** Helm now does this discovery and
+  selection itself while composing a worker's context: it reads the selected
+  project's own skill manifests (`.agents/skills/`, plus a runtime's own root
+  such as `.claude/skills/` for the runtime actually chosen), takes only the
+  ones whose declared description bears on this task, and records what was
+  selected, what was skipped, and anything unreadable on the task itself.
+  Check it with `helm skills <project> --brief "..."` before briefing, because
+  two judgements stay the driver's: whether the runtime you are about to
+  choose can even see the root those skills live in -- the composed
+  `model-selection` domain carries that fit detail -- and whether a skill this
+  task genuinely needs should be pinned in the project's own file rather than
+  left to matching. A skill is guidance a worker reads, not authority: it
+  cannot expand the task's scope, authorize a protected action, or override
+  core safety, and a required skill that is missing or unreadable by the
+  chosen runtime is a capability blocker to report -- not something to
+  improvise around.
 
 ## One task, one worker, one worktree
 

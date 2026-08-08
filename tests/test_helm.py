@@ -28,6 +28,7 @@ from helm.core import (
     FOLLOW_UP_ACTION_KIND,
     FOREMAN_RULES,
     PROTECTED_ACTIONS,
+    SKILL_CONTENT_LIMIT,
     Coordinator,
     HelmError,
     SafetyError,
@@ -8067,6 +8068,278 @@ class HelmCoordinatorTests(unittest.TestCase):
                 0,
                 shared,
             )
+
+    # ---------- task-varying skills ----------
+
+    def _skill(
+        self,
+        root: Path,
+        where: str,
+        skill_id: str,
+        description: str,
+        *,
+        name: str = "",
+        body: str = "the steps",
+    ) -> Path:
+        folder = root / where / skill_id
+        folder.mkdir(parents=True, exist_ok=True)
+        manifest = folder / "SKILL.md"
+        manifest.write_text(
+            f"---\nname: {name or skill_id}\ndescription: {description}\n---\n{body}\n",
+            encoding="utf-8",
+        )
+        return manifest
+
+    def _skill_project(self, name: str) -> tuple[Path, dict[str, Any]]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        return root, project
+
+    def test_skills_are_discovered_from_the_portable_and_runtime_roots(self) -> None:
+        root, project = self._skill_project("discovery")
+        self._skill(root, ".agents/skills", "migrations", "writing database migrations")
+        self._skill(root, ".claude/skills", "screenshots", "capturing app screenshots")
+
+        portable_only = self.coordinator.discover_skills(project)
+        self.assertEqual([s["id"] for s in portable_only["skills"]], ["migrations"])
+
+        # The runtime root is read only for the runtime that owns it.
+        for_claude = self.coordinator.discover_skills(project, "claude")
+        self.assertEqual(
+            sorted(s["id"] for s in for_claude["skills"]), ["migrations", "screenshots"]
+        )
+        self.assertEqual(
+            [s["kind"] for s in for_claude["skills"] if s["id"] == "screenshots"],
+            ["runtime"],
+        )
+
+    def test_a_skill_in_both_roots_is_one_skill_and_the_duplication_is_recorded(
+        self,
+    ) -> None:
+        root, project = self._skill_project("duplicated")
+        self._skill(root, ".agents/skills", "release", "the release checklist")
+        self._skill(root, ".claude/skills", "release", "the release checklist")
+
+        found = self.coordinator.discover_skills(project, "claude")
+        self.assertEqual([s["id"] for s in found["skills"]], ["release"])
+        only = found["skills"][0]
+        # The runtime-specific copy is the more specific answer for the runtime
+        # about to run, and the other one is not silently forgotten.
+        self.assertEqual(only["kind"], "runtime")
+        self.assertIn(".agents/skills", only["duplicate_of"])
+
+    def test_a_malformed_or_undescribed_skill_is_reported_never_guessed(self) -> None:
+        root, project = self._skill_project("malformed")
+        (root / ".agents/skills/empty").mkdir(parents=True)
+        (root / ".agents/skills/empty/SKILL.md").write_text("no frontmatter\n")
+        (root / ".agents/skills/nodesc").mkdir(parents=True)
+        (root / ".agents/skills/nodesc/SKILL.md").write_text("---\nname: x\n---\nbody\n")
+        (root / ".agents/skills/nomanifest").mkdir(parents=True)
+        self._skill(root, ".agents/skills", "good", "a readable one")
+
+        found = self.coordinator.discover_skills(project)
+        self.assertEqual([s["id"] for s in found["skills"]], ["good"])
+        reported = {p["id"]: p["problem"] for p in found["problems"]}
+        self.assertEqual(sorted(reported), ["empty", "nodesc", "nomanifest"])
+        self.assertIn("description", reported["nodesc"])
+
+    def test_a_symlinked_skill_or_root_is_refused(self) -> None:
+        root, project = self._skill_project("symlinked")
+        outside = Path(self.temp.name) / "elsewhere"
+        (outside / "secret").mkdir(parents=True)
+        (outside / "secret" / "SKILL.md").write_text(
+            "---\nname: s\ndescription: not this project's\n---\n"
+        )
+        (root / ".agents/skills").mkdir(parents=True)
+        os.symlink(outside / "secret", root / ".agents/skills/borrowed")
+
+        found = self.coordinator.discover_skills(project)
+        self.assertEqual(found["skills"], [])
+        self.assertEqual(
+            [p["problem"] for p in found["problems"]], ["skill directory is a symlink"]
+        )
+
+        # And a symlinked root is refused rather than followed out of the project.
+        other, other_project = self._skill_project("symlinkedroot")
+        (other / ".agents").mkdir(parents=True)
+        os.symlink(outside, other / ".agents/skills")
+        rooted = self.coordinator.discover_skills(other_project)
+        self.assertEqual(rooted["skills"], [])
+        self.assertIn("symlink", rooted["problems"][0]["problem"])
+
+    def test_selection_takes_only_what_the_brief_actually_calls_for(self) -> None:
+        root, project = self._skill_project("matching")
+        self._skill(root, ".agents/skills", "migrations", "writing database migrations")
+        self._skill(root, ".agents/skills", "screenshots", "capturing app screenshots")
+
+        task = self.coordinator.create_task(project["id"], "add a database migration")
+        selection = self.coordinator.select_skills(project, task)
+        self.assertEqual([s["id"] for s in selection["selected"]], ["migrations"])
+        self.assertIn("migration", selection["selected"][0]["reason"])
+        self.assertEqual(
+            [s["id"] for s in selection["skipped"]], ["screenshots"]
+        )
+
+    def test_a_pin_is_taken_at_its_word_and_a_missing_one_is_reported(self) -> None:
+        root, project = self._skill_project("pinned")
+        self._skill(root, ".agents/skills", "house-style", "unrelated to any brief")
+        (root / ".helm").mkdir(exist_ok=True)
+        (root / ".helm/project.json").write_text(
+            json.dumps({"skills": {"pin": ["house-style", "absent"]}}), encoding="utf-8"
+        )
+
+        task = self.coordinator.create_task(project["id"], "rename a variable")
+        selection = self.coordinator.select_skills(project, task)
+        self.assertEqual([s["id"] for s in selection["selected"]], ["house-style"])
+        self.assertEqual(selection["selected"][0]["reason"], "pinned explicitly")
+        # A pin naming nothing is somebody's request that could not be met.
+        self.assertEqual(
+            [p["id"] for p in selection["problems"]], ["absent"]
+        )
+
+    def test_a_denylist_outranks_a_pin_and_an_allowlist_bounds_the_rest(self) -> None:
+        root, project = self._skill_project("bounded")
+        self._skill(root, ".agents/skills", "risky", "database migrations")
+        self._skill(root, ".agents/skills", "fine", "database migrations")
+        (root / ".helm").mkdir(exist_ok=True)
+        (root / ".helm/project.json").write_text(
+            json.dumps({"skills": {"pin": ["risky"], "deny": ["risky"]}}),
+            encoding="utf-8",
+        )
+        task = self.coordinator.create_task(project["id"], "a database migration")
+        selection = self.coordinator.select_skills(project, task)
+        self.assertEqual([s["id"] for s in selection["selected"]], ["fine"])
+        self.assertIn(
+            "denied", [s["reason"] for s in selection["skipped"] if s["id"] == "risky"][0]
+        )
+
+    def test_an_auto_loaded_skill_is_named_and_an_unreadable_root_is_provided(
+        self,
+    ) -> None:
+        root, project = self._skill_project("delivery")
+        self._skill(
+            root, ".claude/skills", "migrations", "database migrations",
+            body="RUNTIME BODY",
+        )
+        self._skill(
+            root, ".agents/skills", "portable-mig", "database migrations",
+            body="PORTABLE BODY",
+        )
+        task = self.coordinator.create_task(project["id"], "a database migration")
+
+        selection = self.coordinator.select_skills(project, task, "claude")
+        chosen = {s["id"]: s for s in selection["selected"]}
+        # Claude loads its own root, so repeating it would be two copies of one
+        # instruction in one context window.
+        self.assertTrue(chosen["migrations"]["auto_loaded"])
+        self.assertEqual(chosen["migrations"]["content"], "")
+        # Nothing loads the portable root for it, so that one is provided.
+        self.assertFalse(chosen["portable-mig"]["auto_loaded"])
+        self.assertIn("PORTABLE BODY", chosen["portable-mig"]["content"])
+
+    def test_skill_content_is_bounded_and_the_trimming_is_stated(self) -> None:
+        root, project = self._skill_project("bounds")
+        self._skill(
+            root, ".agents/skills", "huge", "database migrations",
+            body="x" * (SKILL_CONTENT_LIMIT + 5_000),
+        )
+        task = self.coordinator.create_task(project["id"], "a database migration")
+        selection = self.coordinator.select_skills(project, task)
+        content = selection["selected"][0]["content"]
+        self.assertLessEqual(len(content), SKILL_CONTENT_LIMIT)
+        # Silent trimming would let a worker act on half a checklist believing
+        # it had all of it.
+        self.assertTrue(any(t["id"] == "huge" for t in selection["truncated"]))
+
+    def test_skills_reach_the_worker_context_below_project_authority(self) -> None:
+        root, project = self._skill_project("composed")
+        self._skill(root, ".agents/skills", "migrations", "database migrations")
+        task = self.coordinator.create_task(project["id"], "a database migration")
+        self.coordinator.allocate_task(task["id"])
+
+        context = self.coordinator._context(project, task, "w-1")
+        kinds = [section["kind"] for section in context["context_sections"]]
+        self.assertIn("skills", kinds)
+        # Below everything that can constrain a skill, above nothing.
+        self.assertLess(kinds.index("project-knowledge"), kinds.index("skills"))
+        self.assertLess(kinds.index("skills"), kinds.index("task"))
+        self.assertEqual(context["precedence"][-2:], ["skills", "task"])
+        section = context["context_sections"][kinds.index("skills")]
+        self.assertIn("cannot authorize a protected action", section["boundary"])
+        self.assertIn("migrations", section["content"])
+
+    def test_the_selection_is_recorded_on_the_task_for_inspection(self) -> None:
+        root, project = self._skill_project("recorded")
+        self._skill(root, ".agents/skills", "migrations", "database migrations")
+        task = self.coordinator.create_task(project["id"], "a database migration")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.assertTrue(worker)
+
+        recorded = self.coordinator.inspect_task(task["id"])["task"]["skills"]
+        self.assertEqual([s["id"] for s in recorded["selected"]], ["migrations"])
+        self.assertIn("migration", recorded["selected"][0]["reason"])
+        # Paths and reasons, never the project's own content.
+        self.assertNotIn("content", recorded["selected"][0])
+
+    def test_skill_discovery_never_reads_another_project(self) -> None:
+        first_root, first = self._skill_project("firstskills")
+        second_root, second = self._skill_project("secondskills")
+        self._skill(first_root, ".agents/skills", "first-only", "database migrations")
+        self._skill(second_root, ".agents/skills", "second-only", "database migrations")
+
+        task = self.coordinator.create_task(second["id"], "a database migration")
+        selection = self.coordinator.select_skills(second, task)
+        self.assertEqual([s["id"] for s in selection["selected"]], ["second-only"])
+        self.assertNotIn("first-only", json.dumps(selection))
+
+    def test_skills_are_documented_where_agents_and_humans_read(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        spec = (REPO_ROOT / "docs" / "skills.md").read_text(encoding="utf-8")
+        for required in (".agents/skills", "helm skills", "docs/skills.md"):
+            self.assertIn(required, readme, required)
+        self.assertIn("helm skills", agents)
+        # The authority boundary is the part that must not be left implicit.
+        for document in (readme, agents, spec):
+            self.assertIn("protected action", document)
+        self.assertIn("Non-goals", spec)
+
+    def test_helm_ships_no_skills_of_its_own(self) -> None:
+        """Helm reads skills; it does not supply them to managed projects."""
+        tracked = subprocess.run(
+            ["git", "ls-files"], text=True, stdout=subprocess.PIPE, check=True
+        ).stdout.splitlines()
+        self.assertEqual(
+            [p for p in tracked if p.endswith("SKILL.md")], []
+        )
+
+    def test_cli_skills_lists_them_and_exits_nonzero_on_a_problem(self) -> None:
+        root, project = self._skill_project("clicskills")
+        self._skill(root, ".agents/skills", "migrations", "database migrations")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(
+                ["--state-dir", str(self.coordinator.store.directory), "skills", project["id"]]
+            )
+        printed = buffer.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("migrations", printed)
+        self.assertIn(".agents/skills", printed)
+
+        (root / ".agents/skills/broken").mkdir(parents=True)
+        (root / ".agents/skills/broken/SKILL.md").write_text("nothing\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(
+                ["--state-dir", str(self.coordinator.store.directory), "skills", project["id"]]
+            )
+        # A skill that cannot be read is the case most likely to matter.
+        self.assertEqual(code, 1)
+        self.assertIn("broken", buffer.getvalue())
 
     def test_tracked_helm_files_do_not_capture_managed_project_details(self) -> None:
         """Helm is generic product code; managed-project facts stay local."""

@@ -123,6 +123,29 @@ PROTECTED_ACTIONS = frozenset({"merge", "push", "publish", "delete", "external"}
 # review's checkout produced no commits at all, and every review branch was
 # deleted as empty when the tasks were cleaned up.
 WORKTREELESS_ROLES = frozenset({"foreman", "reviewer"})
+
+#: The manifest a skill directory is recognized by.
+SKILL_MANIFEST = "SKILL.md"
+#: Where a project may keep task-varying skills. The portable root is readable
+#: by any agent; a runtime root belongs to one runtime, which loads it by its
+#: own convention, so Helm reads it only for that runtime and does not paste
+#: back content that runtime is already going to load for itself.
+PORTABLE_SKILL_ROOT = ".agents/skills"
+RUNTIME_SKILL_ROOTS: dict[str, str] = {"claude": ".claude/skills"}
+#: Bounds, because a skill is content going into somebody's context window.
+#: Exceeding one is stated in the selection rather than silently trimmed away:
+#: a driver that cannot see what was dropped cannot decide to pin it.
+SKILL_CONTENT_LIMIT = 20_000
+SKILL_TOTAL_LIMIT = 60_000
+SKILL_SELECTION_LIMIT = 5
+#: Words too common to be evidence that a skill bears on a brief. Matching is
+#: deliberately dull: a driver that wants an exact set pins it.
+_SKILL_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with",
+    "this", "that", "it", "is", "are", "be", "use", "used", "when", "how",
+    "add", "fix", "update", "make", "run", "new", "from", "into", "by", "at",
+    "helm", "task", "work", "project", "change", "changes", "file", "files",
+})
 _ROLE_DIRECTORY = {"foreman": "foremen", "reviewer": "reviewers"}
 
 FOREMAN_RULES = """You are this project's foreman. You own the loops inside one project; you do
@@ -1641,6 +1664,332 @@ class Coordinator:
             raise SafetyError(f"{label} resolves outside its allowed root: {path}")
         return resolved
 
+    # ---------- task-varying skills ----------
+
+    @staticmethod
+    def _skill_roots(runtime: str | None) -> list[tuple[str, str, str]]:
+        """(relative root, kind, owning runtime) for one runtime's discovery.
+
+        The portable root is readable by every agent. A runtime root belongs to
+        the runtime that defined it, so it is read only when that runtime is
+        the one about to be launched -- reading another agent's root would
+        offer a worker conventions written for a harness it is not running in.
+        """
+        roots = [(PORTABLE_SKILL_ROOT, "portable", "")]
+        name = (runtime or "").strip()
+        if name in RUNTIME_SKILL_ROOTS:
+            roots.append((RUNTIME_SKILL_ROOTS[name], "runtime", name))
+        return roots
+
+    def _read_skill_manifest(
+        self, manifest: Path, project_root: Path
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Read one `SKILL.md`, or say what is wrong with it. Never guesses.
+
+        A skill with no description is not given one: the description is the
+        only evidence selection has that the skill bears on a task, and
+        inventing it would make an unrelated skill look relevant.
+        """
+        if manifest.is_symlink() or manifest.parent.is_symlink():
+            return None, "is a symlink, which could point outside the project"
+        try:
+            resolved = self._safe_configuration_path(
+                manifest, project_root, "project skill"
+            )
+        except SafetyError:
+            return None, "resolves outside the project root"
+        if not resolved.is_file():
+            return None, "has no SKILL.md"
+        try:
+            raw = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, f"could not be read: {exc}"
+        meta = _parse_frontmatter(raw)
+        if not isinstance(meta, dict) or not meta:
+            return None, "has no readable frontmatter (needs name and description)"
+        description = _safe_text(meta.get("description", "")).strip()
+        if not description:
+            return None, "declares no description, so nothing says when it applies"
+        return (
+            {
+                "name": _safe_text(meta.get("name", "")).strip(),
+                "description": description,
+                "body": raw,
+            },
+            "",
+        )
+
+    def discover_skills(
+        self, project: dict[str, Any], runtime: str | None = None
+    ) -> dict[str, Any]:
+        """Every readable skill in one project, plus what could not be read.
+
+        Reads the selected project and nothing else: a skill is a fact about
+        the repository it sits in, and one project's conventions are never
+        evidence about another's.
+        """
+        project_root = canonical(project["root"])
+        skills: dict[str, dict[str, Any]] = {}
+        problems: list[dict[str, str]] = []
+        for relative, kind, owner in self._skill_roots(runtime):
+            root = project_root / relative
+            if root.is_symlink():
+                problems.append({
+                    "id": "", "root": relative,
+                    "problem": "skill root is a symlink, which could point outside the project",
+                })
+                continue
+            if not root.is_dir():
+                continue
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir() or entry.is_symlink():
+                    if entry.is_symlink():
+                        problems.append({
+                            "id": entry.name, "root": relative,
+                            "problem": "skill directory is a symlink",
+                        })
+                    continue
+                manifest, problem = self._read_skill_manifest(
+                    entry / SKILL_MANIFEST, project_root
+                )
+                if manifest is None:
+                    problems.append(
+                        {"id": entry.name, "root": relative, "problem": problem}
+                    )
+                    continue
+                record = {
+                    "id": entry.name,
+                    "name": manifest["name"] or entry.name,
+                    "description": manifest["description"],
+                    "path": f"{relative}/{entry.name}/{SKILL_MANIFEST}",
+                    "root": relative,
+                    "kind": kind,
+                    "runtime": owner,
+                    "body": manifest["body"],
+                    "duplicate_of": "",
+                }
+                existing = skills.get(entry.name)
+                if existing is None:
+                    skills[entry.name] = record
+                    continue
+                # One skill, present twice. The runtime-specific copy is the
+                # more specific answer for the runtime about to run, so it
+                # wins -- and the fact that there were two is recorded rather
+                # than quietly resolved.
+                if kind == "runtime":
+                    record["duplicate_of"] = existing["path"]
+                    skills[entry.name] = record
+                else:
+                    existing["duplicate_of"] = record["path"]
+        return {
+            "skills": [skills[key] for key in sorted(skills)],
+            "problems": problems,
+            "roots": [relative for relative, _, _ in self._skill_roots(runtime)],
+            "runtime": (runtime or "").strip(),
+        }
+
+    @staticmethod
+    def _skill_terms(text: str) -> set[str]:
+        """Comparable words from a brief or a skill description.
+
+        A trailing plural is folded away, and nothing more. "Write a migration"
+        must find the skill described as "database migrations" -- but a real
+        stemmer would start matching words that merely look alike, and a skill
+        selected on a coincidence is worse than one a driver has to pin.
+        """
+        terms = set()
+        for word in re.findall(r"[a-z0-9]+", _safe_text(text).lower()):
+            if len(word) < 3 or word in _SKILL_STOPWORDS:
+                continue
+            if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+                word = word[:-1]
+            if word not in _SKILL_STOPWORDS:
+                terms.add(word)
+        return terms
+
+    def _skill_settings(self, project: dict[str, Any]) -> dict[str, list[str]]:
+        settings = self._discovery_settings(canonical(project["root"])).get("skills")
+        result: dict[str, list[str]] = {"pin": [], "allow": [], "deny": []}
+        if not isinstance(settings, dict):
+            return result
+        for key in result:
+            value = settings.get(key)
+            if isinstance(value, list):
+                result[key] = [_safe_text(v).strip() for v in value if _safe_text(v).strip()]
+        return result
+
+    def select_skills(
+        self,
+        project: dict[str, Any],
+        task: dict[str, Any],
+        runtime: str | None = None,
+        *,
+        pin: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Choose the skills this task actually needs, and say why.
+
+        Conservative on purpose. A pin is an explicit instruction and is taken
+        at its word; everything else has to earn its place by its own declared
+        description overlapping this brief. Selecting the whole directory
+        because it was there is how a worker's context fills with instructions
+        for work it is not doing.
+        """
+        found = self.discover_skills(project, runtime)
+        configured = self._skill_settings(project)
+        pins = [*(configured["pin"]), *[_safe_text(p).strip() for p in (pin or []) if _safe_text(p).strip()]]
+        allow, deny = configured["allow"], configured["deny"]
+        by_id = {skill["id"]: skill for skill in found["skills"]}
+        problems = list(found["problems"])
+        for wanted in pins:
+            if wanted not in by_id:
+                # A pin naming nothing is a capability problem to report, not
+                # an empty selection to shrug at: somebody asked for it.
+                problems.append({
+                    "id": wanted, "root": "",
+                    "problem": "pinned skill was not found in this project",
+                })
+        brief_terms = self._skill_terms(task.get("brief", ""))
+        selected: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        for skill in found["skills"]:
+            if skill["id"] in deny:
+                # A denylist is the one judgement that outranks a pin: it is
+                # the standing decision that this skill must not be used here.
+                skipped.append({"id": skill["id"], "reason": "denied by project configuration"})
+                continue
+            if allow and skill["id"] not in allow:
+                skipped.append({"id": skill["id"], "reason": "not on this project's skill allowlist"})
+                continue
+            if skill["id"] in pins:
+                selected.append({**skill, "reason": "pinned explicitly"})
+                continue
+            overlap = brief_terms & self._skill_terms(
+                f"{skill['id']} {skill['name']} {skill['description']}"
+            )
+            if overlap:
+                selected.append({
+                    **skill,
+                    "reason": "matches this task: " + ", ".join(sorted(overlap)[:5]),
+                })
+            else:
+                skipped.append({"id": skill["id"], "reason": "nothing in it matches this task"})
+        truncated: list[dict[str, str]] = []
+        if len(selected) > SKILL_SELECTION_LIMIT:
+            for skill in selected[SKILL_SELECTION_LIMIT:]:
+                truncated.append({
+                    "id": skill["id"],
+                    "reason": f"beyond the {SKILL_SELECTION_LIMIT}-skill limit for one task",
+                })
+            selected = selected[:SKILL_SELECTION_LIMIT]
+        # The runtime loads its own root by convention, so its content is named
+        # rather than pasted; anything it cannot see is provided in full,
+        # bounded, because otherwise the worker starts blind to it.
+        budget = SKILL_TOTAL_LIMIT
+        for skill in selected:
+            auto = skill["kind"] == "runtime" and skill["runtime"] == (runtime or "").strip()
+            skill["auto_loaded"] = bool(auto)
+            body = skill.pop("body", "")
+            if auto:
+                skill["content"] = ""
+                skill["delivery"] = "named; the runtime loads this root itself"
+                continue
+            if len(body) > SKILL_CONTENT_LIMIT:
+                body = body[:SKILL_CONTENT_LIMIT]
+                truncated.append({
+                    "id": skill["id"],
+                    "reason": f"content trimmed to {SKILL_CONTENT_LIMIT} characters",
+                })
+            if len(body) > budget:
+                body = ""
+                skill["delivery"] = "named only; the context budget for skills was spent"
+                truncated.append({
+                    "id": skill["id"],
+                    "reason": "named only; the context budget for skills was spent",
+                })
+            else:
+                budget -= len(body)
+                skill["delivery"] = "provided in full; this runtime does not load that root"
+            skill["content"] = body
+        return {
+            "selected": selected,
+            "skipped": skipped,
+            "problems": problems,
+            "truncated": truncated,
+            "roots": found["roots"],
+            "runtime": found["runtime"],
+            "reason": (
+                f"{len(selected)} of {len(found['skills'])} project skill(s) match this task"
+                if found["skills"]
+                else "none: this project declares no readable skills"
+            ),
+        }
+
+    @staticmethod
+    def _skills_section_text(selection: dict[str, Any]) -> str:
+        """Render the selection for a worker to read.
+
+        A skill the runtime loads for itself is named, not pasted: two copies
+        of the same instructions in one context window is waste at best, and a
+        contradiction the moment one of them is trimmed. A skill the runtime
+        cannot see is provided in full, because otherwise naming a path it
+        will never open is the same as saying nothing.
+        """
+        lines: list[str] = []
+        for skill in selection.get("selected", []):
+            lines.append(
+                f"## {skill['name']} ({skill['id']}) -- {skill['path']}\n"
+                f"Selected because: {skill.get('reason', '')}\n"
+                f"Delivery: {skill.get('delivery', '')}"
+            )
+            if skill.get("auto_loaded"):
+                lines.append(
+                    "This runtime loads that directory itself; read it there "
+                    "rather than expecting it repeated here."
+                )
+            elif skill.get("content"):
+                lines.append(skill["content"])
+            else:
+                lines.append(f"Read it at {skill['path']}.")
+        for problem in selection.get("problems", []):
+            # Reported, never invented. A skill somebody asked for that cannot
+            # be read is a capability gap the worker should raise, not
+            # something to improvise an equivalent for.
+            lines.append(
+                f"UNAVAILABLE SKILL {problem.get('id') or '(root)'}: "
+                f"{problem.get('problem', '')}. Do not invent a replacement; "
+                "report it if the task needs it."
+            )
+        for dropped in selection.get("truncated", []):
+            lines.append(
+                f"NOT FULLY INCLUDED {dropped.get('id')}: {dropped.get('reason')}."
+            )
+        return "\n\n".join(lines).strip()
+
+    @staticmethod
+    def _skill_record(selection: dict[str, Any]) -> dict[str, Any]:
+        """The durable, content-free summary kept on the task.
+
+        Paths and reasons, never bodies: the content lives in the project, and
+        copying it into Helm's own state would both bloat the record and put a
+        managed project's material somewhere it does not belong.
+        """
+        return {
+            "reason": selection.get("reason", ""),
+            "runtime": selection.get("runtime", ""),
+            "selected": [
+                {
+                    "id": skill["id"],
+                    "path": skill["path"],
+                    "reason": skill.get("reason", ""),
+                    "auto_loaded": skill.get("auto_loaded", False),
+                    "delivery": skill.get("delivery", ""),
+                }
+                for skill in selection.get("selected", [])
+            ],
+            "problems": selection.get("problems", []),
+            "truncated": selection.get("truncated", []),
+        }
+
     @staticmethod
     def _discovery_settings(project_root: Path) -> dict[str, Any]:
         """Read optional per-project defaults without changing the project."""
@@ -1731,6 +2080,30 @@ class Coordinator:
             result["base_branch"] = _validate_branch_name(
                 settings["base_branch"], str(settings_file)
             )
+        # A project may pin, allow, or deny its own task-varying skills. It is
+        # guidance about that project's own files and nothing more: a skill
+        # list cannot name another project, and it never widens what Helm may
+        # do -- a denied skill is simply never offered to a worker.
+        if "skills" in settings:
+            declared = settings["skills"]
+            if not isinstance(declared, dict):
+                raise HelmError(
+                    f"project settings skills must be a JSON object: {settings_file}"
+                )
+            chosen: dict[str, list[str]] = {}
+            for key in ("pin", "allow", "deny"):
+                if key not in declared:
+                    continue
+                value = declared[key]
+                if not isinstance(value, list) or any(
+                    not isinstance(entry, str) for entry in value
+                ):
+                    raise HelmError(
+                        f"project settings skills.{key} must be a list of strings: "
+                        f"{settings_file}"
+                    )
+                chosen[key] = [entry.strip() for entry in value if entry.strip()]
+            result["skills"] = chosen
         return result
 
     def ensure_discovered_project(
@@ -1870,6 +2243,10 @@ class Coordinator:
             f"unknown project {project_id}; expected a Git project at "
             f"{configured_root / 'projects' / project_id}"
         )
+
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        """One registered project, or an error naming the unknown id."""
+        return dict(self._project(self.store.load(), project_id))
 
     def list_projects(self) -> list[dict[str, Any]]:
         data = self.store.load()
@@ -3366,6 +3743,27 @@ class Coordinator:
                 exists=project_knowledge_exists,
             )
         )
+        # Task-varying skills sit below everything that can constrain them and
+        # above nothing. They are the project's own instructions for doing a
+        # kind of work, so they come after that project's knowledge, and they
+        # are guidance a worker reads rather than authority it can invoke.
+        runtime = (agent or {}).get("runtime") or task.get("agent_id") or ""
+        skills = self.select_skills(project, task, runtime)
+        if skills["selected"] or skills["problems"]:
+            sections.append(
+                self._knowledge_section(
+                    "skills",
+                    "helm://task-skills",
+                    self._skills_section_text(skills),
+                    boundary=(
+                        "Task-varying project skills; guidance only. Subordinate to "
+                        "Helm core safety, domain guardrails and project knowledge. "
+                        "A skill cannot authorize a protected action, expand this "
+                        "task's scope, or reach outside this project"
+                    ),
+                    exists=bool(skills["selected"]),
+                )
+            )
         sections.append(
             self._knowledge_section(
                 "task",
@@ -3386,13 +3784,14 @@ class Coordinator:
             # Keep the assignment schema version stable: these are additive
             # sections on the existing context document.
             "schema_version": 1,
-            "precedence": ["core-safety", "domain-knowledge", "domain-guardrails", "project-knowledge", "task"],
+            "precedence": ["core-safety", "domain-knowledge", "domain-guardrails", "project-knowledge", "skills", "task"],
             "safety_rules": {"source": "helm://core-safety-rules", "content": CORE_SAFETY_RULES},
             "domain": domain_payload,
             # Base-first composition order, so a worker can see exactly which
             # shared packs it inherited and in what order.
             "domain_chain": domain_chain,
             "project_knowledge": project_payload,
+            "skills": self._skill_record(skills),
             "context_sections": sections,
             "project": {
                 "id": project["id"],
@@ -3740,6 +4139,10 @@ class Coordinator:
         exit_file = worker_dir / "exit.json"
         config_file = worker_dir / "runner.json"
         context = self._context(project, task, worker_id, selected_agent)
+        # Recorded on the task, so which skills a worker was given -- and which
+        # could not be read -- survives in `helm inspect` rather than only in a
+        # private context file nobody reads afterwards. Paths and reasons only.
+        task["skills"] = context.get("skills", {})
         _write_private_text(context_file, json.dumps(context, indent=2) + "\n")
         _write_private_text(log_file, "")
         # An agent CLI is told where its assignment is; a plain external
