@@ -14,5 +14,5 @@
     "agent-messaging",
     "implementation-notes"
   ],
-  "applies_to": "Any task that writes, changes, or reviews code: features, bug fixes, refactors, tests, and the review that follows. Not for research, writing, or media production."
+  "applies_to": "Building or changing reusable software behavior, or reviewing such a change: features, bug fixes, refactors, tests, and the review that follows. Not for research, writing, or media production, and not for a straight-through operational task even when carrying it out edits a script, config, or tracker file."
 }
