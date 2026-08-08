@@ -22,6 +22,10 @@ from helm.core import (
     project_glyph,
     _COLOR_PALETTE,
     CORE_SAFETY_RULES,
+    DELIVERY_DECISION_KIND,
+    DELIVERY_DECISION_PROJECT_TEXT,
+    DELIVERY_DECISION_TASK_TEXT,
+    FOLLOW_UP_ACTION_KIND,
     FOREMAN_RULES,
     PROTECTED_ACTIONS,
     Coordinator,
@@ -3459,6 +3463,474 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.assertTrue(any("ACTION REQUIRED" in update["text"] for update in updates))
         self.assertEqual(self.coordinator.project_updates_for_watch(), [])
 
+    def _decisions(self, project_id: str) -> list[dict]:
+        return [
+            item
+            for item in self.coordinator.project_status(project_id)["action_items"]
+            if item["kind"] == DELIVERY_DECISION_KIND
+        ]
+
+    def test_a_worker_result_keeps_the_space_and_leaves_a_decision_behind(self) -> None:
+        """The exact order `helm worker report` runs, on the case it broke.
+
+        Record the result, release the finished tab, then check whether the
+        project's space can close. The close check read a task with no pane as
+        nothing left to show -- and releasing the tab is precisely what a clean
+        result does -- so the worker's own success closed the space over a
+        change nobody had reviewed, merged, or cleaned up.
+        """
+        root = self.repo("gate")
+        project = self.coordinator.register_project("Gate", str(root), project_id="gate")
+        task = self.coordinator.create_task(project["id"], "write the change")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.object(
+            cli, "HerdrAdapter", return_value=adapter
+        ):
+            self.assertEqual(
+                cli.main([
+                    "--state-dir", str(self.state.directory),
+                    "worker", "message", worker["id"],
+                    "--type", "result", "--text", "implemented and committed",
+                ]),
+                0,
+            )
+
+        # The tab goes -- it has nothing left to show -- and the space stays.
+        self.assertEqual(len(herdr.closed_tabs), 1)
+        self.assertEqual(herdr.closed_workspaces, [])
+        status = self.coordinator.project_status(project["id"])
+        self.assertTrue(
+            any(
+                "Worker result:" in entry["text"]
+                and "implemented and committed" in entry["text"]
+                for entry in status["situation"]
+            )
+        )
+        self.assertEqual([item["task_id"] for item in self._decisions(project["id"])], [task["id"]])
+        self.assertIn("Commander decision pending", output.getvalue())
+
+    def test_the_outcome_is_routed_before_anything_that_closes_a_pane(self) -> None:
+        """Durable storage is not delivery, and the report runs in the pane.
+
+        A worker reports by running a Helm command inside its own tab, so the
+        confirmation is printed onto the exact surface the next two calls
+        remove. Recording the result correctly, releasing the tab and closing
+        the space then leaves a completed, unmerged change that the session
+        driving the project never heard about -- it was found by inspecting the
+        task by hand after the pane had gone. So the outcome and the decision
+        must reach a surface that outlives the pane BEFORE either call runs.
+        """
+        root = self.repo("routed")
+        project = self.coordinator.register_project(
+            "Routed", str(root), project_id="routed"
+        )
+        task = self.coordinator.create_task(project["id"], "write the change")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        overview = self.state.load()["integrations"]["herdr"]["projects"][
+            project["id"]
+        ]["overview_pane_id"]
+
+        # Watch the order, and what had already been delivered at each step.
+        order: list[str] = []
+        seen: dict[str, dict] = {}
+
+        def snapshot(name: str) -> dict:
+            live = self.state.load()
+            return {
+                "handoff": (live["workers"][worker["id"]].get("outcome_handoff") or {}),
+                "pane": [text for pane, text in herdr.runs if pane == overview],
+                "decisions": self._decisions(project["id"]),
+                "step": name,
+            }
+
+        def watched(name: str, call):
+            def wrapper(*a, **kw):
+                order.append(name)
+                seen.setdefault(name, snapshot(name))
+                return call(*a, **kw)
+            return wrapper
+
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+            cli, "HerdrAdapter", return_value=adapter
+        ), mock.patch.object(
+            adapter, "notify_coordinator",
+            side_effect=watched("notify", adapter.notify_coordinator),
+        ), mock.patch.object(
+            adapter, "release_finished_tabs",
+            side_effect=watched("release", adapter.release_finished_tabs),
+        ), mock.patch.object(
+            adapter, "close_project_space_if_finished",
+            side_effect=watched("close", adapter.close_project_space_if_finished),
+        ):
+            self.assertEqual(
+                cli.main([
+                    "--state-dir", str(self.state.directory),
+                    "worker", "message", worker["id"],
+                    "--type", "result", "--text", "implemented and committed",
+                ]),
+                0,
+            )
+
+        self.assertEqual(order, ["notify", "release", "close"])
+        # By the time the first pane-closing call runs, the outcome had already
+        # been delivered somewhere that outlives the pane -- and the decision
+        # had already been raised.
+        at_release = seen["release"]
+        self.assertIn("status-record", at_release["handoff"]["channels"])
+        self.assertIn("project-pane", at_release["handoff"]["channels"])
+        self.assertEqual(
+            [item["task_id"] for item in at_release["decisions"]], [task["id"]]
+        )
+        # Delivered to the project's own overview pane, which is not the tab
+        # about to be released.
+        routed = "\n".join(at_release["pane"])
+        self.assertIn("FINAL OUTCOME", routed)
+        self.assertIn("implemented and committed", routed)
+        self.assertIn("DECISION NEEDED", routed)
+        self.assertIn(task["id"], routed)
+        # And the space is still standing after all three calls.
+        self.assertEqual(herdr.closed_workspaces, [])
+        self.assertEqual(len(herdr.closed_tabs), 1)
+
+    def test_the_outcome_route_does_not_wait_for_a_foreman_to_exist(self) -> None:
+        """The no-driver case is the one that needed telling, not the exception."""
+        root = self.repo("nodriverroute")
+        project = self.coordinator.register_project(
+            "NoDriverRoute", str(root), project_id="nodriverroute"
+        )
+        task = self.coordinator.create_task(project["id"], "write the change")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.assertIsNone(self.coordinator.foreman_for(project["id"]))
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "implemented and committed"
+        )
+
+        routed = adapter.notify_coordinator(worker["id"])
+
+        self.assertNotIn("foreman", routed["channels"])
+        self.assertIn("status-record", routed["channels"])
+        self.assertIn("project-pane", routed["channels"])
+        self.assertIn("DECISION NEEDED", routed["notice"]["text"])
+
+        # With a driver, it is told as well -- the route widens, it does not
+        # move.
+        other = self.repo("drivenroute")
+        second = self.coordinator.register_project(
+            "DrivenRoute", str(other), project_id="drivenroute"
+        )
+        foreman_task = self.coordinator.create_foreman_task(second["id"])
+        foreman = adapter.launch_task(
+            foreman_task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        driven = self.coordinator.create_task(second["id"], "write more")
+        coder = adapter.launch_task(driven["id"], [sys.executable, "-c", ""], wait=False)
+        self.coordinator.record_worker_message(coder["id"], "result", "done")
+
+        with_driver = adapter.notify_coordinator(coder["id"])
+
+        self.assertIn("foreman", with_driver["channels"])
+        self.assertIn("status-record", with_driver["channels"])
+        foreman_pane = self.state.load()["integrations"]["herdr"]["workers"][
+            foreman["id"]
+        ]["pane_id"]
+        told = [text for pane, text in herdr.sent_text if pane == foreman_pane]
+        self.assertTrue(any(driven["id"] in text for text in told))
+
+    def test_a_tab_is_never_released_while_its_outcome_has_reached_nothing(self) -> None:
+        """The pane is the last copy, so it is not the thing to throw away."""
+        root = self.repo("unroutable")
+        project = self.coordinator.register_project(
+            "Unroutable", str(root), project_id="unroutable"
+        )
+        task = self.coordinator.create_task(project["id"], "write the change")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+
+        with mock.patch.object(
+            adapter, "notify_coordinator",
+            return_value={"channels": [], "notice": {"task_id": task["id"]}},
+        ):
+            self.assertEqual(adapter.release_finished_tabs(), [])
+        self.assertEqual(herdr.closed_tabs, [])
+
+        # Once it has landed somewhere, the tab is free to go.
+        self.assertEqual(adapter.release_finished_tabs(), [worker["id"]])
+        self.assertEqual(len(herdr.closed_tabs), 1)
+
+    def test_a_long_final_summary_is_kept_rather_than_dropped_for_length(self) -> None:
+        """A refused situation line loses the one record of the outcome.
+
+        `record_situation` refuses an over-long note instead of cutting it,
+        which is right for a note somebody wrote. A generated mirror of a
+        worker's result is different: the full text is already durable in the
+        message record, so refusing it just means the project's record has
+        nothing at all about how the work ended.
+        """
+        root = self.repo("longresult")
+        project = self.coordinator.register_project(
+            "Long", str(root), project_id="longresult"
+        )
+        task = self.coordinator.create_task(project["id"], "write a lot")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+
+        self.coordinator.record_worker_message(worker["id"], "result", "x" * 900)
+
+        situation = self.coordinator.project_status(project["id"])["situation"]
+        kept = [entry for entry in situation if "Worker result:" in entry["text"]]
+        self.assertEqual(len(kept), 1)
+        self.assertLessEqual(len(kept[0]["text"]), Coordinator.SITUATION_LINE_LIMIT)
+        self.assertIn(task["id"], kept[0]["text"])
+
+    def test_a_live_foreman_keeps_the_decision_off_the_commanders_desk(self) -> None:
+        """A driver is still driving; asking the commander now is premature."""
+        root = self.repo("driven")
+        project = self.coordinator.register_project(
+            "Driven", str(root), project_id="driven"
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""]
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        coder = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+
+        self.coordinator.record_worker_message(coder["id"], "result", "done and committed")
+
+        # Recorded durably, and handed to the driver rather than to a human.
+        status = self.coordinator.project_status(project["id"])
+        self.assertTrue(any("Worker result:" in e["text"] for e in status["situation"]))
+        self.assertEqual(self._decisions(project["id"]), [])
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        with mock.patch.object(adapter, "answer_worker", return_value=True) as told:
+            self.assertTrue(adapter.notify_foreman(coder["id"]))
+        self.assertEqual(told.call_args[0][0], foreman["id"])
+
+        # When the driver finishes, the work it leaves behind becomes the
+        # commander's -- with no structured payload field anywhere in sight.
+        self.coordinator.record_worker_message(foreman["id"], "result", "project driven")
+
+        decisions = self._decisions(project["id"])
+        self.assertEqual([item["task_id"] for item in decisions], [task["id"]])
+        self.assertTrue(
+            any("Foreman report:" in e["text"] for e in
+                self.coordinator.project_status(project["id"])["situation"])
+        )
+
+    def test_a_foreman_handover_stays_project_scoped_and_is_raised_once(self) -> None:
+        root = self.repo("handover")
+        project = self.coordinator.register_project(
+            "Handover", str(root), project_id="handover"
+        )
+        first = self.coordinator.create_task(project["id"], "first change")
+        second = self.coordinator.create_task(project["id"], "second change")
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""]
+        )
+
+        self.coordinator.record_worker_message(foreman["id"], "result", "handing back")
+
+        decisions = self._decisions(project["id"])
+        self.assertEqual(len(decisions), 1)
+        # Two candidates, so it names neither rather than picking one.
+        self.assertIsNone(decisions[0]["task_id"])
+        self.assertIn("unresolved task work", decisions[0]["text"])
+
+        # A second report -- or a second path raising the same gate -- must not
+        # print the same decision twice.
+        self.coordinator.raise_delivery_decision_for_project(project["id"])
+        self.coordinator.record_delivery_decision(project["id"], source="somewhere else")
+        self.assertEqual(len(self._decisions(project["id"])), 1)
+
+        # Resolving one task is not resolving the project's work.
+        with self.coordinator.store.locked() as data:
+            data["tasks"][first["id"]]["status"] = "merged"
+        self.assertEqual(len(self._decisions(project["id"])), 1)
+        with self.coordinator.store.locked() as data:
+            data["tasks"][second["id"]]["status"] = "pr-merged"
+        self.assertEqual(self._decisions(project["id"]), [])
+
+    def test_a_project_that_declines_a_foreman_still_gets_the_decision(self) -> None:
+        """Opting out of a driver must not opt out of being told."""
+        root = self.repo("nodriver")
+        (root / ".helm").mkdir()
+        (root / ".helm" / "project.json").write_text(json.dumps({"foreman": False}))
+        project = self.coordinator.register_project(
+            "NoDriver", str(root), project_id="nodriver"
+        )
+        self.assertFalse(self.coordinator.project_wants_foreman(project["id"]))
+        task = self.coordinator.create_task(project["id"], "write the change")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+
+        self.assertEqual([i["task_id"] for i in self._decisions(project["id"])], [task["id"]])
+
+    def test_a_foreman_standing_down_hands_over_what_it_was_driving(self) -> None:
+        """Nothing left to drive is not the same as nothing left to decide."""
+        root = self.repo("standdown")
+        project = self.coordinator.register_project(
+            "StandDown", str(root), project_id="standdown"
+        )
+        task = self.coordinator.create_task(project["id"], "write the change")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""]
+        )
+        # The worker's result went to the foreman, so no gate was raised.
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        self.coordinator.stop_worker(worker["id"], "settled")
+        self.assertEqual(self._decisions(project["id"]), [])
+
+        stood_down = self.coordinator.stand_down_idle_foreman(project["id"])
+
+        self.assertIsNotNone(stood_down)
+        self.assertEqual(stood_down["id"], foreman["id"])
+        self.assertEqual([i["task_id"] for i in self._decisions(project["id"])], [task["id"]])
+
+    def test_a_delivery_decision_resolves_when_the_work_is_merged(self) -> None:
+        root, project, task = self._completed_task_awaiting_approval("mergegate")
+        self.coordinator.record_delivery_decision(
+            project["id"], task_id=task["id"], source="Worker result"
+        )
+        self.assertEqual(len(self._decisions(project["id"])), 1)
+
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+
+        self.assertEqual(self._decisions(project["id"]), [])
+        status = self.coordinator._load_status(project["id"])
+        closed = [i for i in status["action_items"] if i["status"] == "resolved"]
+        self.assertEqual(closed[0]["resolved_reason"], "merged")
+
+    def test_a_delivery_decision_resolves_on_pr_merge_continue_and_cleanup(self) -> None:
+        root = self.repo("prgate")
+        project = self.coordinator.register_project(
+            "PRGate", str(root), project_id="prgate", delivery_policy="pr"
+        )
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('change.txt').write_text('worker'); "
+            "subprocess.run(['git','add','change.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker change'],check=True)"
+        )
+        task = self.coordinator.create_task(project["id"], "make a PR change")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        self.coordinator.record_delivery_decision(project["id"], task_id=task["id"])
+
+        # An open PR is not delivery, so the decision stays.
+        self.coordinator.record_pr_status(
+            task["id"], state="open", url="https://example.invalid/pull/1"
+        )
+        self.assertEqual(len(self._decisions(project["id"])), 1)
+        self.coordinator.record_pr_status(
+            task["id"], state="merged", url="https://example.invalid/pull/1"
+        )
+        self.assertEqual(self._decisions(project["id"]), [])
+
+        # Continuing IS the decision, even though it reopens the task.
+        other = self.repo("continuegate")
+        second = self.coordinator.register_project(
+            "ContinueGate", str(other), project_id="continuegate"
+        )
+        rounds = self.coordinator.create_task(second["id"], "another round")
+        worker = self.coordinator.launch_worker(
+            rounds["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "result", "round one done")
+        self.assertEqual(len(self._decisions(second["id"])), 1)
+        self.coordinator.continue_task(rounds["id"], "fix the finding")
+        self.assertEqual(self._decisions(second["id"]), [])
+
+        # And cleanup resolves it for work that is simply thrown away.
+        third = self.repo("cleanupgate")
+        dropped = self.coordinator.register_project(
+            "CleanupGate", str(third), project_id="cleanupgate"
+        )
+        spike = self.coordinator.create_task(dropped["id"], "a spike")
+        spiker = self.coordinator.launch_worker(
+            spike["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(spiker["id"], "result", "spike done")
+        Path(spiker["exit_file"]).write_text(
+            json.dumps({"returncode": 0}) + "\n", encoding="utf-8"
+        )
+        self.assertEqual(len(self._decisions(dropped["id"])), 1)
+        self.coordinator.cleanup_task(spike["id"])
+        self.assertEqual(self._decisions(dropped["id"]), [])
+
+    def test_resolution_never_closes_somebody_elses_follow_up(self) -> None:
+        """Helm knows when a delivery decision was taken. It cannot know that."""
+        root, project, task = self._completed_task_awaiting_approval("followupkept")
+        self.coordinator.record_delivery_decision(project["id"], task_id=task["id"])
+        self.coordinator.record_project_action_item(
+            project["id"],
+            "rotation watcher follow-up needed before the next release",
+            source="Review loop",
+            task_id=task["id"],
+        )
+
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+
+        remaining = self.coordinator.project_status(project["id"])["action_items"]
+        self.assertEqual([item["kind"] for item in remaining], [FOLLOW_UP_ACTION_KIND])
+
+    def test_status_and_watch_put_the_pending_decision_in_front_of_a_reader(self) -> None:
+        root = self.repo("surfaced")
+        project = self.coordinator.register_project(
+            "Surfaced", str(root), project_id="surfaced"
+        )
+        task = self.coordinator.create_task(project["id"], "write the change")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_status(self.coordinator, None)
+        printed = output.getvalue()
+        self.assertIn("Decisions and follow-ups (1)", printed)
+        self.assertIn("Delivery decision needed", printed)
+        self.assertIn(task["id"], printed)
+
+        # A gate keeps showing until somebody answers it. Surfacing it once and
+        # then hiding it is how finished work stops being anybody's problem.
+        first = self.coordinator.project_updates_for_watch()
+        self.assertTrue(any("DECISION REQUIRED" in u["text"] for u in first))
+        second = self.coordinator.project_updates_for_watch()
+        self.assertTrue(any("DECISION REQUIRED" in u["text"] for u in second))
+
+        Path(worker["exit_file"]).write_text(
+            json.dumps({"returncode": 0}) + "\n", encoding="utf-8"
+        )
+        self.coordinator.cleanup_task(task["id"])
+        self.assertEqual(self.coordinator.project_updates_for_watch(), [])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_status(self.coordinator, None)
+        self.assertNotIn("Decisions and follow-ups", output.getvalue())
+
     def test_project_action_command_records_commander_visible_item(self) -> None:
         helm_root = self._helm_root("action-root")
         project_root = self.repo("action-project")
@@ -5285,6 +5757,70 @@ class HelmCoordinatorTests(unittest.TestCase):
 
         self.assertFalse(adapter.close_project_space_if_finished(project["id"]))
         self.assertEqual(herdr.closed_workspaces, [])
+
+    def test_completed_work_holds_its_space_even_with_no_pane_left(self) -> None:
+        """A closed tab is not evidence that a change was delivered.
+
+        Releasing a cleanly finished worker's tab is the first thing that
+        happens after a result, so reading "no pane" as "nothing to see" made
+        the space close on exactly the work still awaiting a decision.
+        """
+        project, herdr, adapter, worker = self._finished_project("nopane")
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "done", requested_status="completed"
+        )
+        adapter.release_finished_tabs()
+        self.assertEqual(len(herdr.closed_tabs), 1)
+
+        self.assertFalse(adapter.close_project_space_if_finished(project["id"]))
+        self.assertEqual(herdr.closed_workspaces, [])
+
+        # Only real delivery releases it.
+        self.coordinator.cleanup_task(worker["task_id"])
+        self.assertTrue(adapter.close_project_space_if_finished(project["id"]))
+
+    def test_work_awaiting_a_human_holds_its_space_with_or_without_a_pane(self) -> None:
+        project, herdr, adapter, worker = self._finished_project("awaiting")
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "needs a merge decision"
+        )
+        with self.coordinator.store.locked() as data:
+            adapter._herdr_state(data)["workers"].pop(worker["id"], None)
+
+        self.assertFalse(adapter.close_project_space_if_finished(project["id"]))
+        self.assertEqual(herdr.closed_workspaces, [])
+
+    def test_foreman_bookkeeping_alone_never_pins_a_settled_space(self) -> None:
+        """A foreman produces no branch, so it has nothing to deliver.
+
+        Holding a space open for its own task record would mean a project that
+        finished everything it was asked to do never releases a space again.
+        """
+        root = self.repo("bookkeeping")
+        project = self.coordinator.register_project(
+            "Bookkeeping", str(root), project_id="bookkeeping"
+        )
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        work = self.coordinator.create_task(project["id"], "the actual change")
+        worker = adapter.launch_task(work["id"], [sys.executable, "-c", ""], wait=False)
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "done", requested_status="completed"
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = adapter.launch_task(
+            foreman_task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(foreman["id"], "result", "handed back")
+
+        # The work is still undecided, so the space stays for it...
+        self.assertFalse(adapter.close_project_space_if_finished(project["id"]))
+        with self.coordinator.store.locked() as data:
+            data["tasks"][work["id"]]["status"] = "merged"
+
+        # ...and once it is delivered, the foreman's own record does not keep
+        # the space open on its own.
+        self.assertTrue(adapter.close_project_space_if_finished(project["id"]))
 
     def test_keep_spaces_env_disables_automatic_closing(self) -> None:
         project, herdr, adapter, worker = self._finished_project("kept")
@@ -7505,6 +8041,63 @@ class HelmCoordinatorTests(unittest.TestCase):
                 if re.search(pattern, text):
                     offenders.append(f"{path}: {pattern}")
         self.assertEqual(offenders, [])
+
+    def test_delivery_decision_surface_carries_no_concrete_project_state(self) -> None:
+        """The gate is generic product code, so nothing real may ride in it.
+
+        A decision item is assembled from constants and printed into docs and
+        panes, which makes it an easy place for one root's task, worker, or
+        ticket identifier to become a committed example.
+        """
+        tracked = subprocess.run(
+            ["git", "ls-files"], text=True, stdout=subprocess.PIPE, check=True
+        ).stdout.splitlines()
+        surfaces = [
+            path
+            for path in tracked
+            if path in {"README.md", "AGENTS.md"}
+            or path.startswith(("helm/", "domains/", "docs/"))
+        ]
+        # Helm's own generated identifiers: a real one in a tracked file is a
+        # managed root's state that escaped into the product.
+        identifiers = re.compile(r"\b[twmisag]-[0-9a-f]{8,}\b")
+        offenders = []
+        for path in surfaces:
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            offenders.extend(f"{path}: {hit}" for hit in identifiers.findall(text))
+        self.assertEqual(offenders, [])
+        for text in (
+            DELIVERY_DECISION_TASK_TEXT,
+            DELIVERY_DECISION_PROJECT_TEXT,
+        ):
+            self.assertFalse(identifiers.search(text))
+            self.assertLessEqual(len(text), Coordinator.SITUATION_LINE_LIMIT)
+
+    def test_the_delivery_decision_is_documented_where_agents_read_it(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        agents = Path("AGENTS.md").read_text(encoding="utf-8")
+        for required in (
+            "**delivery decision**",
+            "no driver\nis left",
+            "never auto-closed",
+            "before any of that runs",
+            "only copy",
+        ):
+            self.assertIn(required, readme)
+        for required in (
+            "worker → foreman → Helm",
+            "delivery decision",
+            "declined one",
+            "routes it before",
+            "only copy",
+        ):
+            self.assertIn(required, agents)
+        # A foreman has to know its final report is the handover, or it stops
+        # at "done" and the decision is never raised.
+        self.assertIn("handover", FOREMAN_RULES)
 
     def test_repository_native_agent_path_requires_no_worker_configuration(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")

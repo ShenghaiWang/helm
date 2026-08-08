@@ -151,6 +151,29 @@ a worker agent the coordinator spawns for that task.
   `pr-open` stays visible for comment/check monitoring. Keep outcomes in
   worktrees, branches, PR records, artifacts, project status, messages and
   logs — not by keeping stale agent sessions alive.
+- **A final summary flows worker → foreman → Helm, and the decision comes back
+  to the commander.** Helm writes every terminal report into the project's own
+  status record as it arrives, so the outcome survives the pane, the session,
+  and this conversation. While a foreman is live it keeps driving and nobody is
+  asked to merge anything. The moment no driver is left — the foreman reported,
+  stood down, or the project declined one — Helm records a commander-visible
+  delivery decision for the work still unresolved: inspect the outcome, then
+  choose review, another round, local merge, PR delivery, or cleanup. It shows
+  in `helm status` and repeats in `helm watch` until it is answered, and it
+  clears itself once the task reaches `merged` or `pr-merged`, is continued, or
+  is cleaned up. So relay it and decide it; do not treat a quiet project as a
+  finished one. A completed-but-undelivered task also keeps its project's Herdr
+  space open even after its worker tab is released, because the tab closing is
+  what a clean result does, not evidence that anything was delivered.
+- **Recording an outcome is not delivering it, so Helm routes it before
+  anything closes.** A worker reports by running a Helm command inside its own
+  pane, which means the confirmation prints onto the exact surface about to be
+  released. So the final summary and the decision it leaves are pushed to the
+  live foreman, to the project's own overview pane, and to the durable record
+  *before* any tab is released or space closed, and where they landed is
+  recorded. No live foreman is not an exception — a project with no driver is
+  the case that most needs telling. A tab whose outcome reached nothing at all
+  is kept, because that pane is then the only copy.
 - **Drive the worker on the user's behalf.** Helm's job is to supply the goal
   and the right knowledge, then keep the work moving without relaying every
   detail to the user. When a worker pushes a `question`, answer it from the task
@@ -279,7 +302,9 @@ friendly — in that order, because a friendly reply that is wrong is worse than
 a blunt one that is right.
 
 Report only what still needs attention: a running worker, an unanswered
-question, an unmerged branch, or a decision waiting on the commander. A project
+question, an unmerged branch, or a decision waiting on the commander —
+including the delivery decision Helm records for itself when a task's outcome
+is left with no driver. A project
 whose work is done and whose space Helm has closed is finished — leave it out.
 A closing roll-call of settled projects buries the one or two items that
 actually need something, and trains the reader to skip the summary, which is

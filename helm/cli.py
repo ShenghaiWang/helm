@@ -14,6 +14,7 @@ from typing import Any
 
 from .core import (
     AUTHORITY_ENV,
+    DELIVERY_DECISION_KIND,
     PROTECTED_ACTIONS,
     Coordinator,
     HelmError,
@@ -399,7 +400,11 @@ def _print_project_status(status: dict[str, Any]) -> None:
         print("  action items:")
         for entry in status["action_items"]:
             task = f" task={entry['task_id']}" if entry.get("task_id") else ""
-            print(f"    {entry['at'][:10]} {entry['text']} ({entry['source']}{task})")
+            gate = " [decision]" if entry.get("kind") == DELIVERY_DECISION_KIND else ""
+            print(
+                f"    {entry['at'][:10]}{gate} {entry['text']} "
+                f"({entry['source']}{task})"
+            )
     if status["situation"]:
         print("  situation:")
         for entry in status["situation"]:
@@ -451,6 +456,25 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
             )
             print(
                 f"  {glyph} {item['kind']:15} {item['role']:8} {item['worker_id']}  {first[:88]}"
+            )
+        print()
+    # A worker result nobody merged is not an escalation -- no agent is stuck
+    # on it -- so it never reached this view, and a fresh coordinator saw a
+    # quiet project instead of a change waiting on a decision.
+    pending = coordinator.open_action_items(project_id)
+    if pending:
+        # Delivery gates first: a follow-up is somebody's note about later, and
+        # a gate is work sitting still until it is answered.
+        ordered = sorted(
+            pending, key=lambda i: i.get("kind") != DELIVERY_DECISION_KIND
+        )
+        print(f"Decisions and follow-ups ({len(pending)}):")
+        for item in ordered:
+            task = f" task={item['task_id']}" if item.get("task_id") else ""
+            label = "decision" if item.get("kind") == DELIVERY_DECISION_KIND else "action"
+            print(
+                f"  {item['glyph']} {item['project_id']} {label}{task}: "
+                f"{item['text'][:110]}"
             )
         print()
     if report["projects"]:
@@ -1719,17 +1743,24 @@ def main(argv: list[str] | None = None) -> int:
                 # must never decide whether the report itself was recorded.
                 released = False
                 released_tabs: list[str] = []
-                told_foreman = False
+                routed: list[str] = []
                 with contextlib.suppress(HelmError, OSError):
                     adapter = HerdrAdapter(coordinator)
                     adapter.route_worker_messages(args.worker_id)
-                    # The pane is where a human looks; this is what tells the
-                    # driver. Without it a foreman only learns its delegated
-                    # work finished by happening to poll.
-                    told_foreman = adapter.notify_foreman(args.worker_id)
+                    # Before anything closes. This command runs inside the
+                    # worker's own pane, so its output is printed onto the
+                    # surface the next two calls are about to remove; the
+                    # outcome and the decision it leaves have to reach the
+                    # driver, the project's own pane, and the durable record
+                    # first. A live foreman is one of those channels, not a
+                    # precondition -- a project without a driver is exactly the
+                    # case that needed telling.
+                    if args.type in Coordinator.TERMINAL_REPORT_KINDS:
+                        routed = adapter.notify_coordinator(args.worker_id)["channels"]
                     released_tabs = adapter.release_finished_tabs()
                     # A reported, clean finish releases the project's space.
                     released = adapter.close_project_space_if_finished(task["project_id"])
+                told_foreman = "foreman" in routed
                 print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
                 if args.type == "approval-needed":
                     hold = coordinator.task_hold(task) or {}
@@ -1745,10 +1776,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if told_foreman:
                     print("  Told the project's foreman; it is theirs to act on")
+                if routed:
+                    print(f"  Routed the final outcome to: {', '.join(routed)}")
                 if released_tabs:
                     print(f"  Closed {len(released_tabs)} finished worker tab(s)")
                 if released:
                     print(f"Closed the Herdr space for project {task['project_id']}")
+                # Say it here too. The gate is recorded either way, but the
+                # coordinator reading this line is the one who can act on it
+                # now rather than at the next `helm status`.
+                if args.type in Coordinator.TERMINAL_REPORT_KINDS:
+                    for item in coordinator.open_action_items(task["project_id"]):
+                        if item.get("kind") != DELIVERY_DECISION_KIND:
+                            continue
+                        scope = f"task {item['task_id']}" if item.get("task_id") else "project"
+                        print(f"  Commander decision pending on {scope}: {item['text']}")
             elif args.worker_command == "stop":
                 # Through the adapter, because a Herdr worker's pane is what
                 # is actually running it; core settles the record either way.

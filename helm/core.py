@@ -194,6 +194,11 @@ HOW TO WORK
   coding/review round, pushed-back finding set, PR state change, or delivery
   gate, send a concise status with `--payload '{"summary":true}'`; Helm records
   that as a project status line for the commander.
+- Finish with one result carrying the final summary in its text. That report is
+  the handover: Helm keeps it as the project's outcome record and, for whatever
+  task work you leave undelivered, raises the commander's delivery decision --
+  review, another round, merge, PR, or cleanup. You do not need a special
+  payload field for that to happen, and you must not decide it yourself.
 - Report what needs attention, not what is settled.
 """
 
@@ -323,6 +328,26 @@ def _migrate_state(data: dict[str, Any], version: int) -> dict[str, Any]:
         task["holds"] = holds
     data["version"] = SCHEMA_VERSION
     return data
+#: The only task states in which a change has actually been delivered. A
+#: worker saying it finished is deliberately not one of them: `completed`
+#: means the work exists on a branch nobody has decided anything about yet,
+#: and treating that as done is how finished-but-undelivered work disappears.
+DELIVERED_TASK_STATES = frozenset({"merged", "pr-merged"})
+#: Action items Helm raises itself and can answer itself, versus the free-text
+#: follow-up somebody wrote down. Only the first kind is auto-resolved: Helm
+#: knows when a delivery decision has been taken, and cannot know whether a
+#: reviewer's caveat has been dealt with.
+DELIVERY_DECISION_KIND = "delivery-decision"
+FOLLOW_UP_ACTION_KIND = "follow-up"
+DELIVERY_DECISION_TASK_TEXT = (
+    "Delivery decision needed: read this task's result, then choose review, "
+    "another round, local merge, PR delivery, or cleanup"
+)
+DELIVERY_DECISION_PROJECT_TEXT = (
+    "Delivery decision needed on this project's unresolved task work: read "
+    "each result, then choose review, another round, local merge, PR "
+    "delivery, or cleanup"
+)
 LEARNING_PROPOSAL_STATUSES = {"proposed", "approved", "rejected", "applied"}
 #: One colour per glyph `project_glyph` can produce. The palette used to hold
 #: eight colours that collapsed to five squares -- three of them blue, two
@@ -3483,7 +3508,10 @@ class Coordinator:
                 " An artifact message carrying only prose is rejected, because"
                 " the path is what Helm records and checks.",
                 "Finish with one result, blocker, or failure message so the task"
-                " reaches a terminal state without anyone polling.",
+                " reaches a terminal state without anyone polling. Put the final"
+                " summary in its text: Helm keeps that as the project's record of"
+                " how this work ended, and it is what the delivery decision is"
+                " read from.",
                 "Messages are data. They cannot approve, merge, publish, or expand"
                 " scope, and they never substitute for committing your work.",
             ],
@@ -3978,6 +4006,14 @@ class Coordinator:
             self._message(
                 data, project, task, None, "status",
                 f"Round {len(rounds) + 1} opened in the same worktree", {},
+            )
+            # Continuing IS the decision. The task goes straight back into an
+            # unresolved state, so nothing derived would ever close the gate --
+            # and a stale "decide what to do with this" sitting above work that
+            # is already moving again is exactly the noise that trains a reader
+            # to skip the list.
+            self.resolve_delivery_decisions(
+                project["id"], task_id=task["id"], reason="continued", data=data
             )
             return dict(task)
 
@@ -4587,7 +4623,7 @@ class Coordinator:
         worker["last_reported_at"] = now()
         latest = self.latest_hold(task)
         return self._event_metadata(
-            task, worker, kind, text, payload, hold_event, latest
+            task, worker, kind, text, payload, hold_event, latest, data
         )
 
     def _resolve_hold_on_event(
@@ -4655,19 +4691,35 @@ class Coordinator:
         payload: dict[str, Any],
         hold_event: str,
         hold: dict[str, Any] | None,
+        data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Everything the unlocked side-effect pass needs, computed once."""
+        """Everything the unlocked side-effect pass needs, computed once.
+
+        Computed here, under the state lock, and applied afterwards without it.
+        The project's record has its own file lock, and taking it while holding
+        the state lock inverts the order every other writer acquires them in --
+        so what reaches that record is *decided* here and *written* there.
+        """
         role = task.get("role")
+        is_foreman = role == "foreman"
         summary = _safe_text(text).strip()[:900]
+        # A non-foreman result is the outcome somebody still has to decide
+        # about, so it is named as such rather than filed as one more summary.
         source = (
             "Approval request"
             if kind == self.HOLD_MESSAGE_KIND
             else "Foreman report"
-            if role == "foreman"
+            if is_foreman
+            else "Worker result"
+            if kind == "result"
             else "Worker summary"
         )
         worth_recording = bool(summary) and (
-            (role == "foreman" and kind in {"result", "blocker", "failure", "approval-needed"})
+            (is_foreman and kind in {"result", "blocker", "failure", "approval-needed"})
+            # A worker's own final report. Without this the one message that
+            # says what was actually produced reached only a pane that the
+            # clean-result path is about to release.
+            or (not is_foreman and kind in self.TERMINAL_REPORT_KINDS)
             or (kind == "status" and self._summary_payload(payload))
             # A gate opening or resolving is the one thing nobody should have to
             # go looking for, on either intake path.
@@ -4695,8 +4747,15 @@ class Coordinator:
             "hold_status": (hold or {}).get("status"),
             "hold_event": hold_event,
             "terminal": kind in self._TERMINAL_MESSAGE_TASK_STATE,
+            # Trimmed to fit rather than built and hoped for. `record_situation`
+            # refuses an over-long line, and the effects pass suppresses that
+            # refusal -- so a long final summary was dropped from the durable
+            # record silently, which is the exact disappearance this gate
+            # exists to prevent. The full text stays in the message record.
             "situation": (
-                f"{source}: task {task['id']} [{task.get('status')}] {summary}"
+                self._situation_line(
+                    f"{source}: task {task['id']} [{task.get('status')}] ", summary
+                )
                 if worth_recording
                 else None
             ),
@@ -4715,6 +4774,26 @@ class Coordinator:
                 kind in self._TERMINAL_MESSAGE_TASK_STATE or hold_event == "request"
             ),
             "learning": kind == "result",
+            # The gate, decided from the state this event has just changed.
+            # A worker's result with no live foreman leaves work nobody is
+            # driving, so it names that task. A foreman's own terminal report
+            # means the driver itself has stopped, so everything still
+            # undelivered in the project is now the commander's to decide.
+            # Deliberately independent of `worth_recording`: a report with an
+            # empty or unreadable summary still leaves a decision behind.
+            "delivery_decision_task": (
+                task["id"]
+                if (
+                    not is_foreman
+                    and kind == "result"
+                    and data is not None
+                    and self._live_foreman_in(data, task["project_id"]) is None
+                )
+                else None
+            ),
+            "delivery_decision_project": (
+                is_foreman and kind in self.TERMINAL_REPORT_KINDS
+            ),
         }
 
     def _apply_event_effects(self, event: dict[str, Any]) -> None:
@@ -4754,6 +4833,22 @@ class Coordinator:
             # cannot approve, apply, or teach anything by themselves.
             with contextlib.suppress(HelmError, SafetyError, OSError):
                 self.generate_learning_proposals(event["task_id"])
+        # The gate itself, written here rather than under the state lock. It
+        # runs before any tab release or space close, because those are driven
+        # by the same terminal message and a worker's confirmation prints onto
+        # the very pane about to be removed.
+        if event["delivery_decision_task"]:
+            with contextlib.suppress(HelmError, OSError):
+                self.record_delivery_decision(
+                    project_id,
+                    task_id=event["delivery_decision_task"],
+                    source=event["source"],
+                )
+        if event["delivery_decision_project"]:
+            with contextlib.suppress(HelmError, OSError):
+                self.raise_delivery_decision_for_project(
+                    project_id, source=event["source"]
+                )
 
     def record_worker_message(
         self,
@@ -5502,12 +5597,20 @@ class Coordinator:
         source: str = "helm",
         task_id: str | None = None,
         key: str | None = None,
+        kind: str = FOLLOW_UP_ACTION_KIND,
     ) -> dict[str, Any]:
         """Record commander-visible follow-up that needs a decision or task.
 
         Situation lines say what happened. Action items say what still needs a
         human or a new piece of work. Keeping those separate prevents a
         non-blocking review caveat from being buried inside a long outcome.
+
+        ``kind`` separates a free-text follow-up from a gate Helm raises and
+        can later answer by itself. A typed item is deduplicated by what it is
+        about rather than by its wording, because Helm may raise the same gate
+        from several paths -- a worker result, a foreman's final report, a
+        foreman standing down -- and three copies of one decision is the same
+        noise as none.
         """
         summary = _safe_text(text).strip()
         if not summary:
@@ -5520,6 +5623,7 @@ class Coordinator:
         task = _safe_text(task_id).strip() if task_id else None
         prefix = _safe_text(source).strip() or "helm"
         marker = _safe_text(key).strip() if key else None
+        label = _safe_text(kind).strip() or FOLLOW_UP_ACTION_KIND
         with self._status_transaction(project_id) as status:
             for item in status["action_items"]:
                 if item.get("status", "open") != "open":
@@ -5528,6 +5632,15 @@ class Coordinator:
                 # thing for the commander to decide, not two.
                 if marker and item.get("key") == marker:
                     return item
+                if item.get("kind", FOLLOW_UP_ACTION_KIND) != label:
+                    continue
+                # A gate Helm raises itself is one per task, however many
+                # paths reach it; a free-text follow-up is deduped only
+                # when it is genuinely the same note.
+                if label != FOLLOW_UP_ACTION_KIND:
+                    if item.get("task_id") == task:
+                        return item
+                    continue
                 if (
                     item.get("text") == summary
                     and item.get("task_id") == task
@@ -5544,6 +5657,11 @@ class Coordinator:
                 # resolves. An unkeyed "Authorize or refuse" line had no way
                 # back: it stayed open after the action it asked about succeeded.
                 "key": marker,
+                # What kind of item this is: only a gate Helm raises for
+                # itself may be auto-resolved. Helm knows when a delivery
+                # decision was taken; it cannot know whether somebody's
+                # written-down caveat was dealt with.
+                "kind": label,
                 "status": "open",
             }
             status["action_items"].append(item)
@@ -5564,6 +5682,245 @@ class Coordinator:
                     item["resolved_at"] = now()
                     closed.append(dict(item))
         return closed
+
+    @staticmethod
+    def task_delivery_resolved(task: dict[str, Any]) -> bool:
+        """Whether a task's outcome has actually been settled.
+
+        Delivered by a merge or a merged PR, or explicitly cleaned up. Nothing
+        else counts -- in particular not `completed`, and not the absence of a
+        worker or a pane. A task whose worker finished and whose tab was closed
+        looks quiet from every direction and is still a change nobody decided
+        anything about.
+        """
+        if task.get("status") in DELIVERED_TASK_STATES:
+            return True
+        return bool(task.get("workspace_removed"))
+
+    def unresolved_delivery_tasks(
+        self, project_id: str, data: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """This project's task work whose outcome nobody has decided yet.
+
+        Bookkeeping roles are excluded for the same reason they are left out of
+        `unmerged`: a foreman or a reviewer produces no branch and no artifact,
+        so it has nothing to deliver and must never be the reason a project
+        looks unfinished.
+        """
+        data = self.store.load() if data is None else data
+        return [
+            task
+            for task in data.get("tasks", {}).values()
+            if task.get("project_id") == project_id
+            and task.get("role") not in WORKTREELESS_ROLES
+            and not self.task_delivery_resolved(task)
+        ]
+
+    def record_delivery_decision(
+        self,
+        project_id: str,
+        *,
+        task_id: str | None = None,
+        source: str = "helm",
+    ) -> dict[str, Any] | None:
+        """Raise the commander-visible gate on an outcome nobody has acted on.
+
+        A worker result is a milestone, and the thing that acts on it is either
+        the project's foreman or a human. When there is no foreman left to
+        drive it, the decision has to be written down where a fresh coordinator
+        will find it, because the alternative is a finished branch that only
+        the conversation remembers.
+        """
+        text = (
+            DELIVERY_DECISION_TASK_TEXT if task_id else DELIVERY_DECISION_PROJECT_TEXT
+        )
+        return self.record_project_action_item(
+            project_id,
+            text,
+            source=source,
+            task_id=task_id,
+            kind=DELIVERY_DECISION_KIND,
+        )
+
+    def resolve_delivery_decisions(
+        self,
+        project_id: str,
+        *,
+        task_id: str | None = None,
+        reason: str = "",
+        data: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Close delivery gates whose decision has since been taken.
+
+        Derived rather than flagged: an item linked to a task is answered once
+        that task is delivered or cleaned up, and a project-scoped one is
+        answered once no unresolved task work remains. `task_id` closes that
+        task's item outright, for the decision that leaves the work unresolved
+        on purpose -- continuing it puts the task straight back into a state
+        this would otherwise still consider open.
+
+        Only Helm's own delivery gate is touched. A free-text follow-up is
+        somebody's judgement about what still needs doing, and Helm has no way
+        to know it has been done.
+        """
+        status = self._load_status(project_id)
+        pending = [
+            item
+            for item in status.get("action_items", [])
+            if item.get("status", "open") == "open"
+            and item.get("kind") == DELIVERY_DECISION_KIND
+        ]
+        if not pending:
+            return []
+        data = self.store.load() if data is None else data
+        tasks = data.get("tasks", {})
+        outstanding = self.unresolved_delivery_tasks(project_id, data)
+        resolved: list[dict[str, Any]] = []
+        for item in pending:
+            linked = item.get("task_id")
+            if linked and task_id and linked == task_id:
+                why = reason or "decided"
+            elif linked:
+                task = tasks.get(linked)
+                if task is not None and not self.task_delivery_resolved(task):
+                    continue
+                why = reason or (
+                    _safe_text(task.get("status")) if task else "task no longer recorded"
+                )
+            else:
+                if outstanding:
+                    continue
+                why = reason or "no unresolved task work remains"
+            item["status"] = "resolved"
+            item["resolved_at"] = now()
+            item["resolved_reason"] = _safe_text(why)[:120]
+            resolved.append(item)
+        if resolved:
+            self._save_status(project_id, status)
+        return resolved
+
+    def compose_outcome_handoff(
+        self, worker_id: str, data: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """The coordinator-facing notice for a worker's terminal report.
+
+        Writing the outcome into the project's record makes it survivable;
+        this is what makes it *arrive*. The two are not the same guarantee, and
+        only the second one is any use to a coordinator that is not, at that
+        moment, reading a status file: a result printed into the worker's own
+        pane vanishes with the pane, and everything downstream -- releasing the
+        tab, closing the space -- is designed to make that pane vanish.
+
+        Returns None when the worker has said nothing terminal, so callers can
+        route unconditionally without deciding what counts.
+        """
+        data = self.store.load() if data is None else data
+        worker = data.get("workers", {}).get(worker_id)
+        if worker is None:
+            return None
+        task = data.get("tasks", {}).get(worker.get("task_id"))
+        project = data.get("projects", {}).get(worker.get("project_id"))
+        if task is None or project is None:
+            return None
+        report = None
+        for message in data.get("messages", []):
+            if (
+                message.get("worker_id") == worker_id
+                and message.get("kind") in self.TERMINAL_REPORT_KINDS
+            ):
+                report = message
+        if report is None:
+            return None
+        decision = ""
+        decision_id = ""
+        for item in self._load_status(project["id"]).get("action_items", []):
+            if item.get("status", "open") != "open":
+                continue
+            if item.get("kind") != DELIVERY_DECISION_KIND:
+                continue
+            if item.get("task_id") in (None, task["id"]):
+                decision = _safe_text(item.get("text", ""))
+                decision_id = _safe_text(item.get("id", ""))
+        summary = _safe_text(report.get("text", "")).strip()[:600]
+        label = f"{project_glyph(project.get('color', ''))} {project.get('name', project['id'])}"
+        lines = [
+            f"FINAL OUTCOME {label} ({project['id']}) task={task['id']} "
+            f"[{task.get('status')}] branch={task.get('branch') or '-'} "
+            f"worker={worker_id} {report['kind']}: {summary}",
+        ]
+        if decision:
+            lines.append(
+                f"DECISION NEEDED: {decision}. Read it with "
+                f"`helm task outcome {task['id']}`."
+            )
+        return {
+            "worker_id": worker_id,
+            "project_id": project["id"],
+            "project_name": project.get("name", project["id"]),
+            "project_color": project.get("color", ""),
+            "task_id": task["id"],
+            "task_status": task.get("status"),
+            "kind": report["kind"],
+            "summary": summary,
+            "decision": decision,
+            "decision_id": decision_id,
+            "text": "\n".join(lines),
+        }
+
+    def record_outcome_handoff(
+        self, worker_id: str, channels: Sequence[str], notice: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """Record where a terminal outcome was actually delivered.
+
+        A route nobody recorded cannot be checked, and the check is the point:
+        no tab closes and no space closes until this says the outcome reached
+        somewhere that outlives the pane.
+        """
+        with self.store.locked() as data:
+            worker = data.get("workers", {}).get(worker_id)
+            if worker is None:
+                return None
+            handoff = {
+                "at": now(),
+                "channels": sorted({_safe_text(c) for c in channels if c}),
+                "task_id": (notice or {}).get("task_id"),
+                "decision_id": (notice or {}).get("decision_id", ""),
+            }
+            worker["outcome_handoff"] = handoff
+            return dict(handoff)
+
+    @staticmethod
+    def outcome_handoff_done(worker: dict[str, Any]) -> bool:
+        """Whether this worker's outcome has reached a surface that outlives it."""
+        handoff = worker.get("outcome_handoff") or {}
+        return bool(handoff.get("channels"))
+
+    def open_action_items(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        """Every commander-visible item still waiting on a human, project-labelled.
+
+        `helm project status` shows one project's items to whoever already knows
+        to look there. This is what lets the default status view say a decision
+        is pending without the reader having to go project by project.
+        """
+        data = self.store.load()
+        items: list[dict[str, Any]] = []
+        for project in sorted(data.get("projects", {}).values(), key=lambda p: p["id"]):
+            if project_id is not None and project["id"] != project_id:
+                continue
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_delivery_decisions(project["id"], data=data)
+            status = self._load_status(project["id"])
+            for entry in status.get("action_items", []):
+                if entry.get("status", "open") != "open":
+                    continue
+                items.append({
+                    **entry,
+                    "kind": entry.get("kind", FOLLOW_UP_ACTION_KIND),
+                    "project_id": project["id"],
+                    "project_name": project.get("name", project["id"]),
+                    "glyph": project_glyph(project.get("color", "")),
+                })
+        return items
 
     @staticmethod
     def _action_item_from_summary(text: str) -> str | None:
@@ -5600,6 +5957,65 @@ class Coordinator:
         return any(
             payload.get(key) is True
             for key in ("summary", "outcome_summary", "report_to_foreman", "report_to_helm")
+        )
+
+    #: Worker pushes that end a piece of work rather than narrate it.
+    TERMINAL_REPORT_KINDS = frozenset(
+        {"result", "blocker", "failure", "approval-needed"}
+    )
+
+    @staticmethod
+    def _live_foreman_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
+        """The project's running foreman, read from state already in hand.
+
+        `foreman_for` re-reads the store, which is wrong for a caller that is
+        holding the lock: it would answer from the copy on disk rather than the
+        one about to be written.
+        """
+        for worker in data.get("workers", {}).values():
+            if worker.get("project_id") != project_id or worker.get("status") != "running":
+                continue
+            task = data.get("tasks", {}).get(worker.get("task_id"))
+            if (task or {}).get("role") == "foreman":
+                return worker
+        return None
+
+    def _situation_line(self, prefix: str, summary: str) -> str:
+        """Fit a generated report into one situation line.
+
+        `record_situation` refuses an over-long note rather than cutting it,
+        because a human-written note keeps its point at the end. This one is
+        generated, and the full text is already durable in the message record,
+        so trimming the mirrored copy loses nothing and keeps the summary from
+        being dropped entirely for being long.
+        """
+        room = self.SITUATION_LINE_LIMIT - len(prefix)
+        if room <= 0:
+            return prefix[: self.SITUATION_LINE_LIMIT]
+        if len(summary) <= room:
+            return f"{prefix}{summary}"
+        return f"{prefix}{summary[: max(1, room - 1)]}…"
+
+    def raise_delivery_decision_for_project(
+        self,
+        project_id: str,
+        *,
+        data: dict[str, Any] | None = None,
+        source: str = "helm",
+    ) -> dict[str, Any] | None:
+        """Hand this project's undecided work to the commander.
+
+        Used where a driver stops -- a foreman's terminal report, a foreman
+        standing down -- because from that moment nobody is going to act on the
+        outcome unless the record says so. One unresolved task is named; several
+        stay project-scoped rather than picking one arbitrarily.
+        """
+        outstanding = self.unresolved_delivery_tasks(project_id, data)
+        if not outstanding:
+            return None
+        linked = outstanding[0]["id"] if len(outstanding) == 1 else None
+        return self.record_delivery_decision(
+            project_id, task_id=linked, source=source
         )
 
     def record_task_progress_summary(
@@ -5677,6 +6093,10 @@ class Coordinator:
         """
         data = self.store.load()
         project = self._project(data, project_id)
+        # Derived, so a gate answered by a path that never ran this check --
+        # or by state changed outside Helm -- still reads as answered here.
+        with contextlib.suppress(HelmError, OSError):
+            self.resolve_delivery_decisions(project_id, data=data)
         tasks = [t for t in data.get("tasks", {}).values() if t["project_id"] == project_id]
 
         def still_worth_keeping(entry: dict[str, Any]) -> bool:
@@ -5725,7 +6145,8 @@ class Coordinator:
             "grants": [g for g in self.list_approval_grants()
                        if g["project_id"] in (None, project_id)],
             "action_items": [
-                e for e in status.get("action_items", [])
+                {**e, "kind": e.get("kind", FOLLOW_UP_ACTION_KIND)}
+                for e in status.get("action_items", [])
                 if e.get("status", "open") == "open"
             ],
             "situation": [e for e in status["situation"] if not e.get("superseded_by")],
@@ -5761,14 +6182,27 @@ class Coordinator:
         seen_at = now()
         limit = max(1, limit_per_project)
         for project in sorted(projects, key=lambda p: p["id"]):
+            # Derived first, so a gate already answered by a path that never
+            # ran this check -- or by state changed outside Helm -- reads as
+            # answered here rather than being surfaced again.
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_delivery_decisions(project["id"], data=data)
             # One transaction per project: this marks what it surfaced, so a
             # concurrent release writing the same record cannot lose either
             # change.
             with self._status_transaction(project["id"]) as status:
+                # A follow-up is news, so it is shown once. A delivery decision
+                # is a gate: it keeps showing until somebody answers it,
+                # because a gate surfaced once and then hidden is how finished
+                # work stops being anybody's problem.
                 action_items = [
                     entry
                     for entry in status.get("action_items", [])
-                    if entry.get("status", "open") == "open" and not entry.get("surfaced_at")
+                    if entry.get("status", "open") == "open"
+                    and (
+                        not entry.get("surfaced_at")
+                        or entry.get("kind") == DELIVERY_DECISION_KIND
+                    )
                 ]
                 pending = [
                     entry
@@ -5783,11 +6217,14 @@ class Coordinator:
                     "glyph": project_glyph(project.get("color", "")),
                 }
                 for entry in action_items:
+                    gate = entry.get("kind") == DELIVERY_DECISION_KIND
+                    marker = "DECISION REQUIRED" if gate else "ACTION REQUIRED"
+                    names = f" (task {entry['task_id']})" if entry.get("task_id") else ""
                     updates.append({
                         **label,
                         "id": entry["id"],
                         "at": entry.get("at"),
-                        "text": f"ACTION REQUIRED: {entry.get('text', '')}",
+                        "text": f"{marker}: {entry.get('text', '')}{names}",
                         "kind": "action",
                     })
                 shown = pending[-limit:]
@@ -6218,6 +6655,15 @@ class Coordinator:
                 "Foreman stood down: nothing left to drive",
                 {"status": "completed"},
             )
+            # "Nothing left to drive" is not the same as "nothing left to
+            # decide": a completed task is not a driven state, so a project
+            # whose work finished and was never merged stands its foreman down
+            # and would otherwise leave that branch with nobody responsible
+            # for it at all.
+            with contextlib.suppress(HelmError, OSError):
+                self.raise_delivery_decision_for_project(
+                    project_id, data=locked, source="Foreman stood down"
+                )
             return dict(worker)
 
     def stop_worker(
@@ -7294,6 +7740,10 @@ class Coordinator:
                 kind = "pr-status"
                 text = f"Pull request still {observed}: {delivery.get('url', '')}".strip()
             self._message(data, project, task, None, kind, text, event)
+            if observed == "merged":
+                self.resolve_delivery_decisions(
+                    project["id"], reason="pr-merged", data=data
+                )
             return task
 
     def task_outcome(self, task_id: str) -> dict[str, Any]:
@@ -7444,6 +7894,9 @@ class Coordinator:
             task["status"] = "merged"
             task["merged_at"] = now()
             self._message(data, project, task, None, "merged", "Approved local fast-forward merge completed", {})
+            self.resolve_delivery_decisions(
+                project["id"], reason="merged", data=data
+            )
             return task
 
     def _session_still_live(self, worker: dict[str, Any]) -> bool:
@@ -7724,6 +8177,9 @@ class Coordinator:
                 # no command able to reach them again.
                 self._remove_worker_directories_locked(data, task)
                 self._remove_task_branch(data, project, task, force=delete_branch)
+                self.resolve_delivery_decisions(
+                    project["id"], reason="cleaned up", data=data
+                )
                 return task
             workspace = self._verify_workspace_record(data, project, task)
             if task.get("role") != "foreman" and not self._workspace_clean(workspace):
@@ -7762,6 +8218,9 @@ class Coordinator:
             self._remove_worker_directories_locked(data, task)
             self._message(data, project, task, None, "cleanup", "Clean worker workspace removed", {})
             self._remove_task_branch(data, project, task, force=delete_branch)
+            self.resolve_delivery_decisions(
+                project["id"], reason="cleaned up", data=data
+            )
             return task
 
     # ---------- learning proposals ----------

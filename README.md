@@ -938,6 +938,41 @@ in durable project surfaces -- the task worktree, branch, PR, delivered
 artifacts, project status, messages and logs -- rather than by keeping an agent
 session alive as storage.
 
+Every terminal report is written into the project's status record as it
+arrives, so a final summary flows worker → foreman → Helm and survives the
+pane, the session and the conversation. What happens next depends on whether
+anything is still driving the work. While the project's foreman is live, the
+result is pushed to it and nobody is asked to merge anything. Once no driver
+is left -- the foreman reported, stood down, or the project declined one --
+Helm records a **delivery decision** as a commander-visible action item on that
+project: read the outcome, then choose review, another round, local merge, PR
+delivery, or cleanup.
+
+```sh
+helm status                 # "Waiting on you": every open decision, project-labelled
+helm project status <id>    # the same items marked [decision], with the task they name
+helm watch                  # repeats DECISION REQUIRED until somebody answers it
+```
+
+Recording the outcome is not the same as delivering it. A worker reports by
+running a Helm command *inside its own pane*, so the confirmation is printed
+onto the surface that releasing the tab is about to remove. Helm therefore
+routes the final summary and the decision before any of that runs — to the
+project's live foreman, to the project's own overview pane, and to the durable
+status record — and records which of those accepted it. There is no
+live-foreman precondition: a project with no driver is the case that most needs
+telling. A finished tab whose outcome reached nothing at all is not released,
+because that pane is then the only copy.
+
+It is deduplicated, so the several paths that can raise it -- a worker result,
+a foreman's final report, a foreman standing down -- produce one item. It names
+the single unresolved task when there is one and stays project-scoped when
+there are several. And it closes itself once the decision has been taken: the
+task reaching `merged` or `pr-merged`, being continued with `helm task
+continue`, or being cleaned up. A free-text follow-up recorded with `helm
+project action` is never auto-closed -- Helm knows when a delivery decision was
+taken and cannot know whether somebody's caveat was dealt with.
+
 For local delivery, the final delivery state is `merged`: Helm records approval,
 fast-forwards the task branch into the project's base branch, copies declared
 local artifacts into the main worktree when needed, and can then release the
@@ -1018,9 +1053,13 @@ automatically once its work is finished and reported — nothing running and
 every task either delivered (`merged` or `pr-merged`) or cleaned up. `helm
 watch` also sweeps recorded project spaces that have no remaining worker tabs,
 so a space left open after an earlier cleanup does not linger forever. `helm
-worker stop` checks the same release gate after closing a worker pane. Failed
-and blocked tasks keep their space while the pane holds evidence,
-approval-needed tasks keep theirs because a human still has to look, and
+worker stop` checks the same release gate after closing a worker pane. A
+completed task keeps its project's space whether or not it still has a worker
+tab: releasing that tab is the first thing a clean result does, so a missing
+pane says nothing about whether the change was delivered. Failed and blocked
+tasks keep their space while the pane holds the diagnosis, approval-needed
+tasks keep theirs because a human still has to look, a foreman's own task
+never holds one -- it produces no branch, so it has nothing to deliver -- and
 `HELM_KEEP_SPACES=1` keeps all of them. In a pane the runner gives the
 worker a real terminal and mirrors it to both the tab and Helm's log, so an
 interactive agent renders its session and stays usable instead of showing a

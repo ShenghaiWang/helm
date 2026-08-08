@@ -22,12 +22,24 @@ from .core import (
     Coordinator,
     HelmError,
     SafetyError,
+    WORKTREELESS_ROLES,
     _git,
     _safe_text,
     canonical,
     now,
     project_glyph,
 )
+
+#: Task states whose pane is worth keeping open: the reason a task stopped, or
+#: the thing a human has been asked to look at.  Work that merely finished
+#: keeps its outcome in the branch, the artifacts, and the project's status
+#: record, so releasing its tab costs nothing.
+_EVIDENCE_TASK_STATES = frozenset({"blocked", "failed", "approval-needed"})
+#: The narrower set where a missing pane means there is genuinely nothing left
+#: to hold a whole project space for.  `approval-needed` is deliberately not
+#: here: it is undelivered work waiting on a person, and it stays visible
+#: whether or not its pane survived.
+_PANE_ONLY_EVIDENCE_STATES = frozenset({"blocked", "failed"})
 
 
 class HerdrUnavailable(HelmError):
@@ -1093,6 +1105,18 @@ class HerdrAdapter:
             "rounds": history,
         }
 
+    def _holds_evidence(self, data: dict[str, Any], task: dict[str, Any]) -> bool:
+        """Whether this task's pane is still the diagnosis someone needs.
+
+        Only for the states where the pane IS the record: a failure, a
+        blocker, or a request a human has to look at.  Work that merely
+        finished has its outcome in the task's branch and the project's status
+        record, so it needs no pane to stay visible.
+        """
+        if task.get("status") not in _EVIDENCE_TASK_STATES:
+            return False
+        return self._task_has_live_pane(data, task["id"])
+
     def _task_has_live_pane(self, data: dict[str, Any], task_id: str) -> bool:
         """Whether any recorded tab still exists for this task's workers."""
         state = self._herdr_state(data)
@@ -1166,6 +1190,75 @@ class HerdrAdapter:
             return bool(self.answer_worker(foreman["id"], text))
         return False
 
+    def _route_to_project_pane(self, notice: dict[str, Any]) -> bool:
+        """Print a notice into the project's own overview pane.
+
+        The project pane, not the worker's tab. A worker tab is released the
+        moment its work finishes cleanly, so anything printed only there is
+        written onto the surface Helm is about to destroy.
+        """
+        if not self.client.available():
+            return False
+        data = self.coordinator.store.load()
+        project_layout = self._herdr_state(data)["projects"].get(notice["project_id"])
+        if project_layout is None:
+            return False
+        self._owned(project_layout, f"workspace for project {notice['project_id']}")
+        for line in notice["text"].splitlines():
+            try:
+                self.client.pane_run(
+                    project_layout["overview_pane_id"],
+                    _paint_command(notice.get("project_color", ""), line),
+                )
+            except HerdrNotFound:
+                # The pane is gone, so the space is gone. Drop the stale record
+                # and report the channel as unavailable rather than raising out
+                # of a routine handoff.
+                with self.coordinator.store.locked() as current:
+                    self._herdr_state(current)["projects"].pop(notice["project_id"], None)
+                return False
+            except HerdrUnavailable:
+                return False
+        return True
+
+    def notify_coordinator(self, worker_id: str) -> dict[str, Any]:
+        """Deliver a terminal outcome to every surface that outlives the worker.
+
+        A worker reports its result by running a Helm command inside its own
+        pane, so the confirmation -- summary, and the decision the outcome
+        leaves behind -- is printed into the one place guaranteed to disappear
+        next. It did: a completed, unmerged change was recorded correctly,
+        the tab was released, the space was closed, and the session driving the
+        project learned nothing until somebody thought to go and inspect the
+        task by hand.
+
+        So the outcome is routed before any of that runs, and where it went is
+        recorded. The project's status record always carries it; the project's
+        own overview pane and a live foreman get it too when they exist. There
+        is no live-foreman precondition -- a project without a driver is
+        exactly the case that needed telling.
+        """
+        notice = self.coordinator.compose_outcome_handoff(worker_id)
+        if notice is None:
+            return {"channels": [], "notice": None}
+        channels: list[str] = []
+        # Durable first and unconditionally: it is the only channel no provider
+        # can take away, and it is what `helm status` and `helm watch` read.
+        if notice["summary"] or notice["decision"]:
+            channels.append("status-record")
+        with contextlib.suppress(HelmError, HerdrUnavailable, OSError):
+            if self.notify_foreman(worker_id):
+                channels.append("foreman")
+        with contextlib.suppress(HelmError, HerdrUnavailable, OSError):
+            if self._route_to_project_pane(notice):
+                channels.append("project-pane")
+        handoff = None
+        with contextlib.suppress(HelmError, OSError):
+            handoff = self.coordinator.record_outcome_handoff(
+                worker_id, channels, notice
+            )
+        return {"channels": channels, "notice": notice, "handoff": handoff}
+
     def stop_worker(self, worker_id: str, reason: str = "") -> dict[str, Any]:
         """Stop a worker wherever it is actually hosted.
 
@@ -1212,7 +1305,7 @@ class HerdrAdapter:
         """
         data = self.coordinator.store.load()
         state = self._herdr_state(data)
-        keep = {"blocked", "failed", "approval-needed"}
+        keep = _EVIDENCE_TASK_STATES
         closed: list[str] = []
         for worker_id, layout in list(state.get("workers", {}).items()):
             worker = data.get("workers", {}).get(worker_id)
@@ -1227,6 +1320,18 @@ class HerdrAdapter:
             # from.
             with contextlib.suppress(HelmError, OSError):
                 self.coordinator.capture_evidence(worker_id)
+            # And the outcome has to have gone somewhere before the pane it was
+            # reported in is closed. Done here rather than only in the report
+            # command so it holds for every caller -- `helm watch`, a merge, a
+            # worker stop -- not just the one path that remembered.
+            if not self.coordinator.outcome_handoff_done(worker):
+                handoff = self.notify_coordinator(worker_id)
+                if handoff["notice"] is not None and not handoff["channels"]:
+                    # There was an outcome and nothing accepted it, not even
+                    # the durable record. The pane is now the only copy, so it
+                    # stays. A worker that reported nothing terminal has no
+                    # outcome to route and is not held back by this.
+                    continue
             try:
                 self.client.tab_close(tab_id)
                 closed.append(worker_id)
@@ -1686,20 +1791,34 @@ class HerdrAdapter:
             return False
         for task in tasks:
             # A task releases the space only once it is genuinely resolved:
-            # delivered by a merge, or cleaned up.  "completed" is not enough,
-            # because the work is still awaiting review and closing the space
-            # would take the session away mid-review.  A failed or blocked task
-            # holds the space as evidence until someone cleans it up, so old
-            # failures stop pinning a space forever once they are dealt with.
-            if task.get("status") in {"merged", "pr-merged"} or task.get("workspace_removed"):
+            # delivered by a merge or a merged PR, or cleaned up.  "completed"
+            # is not enough, because the work is still awaiting a decision and
+            # closing the space would take the session away from it.
+            if self.coordinator.task_delivery_resolved(task):
                 continue
-            # Evidence has to actually exist to be worth keeping a space for.
-            # A failed task whose pane is already gone -- released because it
-            # settled, or closed by the user -- holds nothing, and pinning the
-            # space for it retains an empty room for a diagnosis that is no
-            # longer there.
-            if not self._task_has_live_pane(data, task["id"]):
+            if task.get("role") in WORKTREELESS_ROLES:
+                # A foreman or reviewer produces no branch and no artifact, so
+                # it has nothing to deliver and must never be the reason a
+                # settled project keeps a space forever.  It may still hold one
+                # while its own pane is the evidence for how it ended.
+                if self._holds_evidence(data, task):
+                    return False
                 continue
+            if task.get("status") in _PANE_ONLY_EVIDENCE_STATES:
+                # A failure or a blocker is held for its diagnosis, and
+                # evidence has to actually exist to be worth a space.  A failed
+                # task whose pane is already gone -- released because it
+                # settled, or closed by the user -- holds nothing, and pinning
+                # the space for it retains an empty room for a diagnosis that
+                # is no longer there.
+                if self._holds_evidence(data, task):
+                    return False
+                continue
+            # Everything else is real work whose outcome nobody has decided
+            # on.  Its pane is beside the point: releasing a finished worker's
+            # tab is exactly what happens the instant a result is reported, so
+            # reading "no pane" as "nothing to see" closed the space on the
+            # very change the commander still had to act on.
             return False
         if self._herdr_state(data)["projects"].get(project_id) is None:
             return False
