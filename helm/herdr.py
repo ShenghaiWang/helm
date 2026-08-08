@@ -1242,9 +1242,12 @@ class HerdrAdapter:
         if notice is None:
             return {"channels": [], "notice": None}
         channels: list[str] = []
-        # Durable first and unconditionally: it is the only channel no provider
-        # can take away, and it is what `helm status` and `helm watch` read.
-        if notice["summary"] or notice["decision"]:
+        # Durable first: it is the only channel no provider can take away, and
+        # it is what `helm status` and `helm watch` read. Claimed by reading
+        # the record back, never by the notice merely having had text -- the
+        # write it depends on happens under a suppressed failure, so a channel
+        # asserted here without checking would be a delivery nobody made.
+        if self.coordinator.outcome_reached_the_record(notice):
             channels.append("status-record")
         with contextlib.suppress(HelmError, HerdrUnavailable, OSError):
             if self.notify_foreman(worker_id):

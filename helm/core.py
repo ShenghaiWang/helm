@@ -4716,10 +4716,13 @@ class Coordinator:
         )
         worth_recording = bool(summary) and (
             (is_foreman and kind in {"result", "blocker", "failure", "approval-needed"})
-            # A worker's own final report. Without this the one message that
+            # A worker's own final result. Without this the one message that
             # says what was actually produced reached only a pane that the
-            # clean-result path is about to release.
-            or (not is_foreman and kind in self.TERMINAL_REPORT_KINDS)
+            # clean-result path is about to release. Deliberately just the
+            # result: a blocker or failure already reaches the commander as
+            # captured evidence and an attention entry, and mirroring those
+            # here too would pad the one log that grows.
+            or (not is_foreman and kind == "result")
             or (kind == "status" and self._summary_payload(payload))
             # A gate opening or resolving is the one thing nobody should have to
             # go looking for, on either intake path.
@@ -5866,6 +5869,38 @@ class Coordinator:
             "decision_id": decision_id,
             "text": "\n".join(lines),
         }
+
+    def outcome_reached_the_record(self, notice: dict[str, Any] | None) -> bool:
+        """Whether the durable record actually holds this outcome, by reading it.
+
+        The durable write happens in the unlocked effects pass, where a failure
+        -- a full disk, a refused over-long line, a permission change -- is
+        suppressed so it cannot cost the worker its message. That makes
+        "durable" something to verify rather than assume: claiming the channel
+        because a notice had text would let the tab be released and the space
+        closed on an outcome the record never received, which is precisely the
+        disappearance this routing exists to stop.
+        """
+        if not notice:
+            return False
+        project_id = notice.get("project_id")
+        task_id = notice.get("task_id")
+        if not project_id:
+            return False
+        try:
+            status = self._load_status(project_id)
+        except (HelmError, OSError):
+            return False
+        for item in status.get("action_items", []):
+            if item.get("status", "open") != "open":
+                continue
+            if item.get("kind") != DELIVERY_DECISION_KIND:
+                continue
+            if item.get("task_id") in (None, task_id):
+                return True
+        marker = f"task {task_id}"
+        entries = list(status.get("situation", [])) + list(status.get("history", []))
+        return any(marker in _safe_text(entry.get("text", "")) for entry in entries)
 
     def record_outcome_handoff(
         self, worker_id: str, channels: Sequence[str], notice: dict[str, Any] | None = None

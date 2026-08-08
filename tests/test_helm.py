@@ -1901,8 +1901,15 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.coordinator.record_worker_message(
             worker["id"], "result", "published", payload={"receipt": "r-9"}
         )
-        # Finished and reported: now there is nothing left to show.
+        # Reported, so the pane has nothing left to show and is released --
+        # but the task is `completed`, not delivered, and releasing the tab is
+        # the first thing a clean result does. The space stays until somebody
+        # has actually decided what happens to the work.
         self.assertEqual(adapter.release_finished_tabs(), [worker["id"]])
+        self.assertFalse(adapter.close_project_space_if_finished(project["id"]))
+        self.assertEqual(herdr.closed_workspaces, [])
+
+        self.coordinator.cleanup_task(task["id"])
         self.assertTrue(adapter.close_project_space_if_finished(project["id"]))
         self.assertEqual(len(herdr.closed_workspaces), 1)
 
@@ -3666,6 +3673,54 @@ class HelmCoordinatorTests(unittest.TestCase):
         # Once it has landed somewhere, the tab is free to go.
         self.assertEqual(adapter.release_finished_tabs(), [worker["id"]])
         self.assertEqual(len(herdr.closed_tabs), 1)
+
+    def test_the_durable_channel_is_claimed_only_when_the_record_really_has_it(
+        self,
+    ) -> None:
+        """A channel name is not a delivery.
+
+        The durable write runs in the unlocked effects pass, where a failure is
+        suppressed so it cannot cost the worker its message. Asserting
+        `status-record` because the notice had text would therefore claim a
+        delivery nobody made -- and that claim is what releases the tab and
+        closes the space, so the outcome would vanish with its only copy.
+        """
+        root = self.repo("unwritten")
+        project = self.coordinator.register_project(
+            "Unwritten", str(root), project_id="unwritten"
+        )
+        task = self.coordinator.create_task(project["id"], "write the change")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        # The record refuses every write, exactly as a full disk or a
+        # permission change would, and the effects pass swallows it.
+        def refuse(*args: Any, **kwargs: Any) -> None:
+            raise HelmError("the record could not be written")
+
+        with mock.patch.object(Coordinator, "record_situation", refuse), \
+                mock.patch.object(Coordinator, "record_project_action_item", refuse):
+            self.coordinator.record_worker_message(worker["id"], "result", "done")
+            notice = self.coordinator.compose_outcome_handoff(worker["id"])
+            self.assertIsNotNone(notice)
+            self.assertFalse(self.coordinator.outcome_reached_the_record(notice))
+            routed = adapter.notify_coordinator(worker["id"])
+            # Another surface may still have taken it -- that is a real
+            # delivery and is allowed to release the pane. What must never
+            # happen is the durable channel claiming an outcome it never got.
+            self.assertNotIn("status-record", routed["channels"])
+
+        # With the record writable, the same outcome lands and is claimed.
+        self.coordinator.record_delivery_decision(project["id"], task_id=task["id"])
+        self.assertTrue(
+            self.coordinator.outcome_reached_the_record(
+                self.coordinator.compose_outcome_handoff(worker["id"])
+            )
+        )
+        self.assertIn(
+            "status-record", adapter.notify_coordinator(worker["id"])["channels"]
+        )
 
     def test_a_long_final_summary_is_kept_rather_than_dropped_for_length(self) -> None:
         """A refused situation line loses the one record of the outcome.
@@ -5782,7 +5837,10 @@ class HelmCoordinatorTests(unittest.TestCase):
     def test_work_awaiting_a_human_holds_its_space_with_or_without_a_pane(self) -> None:
         project, herdr, adapter, worker = self._finished_project("awaiting")
         self.coordinator.record_worker_message(
-            worker["id"], "approval-needed", "needs a merge decision"
+            worker["id"],
+            "approval-needed",
+            "needs a publish decision",
+            payload={"action": "publish"},
         )
         with self.coordinator.store.locked() as data:
             adapter._herdr_state(data)["workers"].pop(worker["id"], None)
