@@ -20,6 +20,7 @@ from unittest import mock
 from helm import cli, runtimes
 from helm.core import (
     project_glyph,
+    _color_for,
     _COLOR_PALETTE,
     CORE_SAFETY_RULES,
     FOREMAN_RULES,
@@ -2043,6 +2044,81 @@ class HelmCoordinatorTests(unittest.TestCase):
             )
             glyphs.append(project_glyph(project["color"]))
         self.assertEqual(len(set(glyphs)), len(glyphs), f"glyph collision: {glyphs}")
+
+    def test_palette_covers_at_least_fourteen_projects_before_reuse(self) -> None:
+        # A palette that runs out at seven forces the eighth concurrently
+        # registered project to share a glyph with one already on screen,
+        # which is exactly the ambiguity the glyph exists to remove.
+        self.assertGreaterEqual(len(_COLOR_PALETTE), 14)
+
+    def test_legacy_palette_colours_keep_their_exact_square(self) -> None:
+        # These seven colours and their squares predate the wider palette.
+        # Existing project records on disk store only the hex colour, so if
+        # the mapping from one of these colours to its glyph ever shifted,
+        # every already-registered project using it would silently change
+        # glyph underneath a human who has learned to recognise it.
+        legacy_squares = {
+            "#2563eb": "\N{LARGE BLUE SQUARE}",
+            "#7c3aed": "\N{LARGE PURPLE SQUARE}",
+            "#c2410c": "\N{LARGE ORANGE SQUARE}",
+            "#4d7c0f": "\N{LARGE GREEN SQUARE}",
+            "#be123c": "\N{LARGE RED SQUARE}",
+            "#eab308": "\N{LARGE YELLOW SQUARE}",
+            "#92400e": "\N{LARGE BROWN SQUARE}",
+        }
+        for color, glyph in legacy_squares.items():
+            self.assertEqual(project_glyph(color), glyph)
+
+    def test_fifteenth_project_registers_and_deterministically_reuses_a_glyph(self) -> None:
+        glyphs_by_color = {}
+        for index in range(len(_COLOR_PALETTE) + 1):
+            name = f"reuse-{index}"
+            project = self.coordinator.register_project(
+                name, str(self.repo(name)), project_id=name
+            )
+            glyphs_by_color[project["id"]] = (project["color"], project_glyph(project["color"]))
+
+        # The (len+1)th project still registers -- reuse, not a refusal.
+        self.assertEqual(len(glyphs_by_color), len(_COLOR_PALETTE) + 1)
+        glyphs = [glyph for _, glyph in glyphs_by_color.values()]
+        self.assertEqual(len(set(glyphs)), len(_COLOR_PALETTE), "the last project should reuse a taken glyph")
+
+        # Picking a colour is a pure function of the project id and the
+        # already-claimed glyphs, so re-deriving it is deterministic.
+        last_id = f"reuse-{len(_COLOR_PALETTE)}"
+        taken = [
+            color for pid, (color, _) in glyphs_by_color.items() if pid != last_id
+        ]
+        self.assertEqual(_color_for(last_id, taken), glyphs_by_color[last_id][0])
+
+    def test_custom_colour_keeps_generic_hue_fallback(self) -> None:
+        # A colour outside the built-in palette -- set explicitly, or hashed
+        # for a project registered before the palette grew -- must keep
+        # degrading through the hue bucket, not require a palette entry.
+        project = self.coordinator.register_project(
+            "custom-colour", str(self.repo("custom-colour")), project_id="custom-colour",
+            color="#0369a1",
+        )
+        self.assertEqual(project["color"], "#0369a1")
+        self.assertEqual(project_glyph(project["color"]), "\N{LARGE BLUE SQUARE}")
+        self.assertEqual(project_glyph("nonsense"), "")
+
+    def test_project_glyphs_are_stable_across_a_state_reload(self) -> None:
+        names = [f"stable-{index}" for index in range(16)]
+        colors = {}
+        for name in names:
+            project = self.coordinator.register_project(
+                name, str(self.repo(name)), project_id=name
+            )
+            colors[name] = project["color"]
+
+        reloaded = Coordinator(StateStore(self.state.directory))
+        by_id = {p["id"]: p for p in reloaded.list_projects()}
+        for name in names:
+            self.assertEqual(by_id[name]["color"], colors[name])
+            self.assertEqual(
+                project_glyph(by_id[name]["color"]), project_glyph(colors[name])
+            )
 
     def test_an_idle_foreman_stands_down_so_its_project_can_release_its_space(self) -> None:
         # A foreman was appointed once and never terminated, and releasing a

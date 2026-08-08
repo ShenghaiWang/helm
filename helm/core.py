@@ -237,33 +237,73 @@ LEARNING_PROPOSAL_STATUSES = {"proposed", "approved", "rejected", "applied"}
 #: eight colours that collapsed to five squares -- three of them blue, two
 #: orange, with yellow and brown unused -- so two projects could differ in
 #: colour and still print the same glyph, which is the one thing the glyph
-#: exists to prevent.
+#: exists to prevent. It was later widened from seven colours to fourteen --
+#: the original seven squares plus one alternate colour per hue, printing a
+#: circle -- so more concurrently registered projects get a distinct glyph
+#: before any project has to reuse one.
 _COLOR_PALETTE = (
-    "#2563eb",  # blue
-    "#7c3aed",  # purple
-    "#c2410c",  # orange
-    "#4d7c0f",  # green
-    "#be123c",  # red
-    "#eab308",  # yellow
-    "#92400e",  # brown
+    "#2563eb",  # blue square
+    "#7c3aed",  # purple square
+    "#c2410c",  # orange square
+    "#4d7c0f",  # green square
+    "#be123c",  # red square
+    "#eab308",  # yellow square
+    "#92400e",  # brown square
+    "#3b82f6",  # blue circle
+    "#9333ea",  # purple circle
+    "#f97316",  # orange circle
+    "#16a34a",  # green circle
+    "#dc2626",  # red circle
+    "#facc15",  # yellow circle
+    "#78350f",  # brown circle
 )
+
+#: Exact colour -> glyph for the built-in palette, keyed by lower-cased hex
+#: digits without the leading '#'. Kept separate from the generic hue fallback
+#: below so every palette entry -- including the seven legacy colours -- prints
+#: its own fixed glyph rather than whatever bucket its hue happens to fall
+#: into, which is what let the palette grow without reshuffling glyphs already
+#: on disk in a project record.
+_PALETTE_GLYPHS = {
+    "2563eb": "\N{LARGE BLUE SQUARE}",
+    "7c3aed": "\N{LARGE PURPLE SQUARE}",
+    "c2410c": "\N{LARGE ORANGE SQUARE}",
+    "4d7c0f": "\N{LARGE GREEN SQUARE}",
+    "be123c": "\N{LARGE RED SQUARE}",
+    "eab308": "\N{LARGE YELLOW SQUARE}",
+    "92400e": "\N{LARGE BROWN SQUARE}",
+    "3b82f6": "\N{LARGE BLUE CIRCLE}",
+    "9333ea": "\N{LARGE PURPLE CIRCLE}",
+    "f97316": "\N{LARGE ORANGE CIRCLE}",
+    "16a34a": "\N{LARGE GREEN CIRCLE}",
+    "dc2626": "\N{LARGE RED CIRCLE}",
+    "facc15": "\N{LARGE YELLOW CIRCLE}",
+    "78350f": "\N{LARGE BROWN CIRCLE}",
+}
 
 
 def project_glyph(color: str) -> str:
-    """Map a project's colour to a coloured square that survives a pane.
+    """Map a project's colour to a coloured glyph that survives a pane.
 
     Escape codes do not cross `pane run`, but a character does.  A coloured
     glyph therefore gives a pane the same at-a-glance separation that the Helm
     session gets from a background tint, without any control sequences.  It is
     a second channel only: the line still names the project.
+
+    A built-in palette colour looks up its exact, fixed glyph first. Any other
+    valid colour -- a custom colour, or one hashed for a project before the
+    palette grew -- falls back to a generic hue bucket, same as before.
     """
-    value = str(color or "").strip().lstrip("#")
+    value = str(color or "").strip().lstrip("#").lower()
     if len(value) != 6:
         return ""
     try:
         red, green, blue = (int(value[index : index + 2], 16) for index in (0, 2, 4))
     except ValueError:
         return ""
+    palette_glyph = _PALETTE_GLYPHS.get(value)
+    if palette_glyph:
+        return palette_glyph
     high, low = max(red, green, blue), min(red, green, blue)
     if high - low < 30:
         return "\N{BLACK LARGE SQUARE}" if high < 128 else "\N{WHITE LARGE SQUARE}"
