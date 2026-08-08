@@ -1157,6 +1157,254 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.coordinator.list_approval_grants(), [])
         self.assertIsNone(self.coordinator.approval_grant_for("merge", project["id"]))
 
+    def _paused_on_approval(
+        self, name: str, action: str = "publish"
+    ) -> tuple[dict, dict, dict]:
+        """A live worker paused on a protected action, mid-task."""
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "produce and publish it")
+        # An assignment with no process of its own: an agent that pauses is
+        # still sitting in its session, which is exactly what is under test.
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+        self.commit_on_task_branch(task, "the thing to publish")
+        self.coordinator.record_worker_message(
+            worker["id"],
+            "approval-needed",
+            "ready to publish the rendered file",
+            payload={"action": action},
+        )
+        return project, task, worker
+
+    def test_an_approval_pause_keeps_its_worker_live_and_finishes_after_release(self) -> None:
+        """The whole loop: pause, human decision, same session, real outcome.
+
+        Settling the worker on its own `approval-needed` message marked a live
+        agent failed, which refused every message it tried to push afterwards.
+        The task then had no supported way back to running, so the outcome of
+        the very action a human authorized could never reach Helm at all.
+        """
+        project, task, worker = self._paused_on_approval("paused")
+        held = self.coordinator.inspect_task(task["id"])
+        self.assertEqual(held["task"]["status"], "approval-needed")
+        hold = held["task"]["hold"]
+        self.assertEqual(hold["status"], "waiting")
+        self.assertEqual(hold["action"], "publish")
+        self.assertEqual(hold["worker_id"], worker["id"])
+        # A pause is not a failure. The session is sitting there waiting to be
+        # told, and everything downstream reads this record to decide that.
+        live = self.coordinator.store.load()["workers"][worker["id"]]
+        self.assertEqual(live["status"], "running")
+        self.assertIsNone(live["ended_at"])
+
+        # It says what it is waiting for, rather than looking stalled or done.
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(health[worker["id"]]["verdict"], "awaiting-approval")
+        self.assertIn("publish", health[worker["id"]]["detail"])
+
+        # And it stays addressable: the coordinator can still talk to it, and
+        # it can still report, exactly as it could before it asked.
+        self.coordinator.record_worker_message(worker["id"], "answer", "looking at it now")
+        still_held = self.coordinator.record_worker_message(
+            worker["id"], "status", "waiting on the commander"
+        )
+        self.assertEqual(still_held["status"], "approval-needed")
+
+        # The branch gate is a different question and still refuses: it reviews
+        # finished work, and this worker has not finished.
+        with self.assertRaisesRegex(SafetyError, r"still running"):
+            self.coordinator.approve_task(task["id"])
+
+        released = self.coordinator.release_task_hold(
+            task["id"], action="publish", note="channel upload agreed", confirm=True
+        )
+        self.assertEqual(released["status"], "running")
+        authorization = released["hold"]["authorization"]
+        self.assertEqual(released["hold"]["status"], "authorized")
+        self.assertIsNone(authorization["grant_id"])
+        self.assertEqual(authorization["binding"]["branch"], task["branch"])
+        self.assertTrue(authorization["binding"]["tree"])
+
+        # The same worker, in the same session, reports what it did.
+        finished = self.coordinator.record_worker_message(
+            worker["id"], "result", "published it; the outcome is recorded"
+        )
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["hold"]["status"], "closed")
+        self.assertEqual(
+            self.coordinator.store.load()["workers"][worker["id"]]["status"], "completed"
+        )
+
+        # Both halves reach the project's own record, so the next coordinator
+        # sees what was authorized and what came of it without the transcript.
+        situation = " ".join(
+            entry["text"] for entry in
+            self.coordinator.project_status(project["id"])["situation"]
+        )
+        self.assertIn("authorized publish", situation)
+        self.assertIn("published it", situation)
+
+    def test_release_authorizes_only_the_action_that_was_asked_for(self) -> None:
+        project, task, worker = self._paused_on_approval("authorize")
+
+        # Merging is Helm's own gated operation, reached through the reviewed
+        # branch. Answering a worker must not become a second way to authorize
+        # it, or the review that gate exists for is skipped.
+        with self.assertRaisesRegex(SafetyError, r"helm task approve"):
+            self.coordinator.release_task_hold(task["id"], action="merge", confirm=True)
+        # The commander answers the question that was asked, not a neighbouring
+        # one; anything else authorizes something nobody reviewed.
+        with self.assertRaisesRegex(SafetyError, r"asked for publish, not push"):
+            self.coordinator.release_task_hold(task["id"], action="push", confirm=True)
+        # Nothing authorizes it by default.
+        with self.assertRaisesRegex(SafetyError, r"no standing approval covers publish"):
+            self.coordinator.release_task_hold(task["id"], action="publish")
+        # A grant is checked when it is used: revoked, wrong action, and wrong
+        # project are each not an approval.
+        revoked = self.coordinator.grant_approval("publish", note="while I am away")
+        self.coordinator.revoke_approval_grant(revoked["id"], "back now")
+        with self.assertRaisesRegex(SafetyError, r"was revoked"):
+            self.coordinator.release_task_hold(
+                task["id"], action="publish", grant_id=revoked["id"]
+            )
+        pushes = self.coordinator.grant_approval("push", note="pushes are fine")
+        with self.assertRaisesRegex(SafetyError, r"covers push, not publish"):
+            self.coordinator.release_task_hold(
+                task["id"], action="publish", grant_id=pushes["id"]
+            )
+        other = self.repo("elsewhere")
+        self.coordinator.register_project("Elsewhere", str(other), project_id="elsewhere")
+        elsewhere = self.coordinator.grant_approval(
+            "publish", project_id="elsewhere", note="only that project"
+        )
+        with self.assertRaisesRegex(SafetyError, r"scoped to project elsewhere"):
+            self.coordinator.release_task_hold(
+                task["id"], action="publish", grant_id=elsewhere["id"]
+            )
+        with self.assertRaisesRegex(HelmError, r"unknown approval grant"):
+            self.coordinator.release_task_hold(
+                task["id"], action="publish", grant_id="g-invented"
+            )
+        # Every refusal leaves the gate exactly where it was.
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["hold"]["status"], "waiting"
+        )
+
+        # An agent cannot release its own hold, whatever it is: that is the
+        # approval it asked for, and self-approval is the thing being prevented.
+        argv = ["--state-dir", str(self.state.directory)]
+        for actor in (worker["id"], "w-someone-else"):
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": actor}):
+                self.assertEqual(
+                    cli.main([*argv, "approval", "release", task["id"],
+                              "--action", "publish", "--confirm"]),
+                    2,
+                )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["hold"]["status"], "waiting"
+        )
+
+        # The commander, at the root, can -- and the supported command says so.
+        self.assertEqual(
+            cli.main([*argv, "approval", "release", task["id"],
+                      "--action", "publish", "--confirm", "--note", "agreed"]),
+            0,
+        )
+        after = self.coordinator.inspect_task(task["id"])["task"]
+        self.assertEqual(after["status"], "running")
+        self.assertEqual(after["hold"]["status"], "authorized")
+        # A hold is answered once; a second release has nothing to authorize.
+        with self.assertRaisesRegex(HelmError, r"not waiting on an approval"):
+            self.coordinator.release_task_hold(
+                task["id"], action="publish", confirm=True
+            )
+
+    def test_work_that_changes_after_authorization_goes_back_to_the_gate(self) -> None:
+        """An approval covers one state of one worktree, not a direction."""
+        project, task, worker = self._paused_on_approval("mutated")
+        self.coordinator.release_task_hold(
+            task["id"], action="publish", note="agreed for what I read", confirm=True
+        )
+        # The worker changes the thing it was authorized to act on.
+        self.commit_on_task_branch(task, "something else entirely")
+
+        reported = self.coordinator.record_worker_message(
+            worker["id"], "result", "published it"
+        )
+        # Not completed: what happened is not what was approved, so the task
+        # returns to the gate instead of passing through on a stale agreement.
+        self.assertEqual(reported["status"], "approval-needed")
+        self.assertEqual(reported["hold"]["status"], "invalidated")
+        kinds = [
+            message["kind"]
+            for message in self.coordinator.inspect_task(task["id"])["messages"]
+        ]
+        self.assertIn("approval-invalidated", kinds)
+        with self.assertRaisesRegex(HelmError, r"not waiting on an approval"):
+            self.coordinator.release_task_hold(
+                task["id"], action="publish", confirm=True
+            )
+
+        # The way forward is the ordinary one: a human reads the branch as it
+        # now stands and approves that, bound to the tree they actually saw.
+        approved = self.coordinator.approve_task(task["id"], "read the new tree")
+        self.assertEqual(approved["status"], "approved")
+        self.assertTrue(approved["approval"]["tree"])
+
+    def test_an_uncommitted_edit_after_authorization_breaks_the_binding_too(self) -> None:
+        """A worker pauses mid-task, so committed history is not the whole state."""
+        project, task, worker = self._paused_on_approval("dirtied")
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        (Path(task["workspace"]) / "change.txt").write_text(
+            "edited after the commander read it", encoding="utf-8"
+        )
+
+        # Reported as a status rather than a result: the binding is checked
+        # wherever the task reaches `completed`, so neither route round it.
+        reported = self.coordinator.record_worker_message(
+            worker["id"], "status", "published it", requested_status="completed"
+        )
+        self.assertEqual(reported["status"], "approval-needed")
+        self.assertEqual(reported["hold"]["status"], "invalidated")
+
+    def test_a_paused_task_keeps_its_space_and_releases_it_once_it_finishes(self) -> None:
+        root = self.repo("held-space")
+        project = self.coordinator.register_project(
+            "Held", str(root), project_id="held-space"
+        )
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        task = self.coordinator.create_task(project["id"], "publish something")
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready to publish", payload={"action": "publish"}
+        )
+
+        # A human still has to look, so the pane and the space both stay.
+        self.assertEqual(adapter.release_finished_tabs(), [])
+        self.assertFalse(adapter.close_project_space_if_finished(project["id"]))
+        self.assertEqual(herdr.closed_workspaces, [])
+        self.assertIn(
+            worker["id"],
+            self.coordinator.store.load()["integrations"]["herdr"]["workers"],
+        )
+
+        self.coordinator.release_task_hold(
+            task["id"], action="publish", confirm=True
+        )
+        # The decision is delivered into the same session that asked.
+        self.assertTrue(adapter.answer_worker(worker["id"], "Approved: publish"))
+        self.assertEqual(herdr.sent_text[-1][1], "Approved: publish")
+        self.assertEqual(herdr.sent_keys[-1][1], "Enter")
+
+        self.coordinator.record_worker_message(worker["id"], "result", "published")
+        # Finished and reported: now there is nothing left to show.
+        self.assertEqual(adapter.release_finished_tabs(), [worker["id"]])
+        self.assertTrue(adapter.close_project_space_if_finished(project["id"]))
+        self.assertEqual(len(herdr.closed_workspaces), 1)
+
     def test_helm_sees_a_stalled_worker_without_anyone_opening_its_ui(self) -> None:
         root = self.repo("health")
         project = self.coordinator.register_project("Health", str(root), project_id="health")

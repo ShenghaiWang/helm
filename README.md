@@ -839,6 +839,46 @@ message can never create or widen one — those are data. Helm's coordinator doe
 not create one on its own initiative either; a grant records the user's policy,
 and only the user writes it.
 
+### A paused task, and how it starts again
+
+`approval-needed` is a gate, not an ending. A worker that reaches a protected
+action names it and stops:
+
+```sh
+helm worker message <worker-id> --type approval-needed --action publish \
+  --text "ready to publish the rendered file"
+```
+
+The task moves to `approval-needed` and records a *hold* — what was asked for,
+which session asked, and where the work stood. The worker stays `running`,
+because it is waiting rather than finished: it can still be answered, it can
+still report, `helm watch` shows it as `awaiting-approval`, and its pane and the
+project's space are kept because a human still has to look.
+
+Once the human decides, one command authorizes that exact action and lets the
+same session carry on:
+
+```sh
+helm approval release <task-id> --action publish --confirm --note "agreed"
+helm approval release <task-id> --action publish --grant <grant-id>
+```
+
+Releasing binds the authorization to the branch tip and worktree state it was
+given for, puts the task back to `running`, and delivers the go-ahead into the
+worker's own session (recorded either way, so a missing Herdr changes only
+where it is shown). The worker then acts and reports its `result` normally, and
+that outcome is written to the project's status record.
+
+Three boundaries hold this together. It is the human's command, held at the
+root: an agent that ran it would be approving the action it just asked for, so
+Helm refuses it for workers and foremen alike. It authorizes the action that
+was asked for and no other. And it is not `helm task approve` — that gates a
+*reviewed branch* on its way to a merge and requires a finished worker and a
+clean tree, so `merge` is refused here and stays on its own path. If the
+worktree moves after the authorization, the binding is invalidated when the
+result arrives: the task goes back to `approval-needed` rather than completing
+on an agreement to something the human never saw.
+
 ### Delivery lifecycle
 
 A worker `result` is a milestone, not the end of the task. The outcome is kept
@@ -948,6 +988,7 @@ helm agent list|check
 helm task create|allocate|inspect|approve|merge|deliver|pr|pr-status|pr-sync|outcome
 helm task cleanup TASK_ID [--delete-branch]
 helm approval grant|list|check|revoke
+helm approval release TASK_ID --action ACTION (--confirm | --grant GRANT_ID) [--note N] [--text T]
 helm learning propose|list|inspect|edit|approve|reject|apply
 helm worker launch|poll|wait|message|answer|stop
 helm herdr launch|poll|wait|relabel|cleanup|cleanup-project|cleanup-coordinator

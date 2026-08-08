@@ -475,7 +475,12 @@ class HerdrAdapter:
         routed = set(layout.get("routed_message_ids", []))
         report = self.coordinator.inspect_task(worker["task_id"])
         project = report["project"]
-        allowed = {"status", "result", "blocker", "failure", "approval-needed", "artifact"}
+        # The gate prints too: a pause and the decision that lifted it are the
+        # two lines a human reading this pane most needs to see together.
+        allowed = {
+            "status", "result", "blocker", "failure", "approval-needed", "artifact",
+            "approval", "approval-invalidated",
+        }
         for message in report["messages"]:
             if message.get("worker_id") != worker["id"] or message["kind"] not in allowed:
                 continue

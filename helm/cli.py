@@ -814,6 +814,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "status", "result", "blocker", "failure", "approval-needed", "artifact", "question",
     ))
     report.add_argument("--text", default="")
+    report.add_argument(
+        "--action",
+        choices=sorted(PROTECTED_ACTIONS),
+        help="with --type approval-needed: the exact protected action being asked for",
+    )
     report.add_argument("--status", choices=("running", "completed", "blocked", "failed", "approval-needed"))
     report.add_argument("--path")
     report.add_argument("--payload", help="JSON object payload")
@@ -975,6 +980,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     check_grant.add_argument("action", choices=sorted(PROTECTED_ACTIONS))
     check_grant.add_argument("--project", dest="project_id")
+    release_hold = approval_commands.add_parser(
+        "release",
+        help="authorize the protected action a paused task asked for, and let its worker continue",
+    )
+    release_hold.add_argument("task_id")
+    release_hold.add_argument(
+        "--action",
+        required=True,
+        choices=sorted(PROTECTED_ACTIONS),
+        help="the exact action being authorized; it must match what was asked for",
+    )
+    release_hold.add_argument("--note", default="", help="why this was authorized")
+    release_hold.add_argument(
+        "--confirm", action="store_true", help="the commander is authorizing it now"
+    )
+    release_hold.add_argument(
+        "--grant", dest="grant_id", help="authorize under a standing approval instead"
+    )
+    release_hold.add_argument(
+        "--text", default="", help="what to say to the worker (default: a plain go-ahead)"
+    )
     learning = commands.add_parser(
         "learning", aliases=["learn"], help="propose, review, and apply domain learnings"
     )
@@ -1303,6 +1329,9 @@ _ROOT_ONLY_COMMANDS = frozenset({
     ("task", "pr"),
     ("approval", "grant"),
     ("approval", "revoke"),
+    # Releasing a hold *is* the authorization the worker asked for. An agent
+    # that could run it would be approving its own protected action.
+    ("approval", "release"),
     ("learning", "approve"),
     ("learning", "reject"),
     ("learning", "apply"),
@@ -1630,6 +1659,8 @@ def main(argv: list[str] | None = None) -> int:
                     payload.update(parsed)
                 if args.path:
                     payload["path"] = args.path
+                if args.action:
+                    payload["action"] = args.action
                 task = coordinator.record_worker_message(
                     args.worker_id,
                     args.type,
@@ -1653,6 +1684,13 @@ def main(argv: list[str] | None = None) -> int:
                     # A reported, clean finish releases the project's space.
                     released = adapter.close_project_space_if_finished(task["project_id"])
                 print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
+                if args.type == "approval-needed":
+                    hold = task.get("hold") or {}
+                    print(
+                        "  The task is paused, not finished; this session stays open. "
+                        "A human authorizes it with: helm approval release "
+                        f"{task['id']} --action {hold.get('action') or '<action>'} --confirm"
+                    )
                 if told_foreman:
                     print("  Told the project's foreman; it is theirs to act on")
                 if released_tabs:
@@ -1971,6 +2009,46 @@ def main(argv: list[str] | None = None) -> int:
             elif args.approval_command == "revoke":
                 revoked = coordinator.revoke_approval_grant(args.grant_id, args.note)
                 print(f"Revoked {revoked['id']}: {revoked['action']} for {revoked['project_id'] or 'all projects'}")
+            elif args.approval_command == "release":
+                task = coordinator.release_task_hold(
+                    args.task_id,
+                    action=args.action,
+                    note=args.note,
+                    grant_id=args.grant_id,
+                    confirm=args.confirm,
+                )
+                hold = task.get("hold") or {}
+                authorization = hold.get("authorization") or {}
+                binding = authorization.get("binding") or {}
+                worker_id = hold.get("worker_id", "")
+                # The decision is recorded whether or not the session can be
+                # reached, and then delivered into it -- in that order, because
+                # a presentation surface must never decide what was authorized.
+                message = args.text or (
+                    f"Approved: {args.action}. The commander authorized exactly this"
+                    + (f" ({args.note})" if args.note else "")
+                    + ". Carry it out now, then push your result. If anything about the"
+                    " change moved since you asked, stop and report instead."
+                )
+                delivered = False
+                with contextlib.suppress(HelmError, OSError):
+                    coordinator.record_worker_message(worker_id, "answer", message)
+                    delivered = HerdrAdapter(coordinator).answer_worker(worker_id, message)
+                print(
+                    f"Released {args.action} for task {task['id']} [{task['status']}] "
+                    f"worker={worker_id} "
+                    f"[{'delivered' if delivered else 'recorded only'}]"
+                )
+                if authorization.get("grant_id"):
+                    print(f"  Authority: standing grant {authorization['grant_id']}")
+                if binding:
+                    print(
+                        f"  Bound to {binding.get('branch')} @ "
+                        f"{(binding.get('revision') or '')[:12]}; a change to this "
+                        "worktree invalidates it and asks again"
+                    )
+                else:
+                    print("  No branch to bind to; the authorization stands on the record alone")
             elif args.approval_command == "check":
                 covering = coordinator.approval_grant_for(args.action, args.project_id)
                 scope = args.project_id or "all projects"
