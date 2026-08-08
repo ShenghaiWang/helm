@@ -98,21 +98,61 @@ genuinely goes up is narrow: a protected action, missing credentials, a
 decision that changes scope, a contradiction no source resolves, or repeated
 failure.
 
-## Review only work that needs an independent judgment
+## Classify review by deliverable, not by whether a file changed
 
-Do not burn a reviewer on a purely operational task whose judgment gate has
-already been cleared. Uploading or scheduling an already-produced video is the
-canonical case: if the human has approved the content gate and explicitly
-approved the protected publish action, the worker's job is to execute the
-checklist, verify the scheduled/live state, update the tracker, and report the
-URL. A second agent does not add a useful judgment there unless the worker had
-to change the artifact, metadata, eligibility, policy interpretation, or factual
-claims.
+The question is what the task delivers and whether that deliverable needs an
+independent judgment before anyone trusts it — not whether carrying it out
+happened to touch a file. A script edit inside an established operational
+mechanism is not automatically software delivery, and "nothing was written"
+is not automatically a safe skip either; classify by the kind of work and its
+primary deliverable, then decide review from that.
 
-Use review for work that produces or changes something whose correctness needs
-independent scrutiny: code, generated media, research conclusions, factual
-analysis, candidate eligibility, metadata rewrites, or any fix after a finding.
-For straight-through operations, verify the operation instead of reviewing it.
+**Straight-through operational work gets no independent review agent.**
+Uploading, publishing, or scheduling an already-produced, already-approved
+artifact is the canonical case. Its safety comes from a different chain: the
+protected-action approval gate before a human authorizes the action, an
+immutable preflight check that what is about to run still matches exactly
+what was approved — same artifact, same parameters, nothing drifted since
+approval — a fixed execution checklist the worker runs step by step, and a
+post-action verification that the operation actually took effect (the
+scheduled/live state, the tracker updated, the URL reported). A second agent
+re-reading that sequence adds no judgment the checklist and the state check
+do not already supply.
+
+**A narrow, bounded adjustment to the operational mechanism itself can stay in
+that flow.** Fixing a broken selector in an upload script, correcting a field
+mapping, bumping a schedule offset — these change a script, config, or
+tracker file, but when the commander has explicitly classified the request as
+an operational fix and the change is narrow and bounded to the existing
+mechanism, the deliverable is still the operation, not new software behavior.
+Do not auto-promote it to software delivery merely because a file with code
+or config in it changed — that file-touched trigger is exactly the mechanical
+shortcut this section replaces. Route it through the same preflight,
+checklist, and post-action verification as any other operational task.
+
+**Everything that produces or changes something needing independent scrutiny
+still gets independent review.** Reusable software behavior — a feature, a
+logic change other callers depend on, a new capability; generated or changed
+media; a factual or research conclusion; a policy interpretation; an
+eligibility decision; or a metadata or content change material enough to
+affect what a viewer sees or a decision that follows from it. None of those is
+made safe by a checklist, because the risk sits in the judgment, not in the
+mechanism executing it.
+
+**A request that mixes both kinds of work is classified phase by phase.**
+"Produce this and then publish it" has a production phase whose deliverable
+needs independent review and a publish phase whose deliverable is the
+operation and does not. Do not carry a review requirement from one phase into
+the other in either direction, and do not skip review on the phase that needs
+it because the request also contains an operational step.
+
+**Scope growth or added risk reclassifies mid-task.** An operational task that
+starts rewriting the artifact, materially changing its metadata, touching
+eligibility, or interpreting policy has stopped being straight-through the
+moment that happens, whatever the brief said at the start. Say concretely what
+crossed the line — "the fix now rewrites the description shown to viewers, not
+just the upload script's field mapping" — rather than reclassifying silently
+or leaving it operational because that is where it began.
 
 ## The produced result goes to an independent reviewer before it goes anywhere else
 

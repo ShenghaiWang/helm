@@ -1,6 +1,6 @@
 ---
 id: software-delivery
-applies_to: Any task that writes, changes, or reviews code.
+applies_to: Building or changing reusable software behavior, or reviewing such a change.
 use_when:
   - a feature, bug fix, refactor, or migration is being implemented
   - code written by an agent needs reviewing before it lands
@@ -8,7 +8,10 @@ use_when:
 not_for:
   - research, writing, or media production
   - video scripting or channel work, even when it mentions scripts or builds
-  - operational tasks that touch no source code
+  - a straight-through operational task -- upload, publish, schedule, run a
+    job -- even when carrying it out edits a script, config, or tracker file;
+    classify by what the task delivers, not by whether a file changed. See
+    `driving-delegated-work` for the classification and its limits.
 selectable: true
 extends:
   - work-decomposition
