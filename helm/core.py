@@ -515,19 +515,35 @@ def _private_file(path: Path) -> Path:
 
 
 def _write_private_text(path: Path, content: str) -> None:
+    """Write a Helm-private file so a reader never sees it half-written.
+
+    Truncate-then-write left a window in which the file existed and was empty,
+    and something does read these while they are being written: `poll_worker`
+    treats the existence of `exit.json` as "the worker finished" and its
+    contents as the exit code. Landing in that window parsed nothing, took the
+    unreadable-record branch, and recorded a healthy worker as *failed* --
+    which fails its task, emits a failure message, and keeps the project's
+    Herdr space open on work that actually succeeded.
+
+    So the content is written to a temporary file in the same directory and
+    moved into place with `os.replace`, which is atomic on one filesystem: a
+    reader sees either the previous file or the complete new one, never a
+    partial one.
+    """
     _private_file(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(path, flags, 0o600)
+    directory = path.parent
+    fd, temporary = tempfile.mkstemp(dir=str(directory), prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-    finally:
-        # fdopen owns the descriptor after successful construction; chmod is
-        # still explicit for files that existed before this write.
-        with contextlib.suppress(FileNotFoundError):
-            os.chmod(path, 0o600)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
 
 
 def inside(path: Path, parent: Path) -> bool:
@@ -5382,17 +5398,32 @@ class Coordinator:
                     exit_code = 1
                 finished = True
             elif worker.get("external") is not True and not self._pid_alive(worker.get("pid")):
-                finished = True
-                exit_code = 1
-                self._message(
-                    data,
-                    project,
-                    task,
-                    worker,
-                    "failure",
-                    "Worker runner exited without a completion record",
-                    {},
-                )
+                # The record is checked again before the process's absence is
+                # believed. The runner writes its exit record and *then*
+                # exits, so between the check above and this one it can have
+                # done both -- and the pid can also vanish early, because
+                # anything else creating a subprocess in this interpreter may
+                # reap an already-finished child. Concluding "no completion
+                # record" from that ordering failed workers that had exited 0.
+                if exit_path.exists():
+                    try:
+                        exit_data = json.loads(exit_path.read_text(encoding="utf-8"))
+                        exit_code = int(exit_data["returncode"])
+                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                        exit_code = 1
+                    finished = True
+                else:
+                    finished = True
+                    exit_code = 1
+                    self._message(
+                        data,
+                        project,
+                        task,
+                        worker,
+                        "failure",
+                        "Worker runner exited without a completion record",
+                        {},
+                    )
             if finished:
                 worker["status"] = "completed" if exit_code == 0 else "failed"
                 worker["exit_code"] = exit_code
