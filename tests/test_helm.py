@@ -2105,26 +2105,29 @@ class HelmCoordinatorTests(unittest.TestCase):
         # A palette lookup must not be case-sensitive: a colour is free-form
         # user/config input in practice, and the exact-match lookup added to
         # widen the palette keys off the lower-cased hex digits.
-        circle_color = "#3b82f6"
-        circle_glyph = project_glyph(circle_color)
+        lower_color = "#3b82f6"
+        upper_color = "#3B82F6"
+        circle_glyph = project_glyph(lower_color)
         self.assertTrue(circle_glyph)
-        self.assertEqual(project_glyph(circle_color.upper()), circle_glyph)
+        self.assertEqual(project_glyph(upper_color), circle_glyph)
         # It is really a distinct glyph from the legacy square of the same
         # hue, not a coincidental match through the generic hue fallback.
         self.assertNotEqual(circle_glyph, project_glyph("#2563eb"))
 
         # A glyph is a character, so unlike an escape sequence it must survive
-        # the same established output paths a square glyph always has.
-        command = _paint_command(circle_color, "status: harvest done")
+        # the same established output paths a square glyph always has. Drive
+        # every consumer with the uppercase form specifically, since that is
+        # the case a bare hue-bucket lookup would fail to normalise.
+        command = _paint_command(upper_color, "status: harvest done")
         self.assertIn(circle_glyph, command)
         self.assertNotIn("\x1b", command)
 
-        label = cli._project_label({"id": "media", "name": "Media", "color": circle_color})
+        label = cli._project_label({"id": "media", "name": "Media", "color": upper_color})
         self.assertIn(circle_glyph, label)
 
         project = self.coordinator.register_project(
             "circle-project", str(self.repo("circle-project")), project_id="circle-project",
-            color=circle_color,
+            color=upper_color,
         )
         task = self.coordinator.create_task(project["id"], "the work", no_domain=True)
         herdr = FakeHerdr()
