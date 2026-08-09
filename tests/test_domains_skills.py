@@ -136,6 +136,10 @@ class DomainsSkillsTests(HelmTestCase):
         self.coordinator.record_worker_message(
             worker["id"], "result", "Session list refreshes must reuse the existing intent"
         )
+        # The runner owns its own output and exit files. Nothing here tests a
+        # live session, so reap it before leaving the test: an unwaited runner
+        # writing into the temporary root races tearDown's removal of it.
+        self.coordinator.wait_worker(worker["id"])
         proposals = self.coordinator.store.load().get("learning_proposals", [])
         mine = [p for p in proposals if p.get("source_task_id") == task["id"]]
         self.assertTrue(mine)
@@ -165,6 +169,8 @@ class DomainsSkillsTests(HelmTestCase):
         self.coordinator.record_worker_message(
             worker["id"], "result", "This project pins its simulator to iPhone 17"
         )
+        # Reaped for the same reason as the proposal test above.
+        self.coordinator.wait_worker(worker["id"])
         proposal = [
             p
             for p in self.coordinator.store.load()["learning_proposals"]
@@ -898,6 +904,8 @@ class DomainsSkillsTests(HelmTestCase):
             task["id"], [sys.executable, "-c", ""], wait=False
         )
         self.assertTrue(worker)
+        # The launch is only here to record the selection; reap its runner.
+        self.coordinator.wait_worker(worker["id"])
 
         recorded = self.coordinator.inspect_task(task["id"])["task"]["skills"]
         self.assertEqual([s["id"] for s in recorded["selected"]], ["migrations"])
