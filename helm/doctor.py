@@ -37,7 +37,10 @@ provider auth, status, or catalogue command, and prints no environment *value* -
 not even one that looks like an ordinary runtime id, because "looks ordinary" is
 exactly the judgement a leak survives. An id reaches output only when it is a
 word from a fixed known vocabulary or a value from a file `helm prefs show`
-already prints.
+already prints. That applies to messages doctor merely *relays* as much as to
+ones it writes: the launcher's own refusals quote the argv and model they
+objected to, so doctor states the refusal in its own generic terms rather than
+passing them through.
 
 The contract -- check ids, severities, output shape, exit codes -- is in
 `docs/doctor.md`. Checks reuse the existing loaders and validators rather than
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -63,6 +67,7 @@ from .core import (
     HelmError,
     SafetyError,
     canonical,
+    inside,
     overlaps,
 )
 
@@ -250,6 +255,102 @@ def _git_lines(root: Path, *args: str) -> list[str] | None:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+#: A configuration line that pulls in another file. Git reads a repository's
+#: own `.git/config` no matter what the command line says, and an `include` or
+#: `includeIf` there names a path git will open -- anywhere on the filesystem,
+#: including a credential file. There is no flag that turns includes off, so
+#: the read is prevented by not running git against such a repository at all.
+_GIT_INCLUDE = re.compile(r"\[\s*include(?:if)?\b|\binclude(?:if)?\s*\.\s*path\b", re.I)
+
+
+def _administrative_git_dir(path: Path) -> bool:
+    """Whether a path is somewhere a git administrative directory can live.
+
+    A *linked worktree* keeps its git directory under the main repository's
+    `.git/worktrees/<name>`, which is legitimately outside the worktree -- and
+    Helm's own task worktrees are exactly that shape, so refusing it would
+    break doctor for the workflow this repository is built around. What must
+    still be refused is a gitfile pointing somewhere that is not a git
+    administrative area at all: `gitdir: ~/.aws` would otherwise have doctor
+    read `~/.aws/config`. Requiring a `.git` component is a structural test
+    that admits every real worktree and no credential directory.
+    """
+    return ".git" in canonical(path).parts
+
+
+def _git_config_files(repo_dir: Path) -> tuple[list[Path], str]:
+    """Every config file git would read for this repository, or why not.
+
+    Located without running git, because running git is the thing being gated.
+    `.git` is normally a directory; a *gitfile* points at one elsewhere, which
+    is followed only into a git administrative area.
+    """
+    dot = repo_dir / ".git"
+    if _is_symlink(dot):
+        return [], "its .git is a symlink"
+    if dot.is_dir():
+        gitdir = dot
+    elif dot.is_file():
+        try:
+            raw = dot.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            return [], f"its .git file could not be read: {exc}"
+        if not raw.startswith("gitdir:"):
+            return [], "its .git file does not name a git directory"
+        pointed = Path(raw[len("gitdir:"):].strip()).expanduser()
+        gitdir = pointed if pointed.is_absolute() else repo_dir / pointed
+        if not inside(canonical(gitdir), canonical(repo_dir)) and not _administrative_git_dir(gitdir):
+            return [], "its .git file points outside any git directory"
+    else:
+        return [], ""
+    files = [gitdir / "config"]
+    common = gitdir / "commondir"
+    if common.is_file():
+        try:
+            pointed = Path(common.read_text(encoding="utf-8").strip())
+        except (OSError, UnicodeDecodeError) as exc:
+            return [], f"its commondir could not be read: {exc}"
+        resolved = pointed if pointed.is_absolute() else gitdir / pointed
+        if not inside(canonical(resolved), canonical(repo_dir)) and not _administrative_git_dir(resolved):
+            return [], "its commondir points outside any git directory"
+        files.append(resolved / "config")
+    return files, ""
+
+
+def git_include_problem(repo_dir: Path) -> str:
+    """Why git must not be run against this repository, or "".
+
+    Screened *before* any probe. The overrides on the command line stop a
+    repository configuring a helper Helm would execute; they do nothing about
+    an `include.path` naming a file git will read. Refusing to probe is the
+    only version of this that prevents the read rather than merely surviving
+    it -- and the refusal is a finding, so the repository is not quietly
+    skipped either.
+    """
+    files, problem = _git_config_files(repo_dir)
+    if problem:
+        return problem
+    for config in files:
+        if _is_symlink(config):
+            return "its Git config is a symlink"
+        if not config.is_file():
+            continue
+        try:
+            raw = config.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"its Git config could not be read: {exc}"
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped[0] in "#;":
+                continue
+            if _GIT_INCLUDE.search(stripped):
+                return (
+                    "its Git config uses an include directive, which would make "
+                    "git read a file outside Helm's control"
+                )
+    return ""
+
+
 # ---------- small read-only helpers ----------
 
 
@@ -305,6 +406,7 @@ class _Doctor:
         #: project's pinned runtime and model are part of "what this root
         #: names" rather than a requirement discovered too late to check.
         self._project_root: Path | None = None
+        self._project_id: str = ""
         self._project_settings: dict[str, Any] = {}
         self._profiles: list[dict[str, Any]] | None = None
         #: True when a redirect means doctor never read the preferences Helm
@@ -523,6 +625,16 @@ class _Doctor:
                 "boundaries cannot be verified",
                 "no action needed if the root is deliberately untracked; otherwise "
                 "check that state/, projects/, agents/ and preferences.json are ignored",
+            )
+            return
+        include = git_include_problem(self.root)
+        if include:
+            self.error(
+                "root.boundaries",
+                f"the root repository was not inspected because {include}",
+                "remove the include directive from the repository's Git config; "
+                "doctor will not run git against a repository that can redirect it "
+                "into another file",
             )
             return
         tracked = _git_lines(
@@ -904,7 +1016,11 @@ class _Doctor:
             models.append((loaded.default_model, "preference model.default", True))
         pinned = self._project_settings.get("model")
         if isinstance(pinned, str) and pinned:
-            models.append((pinned, "the project's model pin", True))
+            # Not printable. A project's `.helm/project.json` is project
+            # configuration, the same class of content as a profile's launch
+            # command -- only a preferences value is quotable, because
+            # `helm prefs show` prints it by design.
+            models.append((pinned, "the project's model pin", False))
         ambient = os.environ.get("HELM_MODEL", "").strip()
         if ambient:
             models.append((ambient, "HELM_MODEL", False))
@@ -986,75 +1102,157 @@ class _Doctor:
             return loaded.default_model, "preference model.default", True
         return "", "", True
 
-    def _launch_candidates(self) -> list[tuple[str, dict[str, Any], list[str], bool]]:
-        """(label, profile, command, may-quote-the-error) doctor can simulate.
+    def effective_default_agent(self) -> tuple[str | None, str]:
+        """The runtime a task naming none would actually get, and its label.
+
+        Resolved through `_default_agent_id`, the launcher's own ladder, so the
+        detection step is included rather than approximated. Detection is the
+        step a preflight most needs to simulate: it is the only one that
+        produces a runtime nothing in the configuration mentions, which is
+        exactly the case an inspection of named requirements cannot see.
+        """
+        assert self.coordinator is not None
+        # `_project_agent` falls back to reading the project's own settings
+        # when the record carries no pin, so it needs a root. Doctor has
+        # already read those settings structurally, and points the fallback at
+        # a directory that has none rather than letting it open anything else.
+        project = {
+            "id": self._project_id or "",
+            "agent": self._project_settings.get("agent"),
+            "root": str(self._project_root or (self.root / "projects" if self.root else ".")),
+        }
+        try:
+            agent_id, _ = self.coordinator._default_agent_id(project)
+        except (HelmError, SafetyError, OSError, ValueError):
+            return None, ""
+        if not agent_id:
+            return None, ""
+        # The reason string from `_default_agent_id` can quote HELM_AGENT's
+        # value, so it is discarded; the id itself is printed only when it is a
+        # vocabulary word.
+        return agent_id, _named(agent_id, self._vocabulary())
+
+    def _launch_candidates(self) -> list[tuple[str, dict[str, Any], list[str]]]:
+        """(label, profile, command) for every launch doctor can simulate.
 
         These are the launches a worker would actually be given, as opposed to
         the runtime ids something merely names. A profile that inherits a
-        built-in runtime, a profile whose command bakes its own `--model`, and
-        a custom argv from `HELM_WORKER_COMMAND` each fail differently at
-        launch, and none of the three is visible to an executable-presence
-        check.
+        built-in runtime, a profile whose command bakes its own `--model`, a
+        custom argv from `HELM_WORKER_COMMAND`, and the runtime *detection*
+        picks when nothing names one each fail differently at launch, and none
+        of them is visible to an executable-presence check.
         """
         assert self.coordinator is not None
-        candidates: list[tuple[str, dict[str, Any], list[str], bool]] = []
+        candidates: list[tuple[str, dict[str, Any], list[str]]] = []
         for profile in sorted(self.profiles(), key=lambda item: str(item.get("id"))):
             resolved = self.coordinator._resolve_profile(profile, interactive=True)
             command = resolved.get("command")
             if command:
-                candidates.append((f"profile {profile['id']}", resolved, list(command), True))
+                candidates.append((f"profile {profile['id']}", resolved, list(command)))
         if os.environ.get("HELM_WORKER_COMMAND", "").strip():
             try:
                 ambient = self.coordinator._worker_command(None)
             except HelmError:
                 ambient = []
             if ambient:
-                # Never quotable: both the argv and any model baked into it are
-                # environment values.
                 candidates.append((
                     "the launch named by HELM_WORKER_COMMAND",
                     {"id": "default", "builtin": False},
                     ambient,
-                    False,
                 ))
-        for runtime_id, sources in sorted(self.named_runtimes().items()):
+        for runtime_id in sorted(self.named_runtimes()):
             runtime = runtimes.builtin_runtime(runtime_id)
             if runtime is None:
                 continue
             profile = self.coordinator._builtin_profile(runtime, interactive=True)
-            quotable = all(source != "HELM_AGENT" for source in sources)
             candidates.append((
                 f"runtime {_named(runtime_id, self._vocabulary())}",
                 profile,
                 list(profile["command"]),
-                quotable,
             ))
+        # The effective default last, and only when nothing above already
+        # covers it: a root that names no runtime at all still launches one,
+        # and that is the launch a preflight has least excuse to miss.
+        effective, shown = self.effective_default_agent()
+        if effective and effective not in self.named_runtimes():
+            try:
+                profile = self.coordinator._profile_for_agent_id(
+                    self.profiles(), effective, interactive=True
+                )
+            except HelmError:
+                profile = {}
+            command = profile.get("command") if profile else None
+            if command:
+                candidates.append((
+                    f"the runtime this session detects ({shown})", profile, list(command)
+                ))
         return candidates
+
+    def _refusal_reason(
+        self, profile: dict[str, Any], command: Sequence[str], model: str
+    ) -> str:
+        """Why a launch would be refused, in generic terms only.
+
+        Deliberately not `_with_model`'s own message. That message is written
+        for someone who already has the configuration in front of them, so it
+        quotes the model it objected to -- and that model may have been parsed
+        out of a *profile's launch command*, which is configuration-file
+        content doctor does not print. A family name is different: it comes
+        from a fixed enumeration in the classifier and is already a preference
+        key, so it names the restriction to remove without disclosing anything.
+
+        `_with_model` stays the authority on *whether* a launch is refused;
+        this only says which of the three shapes of refusal it was.
+        """
+        try:
+            loaded = self.root_preferences()
+        except (prefs.PreferencesError, OSError, ValueError):  # pragma: no cover
+            loaded = prefs.EMPTY
+        baked = runtimes.model_in_command(command)
+        if baked is not None:
+            constraint = loaded.constraint_for(baked)
+            if constraint is not None:
+                family, allowed = constraint
+                return (
+                    "its launch command selects a model in the "
+                    f"{family} family, which this root restricts to "
+                    f"{', '.join(sorted(allowed))}"
+                )
+        if model:
+            effective = profile.get("runtime") or profile.get("id")
+            constraint = loaded.constraint_for(model)
+            if constraint is not None and runtimes.builtin_runtime(effective) is not None:
+                family, allowed = constraint
+                return (
+                    f"the resolved model is in the {family} family, which this "
+                    f"root restricts to {', '.join(sorted(allowed))}"
+                )
+            if not profile.get("builtin"):
+                return (
+                    "it supplies its own launch command, which has nowhere to "
+                    "carry a resolved model"
+                )
+        return "Helm would refuse this launch"
 
     def _effective_launch_problems(self) -> list[str]:
         """Launches this root has configured that Helm would refuse to start.
 
-        Simulated through `_with_model`, which is the code that actually
-        refuses them, so a preflight cannot come to a different conclusion than
-        the launcher for the same configuration. Nothing is started: the method
-        either returns an argv nobody runs, or raises.
+        Decided by `_with_model`, which is the code that actually refuses them,
+        so a preflight cannot come to a different conclusion than the launcher
+        for the same configuration. Nothing is started: the method either
+        returns an argv nobody runs, or raises. The *wording* is doctor's own,
+        because the launcher's is free to quote configuration doctor is not.
         """
         if self._preferences_unchecked:
             return []
         assert self.coordinator is not None
-        model, source, model_printable = self._primary_model()
+        model, _, _ = self._primary_model()
         problems: list[str] = []
-        for label, profile, command, quotable in self._launch_candidates():
+        for label, profile, command in self._launch_candidates():
             try:
-                self.coordinator._with_model(profile, command, model or None, source)
-            except HelmError as exc:
-                if quotable and model_printable:
-                    problems.append(f"{label}: {exc}")
-                else:
-                    problems.append(
-                        f"{label} cannot be started with the model named by "
-                        f"{source or 'this root'}"
-                    )
+                self.coordinator._with_model(profile, command, model or None, "")
+            except HelmError:
+                problems.append(f"{label}: {self._refusal_reason(profile, command, model)}")
             except (SafetyError, OSError, ValueError):  # pragma: no cover
                 continue
         return problems
@@ -1121,12 +1319,35 @@ class _Doctor:
                 "delegation needs something to start",
             )
             return
-        detail = "named runtimes usable; " if named else ""
+        # Which runtime is *installed* is not the question a task asks. A task
+        # naming no agent gets exactly one runtime, chosen by the ladder ending
+        # in detection, and reporting the installed set as though any of them
+        # would do is what let a detected runtime the launcher then refused
+        # read as healthy here.
+        effective, shown = self.effective_default_agent()
+        if effective is None:
+            self.warn(
+                "root.runtimes",
+                f"{len(launchable)} built-in runtime(s) are launchable but none is "
+                "pinned, configured, or detectable, so a task naming no agent has "
+                "nothing to resolve to",
+                "name one with helm prefs set agent.default, or pin one in the "
+                "project's .helm/project.json",
+            )
+            return
+        if effective in excluded:
+            self.error(
+                "root.runtimes",
+                f"the runtime a task would resolve to ({shown}) is excluded by this root",
+                "name a different agent.default, or drop the exclusion with "
+                "helm prefs unset agent.exclude",
+            )
+            return
         self.ok(
             "root.runtimes",
-            f"{detail}{len(launchable)} built-in runtime(s) launchable: "
-            f"{', '.join(launchable)} (executable presence only, not credential "
-            "or catalogue readiness)",
+            f"a task naming no agent resolves to {shown}; "
+            f"{len(launchable)} built-in runtime(s) launchable: {', '.join(launchable)} "
+            "(executable presence only, not credential or catalogue readiness)",
         )
 
     def _check_herdr(self) -> None:
@@ -1193,6 +1414,7 @@ class _Doctor:
         if not project_root.is_dir() or self._settings_paths_linked(project_root):
             return
         self._project_root = project_root
+        self._project_id = project_id
         try:
             assert self.coordinator is not None
             settings = self.coordinator._discovery_settings(project_root)
@@ -1275,6 +1497,19 @@ class _Doctor:
         return True
 
     def _check_git(self, project_root: Path) -> bool:
+        # Screened before the first probe, not after it: the point is that git
+        # never opens the included file, which a check running afterwards
+        # cannot deliver.
+        include = git_include_problem(project_root)
+        if include:
+            self.error(
+                "project.git",
+                f"the project was not inspected because {include}",
+                "remove the include directive from the project's Git config; "
+                "doctor will not run git against a repository that can redirect "
+                "it into another file",
+            )
+            return False
         toplevel = _git_lines(project_root, "rev-parse", "--show-toplevel")
         if not toplevel:
             self.error(

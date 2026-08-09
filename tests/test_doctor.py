@@ -17,8 +17,8 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
-from helm import cli, doctor, preferences
-from helm.core import Coordinator, SafetyError, StateStore, canonical
+from helm import cli, doctor, preferences, runtimes
+from helm.core import Coordinator, HelmError, SafetyError, StateStore, canonical
 
 from tests.support import SHIPPED_DOMAINS, HelmTestCase
 
@@ -1340,11 +1340,16 @@ class SecondReviewRegressionTests(DoctorTestCase):
             agent={"default": "claude"},
             model={"default": "claude-opus-5", "runtimes": {"claude": ["claude"]}},
         )
-        with mock.patch.object(
+        # The suite pins HELM_AGENT=none, which outranks a root preference and
+        # would correctly leave a task naming no agent with nothing to resolve
+        # to. Cleared here so the preference under test is the one that decides.
+        with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(
             Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
         ):
             report = self.report(helm_root)
-        self.assertEqual(self.finding(report, "root.runtimes").severity, doctor.OK)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.OK)
+        self.assertIn("resolves to claude", finding.message)
 
     def test_a_configured_profile_cannot_carry_a_resolved_model(self) -> None:
         """Core refuses this at launch, so the preflight has to say so.
@@ -1470,3 +1475,315 @@ class SecondReviewRegressionTests(DoctorTestCase):
             finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
         self.assertEqual(finding.severity, doctor.WARNING)
         self.assertIn("could not list the remotes", finding.message)
+
+
+class ThirdReviewRegressionTests(DoctorTestCase):
+    """One case per finding from the third independent review.
+
+    All three are the same species as round two's: a guarantee that held at the
+    place it was written and not at the place it was needed. A value was
+    redacted at one call site and quoted at another; git's environment was
+    scrubbed while the repository's own config still named files to open; the
+    launcher's ladder was simulated down to its last rung and not past it.
+    """
+
+    # 1 -- a model recovered from profile configuration must not be printed.
+
+    def test_a_model_baked_into_a_profile_command_is_never_printed(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, model={"runtimes": {"claude": ["pi"]}})
+        baked = "claude-sk-secret-baked-model"
+        (helm_root / "agents.json").write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {
+                            "id": "codex",
+                            "runtime": "codex",
+                            "command": ["git", "--model", baked],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.report(helm_root)
+        rendered = doctor.render_json(report)
+
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertNotIn(baked, rendered)
+        self.assertNotIn("sk-secret", rendered)
+        # The validated profile id and the family name are enough to act on.
+        self.assertIn("codex", finding.message)
+        self.assertIn("claude", finding.message)
+
+    def test_no_launch_argv_reaches_output_from_any_candidate(self) -> None:
+        """Belt and braces across every candidate shape at once."""
+        helm_root, _ = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            model={"default": "claude-opus-5", "runtimes": {"claude": ["pi"]}},
+        )
+        (helm_root / "agents.json").write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {"id": "inherits", "runtime": "codex"},
+                        {
+                            "id": "bakes",
+                            "runtime": "codex",
+                            "command": ["git", "--model", "claude-sk-one"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ, {"HELM_WORKER_COMMAND": "git --model claude-sk-two"}
+        ):
+            rendered = doctor.render_json(self.report(helm_root))
+        for leaked in ("claude-sk-one", "claude-sk-two", "--model", "git "):
+            self.assertNotIn(leaked, rendered, f"{leaked!r} reached output")
+
+    def test_a_project_pinned_model_value_is_not_quoted(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, model={"runtimes": {"claude": ["pi"]}})
+        project_root = self.add_project(helm_root, "alpha")
+        (project_root / ".helm").mkdir()
+        (project_root / ".helm" / "project.json").write_text(
+            json.dumps({"agent": "codex", "model": "claude-sk-pinned"}), encoding="utf-8"
+        )
+        report = self.report(helm_root, "alpha")
+        rendered = doctor.render_json(report)
+        self.assertEqual(self.finding(report, "root.runtimes").severity, doctor.ERROR)
+        self.assertNotIn("sk-pinned", rendered)
+
+    # 2 -- a repository include must not cause any external read.
+
+    def test_a_repository_include_stops_the_probe_before_git_runs(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        outside = Path(self.temp.name) / "outside-gitconfig"
+        outside.write_text("[core]\n\tbare = notabool\n", encoding="utf-8")
+        with (project_root / ".git" / "config").open("a", encoding="utf-8") as stream:
+            stream.write(f"[include]\n\tpath = {outside}\n")
+
+        commands: list[tuple[str, ...]] = []
+        real = doctor.subprocess.run
+
+        def watched(command, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(tuple(command))
+            return real(command, **kwargs)
+
+        with mock.patch("helm.doctor.subprocess.run", watched):
+            report = self.report(helm_root, "alpha")
+
+        finding = self.finding(report, "project.git")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("include directive", finding.message)
+        # The point is the absence of the read, so no git ran against it.
+        self.assertFalse(
+            [c for c in commands if str(project_root) in c],
+            "doctor ran git against a repository that could redirect it",
+        )
+        self.assertNotIn(str(outside), doctor.render_json(report))
+
+    def test_an_includeif_is_caught_too(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        with (project_root / ".git" / "config").open("a", encoding="utf-8") as stream:
+            stream.write('[includeIf "gitdir:/"]\n\tpath = /etc/helm-not-real\n')
+        finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("include directive", finding.message)
+
+    def test_a_commented_include_is_not_a_false_positive(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        with (project_root / ".git" / "config").open("a", encoding="utf-8") as stream:
+            stream.write("# [include]\n; path = /etc/nope\n")
+        self.assertEqual(
+            self.finding(self.report(helm_root, "alpha"), "project.git").severity,
+            doctor.OK,
+        )
+
+    def test_a_root_repository_include_stops_the_boundary_probe(self) -> None:
+        helm_root, _ = self.sound_root()
+        subprocess.run(["git", "init", "-q", str(helm_root)], check=True)
+        outside = Path(self.temp.name) / "root-gitconfig"
+        outside.write_text("[user]\n\tname = planted\n", encoding="utf-8")
+        with (helm_root / ".git" / "config").open("a", encoding="utf-8") as stream:
+            stream.write(f"[include]\n\tpath = {outside}\n")
+        finding = self.finding(self.report(helm_root), "root.boundaries")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("include directive", finding.message)
+
+    def test_a_gitfile_pointing_outside_any_git_directory_is_refused(self) -> None:
+        """`gitdir: ~/.aws` would otherwise have doctor read ~/.aws/config."""
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        elsewhere = Path(self.temp.name) / "not-a-git-area"
+        shutil.move(str(project_root / ".git"), str(elsewhere))
+        (project_root / ".git").write_text(f"gitdir: {elsewhere}\n", encoding="utf-8")
+        opened: list[str] = []
+        with self.watch_reads(opened):
+            finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("outside any git directory", finding.message)
+        self.assertNotIn(str(elsewhere / "config"), opened)
+
+    def test_a_linked_worktree_is_inspected_normally(self) -> None:
+        """Helm's own task worktrees are linked worktrees.
+
+        A screen that refused every gitfile pointing outside the checkout would
+        refuse the exact layout this repository is built around -- doctor would
+        error on every task worktree it was run in.
+        """
+        helm_root, _ = self.sound_root()
+        origin = self.repo("worktree-origin")
+        project_root = helm_root / "projects" / "alpha"
+        subprocess.run(
+            ["git", "-C", str(origin), "worktree", "add", "-q", "-b", "wt",
+             str(project_root)],
+            check=True,
+        )
+        self.addCleanup(
+            lambda: subprocess.run(
+                ["git", "-C", str(origin), "worktree", "remove", "--force",
+                 str(project_root)],
+                check=False,
+            )
+        )
+        self.assertTrue((project_root / ".git").is_file(), "expected a gitfile")
+
+        finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+
+        self.assertEqual(finding.severity, doctor.OK, finding.message)
+
+    def test_an_include_in_a_linked_worktrees_shared_config_is_caught(self) -> None:
+        """The include can sit in the common config, not the per-worktree one."""
+        helm_root, _ = self.sound_root()
+        origin = self.repo("shared-origin")
+        project_root = helm_root / "projects" / "alpha"
+        subprocess.run(
+            ["git", "-C", str(origin), "worktree", "add", "-q", "-b", "wt2",
+             str(project_root)],
+            check=True,
+        )
+        self.addCleanup(
+            lambda: subprocess.run(
+                ["git", "-C", str(origin), "worktree", "remove", "--force",
+                 str(project_root)],
+                check=False,
+            )
+        )
+        with (origin / ".git" / "config").open("a", encoding="utf-8") as stream:
+            stream.write("[include]\n\tpath = /etc/helm-not-real\n")
+
+        finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("include directive", finding.message)
+
+    def test_a_symlinked_git_config_is_refused(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        planted = Path(self.temp.name) / "planted-config"
+        planted.write_text("[core]\n", encoding="utf-8")
+        (project_root / ".git" / "config").unlink()
+        (project_root / ".git" / "config").symlink_to(planted)
+        opened: list[str] = []
+        with self.watch_reads(opened):
+            finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertNotIn(str(planted), opened)
+
+    # 3 -- the fallback detector is part of the effective launch.
+
+    def test_a_detected_runtime_refused_by_the_launcher_is_an_error(self) -> None:
+        """The exact reproduction: nothing names a runtime, detection picks one."""
+        helm_root, _ = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            model={"default": "claude-opus-5", "runtimes": {"claude": ["claude"]}},
+        )
+        detected = runtimes.builtin_runtime("codex")
+        with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(
+            runtimes, "detect_runtime", lambda *a, **k: detected
+        ), mock.patch.object(
+            Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
+        ):
+            report = self.report(helm_root)
+
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("codex", finding.message)
+        self.assertEqual(report.exit_code, 1)
+
+    def test_a_detected_runtime_the_launcher_accepts_stays_ok(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            model={"default": "claude-opus-5", "runtimes": {"claude": ["claude"]}},
+        )
+        detected = runtimes.builtin_runtime("claude")
+        with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(
+            runtimes, "detect_runtime", lambda *a, **k: detected
+        ), mock.patch.object(
+            Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
+        ):
+            report = self.report(helm_root)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.OK)
+        self.assertIn("resolves to claude", finding.message)
+
+    def test_doctor_and_the_launcher_agree_on_the_detected_runtime(self) -> None:
+        """The invariant itself, asserted against the production selector."""
+        helm_root, coordinator = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            model={"default": "claude-opus-5", "runtimes": {"claude": ["claude"]}},
+        )
+        self.add_project(helm_root, "alpha")
+        detected = runtimes.builtin_runtime("codex")
+        with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(
+            runtimes, "detect_runtime", lambda *a, **k: detected
+        ), mock.patch.object(
+            Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
+        ):
+            report = self.report(helm_root, "alpha")
+            project = coordinator.discover_project(helm_root, "alpha")
+            task = coordinator.create_task(project["id"], "do the thing")
+            with self.assertRaises(HelmError):
+                coordinator._select_agent(
+                    coordinator.store.load(), project, task, None
+                )
+
+        self.assertEqual(self.finding(report, "root.runtimes").severity, doctor.ERROR)
+
+    def test_no_resolvable_default_runtime_is_a_warning_not_silence(self) -> None:
+        helm_root, _ = self.sound_root()
+        with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(
+            runtimes, "detect_runtime", lambda *a, **k: None
+        ):
+            report = self.report(helm_root)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("nothing to resolve to", finding.message)
+        self.assertEqual(report.exit_code, 0)
+
+    def test_an_excluded_effective_runtime_is_an_error(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, agent={"exclude": ["codex"]})
+        detected = runtimes.builtin_runtime("codex")
+        with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(
+            runtimes, "detect_runtime", lambda *a, **k: detected
+        ), mock.patch.object(
+            Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
+        ):
+            finding = self.finding(self.report(helm_root), "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("excluded", finding.message)

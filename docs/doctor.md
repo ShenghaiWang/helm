@@ -112,13 +112,29 @@ a preflight handing control to the thing it was asked to inspect — and a statu
 probe would be a write.
 
 The **entire `GIT_*` environment namespace is dropped** from every probe, and
-`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` are then set
-so the `-c` flags are the whole of the configuration. `-c` flags stop a
-*repository* configuring a helper; they do nothing about `GIT_DIR`,
-`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` or `GIT_CONFIG_GLOBAL` pointing git at
-different files entirely. Dropping the namespace is the only version of this
-that does not require a complete, permanently up-to-date list of git's path
-variables to be correct.
+`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` are then set.
+`-c` flags stop a *repository* configuring a helper; they do nothing about
+`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` or `GIT_CONFIG_GLOBAL`
+pointing git at different files entirely. Dropping the namespace is the only
+version of this that does not require a complete, permanently up-to-date list of
+git's path variables to be correct.
+
+That still leaves the one configuration file no command line can suppress: git
+always reads the **repository's own** `.git/config`, and an `include.path` or
+`includeIf` there names a file git will open — anywhere on the filesystem,
+including a credential store. Overriding the dangerous *values* does not prevent
+that read; only not running git does. So doctor screens the repository's config
+files first, without running git, and **refuses to probe** a repository whose
+config uses an include directive, reporting `project.git` (or `root.boundaries`)
+as an `error` rather than skipping it quietly. The screen also refuses a `.git`
+symlink, a symlinked config file, and a gitfile pointing somewhere that is not a
+git administrative area at all (`gitdir: ~/.aws` would otherwise have doctor read
+`~/.aws/config`). A **linked worktree** is not refused: its git directory
+legitimately lives under the main repository's `.git/worktrees/<name>`, and
+Helm's own task worktrees are exactly that shape, so both its own config and the
+shared one are screened where they actually are. Locating those files is done by
+reading the gitfile and `commondir` directly, for the same reason: running git is
+the thing being gated.
 
 A probe that **does not answer** (a corrupt index, a timeout, a missing `git`)
 is never read as a clean answer. That distinction is the difference between
@@ -174,11 +190,11 @@ iteration, filesystem order, or wall-clock time.
 | `root.layout` | `projects/` or `state/` is missing | `domains/` or `agents/` is missing |
 | `root.symlinks` | a Helm-owned root directory (`projects`, `domains`, `agents`, `state`) is a symlink | — |
 | `root.state` | state cannot be opened, parsed, is version-unsupported, has an unwalkable shape (any of `projects`, `tasks`, `workers`, `config`, `approval_grants`, `integrations` not an object, or `messages`, `artifacts`, `learning_proposals` not a list), or its directory identity does not match the root | state directory or state file is readable beyond its owner |
-| `root.boundaries` | any path under `state/`, `agents/`, `projects/`, or `preferences.json` is **tracked** in the root's Git repository, other than the exact shipped `.gitkeep` placeholders | the root is not a Git repository, or Git could not answer, so the boundary cannot be verified |
+| `root.boundaries` | any path under `state/`, `agents/`, `projects/`, or `preferences.json` is **tracked** in the root's Git repository, other than the exact shipped `.gitkeep` placeholders, or the root repository's Git configuration uses an include directive | the root is not a Git repository, or Git could not answer, so the boundary cannot be verified |
 | `root.preferences` | the file is a symlink, unparseable, oversized, or carries an unknown key or invalid value | `HELM_PREFERENCES_FILE` redirects preferences away from the root |
 | `root.domains` | `domains/` is a symlink, or a domain manifest, `extends` chain, or manifest link is invalid | a domain directory has no readable `knowledge.md` |
 | `root.profiles` | `agents/` or an agent configuration file is a symlink, a profile is malformed, or a profile's launch **or availability-check** executable is missing, or `HELM_WORKER_COMMAND` names one that is not available | `HELM_AGENTS_FILE` redirects profiles away from the root |
-| `root.runtimes` | a runtime this root *names* has no executable on `PATH`, is excluded by this root, or the launch Helm would actually perform is one it would refuse to start | no built-in runtime at all is launchable, or a preferences redirect means the restrictions could not be read |
+| `root.runtimes` | a runtime this root *names* has no executable on `PATH`, the runtime a task would actually resolve to is excluded, or the launch Helm would actually perform is one it would refuse to start | no built-in runtime at all is launchable, nothing is pinned/configured/detectable, or a preferences redirect means the restrictions could not be read |
 | `root.herdr` | `HERDR_ENV=1` but the `herdr` executable is not on `PATH` | — |
 | `root.authority` | — | — (always `ok`; reports whether a capability is configured) |
 
@@ -193,7 +209,7 @@ and from Helm's own state; **doctor never registers it**.
 | id | error when | warning when |
 | --- | --- | --- |
 | `project.location` | `projects/` or `projects/<id>` is a symlink, or `projects/<id>` is not a directory or resolves outside `projects/` | — |
-| `project.git` | not its own committed Git repository root (no repo, nested repo, or no commit) | the checkout is dirty, mid-operation, or Git could not report its state |
+| `project.git` | not its own committed Git repository root (no repo, nested repo, or no commit), or its Git configuration uses an include directive, a symlink, or a git directory outside the project | the checkout is dirty, mid-operation, or Git could not report its state |
 | `project.isolation` | its root overlaps another registered project's root | — |
 | `project.config` | `.helm/project.json` is unreadable, is not an object, or fails validation | — |
 | `project.base_branch` | a configured `base_branch` does not resolve locally | no base branch can be determined **locally**; name one explicitly |
@@ -228,12 +244,28 @@ whether it was named by the root or by one project.
 `root.runtimes` also **simulates the launch itself**, through the same
 `_with_model` that refuses one at spawn time, so the preflight cannot reach a
 different conclusion than the launcher for the same configuration. That covers
-three cases an executable-presence check cannot see: a profile inheriting a
+four cases an executable-presence check cannot see: a profile inheriting a
 built-in runtime whose model family this root restricts elsewhere, a profile
-command that bakes its own `--model`, and a custom argv (`HELM_WORKER_COMMAND`,
-or any profile supplying its own command) that has nowhere to put a resolved
-model. Nothing is started — the simulation either returns an argv nobody runs,
-or raises.
+command that bakes its own `--model`, a custom argv (`HELM_WORKER_COMMAND`, or
+any profile supplying its own command) that has nowhere to put a resolved model,
+and — the one nothing in the configuration mentions — the runtime **detection**
+selects when nothing names one. Nothing is started: the simulation either
+returns an argv nobody runs, or raises.
+
+The effective default runtime is resolved through `_default_agent_id`, the
+launcher's own ladder, detection step included. `root.runtimes` therefore names
+*the* runtime a task naming no agent would get, rather than reporting the set of
+installed runtimes as though any of them would do — a detected runtime the
+launcher would refuse is an `error`, an excluded one is an `error`, and a root
+where nothing is pinned, configured, or detectable is a `warning`, because a
+task naming no agent then has nothing to resolve to.
+
+The *wording* of a refusal is doctor's own, not `_with_model`'s. The launcher's
+message is written for someone holding the configuration and quotes the model it
+objected to — which may have been parsed out of a profile's launch command. So
+doctor reports the validated profile id and a generic incompatibility reason,
+naming only the model **family**, which comes from a fixed enumeration and is
+already a preference key.
 
 ## JSON output
 
@@ -321,10 +353,15 @@ output, not even redacted. Concretely, doctor:
   `HELM_AGENT`, `HELM_MODEL`, or `HELM_WORKER_COMMAND` is described by its
   source and never quoted — "it looks like an ordinary runtime id" is exactly
   the judgement a leak survives;
-- never prints a launch command or its `argv[0]`. A profile's executable is
-  configuration-file content, and the underlying validator's own failure reason
-  quotes it, so `root.profiles` reports the *profile id* and a fixed category
-  ("launch executable is not available") instead of passing that reason through.
+- never prints a launch command, its `argv[0]`, or a model recovered from one.
+  A profile's executable and any `--model` baked into its command are
+  configuration-file content, and the underlying validators quote both in their
+  own failure messages, so `root.profiles` and `root.runtimes` report the
+  *profile id* plus a fixed category instead of passing those messages through;
+- quotes a model identifier only when it came from `preferences.json`, which
+  `helm prefs show` prints by design. A model from a project's
+  `.helm/project.json`, from a profile command, or from the environment is
+  described by its source alone.
 
 ## Implementation pointers
 
