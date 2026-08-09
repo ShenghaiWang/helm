@@ -30,6 +30,7 @@ from .core import (
 from . import doctor as doctor_module
 from . import models
 from . import preferences
+from . import runtimes
 from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter
 
 
@@ -177,6 +178,47 @@ def _model_cost(entry: Any) -> str:
     return "free" if entry.free else "unknown"
 
 
+def _profile_runtime_id(
+    profile: dict[str, Any],
+    *,
+    which: "callable[[str], str | None] | None" = None,
+) -> str | None:
+    """Name the built-in runtime a profile's catalogue may safely be reused from.
+
+    Two provable cases only -- never a bare basename guess, which would credit
+    a profile with a built-in's catalogue merely because some other program on
+    `PATH` happens to share its name:
+
+    - a validated `runtime` declaration (`_load_agent_profiles` already
+      refused anything that does not name a known built-in), as long as an
+      explicit command does not name a different program; a declared runtime
+      whose command disagrees is a misconfiguration, not evidence.
+    - an undeclared command whose executable resolves, through the same
+      search Helm would use to launch it, to the exact same file on disk as
+      the built-in of that basename -- so `/opt/vendor/pi` is credited only
+      when it *is* the `pi` Helm would launch, never merely named `pi`.
+
+    The profile's command is never executed to answer this question.
+    """
+    find = shutil.which if which is None else which
+    declared = profile.get("runtime")
+    command = profile.get("command") or []
+    basename = Path(str(command[0])).name if command else None
+    if declared:
+        if basename and basename != declared:
+            return None
+        return str(declared)
+    if basename is None or runtimes.builtin_runtime(basename) is None:
+        return None
+    profile_resolved = find(command[0])
+    builtin_resolved = find(basename)
+    if profile_resolved is None or builtin_resolved is None:
+        return None
+    if profile_resolved != builtin_resolved:
+        return None
+    return basename
+
+
 def _agent_models_report(coordinator: Coordinator) -> dict[str, Any]:
     """One deterministic report: readiness per runtime plus live catalogues.
 
@@ -232,51 +274,66 @@ def _agent_models_report(coordinator: Coordinator) -> dict[str, Any]:
             "launchable": entry["available"],
             "excluded": entry["excluded"],
             "default": entry["default"],
+            "default_reason": entry["default_reason"],
             "detected": entry["detected"],
             "catalogue": catalogue,
         })
     # Same resolved id `builtin_runtime_availability` used above for the
     # built-in rows' own `default` flag, reused here so a profile can be
     # named as the root default too (e.g. `HELM_AGENT=<profile id>`).
-    default_agent_id, _ = coordinator._root_agent_default()
+    default_agent_id, default_agent_reason = coordinator._root_agent_default()
+    excluded_agents = coordinator.excluded_agents()
     for profile in coordinator.list_agent_profiles():
-        # A profile's command is never executed here -- it is only compared,
-        # by basename, against the built-in runtimes Helm already proved
-        # launchable above. A match reuses that catalogue query verbatim;
-        # anything else (a wrapper, an opaque script, no command at all) is
-        # reported unsupported rather than run to find out what it is.
+        # A profile's command is never executed here. `_profile_runtime_id`
+        # names the built-in runtime only for the two provable cases; anything
+        # else (an opaque wrapper, a disagreeing command, no command at all)
+        # is reported unsupported rather than guessed at.
+        runtime_id = _profile_runtime_id(profile)
         command = profile.get("command") or []
-        runtime_id = Path(str(command[0])).name if command else None
-        query = queried.get(runtime_id) if runtime_id else None
-        if query is not None:
+        if runtime_id is not None and runtime_id in excluded_agents:
+            # A profile that inherits an excluded runtime is refused the same
+            # way a bare `--agent <that runtime>` would be: the root's cost
+            # decision, not this command's own shape, is why it has no
+            # catalogue -- so it reads exactly like the built-in's own row.
             catalogue = {
-                "command": list(query.command),
-                "supported": query.supported,
-                "available": query.available,
-                "reason": query.reason,
-                "models": [
-                    {"id": model.id, "cost": _model_cost(model)}
-                    for model in query.models
-                ],
-            }
-        else:
-            catalogue = {
-                "command": [],
-                "supported": False,
+                "command": list(models.catalogue_command(runtime_id) or ()),
+                "supported": models.catalogue_command(runtime_id) is not None,
                 "available": False,
-                "reason": (
-                    f"configured command does not provably invoke a built-in "
-                    f"runtime's catalogue command: {' '.join(command) or '(none)'}"
-                ),
+                "reason": "skipped: this root excludes the runtime",
                 "models": [],
             }
+        else:
+            query = queried.get(runtime_id) if runtime_id else None
+            if query is not None:
+                catalogue = {
+                    "command": list(query.command),
+                    "supported": query.supported,
+                    "available": query.available,
+                    "reason": query.reason,
+                    "models": [
+                        {"id": model.id, "cost": _model_cost(model)}
+                        for model in query.models
+                    ],
+                }
+            else:
+                catalogue = {
+                    "command": [],
+                    "supported": False,
+                    "available": False,
+                    "reason": (
+                        f"configured command does not provably invoke a built-in "
+                        f"runtime's catalogue command: {' '.join(command) or '(none)'}"
+                    ),
+                    "models": [],
+                }
         runtimes_report.append({
             "id": profile["id"],
             "name": profile["name"],
             "builtin": False,
             "launchable": None,
-            "excluded": False,
+            "excluded": runtime_id is not None and runtime_id in excluded_agents,
             "default": profile["id"] == default_agent_id,
+            "default_reason": default_agent_reason if profile["id"] == default_agent_id else "",
             "detected": False,
             "catalogue": catalogue,
         })
@@ -331,12 +388,20 @@ def _print_agent_models(coordinator: Coordinator, *, as_json: bool) -> None:
             status = "ok"
         else:
             status = "unavailable"
+        # `default` fires for HELM_AGENT, the root preference, *and*
+        # detection (see `Coordinator._root_agent_default`), but only the
+        # first two are a standing choice worth calling "root default" --
+        # detection is a guess made for lack of one, the same fact `[this
+        # session]` already names for the built-in `detected` flag.
+        detected_default = entry["default"] and entry["default_reason"].startswith(
+            "same runtime as this Helm session"
+        )
         marks = ""
         if entry["excluded"]:
             marks = " [excluded by root]"
-        elif entry["default"]:
+        elif entry["default"] and not detected_default:
             marks = " [root default]"
-        elif entry["detected"]:
+        elif entry["detected"] or detected_default:
             marks = " [this session]"
         print(
             f"{entry['id']:<10} {command:<20} {status:<12} "

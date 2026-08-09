@@ -3354,9 +3354,13 @@ class Coordinator:
         ``available`` is executable presence alone. It must not read as "this
         root will let you use it", so the same rows also carry the root's own
         verdicts: ``excluded`` when the root will not start the runtime at
-        all, and ``default`` when the root names it as `agent.default` -- an
+        all, and ``default`` when `_root_agent_default` resolves to it --
+        `HELM_AGENT`, this root's own `agent.default` preference, or (lacking
+        either) the runtime this Helm session is itself detected to be
+        running under. ``default_reason`` names which of the three it was, so
+        a caller can tell a standing choice from a same-session guess. An
         excluded runtime stays *excluded*, never "unavailable" and never
-        quietly "available".
+        quietly "available", and it is never marked ``default`` either.
         """
         detected = runtimes.detect_runtime()
         integrations = runtimes.herdr_integration_status()

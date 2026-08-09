@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 from helm import cli, models, preferences
+from helm import runtimes as coordinator_runtimes
 from helm.core import Coordinator, StateStore
 
 from tests.support import HelmTestCase
@@ -349,20 +350,20 @@ class ReadinessAndCliTests(HelmTestCase):
             {"id": "alpha-1:free", "cost": "free"},
         )
 
-    def test_agent_models_maps_a_profile_only_to_a_provable_builtin_invocation(
+    def _write_agents(self, helm_root: Path, agents: list[dict]) -> None:
+        (helm_root / "agents.json").write_text(json.dumps({"agents": agents}))
+
+    def test_agent_models_reuses_catalogue_for_declared_runtime_with_no_command(
         self,
     ) -> None:
         coordinator, helm_root = self._root()
         self.write_preferences(helm_root, model={"free": "prefer"})
-        (helm_root / "agents.json").write_text(
-            json.dumps(
-                {
-                    "agents": [
-                        {"id": "pi-alias", "command": ["pi", "--agent-mode"]},
-                        {"id": "opaque", "command": ["some-wrapper-script"]},
-                    ]
-                }
-            )
+        self._write_agents(
+            helm_root,
+            [
+                {"id": "pi-alias", "runtime": "pi"},
+                {"id": "opaque", "command": ["some-wrapper-script"]},
+            ],
         )
         queried: list[str] = []
         buffer = io.StringIO()
@@ -374,8 +375,8 @@ class ReadinessAndCliTests(HelmTestCase):
             report = cli._agent_models_report(coordinator)
             queried.clear()
             cli._print_agent_models(coordinator, as_json=False)
-        # The profile's own command is never run -- only compared by
-        # basename -- so "pi" is queried exactly once for both rows.
+        # The profile's own command is never run -- and there is none here --
+        # so "pi" is queried exactly once, for the built-in row.
         self.assertEqual(queried.count("pi"), 1)
         by_id = {entry["id"]: entry for entry in report["runtimes"]}
         self.assertTrue(by_id["pi-alias"]["catalogue"]["available"])
@@ -390,6 +391,134 @@ class ReadinessAndCliTests(HelmTestCase):
         )
         self.assertIn("pi-alias   ", buffer.getvalue())
         self.assertRegex(buffer.getvalue(), r"pi-alias\s+.*\s+ok\s")
+
+    def test_agent_models_refuses_a_declared_runtime_that_disagrees_with_its_command(
+        self,
+    ) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, model={"free": "prefer"})
+        self._write_agents(
+            helm_root,
+            [{"id": "mislabeled", "runtime": "pi", "command": ["opencode", "models"]}],
+        )
+        with mock.patch(
+            "helm.cli.models.query_catalogue",
+            side_effect=self._fake_query(raise_for=set(), queried=[]),
+        ), mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")):
+            report = cli._agent_models_report(coordinator)
+        by_id = {entry["id"]: entry for entry in report["runtimes"]}
+        self.assertFalse(by_id["mislabeled"]["catalogue"]["supported"])
+        self.assertIn(
+            "does not provably invoke a built-in runtime",
+            by_id["mislabeled"]["catalogue"]["reason"],
+        )
+
+    def test_agent_models_does_not_credit_a_same_named_program_at_a_different_path(
+        self,
+    ) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, model={"free": "prefer"})
+        self._write_agents(
+            helm_root, [{"id": "impostor", "command": ["/opt/rogue/pi", "serve"]}]
+        )
+
+        def fake_which(name: str) -> str | None:
+            if name == "/opt/rogue/pi":
+                return "/opt/rogue/pi"
+            if name == "pi":
+                return "/usr/local/bin/pi"
+            return None
+
+        with mock.patch(
+            "helm.cli.models.query_catalogue",
+            side_effect=self._fake_query(raise_for=set(), queried=[]),
+        ), mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")), \
+            mock.patch("helm.cli.shutil.which", side_effect=fake_which):
+            report = cli._agent_models_report(coordinator)
+        by_id = {entry["id"]: entry for entry in report["runtimes"]}
+        # Same basename, different file on disk: never credited with pi's
+        # catalogue, and pi's own catalogue must not have been re-queried
+        # under the impostor's path.
+        self.assertFalse(by_id["impostor"]["catalogue"]["supported"])
+        self.assertIn(
+            "does not provably invoke a built-in runtime",
+            by_id["impostor"]["catalogue"]["reason"],
+        )
+
+    def test_agent_models_credits_the_exact_same_executable_by_a_different_path(
+        self,
+    ) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, model={"free": "prefer"})
+        self._write_agents(
+            helm_root, [{"id": "vendored", "command": ["/opt/vendor/pi", "serve"]}]
+        )
+
+        def fake_which(name: str) -> str | None:
+            if name in ("/opt/vendor/pi", "pi"):
+                return "/usr/local/bin/pi"
+            return None
+
+        queried: list[str] = []
+        with mock.patch(
+            "helm.cli.models.query_catalogue",
+            side_effect=self._fake_query(raise_for=set(), queried=queried),
+        ), mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")), \
+            mock.patch("helm.cli.shutil.which", side_effect=fake_which):
+            report = cli._agent_models_report(coordinator)
+        by_id = {entry["id"]: entry for entry in report["runtimes"]}
+        self.assertTrue(by_id["vendored"]["catalogue"]["available"])
+        self.assertEqual(
+            by_id["vendored"]["catalogue"]["models"], by_id["pi"]["catalogue"]["models"]
+        )
+        self.assertEqual(queried.count("pi"), 1)
+
+    def test_agent_models_marks_a_profile_excluded_for_its_inherited_runtime(
+        self,
+    ) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, model={"free": "prefer"})
+        self._write_agents(helm_root, [{"id": "codex-wrapper", "runtime": "codex"}])
+        queried: list[str] = []
+        with mock.patch(
+            "helm.cli.models.query_catalogue",
+            side_effect=self._fake_query(raise_for={"codex"}, queried=queried),
+        ), mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")), \
+            mock.patch.dict(os.environ, {"HELM_EXCLUDE_AGENTS": "codex"}):
+            report = cli._agent_models_report(coordinator)
+        by_id = {entry["id"]: entry for entry in report["runtimes"]}
+        self.assertTrue(by_id["codex-wrapper"]["excluded"])
+        self.assertEqual(
+            by_id["codex-wrapper"]["catalogue"]["reason"],
+            "skipped: this root excludes the runtime",
+        )
+        self.assertNotIn("codex", queried)
+
+    def test_agent_models_default_marks_this_session_when_only_detected(
+        self,
+    ) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, model={"free": "prefer"})
+        queried: list[str] = []
+        buffer = io.StringIO()
+        with mock.patch(
+            "helm.cli.models.query_catalogue",
+            side_effect=self._fake_query(raise_for=set(), queried=queried),
+        ), mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")), \
+            mock.patch.dict(os.environ, {"HELM_AGENT": ""}), \
+            mock.patch(
+                "helm.core.runtimes.detect_runtime",
+                return_value=next(
+                    r for r in coordinator_runtimes.BUILTIN_RUNTIMES if r.id == "pi"
+                ),
+            ), contextlib.redirect_stdout(buffer):
+            report = cli._agent_models_report(coordinator)
+            cli._print_agent_models(coordinator, as_json=False)
+        by_id = {entry["id"]: entry for entry in report["runtimes"]}
+        self.assertTrue(by_id["pi"]["default"])
+        self.assertTrue(by_id["pi"]["default_reason"].startswith("same runtime"))
+        self.assertIn("[this session]", buffer.getvalue())
+        self.assertNotIn("[root default]", buffer.getvalue())
 
     def test_agent_models_json_is_stable_and_deterministic(self) -> None:
         coordinator, helm_root = self._root()
