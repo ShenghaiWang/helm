@@ -6173,28 +6173,41 @@ class HelmCoordinatorTests(unittest.TestCase):
                 return True
 
         terminal = FakeTerminal()
-        painted_first = cli._project_paint(first, "status: harvest done", stream=terminal)
-        painted_second = cli._project_paint(second, "status: harvest done", stream=terminal)
-        # Same text, different projects, visibly different lines.
-        self.assertNotEqual(painted_first, painted_second)
-        self.assertIn("48;2;3;105;161", painted_first)
-        self.assertIn("48;2;180;83;9", painted_second)
-        self.assertTrue(painted_first.endswith("\033[0m"))
-        # The label still carries identity, so colour is never the only channel.
-        self.assertIn("harvest done", painted_first)
+        # Asserting that colour *happens* means asking for it. A session that
+        # sets NO_COLOR -- as an agent harness reasonably does -- would
+        # otherwise fail this test for doing exactly what the last assertions
+        # here require. So the opt-outs `_color_enabled` honours are cleared
+        # for the half that needs colour, and only for that half.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("NO_COLOR", None)
+            os.environ.pop("HELM_NO_COLOR", None)
+            painted_first = cli._project_paint(first, "status: harvest done", stream=terminal)
+            painted_second = cli._project_paint(second, "status: harvest done", stream=terminal)
+            # Same text, different projects, visibly different lines.
+            self.assertNotEqual(painted_first, painted_second)
+            self.assertIn("48;2;3;105;161", painted_first)
+            self.assertIn("48;2;180;83;9", painted_second)
+            self.assertTrue(painted_first.endswith("\033[0m"))
+            # The label still carries identity, so colour is never the only channel.
+            self.assertIn("harvest done", painted_first)
 
-        # A light project colour gets dark text rather than unreadable white.
-        light = cli._project_paint(
-            {"id": "l", "name": "L", "color": "#f5f5f5"}, "x", stream=terminal
-        )
-        self.assertIn(";30m", light)
+            # A light project colour gets dark text rather than unreadable white.
+            light = cli._project_paint(
+                {"id": "l", "name": "L", "color": "#f5f5f5"}, "x", stream=terminal
+            )
+            self.assertIn(";30m", light)
 
-        # Never corrupt piped output or defy NO_COLOR.
-        self.assertEqual(
-            cli._project_paint(first, "plain", stream=io.StringIO()), "plain"
-        )
-        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
-            self.assertEqual(cli._project_paint(first, "plain", stream=terminal), "plain")
+            # And piped output is never corrupted, opt-out or not.
+            self.assertEqual(
+                cli._project_paint(first, "plain", stream=io.StringIO()), "plain"
+            )
+
+        # Never defy an opt-out, whichever of the two the caller set.
+        for variable in ("NO_COLOR", "HELM_NO_COLOR"):
+            with mock.patch.dict(os.environ, {variable: "1"}):
+                self.assertEqual(
+                    cli._project_paint(first, "plain", stream=terminal), "plain"
+                )
 
     def test_run_returns_without_waiting_so_the_session_stays_responsive(self) -> None:
         parser = cli._build_parser()
