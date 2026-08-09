@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -8588,6 +8589,59 @@ class HelmCoordinatorTests(unittest.TestCase):
         # A skill that cannot be read is the case most likely to matter.
         self.assertEqual(code, 1)
         self.assertIn("broken", buffer.getvalue())
+
+    def test_a_private_file_is_never_observable_half_written(self) -> None:
+        """A reader sees the old file or the new one, never an empty one.
+
+        `poll_worker` reads `exit.json` the moment it exists and reads its
+        absence of content as an unreadable exit record -- which marked a
+        worker that had exited 0 as failed, failing its task and emitting a
+        failure message for work that had actually succeeded.
+        """
+        from helm.core import _write_private_text
+
+        target = Path(self.temp.name) / "exit.json"
+        _write_private_text(target, json.dumps({"returncode": 0}) + "\n")
+        payload = json.dumps({"returncode": 0, "detail": "x" * 200_000}) + "\n"
+        seen: list[str] = []
+        stop = threading.Event()
+
+        def reader() -> None:
+            while not stop.is_set():
+                with contextlib.suppress(OSError):
+                    if target.exists():
+                        seen.append(target.read_text(encoding="utf-8"))
+
+        watcher = threading.Thread(target=reader, daemon=True)
+        watcher.start()
+        try:
+            for _ in range(25):
+                _write_private_text(target, payload)
+        finally:
+            stop.set()
+            watcher.join(timeout=5)
+
+        self.assertTrue(seen, "the reader never managed to observe the file")
+        for observed in seen:
+            # Every observation parses: no truncated or empty intermediate.
+            self.assertEqual(json.loads(observed)["returncode"], 0)
+        self.assertEqual(oct(target.stat().st_mode & 0o777), oct(0o600))
+
+    def test_a_worker_that_exits_zero_is_never_recorded_as_failed(self) -> None:
+        """The flake this fixes, driven through the public path."""
+        root = self.repo("exitrace")
+        project = self.coordinator.register_project(
+            "Exit", str(root), project_id="exitrace"
+        )
+        for _ in range(6):
+            task = self.coordinator.create_task(project["id"], "exit cleanly")
+            worker = self.coordinator.launch_worker(
+                task["id"], [sys.executable, "-c", "print('done')"]
+            )
+            self.assertEqual(worker["status"], "completed", worker.get("exit_code"))
+            self.assertEqual(
+                self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
+            )
 
     def test_tracked_helm_files_do_not_capture_managed_project_details(self) -> None:
         """Helm is generic product code; managed-project facts stay local."""
