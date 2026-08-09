@@ -56,6 +56,24 @@ class DoctorTestCase(HelmTestCase):
             code = cli.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
+    @contextlib.contextmanager
+    def watch_reads(self, opened: list[str]):
+        """Record every path doctor actually opens.
+
+        Asserting on the rendered output alone is not enough for the
+        never-open-a-credential promise: a file can be read, understood, and
+        merely not quoted back. What has to be true is that the read never
+        happened, so the fixtures assert on this list.
+        """
+        real_open = Path.open
+
+        def watched(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", watched):
+            yield opened
+
 
 class RootChecksTests(DoctorTestCase):
     def test_a_sound_root_raises_no_error_and_exits_zero(self) -> None:
@@ -255,10 +273,14 @@ class RootChecksTests(DoctorTestCase):
             finding = self.finding(self.report(helm_root), "root.herdr")
         self.assertEqual(finding.severity, doctor.ERROR)
 
-    def test_no_resolvable_root_reports_one_finding_and_stops(self) -> None:
+    def test_no_resolvable_root_reports_the_root_and_stops(self) -> None:
         coordinator = Coordinator(self.state)
         report = doctor.run(coordinator, None, "anything")
-        self.assertEqual([f.id for f in report.findings], ["root.configured"])
+        self.assertEqual(report.findings[0].id, "root.configured")
+        self.assertEqual(report.findings[0].severity, doctor.ERROR)
+        self.assertEqual(
+            [f.id for f in report.findings[1:]], list(doctor.PROJECT_CHECKS)
+        )
         self.assertEqual(report.exit_code, 1)
         self.assertIsNone(report.document()["root"])
 
@@ -314,8 +336,13 @@ class ProjectChecksTests(DoctorTestCase):
         report = self.report(helm_root, "linked")
         finding = self.finding(report, "project.location")
         self.assertEqual(finding.severity, doctor.ERROR)
-        self.assertEqual([f.id for f in report.findings if f.scope == "project"],
-                         ["project.location"])
+        # The dependent checks are stated as unrun rather than dropped: a
+        # missing id reads as "nothing to say", which is not what happened.
+        rest = [f for f in report.findings if f.scope == "project"][1:]
+        self.assertEqual([f.id for f in rest], list(doctor.PROJECT_CHECKS[1:]))
+        for entry in rest:
+            self.assertEqual(entry.severity, doctor.WARNING)
+            self.assertTrue(entry.message.startswith("not checked: "))
 
     def test_invalid_project_settings_are_an_error(self) -> None:
         helm_root, _ = self.sound_root()
@@ -510,13 +537,7 @@ class SecretSafetyTests(DoctorTestCase):
         (helm_root / "auth.json").write_text(f"token={secret}\n", encoding="utf-8")
 
         opened: list[str] = []
-        real_open = Path.open
-
-        def watched(self_path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
-            opened.append(str(self_path))
-            return real_open(self_path, *args, **kwargs)
-
-        with mock.patch.object(Path, "open", watched):
+        with self.watch_reads(opened):
             rendered = doctor.render_json(self.report(helm_root, "alpha"))
 
         self.assertNotIn(secret, rendered)
@@ -569,3 +590,484 @@ class SecretSafetyTests(DoctorTestCase):
             "not credential readiness",
             self.finding(report, "root.profiles").message,
         )
+
+
+class ReviewRegressionTests(DoctorTestCase):
+    """One case per finding from the independent review of this command.
+
+    They are grouped rather than scattered because they share a subject: each
+    is a way a preflight can look healthy while being wrong, which is the only
+    failure mode that makes doctor worse than not running it.
+    """
+
+    # 1 -- state permissions must report what was found, not what Helm repaired.
+
+    def test_exposed_state_permissions_survive_helms_own_repair(self) -> None:
+        helm_root, _ = self.sound_root()
+        state_dir = helm_root / "state"
+        state_file = state_dir / "state.json"
+        state_file.write_text(
+            json.dumps(StateStore.empty() | {"config": {"helm_root": str(helm_root)}}),
+            encoding="utf-8",
+        )
+        os.chmod(state_dir, 0o755)
+        os.chmod(state_file, 0o644)
+
+        report = self.report(helm_root)
+
+        finding = self.finding(report, "root.state")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("readable beyond its owner", finding.message)
+        self.assertIn("restricted it on open", finding.message)
+        # Helm still repairs on open -- doctor simply no longer reads its own
+        # repair back and calls the root healthy.
+        self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
+
+    # 2 -- git probes must not execute a checkout's configured helpers.
+
+    def _fsmonitor_repo(self, project_root: Path) -> Path:
+        marker = Path(self.temp.name) / "fsmonitor-ran"
+        helper = Path(self.temp.name) / "fsmonitor.sh"
+        helper.write_text(
+            f"#!/bin/sh\ntouch {marker}\nprintf '/\\0'\n", encoding="utf-8"
+        )
+        helper.chmod(0o755)
+        subprocess.run(
+            ["git", "-C", str(project_root), "config", "core.fsmonitor", str(helper)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(project_root), "config", "core.fsmonitorHookVersion", "2"],
+            check=True,
+        )
+        return marker
+
+    def test_a_repositorys_own_fsmonitor_helper_is_never_executed(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        marker = self._fsmonitor_repo(project_root)
+
+        report = self.report(helm_root, "alpha")
+
+        self.assertFalse(
+            marker.exists(),
+            "doctor executed a helper configured by the repository it inspected",
+        )
+        self.assertIn(
+            self.finding(report, "project.git").severity, {doctor.OK, doctor.WARNING}
+        )
+
+    def test_git_probes_do_not_rewrite_the_index(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        index = project_root / ".git" / "index"
+        before = index.read_bytes()
+        os.utime(project_root / "README.txt", (0, 0))
+
+        self.report(helm_root, "alpha")
+
+        self.assertEqual(index.read_bytes(), before)
+
+    # 3 -- configuration is read from the layout, never from a redirect.
+
+    def test_a_preferences_env_override_is_reported_not_followed(self) -> None:
+        helm_root, _ = self.sound_root()
+        planted = Path(self.temp.name) / "auth.json"
+        planted.write_text('{"version": 1, "token": "sk-secret"}', encoding="utf-8")
+        with mock.patch.dict(os.environ, {preferences.PREFERENCES_ENV: str(planted)}):
+            report = self.report(helm_root)
+            rendered = doctor.render_json(report)
+        finding = self.finding(report, "root.preferences")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn(preferences.PREFERENCES_ENV, finding.message)
+        self.assertNotIn("sk-secret", rendered)
+        self.assertNotIn(str(planted), rendered)
+
+    def test_an_agents_env_override_is_reported_not_followed(self) -> None:
+        helm_root, _ = self.sound_root()
+        planted = Path(self.temp.name) / "credentials.json"
+        planted.write_text('{"agents": []}', encoding="utf-8")
+        opened: list[str] = []
+        with mock.patch.dict(os.environ, {"HELM_AGENTS_FILE": str(planted)}):
+            with self.watch_reads(opened):
+                report = self.report(helm_root)
+        finding = self.finding(report, "root.profiles")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("HELM_AGENTS_FILE", finding.message)
+        self.assertNotIn(str(planted), opened)
+
+    def test_a_symlinked_project_settings_file_is_refused_not_resolved(self) -> None:
+        """The link stays inside the project, so path resolution allows it."""
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        secret = project_root / "auth.json"
+        secret.write_text('{"token": "sk-inside-the-project"}', encoding="utf-8")
+        (project_root / ".helm").mkdir()
+        (project_root / ".helm" / "project.json").symlink_to(secret)
+
+        opened: list[str] = []
+        with self.watch_reads(opened):
+            report = self.report(helm_root, "alpha")
+
+        finding = self.finding(report, "project.config")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("symlink", finding.message)
+        self.assertNotIn(str(secret), opened)
+        self.assertNotIn("sk-inside-the-project", doctor.render_json(report))
+
+    def test_a_symlinked_agent_configuration_is_refused(self) -> None:
+        helm_root, _ = self.sound_root()
+        planted = Path(self.temp.name) / "agent-auth.json"
+        planted.write_text('{"agents": []}', encoding="utf-8")
+        (helm_root / "agents.json").symlink_to(planted)
+        opened: list[str] = []
+        with self.watch_reads(opened):
+            finding = self.finding(self.report(helm_root), "root.profiles")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("symlink", finding.message)
+        self.assertNotIn(str(planted), opened)
+
+    def test_a_symlinked_domain_manifest_is_refused(self) -> None:
+        helm_root, _ = self.sound_root()
+        planted = Path(self.temp.name) / "domain-auth.json"
+        planted.write_text('{"extends": []}', encoding="utf-8")
+        domain = helm_root / "domains" / "linked"
+        domain.mkdir(parents=True)
+        (domain / "knowledge.md").write_text("k", encoding="utf-8")
+        (domain / "domain.json").symlink_to(planted)
+        opened: list[str] = []
+        with self.watch_reads(opened):
+            finding = self.finding(self.report(helm_root), "root.domains")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("symlink", finding.message)
+        self.assertNotIn(str(planted), opened)
+
+    # 4 -- an environment value never reaches output.
+
+    def test_an_unknown_helm_agent_value_is_never_printed(self) -> None:
+        helm_root, _ = self.sound_root()
+        with mock.patch.dict(os.environ, {"HELM_AGENT": "sk-looks-like-a-runtime"}):
+            report = self.report(helm_root)
+            rendered = doctor.render_json(report)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertNotIn("sk-looks-like-a-runtime", rendered)
+        self.assertIn("HELM_AGENT", finding.message)
+
+    def test_a_helm_model_value_is_never_printed(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            agent={"default": "claude"},
+            model={"runtimes": {"claude": ["pi"]}},
+        )
+        with mock.patch.dict(os.environ, {"HELM_MODEL": "claude-sk-secret-model"}):
+            report = self.report(helm_root)
+            rendered = doctor.render_json(report)
+        self.assertEqual(self.finding(report, "root.runtimes").severity, doctor.ERROR)
+        self.assertNotIn("claude-sk-secret-model", rendered)
+        self.assertIn("HELM_MODEL", self.finding(report, "root.runtimes").message)
+
+    # 5 -- a symlinked Helm-owned directory is not traversed.
+
+    def test_a_symlinked_projects_directory_stops_every_project_check(self) -> None:
+        helm_root, _ = self.sound_root()
+        outside = Path(self.temp.name) / "outside-projects"
+        outside.mkdir()
+        external = outside / "alpha"
+        shutil.move(str(self.repo("alpha")), str(external))
+        marker = self._fsmonitor_repo(external)
+        shutil.rmtree(helm_root / "projects")
+        (helm_root / "projects").symlink_to(outside)
+
+        report = self.report(helm_root, "alpha")
+
+        self.assertEqual(self.finding(report, "root.symlinks").severity, doctor.ERROR)
+        self.assertEqual(self.finding(report, "project.location").severity, doctor.ERROR)
+        self.assertFalse(marker.exists(), "doctor traversed a linked projects/")
+        self.assertNotIn("project.git", [
+            f.id for f in report.findings if f.severity == doctor.OK
+        ])
+
+    def test_a_symlinked_domains_directory_is_not_read(self) -> None:
+        helm_root, _ = self.sound_root()
+        outside = Path(self.temp.name) / "outside-domains"
+        (outside / "planted").mkdir(parents=True)
+        planted = outside / "planted" / "domain.json"
+        planted.write_text('{"extends": ["nowhere"]}', encoding="utf-8")
+        shutil.rmtree(helm_root / "domains")
+        (helm_root / "domains").symlink_to(outside)
+
+        opened: list[str] = []
+        with self.watch_reads(opened):
+            finding = self.finding(self.report(helm_root), "root.domains")
+
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("symlink", finding.message)
+        self.assertNotIn(str(planted), opened)
+
+    # 6 -- malformed input still produces a valid report.
+
+    def test_unreadable_state_still_produces_a_report_and_exit_one(self) -> None:
+        helm_root, _ = self.sound_root()
+        (helm_root / "state" / "state.json").write_text("{not json", encoding="utf-8")
+        code, out, err = self.run_cli("--root", str(helm_root), "doctor", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        document = json.loads(out)
+        state = [f for f in document["findings"] if f["id"] == "root.state"]
+        self.assertEqual([f["severity"] for f in state], ["error"])
+        self.assertEqual(
+            [f["id"] for f in document["findings"] if f["scope"] == "root"],
+            list(doctor.ROOT_CHECKS),
+        )
+
+    def test_non_utf8_configuration_is_a_finding_not_a_traceback(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        (project_root / ".helm").mkdir()
+        (project_root / ".helm" / "project.json").write_bytes(b'{"label": "\xff\xfe"}')
+        (helm_root / "agents.json").write_bytes(b'{"agents": [\xff]}')
+        domain = helm_root / "domains" / "binary"
+        domain.mkdir(parents=True)
+        (domain / "knowledge.md").write_text("k", encoding="utf-8")
+        (domain / "domain.json").write_bytes(b"\xff\xfe\x00")
+
+        code, out, err = self.run_cli(
+            "--root", str(helm_root), "doctor", "--project", "alpha", "--json"
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        document = json.loads(out)
+        for check in ("root.domains", "root.profiles", "project.config"):
+            entry = next(f for f in document["findings"] if f["id"] == check)
+            self.assertEqual(entry["severity"], "error", check)
+
+    def test_a_state_document_of_the_wrong_shape_is_a_finding(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.add_project(helm_root, "alpha")
+        broken = StateStore.empty() | {
+            "config": {"helm_root": str(helm_root)},
+            "tasks": [],
+        }
+        (helm_root / "state" / "state.json").write_text(
+            json.dumps(broken), encoding="utf-8"
+        )
+        code, out, err = self.run_cli(
+            "--root", str(helm_root), "doctor", "--project", "alpha", "--json"
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        document = json.loads(out)
+        entry = next(f for f in document["findings"] if f["id"] == "root.state")
+        self.assertEqual(entry["severity"], "error")
+        self.assertIn("shape", entry["message"])
+
+    # 7 -- the effective configured launch is what gets checked.
+
+    def test_a_missing_project_pinned_runtime_is_an_error(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        (project_root / ".helm").mkdir()
+        (project_root / ".helm" / "project.json").write_text(
+            json.dumps({"agent": "codex"}), encoding="utf-8"
+        )
+        with mock.patch("shutil.which", return_value=None):
+            report = self.report(helm_root, "alpha")
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("the project's agent pin", finding.message)
+        self.assertEqual(report.exit_code, 1)
+
+    def test_a_forbidden_project_model_family_pairing_is_an_error(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, model={"runtimes": {"claude": ["pi"]}})
+        project_root = self.add_project(helm_root, "alpha")
+        (project_root / ".helm").mkdir()
+        (project_root / ".helm" / "project.json").write_text(
+            json.dumps({"agent": "codex", "model": "claude-opus-5"}), encoding="utf-8"
+        )
+        report = self.report(helm_root, "alpha")
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("claude", finding.message)
+        self.assertIn("pi", finding.message)
+
+    def test_a_profile_availability_check_executable_must_exist(self) -> None:
+        helm_root, _ = self.sound_root()
+        (helm_root / "agents.json").write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {
+                            "id": "configured",
+                            "command": ["git"],
+                            "check_command": ["helm-availability-not-installed"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        finding = self.finding(self.report(helm_root), "root.profiles")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("availability check", finding.message)
+
+    def test_a_missing_ambient_worker_command_is_an_error_without_its_value(self) -> None:
+        helm_root, _ = self.sound_root()
+        with mock.patch.dict(
+            os.environ, {"HELM_WORKER_COMMAND": "helm-secret-binary --key sk-secret"}
+        ):
+            report = self.report(helm_root)
+            rendered = doctor.render_json(report)
+        finding = self.finding(report, "root.profiles")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("HELM_WORKER_COMMAND", finding.message)
+        self.assertNotIn("sk-secret", rendered)
+
+    # 8 -- a probe that did not answer is not a clean checkout.
+
+    def test_a_git_probe_that_fails_is_not_reported_as_clean(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        real = doctor._git_lines
+
+        def failing(root: Path, *args: str):
+            if args[:1] == ("status",):
+                return None
+            return real(root, *args)
+
+        with mock.patch("helm.doctor._git_lines", failing):
+            finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("could not report", finding.message)
+
+    def test_an_unresolved_merge_is_reported(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        (project_root / ".git" / "MERGE_HEAD").write_text(
+            self._run_git(project_root, "rev-parse", "HEAD") + "\n", encoding="utf-8"
+        )
+        finding = self.finding(self.report(helm_root, "alpha"), "project.git")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("merge", finding.message)
+
+    # 9 -- the boundary allowlist is exact paths, not basenames.
+
+    def test_a_tracked_gitkeep_deeper_in_state_does_not_pass(self) -> None:
+        helm_root, _ = self.sound_root()
+        subprocess.run(["git", "init", "-q", str(helm_root)], check=True)
+        subprocess.run(["git", "-C", str(helm_root), "config", "user.name", "T"], check=True)
+        subprocess.run(
+            ["git", "-C", str(helm_root), "config", "user.email", "t@example.invalid"],
+            check=True,
+        )
+        planted = helm_root / "state" / "private"
+        planted.mkdir()
+        (planted / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(helm_root), "add", "-f", "state/private/.gitkeep"], check=True
+        )
+        subprocess.run(["git", "-C", str(helm_root), "commit", "-qm", "oops"], check=True)
+
+        finding = self.finding(self.report(helm_root), "root.boundaries")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("state/private/.gitkeep", finding.message)
+
+    def test_the_shipped_placeholders_are_still_allowed(self) -> None:
+        helm_root, _ = self.sound_root()
+        subprocess.run(["git", "init", "-q", str(helm_root)], check=True)
+        subprocess.run(["git", "-C", str(helm_root), "config", "user.name", "T"], check=True)
+        subprocess.run(
+            ["git", "-C", str(helm_root), "config", "user.email", "t@example.invalid"],
+            check=True,
+        )
+        for name in ("projects", "agents", "state"):
+            (helm_root / name / ".gitkeep").write_text("", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(helm_root), "add", "-f", f"{name}/.gitkeep"], check=True
+            )
+        subprocess.run(["git", "-C", str(helm_root), "commit", "-qm", "layout"], check=True)
+        self.assertEqual(
+            self.finding(self.report(helm_root), "root.boundaries").severity, doctor.OK
+        )
+
+    # 10 -- the retained scan is linear in the root's history.
+
+    def test_retained_scanning_visits_each_worker_once(self) -> None:
+        helm_root, coordinator = self.sound_root()
+        self.add_project(helm_root, "alpha")
+        project = coordinator.discover_project(helm_root, "alpha")
+        with coordinator.store.locked() as data:
+            for index in range(30):
+                task_id = f"t-{index:04d}"
+                data["tasks"][task_id] = {
+                    "id": task_id,
+                    "project_id": project["id"],
+                    "status": "merged",
+                    "holds": [],
+                    "workspace": str(helm_root / "state" / "worktrees" / task_id),
+                }
+                worker_id = f"w-{index:04d}"
+                data["workers"][worker_id] = {
+                    "id": worker_id,
+                    "task_id": task_id,
+                    "status": "completed",
+                }
+
+        seen: list[str] = []
+        real = type(coordinator)._task_workers
+
+        def counted(data, task_id):  # type: ignore[no-untyped-def]
+            seen.append(task_id)
+            return real(data, task_id)
+
+        with mock.patch.object(type(coordinator), "_task_workers", staticmethod(counted)):
+            report = self.report(helm_root, "alpha")
+
+        self.assertEqual(self.finding(report, "project.retained").severity, doctor.WARNING)
+        # One lookup per task, each over only that task's own workers -- not
+        # one lookup per task over every worker in the root.
+        self.assertEqual(len(seen), 30)
+
+    # 11 -- a locally recorded remote default counts as a local answer.
+
+    def test_a_recorded_remote_head_resolves_the_base_branch(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        branch = self._run_git(project_root, "symbolic-ref", "--short", "HEAD")
+        subprocess.run(
+            ["git", "-C", str(project_root), "remote", "add", "origin",
+             "https://helm.invalid/nothing.git"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(project_root), "symbolic-ref",
+             "refs/remotes/origin/HEAD", f"refs/remotes/origin/{branch}"],
+            check=True,
+        )
+        finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
+        self.assertEqual(finding.severity, doctor.OK)
+        self.assertIn(branch, finding.message)
+
+    def test_disagreeing_remote_heads_are_not_an_answer(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        branch = self._run_git(project_root, "symbolic-ref", "--short", "HEAD")
+        subprocess.run(
+            ["git", "-C", str(project_root), "branch", "other"], check=True
+        )
+        for remote, head in (("origin", branch), ("mirror", "other")):
+            subprocess.run(
+                ["git", "-C", str(project_root), "remote", "add", remote,
+                 f"https://helm.invalid/{remote}.git"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(project_root), "symbolic-ref",
+                 f"refs/remotes/{remote}/HEAD", f"refs/remotes/{remote}/{head}"],
+                check=True,
+            )
+        finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
+        self.assertEqual(finding.severity, doctor.WARNING)

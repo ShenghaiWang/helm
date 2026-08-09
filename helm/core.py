@@ -756,6 +756,20 @@ def _resolve_base_branch(project_root: Path, settings: dict[str, Any]) -> str:
     return _repository_default_branch(project_root)
 
 
+#: Git's own markers for an operation the user has not finished. Shared with
+#: `helm doctor`, which warns about exactly the states this function refuses a
+#: task base for -- two lists would eventually disagree about what
+#: "mid-operation" means, and the disagreement would surface as a preflight
+#: that called a checkout healthy and a task that then refused it.
+CHECKOUT_OPERATION_MARKERS = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+)
+
+
 def _project_checkout_conflict(root: Path) -> str | None:
     """Describe a dirty or mid-operation project checkout, or None if clean.
 
@@ -773,7 +787,7 @@ def _project_checkout_conflict(root: Path) -> str | None:
     to; treating every untracked file as a block would make Helm unusable
     for exactly the project layout its own settings file expects.
     """
-    for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
+    for marker in CHECKOUT_OPERATION_MARKERS:
         located = _git(root, "rev-parse", "--git-path", marker, check=False)
         if located and (root / located).exists():
             return f"an unresolved {marker.replace('_HEAD', '').replace('-', ' ').lower()} is in progress"
@@ -1420,7 +1434,19 @@ class StateStore:
         self.state_file = self.directory / "state.json"
         self.lock_file = self.directory / ".lock"
         self._validate_open()
+        #: The permission bits found on the way in, before the repair below
+        #: tightens them. Opening a store is what every command does first, so
+        #: by the time anything could look at the disk the exposure is already
+        #: gone -- and a permission check that reads back its own repair is a
+        #: check that can only ever say "fine". `helm doctor` reports from this
+        #: record instead. Captured, never acted on: this changes nothing about
+        #: what the repair does.
+        self.opened_modes: dict[str, int] = {}
         if self.directory.exists():
+            for path in (self.directory, self.state_file, self.lock_file):
+                with contextlib.suppress(OSError):
+                    if path.exists() and not path.is_symlink():
+                        self.opened_modes[str(path)] = path.stat().st_mode & 0o777
             _private_dir(self.directory)
             _private_file(self.state_file)
             _private_file(self.lock_file)
@@ -1459,7 +1485,11 @@ class StateStore:
             return
         try:
             raw = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        # `UnicodeDecodeError` is raised by the decode, before json ever sees
+        # the bytes, so a file that is merely not UTF-8 used to escape every
+        # handler here as a traceback rather than the "cannot read" this
+        # promises. Every JSON read in this module catches it for that reason.
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HelmError(f"cannot read state {self.state_file}: {exc}") from exc
         if not isinstance(raw, dict):
             raise HelmError(f"unsupported or corrupt Helm state: {self.state_file}")
@@ -1484,7 +1514,7 @@ class StateStore:
             return self.empty()
         try:
             data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HelmError(f"cannot read state {self.state_file}: {exc}") from exc
         if not isinstance(data, dict) or data.get("version") not in SUPPORTED_SCHEMA_VERSIONS:
             raise HelmError(f"unsupported or corrupt Helm state: {self.state_file}")
@@ -1496,6 +1526,17 @@ class StateStore:
         # Migration on read, so a root written by the build that had the bug
         # opens here instead of being refused as corrupt. The upgraded document
         # is persisted by the next save; reading alone changes nothing on disk.
+        # A document can carry a supported version and still be unwalkable --
+        # `tasks` as a list parses, passes the version check, and then raises
+        # an AttributeError from whichever caller iterates it first. That is a
+        # traceback where every other corrupt-state path gives a clear refusal,
+        # so the containers are checked here, once, for everybody.
+        for key in ("projects", "tasks", "workers"):
+            if not isinstance(data.get(key), dict):
+                raise HelmError(
+                    f"unusable Helm state shape in {self.state_file}: "
+                    f"{key} is not an object"
+                )
         version = int(data.get("version") or 1)
         if version != SCHEMA_VERSION:
             data = _migrate_state(data, version)
@@ -2074,7 +2115,7 @@ class Coordinator:
             return {}
         try:
             settings = json.loads(settings_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HelmError(f"cannot read project settings {settings_file}: {exc}") from exc
         if not isinstance(settings, dict):
             raise HelmError(f"project settings must be a JSON object: {settings_file}")
@@ -2554,7 +2595,7 @@ class Coordinator:
             return []
         try:
             declared = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HelmError(f"invalid domain manifest for {domain_id}: {exc}") from exc
         if not isinstance(declared, dict):
             raise HelmError(f"invalid domain manifest for {domain_id}: expected an object")
@@ -2614,7 +2655,7 @@ class Coordinator:
             if settings.is_file():
                 try:
                     payload = json.loads(settings.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise HelmError(f"cannot read domain settings {settings}: {exc}") from exc
                 if isinstance(payload, dict) and payload.get("inferable") is False:
                     continue
@@ -2666,7 +2707,7 @@ class Coordinator:
                     meta.update(loaded)
                     if loaded.get("inferable") is False:
                         meta["selectable"] = False
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 pass
         knowledge = domain_root / domain_id / "knowledge.md"
         if knowledge.is_file():
@@ -3181,7 +3222,7 @@ class Coordinator:
                 continue
             try:
                 payload = json.loads(source.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise HelmError(f"cannot read agent profiles {source}: {exc}") from exc
             for raw in self._profile_entries(payload, source):
                 profile_id = raw.get("id")
@@ -6613,7 +6654,7 @@ class Coordinator:
             return {"situation": [], "action_items": [], "history": [], "evidence": {}}
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return {"situation": [], "action_items": [], "history": [], "evidence": {}}
         loaded.setdefault("situation", [])
         loaded.setdefault("action_items", [])

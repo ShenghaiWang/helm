@@ -35,6 +35,7 @@ It does **not**:
   `.env`, auth file, token cache, or environment **value**. Doctor may report
   that an environment variable is *set* where that is the configuration fact
   under test (`HERDR_ENV`, `HELM_AGENT`); it never prints what it holds.
+- follow a path it was pointed at. See "Structural path allowlist" below.
 - decide anything. It reports; the human acts.
 
 ## Invocation
@@ -52,6 +53,43 @@ helm doctor [--project <id>] [--json]
 
 Doctor is read-only, so it is available to every caller — coordinator, foreman,
 and worker alike. It authorizes nothing.
+
+## Structural path allowlist
+
+Doctor opens a configuration file because the **layout** puts it there, never
+because something asked it to. Three rules, and they are structural rather than
+name-based on purpose — a denylist of credential-looking filenames fails on the
+file nobody thought of:
+
+- **A symlinked configuration path is refused, not resolved.** `preferences.json`,
+  `agents.json`, `agents/*.json`, `agents/<id>/profile.json`, a domain's
+  `domain.json`/`knowledge.md`/`guardrails.md`, and a project's `.helm/` and
+  `.helm/project.json` are each read only when the path itself is a real file.
+  Resolution is not enough: a link from `.helm/project.json` to a credential file
+  elsewhere *inside the same project* resolves cleanly and would be read.
+- **A symlinked Helm-owned directory stops every check that would traverse it.**
+  Reporting `root.symlinks` is not sufficient. A linked `projects/` means the
+  project checks are refused outright, not run against a tree outside the root;
+  a linked `domains/` or `agents/` means no domain or profile is read.
+- **An environment variable that redirects configuration is reported, not
+  followed.** `HELM_PREFERENCES_FILE` and `HELM_AGENTS_FILE` each turn their
+  check into a `warning` naming the variable, and doctor reads only the root's
+  own file. That is a deliberate divergence from the rest of Helm, which honours
+  both: doctor's promise is about what it opens.
+
+## Read-only Git probing
+
+Every Git query runs with hooks, `core.fsmonitor`, credential helpers, pagers,
+and remote protocols forced off, and with `--no-optional-locks` plus
+`GIT_OPTIONAL_LOCKS=0` so no probe refreshes or rewrites the index. Without
+that, inspecting a repository would run scripts that repository configured —
+a preflight handing control to the thing it was asked to inspect — and a status
+probe would be a write.
+
+A probe that **does not answer** (a corrupt index, a timeout, a missing `git`)
+is never read as a clean answer. That distinction is the difference between
+"this checkout is fine" and "I could not tell", and collapsing it is how a
+broken repository reports healthy.
 
 ## Findings
 
@@ -73,6 +111,11 @@ One check produces exactly one finding. A finding is:
   needs a human decision. Work can still proceed. Doctor still exits 0.
 - `ok` — checked, and sound. Informational statements ("Herdr is not in use, so
   workers run through the process launcher") are `ok`, not `warning`.
+
+A check whose precondition failed is emitted as a `warning` whose message begins
+`not checked:` — never omitted. A missing id reads as "nothing to say", which is
+not what happened, and an automation comparing id sets would see a shorter list
+rather than a stated gap. So the id set in a report is always complete.
 
 The distinction that matters most: **an optional capability being absent is not
 an error; a *named* requirement being broken is.** A runtime nobody configured
@@ -96,12 +139,12 @@ iteration, filesystem order, or wall-clock time.
 | `root.configured` | no Helm root can be resolved at all | — |
 | `root.layout` | `projects/` or `state/` is missing | `domains/` or `agents/` is missing |
 | `root.symlinks` | a Helm-owned root directory (`projects`, `domains`, `agents`, `state`) is a symlink | — |
-| `root.state` | state cannot be opened, parsed, or is version-unsupported, or its directory identity does not match the root | state directory or state file is readable beyond its owner |
-| `root.boundaries` | local state or preferences is **tracked** in the root's Git repository | the root is not a Git repository, so the boundary cannot be verified |
-| `root.preferences` | the file is a symlink, unparseable, oversized, or carries an unknown key or invalid value | — |
-| `root.domains` | a domain manifest or `extends` chain is invalid | a domain directory has no readable `knowledge.md` |
-| `root.profiles` | a configured agent profile is malformed, or its launch executable is missing | — |
-| `root.runtimes` | a runtime this root *names* has no executable on `PATH` | no built-in runtime at all is launchable |
+| `root.state` | state cannot be opened, parsed, is version-unsupported, has an unwalkable shape, or its directory identity does not match the root | state directory or state file **was** readable beyond its owner when Helm opened it |
+| `root.boundaries` | any path under `state/`, `agents/`, `projects/`, or `preferences.json` is **tracked** in the root's Git repository, other than the exact shipped `.gitkeep` placeholders | the root is not a Git repository, or Git could not answer, so the boundary cannot be verified |
+| `root.preferences` | the file is a symlink, unparseable, oversized, or carries an unknown key or invalid value | `HELM_PREFERENCES_FILE` redirects preferences away from the root |
+| `root.domains` | `domains/` is a symlink, or a domain manifest, `extends` chain, or manifest link is invalid | a domain directory has no readable `knowledge.md` |
+| `root.profiles` | `agents/` or an agent configuration file is a symlink, a profile is malformed, or a profile's launch **or availability-check** executable is missing, or `HELM_WORKER_COMMAND` names one that is not available | `HELM_AGENTS_FILE` redirects profiles away from the root |
+| `root.runtimes` | a runtime this root *names* has no executable on `PATH`, is excluded by this root, or is paired with a model whose family this root restricts to other runtimes | no built-in runtime at all is launchable |
 | `root.herdr` | `HERDR_ENV=1` but the `herdr` executable is not on `PATH` | — |
 | `root.authority` | — | — (always `ok`; reports whether a capability is configured) |
 
@@ -115,8 +158,8 @@ and from Helm's own state; **doctor never registers it**.
 
 | id | error when | warning when |
 | --- | --- | --- |
-| `project.location` | `projects/<id>` exists but is a symlink or is not a directory | — |
-| `project.git` | not its own committed Git repository root (no repo, nested repo, or no commit) | the checkout is dirty or mid-operation |
+| `project.location` | `projects/` or `projects/<id>` is a symlink, or `projects/<id>` is not a directory or resolves outside `projects/` | — |
+| `project.git` | not its own committed Git repository root (no repo, nested repo, or no commit) | the checkout is dirty, mid-operation, or Git could not report its state |
 | `project.isolation` | its root overlaps another registered project's root | — |
 | `project.config` | `.helm/project.json` is unreadable, is not an object, or fails validation | — |
 | `project.base_branch` | a configured `base_branch` does not resolve locally | no base branch can be determined **locally**; name one explicitly |
@@ -129,9 +172,16 @@ invocation, not a finding about the root: doctor exits `2` with the same
 "unknown project" refusal every other command gives, rather than reporting a
 fault in a root that may be perfectly sound.
 
-`project.base_branch` resolves **locally only** — recorded base branch, project
-setting, or a local ref. It never runs `ls-remote`. Where a local answer is not
-available the finding says so rather than reaching the network.
+`project.base_branch` resolves **locally only** — the project setting, Helm's
+recorded base branch, a locally recorded `refs/remotes/<remote>/HEAD` that every
+remote agrees on, or the checked-out branch of a repository with no remote at
+all. It never runs `ls-remote`. Where no local answer exists the finding says so
+rather than reaching the network.
+
+The runtimes a project *pins* (`"agent"`, `"model"` in its `.helm/project.json`)
+are read before the root checks run, so they are part of what `root.runtimes`
+treats as named. A pinned runtime that is not installed is a broken requirement
+whether it was named by the root or by one project.
 
 ## JSON output
 
@@ -186,7 +236,14 @@ project example
 | --- | --- |
 | `0` | doctor ran and found no `error` finding. Warnings do not change this. |
 | `1` | doctor ran and found at least one `error` finding. |
-| `2` | doctor could not run: invalid invocation, unknown project, or a root that could not be opened at all. |
+| `2` | doctor could not run: invalid invocation, or an unknown project id. |
+
+A Helm root whose **state file** cannot be opened is not a `2`: that is the
+condition doctor exists to name. Every command opens the store before dispatch,
+so without special handling the one case most needing a report would produce
+none. Instead the store-independent checks still run, `root.state` is an
+`error`, the remaining checks are `not checked:` warnings, and doctor exits `1`
+with a complete document on stdout.
 
 `2` is the code the rest of the Helm CLI already uses for a refused or failed
 command, so automation branching on doctor branches the same way it does on
@@ -205,7 +262,13 @@ output, not even redacted. Concretely, doctor:
   than invoking a provider command that would print account state;
 - rebuilds every preferences line from validated fields (the same rule
   `helm prefs show` follows), so a value Helm did not understand can never be
-  read back out of the file.
+  read back out of the file;
+- prints a runtime or model id only when it is a word from a fixed known
+  vocabulary (a built-in runtime id, or a configured profile's id) or a value
+  from a file `helm prefs show` already prints. An id that came from
+  `HELM_AGENT`, `HELM_MODEL`, or `HELM_WORKER_COMMAND` is described by its
+  source and never quoted — "it looks like an ordinary runtime id" is exactly
+  the judgement a leak survives.
 
 ## Implementation pointers
 

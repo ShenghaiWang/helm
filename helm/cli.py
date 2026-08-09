@@ -1436,6 +1436,50 @@ def _ensure_foreman(coordinator: Coordinator, project_id: str, *, herdr: bool = 
     )
 
 
+def _doctor_command(
+    coordinator: Coordinator, helm_root: Path | None, args: argparse.Namespace
+) -> int:
+    """Validate the invocation, then report. Never changes anything."""
+    project_id = args.doctor_project
+    if project_id is not None:
+        if helm_root is None:
+            raise HelmError("--project needs a Helm root; run helm doctor --root <path>")
+        # An id naming nothing at all is a mistyped invocation, not a finding
+        # about the root, so it exits 2 like every other command's unknown
+        # project rather than reading as a fault in a root that may be sound.
+        # `exists()` deliberately follows a link so a symlinked project reaches
+        # the check that refuses it, rather than looking absent here.
+        if not (helm_root / "projects" / _validate_project_id(project_id)).exists() and not (
+            helm_root / "projects" / project_id
+        ).is_symlink():
+            raise HelmError(
+                f"unknown project {project_id}; expected a Git project at "
+                f"{helm_root / 'projects' / project_id}"
+            )
+    return _emit_doctor(args, doctor_module.run(coordinator, helm_root, project_id))
+
+
+def _emit_doctor(args: argparse.Namespace, report: doctor_module.Report) -> int:
+    """Print one doctor report and return its exit status.
+
+    Shared by both callers so a root whose state will not open still gets the
+    same document -- an automation branching on `--json` must never have to
+    handle "sometimes there is no JSON".
+    """
+    if args.doctor_json:
+        print(doctor_module.render_json(report))
+    else:
+        for line in doctor_module.render_text(report):
+            print(line)
+    return report.exit_code
+
+
+def _doctor_root(args: argparse.Namespace) -> Path | None:
+    with contextlib.suppress(HelmError, OSError, ValueError):
+        return _root_argument(args)
+    return None
+
+
 def _prefs_command(
     coordinator: Coordinator, helm_root: Path | None, args: argparse.Namespace
 ) -> int:
@@ -1621,10 +1665,34 @@ def main(argv: list[str] | None = None) -> int:
     try:
         store, helm_root = _store_for_args(args)
         coordinator = Coordinator(store)
-    except (HelmError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+    except (
+        HelmError,
+        OSError,
+        subprocess.SubprocessError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        # A state file Helm cannot open is precisely the condition doctor
+        # exists to name, and every command opens the store before dispatch --
+        # so without this, the one case that most needs a report got a bare
+        # exit 2 and no output at all. The checks that need no store still run.
+        if args.command == "doctor":
+            return _emit_doctor(
+                args,
+                doctor_module.report_unopenable_state(
+                    _doctor_root(args), str(exc), args.doctor_project
+                ),
+            )
         print(f"helm: {exc}", file=sys.stderr)
         return 2
     try:
+        # Dispatched ahead of the role check on purpose. Doctor authorizes
+        # nothing and is open to every caller, so the check is a no-op for it --
+        # but it reads the state to identify the caller, and a root whose state
+        # will not open is exactly the root doctor was run to diagnose.
+        if args.command == "doctor":
+            return _doctor_command(coordinator, helm_root, args)
+
         refusal = _authority_refusal(coordinator, args)
         if refusal is not None:
             print(f"helm: {refusal}", file=sys.stderr)
@@ -2457,29 +2525,6 @@ def main(argv: list[str] | None = None) -> int:
                         "as the root."
                     )
             return 0
-        if args.command == "doctor":
-            project_id = args.doctor_project
-            if project_id is not None:
-                if helm_root is None:
-                    raise HelmError(
-                        "--project needs a Helm root; run helm doctor --root <path>"
-                    )
-                # An id naming nothing at all is a mistyped invocation, not a
-                # finding about the root, so it exits 2 like every other
-                # command's unknown project rather than reading as a fault.
-                if not (helm_root / "projects" / _validate_project_id(project_id)).exists():
-                    raise HelmError(
-                        f"unknown project {project_id}; expected a Git project at "
-                        f"{helm_root / 'projects' / project_id}"
-                    )
-            report = doctor_module.run(coordinator, helm_root, project_id)
-            if args.doctor_json:
-                print(doctor_module.render_json(report))
-            else:
-                for line in doctor_module.render_text(report):
-                    print(line)
-            return report.exit_code
-
         if args.command == "review":
             outcome = HerdrAdapter(coordinator).run_review_cycle(
                 args.task_id,
