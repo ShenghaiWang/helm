@@ -23,6 +23,7 @@ from helm.core import (
     _COLOR_PALETTE,
     CORE_SAFETY_RULES,
     DELIVERY_DECISION_KIND,
+    FINALIZATION_ACTION_KIND,
     DELIVERY_DECISION_PROJECT_TEXT,
     DELIVERY_DECISION_TASK_TEXT,
     FOLLOW_UP_ACTION_KIND,
@@ -3934,6 +3935,115 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.coordinator.cleanup_task(spike["id"])
         self.assertEqual(self._decisions(dropped["id"]), [])
 
+    def _finalizations(self, project_id: str) -> list[dict]:
+        return [
+            item
+            for item in self.coordinator.project_status(project_id)["action_items"]
+            if item["kind"] == FINALIZATION_ACTION_KIND
+        ]
+
+    def test_delivered_work_still_holding_disk_raises_a_cleanup_gate(self) -> None:
+        """Merged closes the delivery gate and opens the finalization one."""
+        root, project, task = self._completed_task_awaiting_approval("finalize")
+        self.coordinator.record_delivery_decision(project["id"], task_id=task["id"])
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+
+        self.assertEqual(self._decisions(project["id"]), [])
+        items = self._finalizations(project["id"])
+        self.assertEqual([item["task_id"] for item in items], [task["id"]])
+        text = items[0]["text"]
+        # It has to say what is retained and the one safe command that sheds it.
+        self.assertIn("its task worktree", text)
+        self.assertIn(f"helm/{project['id']}/{task['id']}", text)
+        self.assertIn(f"helm task cleanup {task['id']}", text)
+        self.assertLessEqual(len(text), Coordinator.SITUATION_LINE_LIMIT)
+
+        # Derived, so recomputing it never produces a second copy.
+        for _ in range(3):
+            self.coordinator.refresh_finalization_decisions(project["id"])
+        self.assertEqual(len(self._finalizations(project["id"])), 1)
+
+        # And it is a gate, so `helm watch` keeps showing it rather than
+        # surfacing it once and going quiet.
+        self.assertTrue(
+            any("Cleanup decision" in u["text"] for u in self.coordinator.project_updates_for_watch())
+        )
+        self.assertTrue(
+            any("Cleanup decision" in u["text"] for u in self.coordinator.project_updates_for_watch())
+        )
+
+        # Cleanup is what answers it, and answering is idempotent.
+        self.coordinator.cleanup_task(task["id"])
+        self.assertEqual(self._finalizations(project["id"]), [])
+        self.coordinator.refresh_finalization_decisions(project["id"])
+        self.assertEqual(self._finalizations(project["id"]), [])
+
+    def test_nothing_retained_and_undelivered_work_raise_no_cleanup_gate(self) -> None:
+        """A gate that fires on healthy work is what teaches a reader to skip."""
+        root = self.repo("noresidue")
+        project = self.coordinator.register_project(
+            "NoResidue", str(root), project_id="noresidue"
+        )
+        # Undelivered work: the delivery decision covers it, not this.
+        task = self.coordinator.create_task(project["id"], "still going")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        self.assertEqual(self._finalizations(project["id"]), [])
+        self.assertEqual(len(self._decisions(project["id"])), 1)
+
+        # Blocked and approval-needed work is likewise not this gate's business.
+        for state in ("blocked", "failed", "approval-needed", "pr-open"):
+            with self.coordinator.store.locked() as data:
+                data["tasks"][task["id"]]["status"] = state
+            self.assertEqual(self._finalizations(project["id"]), [])
+
+    def test_a_kept_branch_leaves_the_cleanup_gate_open_and_says_so(self) -> None:
+        """Cleanup answers this gate only for what it actually shed."""
+        root = self.repo("prfinalize")
+        project = self.coordinator.register_project(
+            "PRFinalize", str(root), project_id="prfinalize", delivery_policy="pr"
+        )
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('change.txt').write_text('worker'); "
+            "subprocess.run(['git','add','change.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker change'],check=True)"
+        )
+        task = self.coordinator.create_task(project["id"], "make a PR change")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        self.coordinator.record_pr_status(
+            task["id"], state="merged", url="https://example.invalid/pull/1"
+        )
+        self.assertEqual(len(self._finalizations(project["id"])), 1)
+
+        # The remote merged it; this base worktree has not, so the branch is
+        # unmerged locally and cleanup keeps it -- and says which piece is left.
+        self.coordinator.cleanup_task(task["id"])
+        remaining = self._finalizations(project["id"])
+        self.assertEqual(len(remaining), 1)
+        self.assertNotIn("its task worktree", remaining[0]["text"])
+        self.assertIn(f"helm/{project['id']}/{task['id']}", remaining[0]["text"])
+
+        self.coordinator.cleanup_task(task["id"], delete_branch=True)
+        self.assertEqual(self._finalizations(project["id"]), [])
+
+    def test_a_dirty_delivered_workspace_keeps_its_gate_and_its_work(self) -> None:
+        """The gate never weakens a cleanup refusal; it reports the standoff."""
+        root, project, task = self._completed_task_awaiting_approval("dirtyfinal")
+        self.coordinator.approve_task(task["id"], "reviewed")
+        merged = self.coordinator.merge_task(task["id"])
+        (Path(merged["workspace"]) / "scratch.txt").write_text("uncommitted")
+
+        with self.assertRaises(SafetyError):
+            self.coordinator.cleanup_task(task["id"])
+        items = self._finalizations(project["id"])
+        self.assertEqual(len(items), 1)
+        self.assertIn("its task worktree", items[0]["text"])
+        self.assertTrue(Path(merged["workspace"]).exists())
+
     def test_resolution_never_closes_somebody_elses_follow_up(self) -> None:
         """Helm knows when a delivery decision was taken. It cannot know that."""
         root, project, task = self._completed_task_awaiting_approval("followupkept")
@@ -3949,7 +4059,10 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.coordinator.merge_task(task["id"])
 
         remaining = self.coordinator.project_status(project["id"])["action_items"]
-        self.assertEqual([item["kind"] for item in remaining], [FOLLOW_UP_ACTION_KIND])
+        # The merged task still holds its worktree, so its own cleanup gate is
+        # open alongside; what must survive is the note Helm cannot judge.
+        self.assertNotIn(DELIVERY_DECISION_KIND, [item["kind"] for item in remaining])
+        self.assertIn(FOLLOW_UP_ACTION_KIND, [item["kind"] for item in remaining])
 
     def test_status_and_watch_put_the_pending_decision_in_front_of_a_reader(self) -> None:
         root = self.repo("surfaced")
@@ -8429,6 +8542,20 @@ class HelmCoordinatorTests(unittest.TestCase):
         # A foreman has to know its final report is the handover, or it stops
         # at "done" and the decision is never raised.
         self.assertIn("handover", FOREMAN_RULES)
+        # Delivered is not finalized: both surfaces have to say cleanup is a
+        # decision a human still owes, or a coordinator calls a merge the end.
+        for required in (
+            "Delivery is not finalization",
+            "helm task cleanup <task>",
+            "not finalized until",
+        ):
+            self.assertIn(required, readme)
+        for required in (
+            "Delivered is not finalized",
+            "helm task cleanup <task>",
+            "approved cleanup decision is resolved",
+        ):
+            self.assertIn(required, agents)
 
     def test_repository_native_agent_path_requires_no_worker_configuration(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")

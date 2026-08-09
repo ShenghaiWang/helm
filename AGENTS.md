@@ -175,6 +175,19 @@ a worker agent the coordinator spawns for that task.
   finished one. A completed-but-undelivered task also keeps its project's Herdr
   space open even after its worker tab is released, because the tab closing is
   what a clean result does, not evidence that anything was delivered.
+- **Delivered is not finalized: the cleanup decision is the last gate.** A
+  merged or `pr-merged` task still holds its task worktree, its task branch and
+  its worker directories, and the delivery decision closes the instant the
+  merge lands — so nothing would be asking about the residue. Helm therefore
+  raises a second commander-visible decision naming exactly what that task
+  still holds and pointing at `helm task cleanup <task>` (or `helm project
+  release <id>`); it repeats in `helm status` and `helm watch` until it is
+  answered. Relay it and get the commander's approval — cleanup deletes a
+  checkout and a branch, so Helm never runs it by itself, and it is never
+  raised for a task that holds nothing. It resolves only for what cleanup
+  actually shed, so a branch kept because it carries unmerged commits leaves
+  the item open naming just that branch. A task is not finished until that
+  approved cleanup decision is resolved.
 - **Recording an outcome is not delivering it, so Helm routes it before
   anything closes.** A worker reports by running a Helm command inside its own
   pane, which means the confirmation prints onto the exact surface about to be

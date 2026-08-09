@@ -361,7 +361,19 @@ DELIVERED_TASK_STATES = frozenset({"merged", "pr-merged"})
 #: knows when a delivery decision has been taken, and cannot know whether a
 #: reviewer's caveat has been dealt with.
 DELIVERY_DECISION_KIND = "delivery-decision"
+#: Delivery is not the end of a task's life. A merged task still owns its
+#: worktree, its branch and its worker directories until somebody says to let
+#: them go, and the delivery gate closes the moment the merge lands -- so the
+#: commander saw nothing outstanding while the disk still held everything. This
+#: kind keeps that visible until cleanup is approved and actually done. It is
+#: never automatic: cleanup deletes a checkout and a branch, and Helm's whole
+#: cleanup design is that a human asks for that explicitly.
+FINALIZATION_ACTION_KIND = "finalization"
 FOLLOW_UP_ACTION_KIND = "follow-up"
+#: The item kinds that are gates rather than notes: they keep showing until
+#: they are answered, because a gate surfaced once and then hidden is how
+#: finished-looking work stops being anybody's problem.
+GATE_ACTION_KINDS = frozenset({DELIVERY_DECISION_KIND, FINALIZATION_ACTION_KIND})
 DELIVERY_DECISION_TASK_TEXT = (
     "Delivery decision needed: read this task's result, then choose review, "
     "another round, local merge, PR delivery, or cleanup"
@@ -371,6 +383,22 @@ DELIVERY_DECISION_PROJECT_TEXT = (
     "each result, then choose review, another round, local merge, PR "
     "delivery, or cleanup"
 )
+
+
+def finalization_text(task_id: str, retained: Sequence[str]) -> str:
+    """The commander-facing line for delivered work that still holds disk.
+
+    It names exactly what is retained and the one safe command that sheds it,
+    because "this project has residue" without either is a line a reader can
+    only act on by going and looking.
+    """
+    return (
+        f"Cleanup decision needed: delivered task {task_id} still holds "
+        f"{', '.join(retained)}. Approve cleanup, then run "
+        f"helm task cleanup {task_id} (add --delete-branch to discard the "
+        "branch); unmerged commits, a dirty workspace or a live session are "
+        "kept and reported instead."
+    )
 LEARNING_PROPOSAL_STATUSES = {"proposed", "approved", "rejected", "applied"}
 #: One colour per glyph `project_glyph` can produce. The palette used to hold
 #: eight colours that collapsed to five squares -- three of them blue, two
@@ -6205,6 +6233,105 @@ class Coordinator:
             self._save_status(project_id, status)
         return resolved
 
+    def task_retained_resources(
+        self, task: dict[str, Any], project: dict[str, Any], data: dict[str, Any]
+    ) -> list[str]:
+        """What this task still occupies on disk, in the reader's terms.
+
+        Read-only, and deliberately concrete: a worktree, a branch and a
+        worker directory are three different things to let go of, and the two
+        that survive a plain `helm task cleanup` -- an unmerged branch, a
+        directory belonging to a session still alive -- are exactly the ones a
+        commander needs named rather than implied.
+        """
+        retained: list[str] = []
+        workspace = task.get("workspace")
+        if workspace and not task.get("workspace_removed"):
+            with contextlib.suppress(OSError):
+                if canonical(workspace).exists():
+                    retained.append("its task worktree")
+        branch = task.get("branch")
+        if branch == f"helm/{task.get('project_id')}/{task.get('id')}":
+            with contextlib.suppress(OSError, HelmError):
+                root = canonical(project["root"])
+                if _git(root, "show-ref", "--verify", f"refs/heads/{branch}", check=False):
+                    retained.append(f"its task branch {branch}")
+        directories = 0
+        for worker in self._task_workers(data, task["id"]):
+            config_file = worker.get("config_file")
+            if not config_file or worker.get("directory_removed"):
+                continue
+            with contextlib.suppress(OSError):
+                worker_dir = canonical(Path(config_file).parent)
+                if overlaps(worker_dir, self.store.directory / "workers") and worker_dir.is_dir():
+                    directories += 1
+        if directories:
+            retained.append(f"{directories} worker directory/directories")
+        return retained
+
+    def refresh_finalization_decisions(
+        self, project_id: str, data: dict[str, Any] | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Keep the post-delivery cleanup gate in step with what is on disk.
+
+        Derived, like the delivery gate above it, so it is idempotent: running
+        it twice raises one item, and it closes itself the moment the task's
+        residue is gone. A task holding nothing never gets an item at all --
+        a gate that fires on healthy work is the noise that teaches a reader
+        to skip the list.
+
+        This raises a decision; it never acts on one. Cleanup stays the
+        explicit command it always was, with its dirty, unmerged and
+        live-session refusals untouched.
+        """
+        data = self.store.load() if data is None else data
+        project = self._project(data, project_id)
+        raised: list[dict[str, Any]] = []
+        resolved: list[dict[str, Any]] = []
+        wanted: dict[str, str] = {}
+        for task in data.get("tasks", {}).values():
+            if task.get("project_id") != project_id:
+                continue
+            if task.get("status") not in DELIVERED_TASK_STATES:
+                continue
+            retained = self.task_retained_resources(task, project, data)
+            if retained:
+                wanted[task["id"]] = finalization_text(task["id"], retained)
+        status = self._load_status(project_id)
+        dirty = False
+        for item in status.get("action_items", []):
+            if item.get("status", "open") != "open":
+                continue
+            if item.get("kind") != FINALIZATION_ACTION_KIND:
+                continue
+            linked = item.get("task_id")
+            text = wanted.pop(linked, None) if linked else None
+            if text is None:
+                item["status"] = "resolved"
+                item["resolved_at"] = now()
+                item["resolved_reason"] = "nothing retained"
+                resolved.append(item)
+                dirty = True
+            elif item.get("text") != text:
+                # What is retained changes as pieces are shed -- a branch
+                # deleted while the worktree stays. A stale list is worse than
+                # none, because it is the part a reader acts on.
+                item["text"] = text
+                dirty = True
+        if dirty:
+            self._save_status(project_id, status)
+        for task_id, text in wanted.items():
+            item = self.record_project_action_item(
+                project_id,
+                text,
+                source="helm",
+                task_id=task_id,
+                kind=FINALIZATION_ACTION_KIND,
+            )
+            if item is not None:
+                raised.append(item)
+        return {"raised": raised, "resolved": resolved}
+
     def compose_outcome_handoff(
         self, worker_id: str, data: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
@@ -6347,6 +6474,7 @@ class Coordinator:
                 continue
             with contextlib.suppress(HelmError, OSError):
                 self.resolve_delivery_decisions(project["id"], data=data)
+                self.refresh_finalization_decisions(project["id"], data=data)
             status = self._load_status(project["id"])
             for entry in status.get("action_items", []):
                 if entry.get("status", "open") != "open":
@@ -6535,6 +6663,7 @@ class Coordinator:
         # or by state changed outside Helm -- still reads as answered here.
         with contextlib.suppress(HelmError, OSError):
             self.resolve_delivery_decisions(project_id, data=data)
+            self.refresh_finalization_decisions(project_id, data=data)
         tasks = [t for t in data.get("tasks", {}).values() if t["project_id"] == project_id]
 
         def still_worth_keeping(entry: dict[str, Any]) -> bool:
@@ -6625,6 +6754,7 @@ class Coordinator:
             # answered here rather than being surfaced again.
             with contextlib.suppress(HelmError, OSError):
                 self.resolve_delivery_decisions(project["id"], data=data)
+                self.refresh_finalization_decisions(project["id"], data=data)
             # One transaction per project: this marks what it surfaced, so a
             # concurrent release writing the same record cannot lose either
             # change.
@@ -6639,7 +6769,7 @@ class Coordinator:
                     if entry.get("status", "open") == "open"
                     and (
                         not entry.get("surfaced_at")
-                        or entry.get("kind") == DELIVERY_DECISION_KIND
+                        or entry.get("kind") in GATE_ACTION_KINDS
                     )
                 ]
                 pending = [
@@ -8182,6 +8312,11 @@ class Coordinator:
                 self.resolve_delivery_decisions(
                     project["id"], reason="pr-merged", data=data
                 )
+                # Delivered is not finished. Raise the cleanup gate in the same
+                # breath, so the moment the delivery decision closes there is
+                # still something saying what this task holds.
+                with contextlib.suppress(HelmError, OSError):
+                    self.refresh_finalization_decisions(project["id"], data=data)
             return task
 
     def task_outcome(self, task_id: str) -> dict[str, Any]:
@@ -8335,6 +8470,8 @@ class Coordinator:
             self.resolve_delivery_decisions(
                 project["id"], reason="merged", data=data
             )
+            with contextlib.suppress(HelmError, OSError):
+                self.refresh_finalization_decisions(project["id"], data=data)
             return task
 
     def _session_still_live(self, worker: dict[str, Any]) -> bool:
@@ -8618,6 +8755,8 @@ class Coordinator:
                 self.resolve_delivery_decisions(
                     project["id"], reason="cleaned up", data=data
                 )
+                with contextlib.suppress(HelmError, OSError):
+                    self.refresh_finalization_decisions(project["id"], data=data)
                 return task
             workspace = self._verify_workspace_record(data, project, task)
             if task.get("role") != "foreman" and not self._workspace_clean(workspace):
@@ -8659,6 +8798,11 @@ class Coordinator:
             self.resolve_delivery_decisions(
                 project["id"], reason="cleaned up", data=data
             )
+            # Cleanup is what answers this gate -- but only for what it
+            # actually shed. A branch kept because it holds unmerged commits
+            # leaves the item open, now naming just the branch.
+            with contextlib.suppress(HelmError, OSError):
+                self.refresh_finalization_decisions(project["id"], data=data)
             return task
 
     # ---------- learning proposals ----------

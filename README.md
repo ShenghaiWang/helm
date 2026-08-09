@@ -1025,6 +1025,30 @@ continue`, or being cleaned up. A free-text follow-up recorded with `helm
 project action` is never auto-closed -- Helm knows when a delivery decision was
 taken and cannot know whether somebody's caveat was dealt with.
 
+**Delivery is not finalization.** A task that reaches `merged` or `pr-merged`
+still owns its task worktree, its `helm/<project>/<task>` branch, and its
+worker directories, and the delivery decision closes the moment the merge
+lands -- so the commander saw nothing outstanding while the disk still held
+everything. Helm therefore raises a second gate, also shown as `[decision]`
+and repeated by `helm watch`, naming exactly what that task still holds and
+the safe command that sheds it:
+
+```sh
+helm task cleanup <task>                   # worktree, worker directories, merged branch
+helm task cleanup <task> --delete-branch   # also discard a branch with unmerged commits
+helm project release <id>                  # the same, task by task, reporting what it kept
+```
+
+Like the delivery decision it is derived rather than flagged, so it is raised
+once however many times it is recomputed, it is never raised for a task that
+holds nothing, and it resolves itself as soon as the residue is gone. It
+resolves only for what cleanup actually shed: a branch kept because it holds
+unmerged commits leaves the item open, now naming just the branch. Cleanup
+stays explicit -- Helm never runs it for you -- and its refusals are unchanged:
+a dirty workspace, a live session, work still awaiting approval, and an
+unmerged branch are all preserved and reported. The work is not finalized until
+that approved cleanup decision is resolved.
+
 For local delivery, the final delivery state is `merged`: Helm records approval,
 fast-forwards the task branch into the project's base branch, copies declared
 local artifacts into the main worktree when needed, and can then release the

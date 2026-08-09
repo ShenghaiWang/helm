@@ -15,6 +15,7 @@ from typing import Any
 from .core import (
     AUTHORITY_ENV,
     DELIVERY_DECISION_KIND,
+    GATE_ACTION_KINDS,
     PROTECTED_ACTIONS,
     Coordinator,
     HelmError,
@@ -400,7 +401,7 @@ def _print_project_status(status: dict[str, Any]) -> None:
         print("  action items:")
         for entry in status["action_items"]:
             task = f" task={entry['task_id']}" if entry.get("task_id") else ""
-            gate = " [decision]" if entry.get("kind") == DELIVERY_DECISION_KIND else ""
+            gate = " [decision]" if entry.get("kind") in GATE_ACTION_KINDS else ""
             print(
                 f"    {entry['at'][:10]}{gate} {entry['text']} "
                 f"({entry['source']}{task})"
@@ -466,12 +467,12 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
         # Delivery gates first: a follow-up is somebody's note about later, and
         # a gate is work sitting still until it is answered.
         ordered = sorted(
-            pending, key=lambda i: i.get("kind") != DELIVERY_DECISION_KIND
+            pending, key=lambda i: i.get("kind") not in GATE_ACTION_KINDS
         )
         print(f"Decisions and follow-ups ({len(pending)}):")
         for item in ordered:
             task = f" task={item['task_id']}" if item.get("task_id") else ""
-            label = "decision" if item.get("kind") == DELIVERY_DECISION_KIND else "action"
+            label = "decision" if item.get("kind") in GATE_ACTION_KINDS else "action"
             print(
                 f"  {item['glyph']} {item['project_id']} {label}{task}: "
                 f"{item['text'][:110]}"
