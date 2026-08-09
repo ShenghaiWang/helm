@@ -1260,6 +1260,39 @@ def _validate_ticket_id(ticket_id: Any, source: str = "") -> str:
     return ticket_id
 
 
+def task_branch_name(
+    project_id: str, task_id: str, ticket: str | None = None
+) -> str:
+    """The one branch name Helm generates for a task.
+
+    The single definition of that name. It was written out at creation and
+    then re-derived, without the ticket, everywhere a caller had to decide
+    whether a branch was Helm's to touch -- so a ticketed task's
+    `helm/<project>/<ticket>-<task>` matched nothing, its branch survived
+    cleanup forever, and nothing counted it as retained.
+    """
+    return f"helm/{project_id}/{ticket}-{task_id}" if ticket else f"helm/{project_id}/{task_id}"
+
+
+def task_owns_branch(task: dict[str, Any]) -> bool:
+    """Whether a task's recorded branch is exactly the one Helm named for it.
+
+    Strict by design, and deliberately not a prefix or pattern test: this is
+    the predicate that decides what cleanup may delete. It admits the one name
+    `task_branch_name` would produce from that task's own project, id and
+    recorded ticket, so a record that somehow carried a base branch, a user's
+    branch, or another task's branch is not Helm's to remove.
+    """
+    branch = task.get("branch")
+    if not branch:
+        return False
+    return branch == task_branch_name(
+        str(task.get("project_id") or ""),
+        str(task.get("id") or ""),
+        task.get("ticket") or None,
+    )
+
+
 def _validate_branch_name(value: Any, source: str = "") -> str:
     """Accept a branch name safe to resolve and to pass to git as an argument.
 
@@ -2729,11 +2762,7 @@ class Coordinator:
                         # actually scan. The task id stays in both names: it
                         # is what Helm routes worktrees and cleanup by, and it
                         # keeps retries for one ticket distinct.
-                        branch = (
-                            f"helm/{project_id}/{ticket}-{task_id}"
-                            if ticket
-                            else f"helm/{project_id}/{task_id}"
-                        )
+                        branch = task_branch_name(project_id, task_id, ticket)
                         workspace_name = f"{ticket}-{task_id}" if ticket else task_id
                         workspace = self.store.directory / "worktrees" / project_id / workspace_name
                     task = {
@@ -6251,7 +6280,7 @@ class Coordinator:
                 if canonical(workspace).exists():
                     retained.append("its task worktree")
         branch = task.get("branch")
-        if branch == f"helm/{task.get('project_id')}/{task.get('id')}":
+        if task_owns_branch(task):
             with contextlib.suppress(OSError, HelmError):
                 root = canonical(project["root"])
                 if _git(root, "show-ref", "--verify", f"refs/heads/{branch}", check=False):
@@ -8515,9 +8544,11 @@ class Coordinator:
         task leaked a `helm/<project>/<task>` ref nobody could account for.
         """
         branch = task["branch"]
-        # Only ever the branch Helm itself named for this task. A record that
-        # somehow carried a base or user branch must not be deletable here.
-        if branch != f"helm/{task['project_id']}/{task['id']}":
+        # Only ever the branch Helm itself named for this task -- including the
+        # ticketed form, which this test used to miss, leaking every ticketed
+        # task's ref. A record that somehow carried a base or user branch must
+        # not be deletable here.
+        if not task_owns_branch(task):
             return
         root = canonical(project["root"])
         ref = f"refs/heads/{branch}"

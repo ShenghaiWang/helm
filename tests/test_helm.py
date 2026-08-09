@@ -24,6 +24,7 @@ from helm.core import (
     CORE_SAFETY_RULES,
     DELIVERY_DECISION_KIND,
     FINALIZATION_ACTION_KIND,
+    task_owns_branch,
     DELIVERY_DECISION_PROJECT_TEXT,
     DELIVERY_DECISION_TASK_TEXT,
     FOLLOW_UP_ACTION_KIND,
@@ -3978,6 +3979,67 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.assertEqual(self._finalizations(project["id"]), [])
         self.coordinator.refresh_finalization_decisions(project["id"])
         self.assertEqual(self._finalizations(project["id"]), [])
+
+    def test_a_ticketed_task_branch_is_counted_and_shed_like_any_other(self) -> None:
+        """The ticket is in the branch name, and both sides must know it.
+
+        `helm/<project>/<ticket>-<task>` matched neither the cleanup
+        predicate nor the retained-resource check, so a ticketed task's branch
+        survived cleanup forever and nothing ever said it was still there.
+        """
+        root = self.repo("ticketfinal")
+        project = self.coordinator.register_project(
+            "TicketFinal", str(root), project_id="ticketfinal"
+        )
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('change.txt').write_text('worker'); "
+            "subprocess.run(['git','add','change.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker change'],check=True)"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "commit a change", ticket="TICKET-192"
+        )
+        self.assertEqual(task["branch"], f"helm/{project['id']}/TICKET-192-{task['id']}")
+        self.assertTrue(task_owns_branch(task))
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+
+        items = self._finalizations(project["id"])
+        self.assertEqual(len(items), 1)
+        self.assertIn(task["branch"], items[0]["text"])
+
+        self.coordinator.cleanup_task(task["id"])
+        # Merged, so plain cleanup sheds it: the ref is gone and so is the gate.
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "show-ref", "--verify", f"refs/heads/{task['branch']}"],
+                cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode,
+            0,
+        )
+        self.assertEqual(self._finalizations(project["id"]), [])
+
+    def test_a_branch_helm_did_not_name_is_never_this_tasks_to_delete(self) -> None:
+        """The predicate widens nothing: it admits one exact name."""
+        base = {"id": "t-1", "project_id": "p", "ticket": None, "branch": "helm/p/t-1"}
+        self.assertTrue(task_owns_branch(base))
+        self.assertTrue(
+            task_owns_branch({**base, "ticket": "TICKET-9", "branch": "helm/p/TICKET-9-t-1"})
+        )
+        for branch in (
+            "main",
+            "helm/p/t-2",
+            "helm/other/t-1",
+            "helm/p/TICKET-9-t-1",     # ticket in the name, none on the record
+            "helm/p/t-1-extra",
+            "",
+            None,
+        ):
+            self.assertFalse(task_owns_branch({**base, "branch": branch}), branch)
+        # And a ticket on the record with the unticketed name is not it either.
+        self.assertFalse(task_owns_branch({**base, "ticket": "TICKET-9"}))
 
     def test_nothing_retained_and_undelivered_work_raise_no_cleanup_gate(self) -> None:
         """A gate that fires on healthy work is what teaches a reader to skip."""
