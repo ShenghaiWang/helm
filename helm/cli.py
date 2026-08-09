@@ -650,13 +650,20 @@ def _store_for_args(args: argparse.Namespace) -> tuple[StateStore, Path | None]:
     root = _root_argument(args)
     if args.command == "init" and root is not None:
         return StateStore(root / "state", helm_root=root), root
+    # Opening a store normally repairs the permissions of the directory and
+    # files it finds. That is right for a command about to write and wrong for
+    # `doctor`, whose entire contract is that it changes nothing -- and the
+    # store is opened here, before dispatch, so the repair would already have
+    # happened by the time doctor looked. A read-only store performs no repair
+    # and refuses every write.
+    read_only = args.command == "doctor"
     state_dir = args.state_dir or os.environ.get("HELM_STATE_DIR")
     if state_dir:
-        store = StateStore(state_dir, helm_root=root)
+        store = StateStore(state_dir, helm_root=root, read_only=read_only)
     elif root is not None:
-        store = StateStore(root / "state", helm_root=root)
+        store = StateStore(root / "state", helm_root=root, read_only=read_only)
     else:
-        store = StateStore()
+        store = StateStore(read_only=read_only)
     return store, root or store.configured_root()
 
 
@@ -1444,17 +1451,21 @@ def _doctor_command(
     if project_id is not None:
         if helm_root is None:
             raise HelmError("--project needs a Helm root; run helm doctor --root <path>")
+        projects_root = helm_root / "projects"
+        candidate = projects_root / _validate_project_id(project_id)
         # An id naming nothing at all is a mistyped invocation, not a finding
         # about the root, so it exits 2 like every other command's unknown
         # project rather than reading as a fault in a root that may be sound.
-        # `exists()` deliberately follows a link so a symlinked project reaches
-        # the check that refuses it, rather than looking absent here.
-        if not (helm_root / "projects" / _validate_project_id(project_id)).exists() and not (
-            helm_root / "projects" / project_id
-        ).is_symlink():
+        #
+        # That reasoning only holds for a projects/ directory doctor can trust.
+        # When projects/ is itself a symlink, "the child is not there" is a
+        # statement about somebody else's directory, and answering it here
+        # would exit 2 with no report -- hiding the root.symlinks error that is
+        # the actual finding. So the precheck stands down and doctor reports.
+        trustworthy = projects_root.is_dir() and not projects_root.is_symlink()
+        if trustworthy and not candidate.exists() and not candidate.is_symlink():
             raise HelmError(
-                f"unknown project {project_id}; expected a Git project at "
-                f"{helm_root / 'projects' / project_id}"
+                f"unknown project {project_id}; expected a Git project at {candidate}"
             )
     return _emit_doctor(args, doctor_module.run(coordinator, helm_root, project_id))
 

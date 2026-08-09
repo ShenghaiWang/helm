@@ -489,7 +489,9 @@ helm --root <helm-root> doctor --project <project-id> --json
 ```
 
 It is read-only: it never initializes, registers, repairs, cleans, or fetches,
-so a broken root stays broken until a human fixes it. It exits `0` when nothing
+so a broken root stays broken until a human fixes it. That includes the repair
+Helm's own state store performs on open — doctor opens a read-only store, so it
+creates no lock file and changes no permissions. It exits `0` when nothing
 is an error (warnings do not change that), `1` when an error was found, and `2`
 when it could not run. Runtime readiness there is *executable presence* — doctor
 runs no provider auth, status, or model command, and reads no credential store.

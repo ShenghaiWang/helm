@@ -12,9 +12,10 @@ Four properties are load-bearing, and the tests hold each of them:
 fetches, or discovers. A broken root is reported broken -- `helm init` stays an
 explicit human operation, and a project that is not registered stays that way,
 because a preflight that quietly fixed what it found would make "is this sound"
-unanswerable. Where Helm's own machinery repairs something on open (the state
-directory's permissions), doctor reports what was *found*, not what it was
-left as.
+unanswerable. That extends to Helm's own machinery: opening a state store
+normally tightens permissions and creates a lock file, so doctor opens a
+read-only store that performs no repair and refuses every write. Reporting the
+exposure accurately was never a substitute for not causing it.
 
 **It reads only structurally-allowed paths.** A configuration path is followed
 because the layout puts it there, never because a file or an environment
@@ -195,12 +196,14 @@ _GIT_SAFE_CONFIG = (
 
 #: `--no-optional-locks` plus `GIT_OPTIONAL_LOCKS=0` keep a status probe from
 #: refreshing and rewriting the index, which is a write, however harmless it
-#: looks. `GIT_CONFIG_NOSYSTEM` removes /etc/gitconfig from the picture; the
-#: explicit `-c` flags above already outrank whatever survives.
+#: looks. The three config variables take every configuration file out of the
+#: picture, so the `-c` flags above are the whole of the configuration.
 _GIT_SAFE_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
     "GIT_ASKPASS": "",
     "GIT_ALLOW_PROTOCOL": "",
     "GIT_PAGER": "cat",
@@ -219,7 +222,16 @@ def _git_lines(root: Path, *args: str) -> list[str] | None:
     Never fetches, never writes: doctor's whole Git surface is local queries
     about a checkout that is already on disk.
     """
-    env = dict(os.environ)
+    # Every inherited `GIT_*` variable is dropped, not just the ones with
+    # known-dangerous names. `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`,
+    # `GIT_OBJECT_DIRECTORY`, `GIT_CONFIG_GLOBAL` and friends each redirect
+    # which files git opens, so an allowlist of overrides layered on top of a
+    # full environment leaves the redirect in place -- the `-c` flags stop a
+    # repository configuring a helper, and do nothing about the environment
+    # pointing git at another file entirely. Dropping the whole namespace is
+    # the only version of this that does not need a complete list of git's
+    # path variables to be correct.
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     env.update(_GIT_SAFE_ENV)
     try:
         result = subprocess.run(
@@ -295,6 +307,28 @@ class _Doctor:
         self._project_root: Path | None = None
         self._project_settings: dict[str, Any] = {}
         self._profiles: list[dict[str, Any]] | None = None
+        #: True when a redirect means doctor never read the preferences Helm
+        #: would actually use, so every conclusion drawn from them is stated
+        #: as unchecked rather than asserted against an empty set.
+        self._preferences_unchecked = False
+        #: Domains `root.domains` found unreadable -- a linked directory, a
+        #: linked manifest, a broken extends chain. A project declaring one is
+        #: declaring a source that will not arrive, so `project.domains` reads
+        #: this rather than asking the filesystem again: `is_dir()` follows a
+        #: link and would call the very domain that check just refused present.
+        self._unusable_domains: set[str] = set()
+        #: Doctor resolves the preferences file structurally and pins the
+        #: result, so no core method called on its behalf can follow the
+        #: redirect it declined -- `excluded_agents` and the launch checks both
+        #: consult preferences, and each would otherwise reopen the very file
+        #: `root.preferences` refused.
+        if coordinator is not None:
+            self._preferences_unchecked = self._preferences_override()
+            try:
+                coordinator.use_preferences(self.root_preferences())
+            except (prefs.PreferencesError, OSError, ValueError):
+                coordinator.use_preferences(prefs.EMPTY)
+                self._preferences_unchecked = True
 
     # -- recording --
 
@@ -437,12 +471,14 @@ class _Doctor:
         found = getattr(store, "opened_modes", {}) or {}
         exposed = sorted(path for path, mode in found.items() if _exposed(mode))
         if exposed:
+            # No "Helm restricted it on open" here: doctor's store is read-only,
+            # so the exposure it found is the exposure that is still there. The
+            # remediation therefore has to be an action, not reassurance.
             self.warn(
                 "root.state",
-                f"Helm state was readable beyond its owner when opened: "
-                f"{', '.join(exposed)} (Helm restricted it on open)",
-                "check who had access while it was exposed; state holds task "
-                "records, worker output and approval grants",
+                f"Helm state is readable beyond its owner: {', '.join(exposed)}",
+                "chmod 700 the state directory and 600 the state file; state holds "
+                "task records, worker output and approval grants",
             )
             return
         self.ok(
@@ -585,6 +621,12 @@ class _Doctor:
 
     def _check_domains(self) -> None:
         assert self.root is not None
+        if not self._state_ok:
+            # Domain lookup resolves its root through the store's recorded
+            # Helm root, so an unreadable state turns every domain into a
+            # second, misleading error about domains.
+            self._unchecked("root.domains", "Helm state could not be read")
+            return
         if "domains" in self._linked:
             self.error(
                 "root.domains",
@@ -615,6 +657,7 @@ class _Doctor:
         for entry in entries:
             if _is_symlink(entry):
                 broken.append(f"{entry.name} (directory is a symlink)")
+                self._unusable_domains.add(entry.name)
                 continue
             if not entry.is_dir():
                 continue
@@ -626,12 +669,14 @@ class _Doctor:
             )
             if linked:
                 broken.append(f"{entry.name} ({', '.join(linked)} is a symlink)")
+                self._unusable_domains.add(entry.name)
                 continue
             try:
                 assert self.coordinator is not None
                 self.coordinator._domain_chain(domain_root, entry.name)
             except (HelmError, SafetyError, OSError, ValueError) as exc:
                 broken.append(f"{entry.name} ({exc})")
+                self._unusable_domains.add(entry.name)
                 continue
             if not (domain_root / entry.name / "knowledge.md").is_file():
                 thin.append(entry.name)
@@ -678,6 +723,9 @@ class _Doctor:
 
     def _check_profiles(self) -> None:
         assert self.root is not None
+        if not self._state_ok:
+            self._unchecked("root.profiles", "Helm state could not be read")
+            return
         if os.environ.get(_AGENTS_OVERRIDE, "").strip():
             self.warn(
                 "root.profiles",
@@ -758,17 +806,23 @@ class _Doctor:
             resolved = self.coordinator._resolve_profile(profile, interactive=True)
             command = resolved.get("command")
             if not command:
-                problems.append(f"{profile['id']} (no launch command)")
+                problems.append(f"{profile['id']}: no launch command")
                 continue
-            available, reason = self.coordinator._check_command(command, cwd=cwd)
+            # The validator's own reason quotes argv[0], and argv comes out of
+            # a configuration file whose contents doctor does not print. The
+            # profile id is enough to find it, and is itself a narrow validated
+            # identifier that `helm agent list` already shows.
+            available, _ = self.coordinator._check_command(command, cwd=cwd)
             if not available:
-                problems.append(f"{profile['id']} ({reason})")
+                problems.append(f"{profile['id']}: launch executable is not available")
                 continue
             check = resolved.get("check_command")
             if check:
-                available, reason = self.coordinator._check_command(check, cwd=cwd)
+                available, _ = self.coordinator._check_command(check, cwd=cwd)
                 if not available:
-                    problems.append(f"{profile['id']} (availability check: {reason})")
+                    problems.append(
+                        f"{profile['id']}: availability-check executable is not available"
+                    )
         return problems
 
     def _ambient_worker_command_problem(self) -> tuple[str, str] | None:
@@ -887,11 +941,135 @@ class _Doctor:
                 )
         return problems
 
+    def _launchable_builtins(self, excluded: set[str]) -> list[str]:
+        """Built-in runtimes this machine could start, by executable presence.
+
+        Deliberately not `builtin_runtime_availability`, which additionally
+        shells out to `herdr integration status`. Herdr recognizing an agent
+        says nothing about whether Helm can launch it, and a preflight that
+        spawns an external process to answer a question it does not use is one
+        more thing that can hang or vary between runs.
+        """
+        assert self.coordinator is not None
+        launchable: list[str] = []
+        for runtime_id in sorted(runtimes.builtin_runtime_ids()):
+            if runtime_id in excluded:
+                continue
+            runtime = runtimes.builtin_runtime(runtime_id)
+            if runtime is None:  # pragma: no cover - ids come from the registry
+                continue
+            available, _ = self.coordinator._check_command(
+                runtime.command(interactive=True), cwd=self._project_root
+            )
+            if available:
+                launchable.append(runtime_id)
+        return launchable
+
+    def _primary_model(self) -> tuple[str, str, bool]:
+        """The model a worker would actually get, most-specific first.
+
+        Same ladder the launcher uses -- project pin, then `HELM_MODEL` as a
+        session override, then the root default. `printable` is False when the
+        value came from the environment.
+        """
+        pinned = self._project_settings.get("model")
+        if isinstance(pinned, str) and pinned:
+            return pinned, "the project's model pin", True
+        ambient = os.environ.get("HELM_MODEL", "").strip()
+        if ambient:
+            return ambient, "HELM_MODEL", False
+        try:
+            loaded = self.root_preferences()
+        except (prefs.PreferencesError, OSError, ValueError):
+            return "", "", True
+        if loaded.default_model:
+            return loaded.default_model, "preference model.default", True
+        return "", "", True
+
+    def _launch_candidates(self) -> list[tuple[str, dict[str, Any], list[str], bool]]:
+        """(label, profile, command, may-quote-the-error) doctor can simulate.
+
+        These are the launches a worker would actually be given, as opposed to
+        the runtime ids something merely names. A profile that inherits a
+        built-in runtime, a profile whose command bakes its own `--model`, and
+        a custom argv from `HELM_WORKER_COMMAND` each fail differently at
+        launch, and none of the three is visible to an executable-presence
+        check.
+        """
+        assert self.coordinator is not None
+        candidates: list[tuple[str, dict[str, Any], list[str], bool]] = []
+        for profile in sorted(self.profiles(), key=lambda item: str(item.get("id"))):
+            resolved = self.coordinator._resolve_profile(profile, interactive=True)
+            command = resolved.get("command")
+            if command:
+                candidates.append((f"profile {profile['id']}", resolved, list(command), True))
+        if os.environ.get("HELM_WORKER_COMMAND", "").strip():
+            try:
+                ambient = self.coordinator._worker_command(None)
+            except HelmError:
+                ambient = []
+            if ambient:
+                # Never quotable: both the argv and any model baked into it are
+                # environment values.
+                candidates.append((
+                    "the launch named by HELM_WORKER_COMMAND",
+                    {"id": "default", "builtin": False},
+                    ambient,
+                    False,
+                ))
+        for runtime_id, sources in sorted(self.named_runtimes().items()):
+            runtime = runtimes.builtin_runtime(runtime_id)
+            if runtime is None:
+                continue
+            profile = self.coordinator._builtin_profile(runtime, interactive=True)
+            quotable = all(source != "HELM_AGENT" for source in sources)
+            candidates.append((
+                f"runtime {_named(runtime_id, self._vocabulary())}",
+                profile,
+                list(profile["command"]),
+                quotable,
+            ))
+        return candidates
+
+    def _effective_launch_problems(self) -> list[str]:
+        """Launches this root has configured that Helm would refuse to start.
+
+        Simulated through `_with_model`, which is the code that actually
+        refuses them, so a preflight cannot come to a different conclusion than
+        the launcher for the same configuration. Nothing is started: the method
+        either returns an argv nobody runs, or raises.
+        """
+        if self._preferences_unchecked:
+            return []
+        assert self.coordinator is not None
+        model, source, model_printable = self._primary_model()
+        problems: list[str] = []
+        for label, profile, command, quotable in self._launch_candidates():
+            try:
+                self.coordinator._with_model(profile, command, model or None, source)
+            except HelmError as exc:
+                if quotable and model_printable:
+                    problems.append(f"{label}: {exc}")
+                else:
+                    problems.append(
+                        f"{label} cannot be started with the model named by "
+                        f"{source or 'this root'}"
+                    )
+            except (SafetyError, OSError, ValueError):  # pragma: no cover
+                continue
+        return problems
+
     def _check_runtimes(self) -> None:
+        if not self._state_ok:
+            self._unchecked("root.runtimes", "Helm state could not be read")
+            return
         named = self.named_runtimes()
         vocabulary = self._vocabulary()
         assert self.coordinator is not None
         try:
+            # Safe to call now: the coordinator's preferences are pinned to the
+            # file doctor resolved structurally, so this cannot reopen a
+            # redirected one.
             excluded = self.coordinator.excluded_agents()
         except (HelmError, SafetyError, OSError, ValueError):
             excluded = set()
@@ -916,6 +1094,7 @@ class _Doctor:
             if not available:
                 broken.append(f"{shown} named by {sources}: {reason}")
         broken.extend(self._pairing_problems(named))
+        broken.extend(self._effective_launch_problems())
         if broken:
             self.error(
                 "root.runtimes",
@@ -926,11 +1105,14 @@ class _Doctor:
             )
             return
 
-        launchable = sorted(
-            entry["id"]
-            for entry in self.coordinator.builtin_runtime_availability()
-            if entry["available"] and entry["id"] not in excluded
-        )
+        if self._preferences_unchecked:
+            self._unchecked(
+                "root.runtimes",
+                f"{_PREFERENCES_OVERRIDE} redirects the preferences that decide "
+                "exclusions and model-family restrictions",
+            )
+            return
+        launchable = self._launchable_builtins(excluded)
         if not launchable:
             self.warn(
                 "root.runtimes",
@@ -1243,13 +1425,23 @@ class _Doctor:
                 'correct "base_branch" in .helm/project.json, or create the branch',
             )
             return
-        remotes = _git_lines(project_root, "remote") or []
+        remotes = _git_lines(project_root, "remote")
+        if remotes is None:
+            # Not the same as "no remotes". A repository whose remotes could
+            # not be listed might have one, and the checked-out branch is only
+            # evidence for a repository that certainly has none.
+            self.warn(
+                "project.base_branch",
+                "no base branch is configured and git could not list the remotes",
+                'name one explicitly with "base_branch" in .helm/project.json',
+            )
+            return
         recorded = self._recorded_remote_default(project_root, remotes)
         if recorded:
             self.ok(
                 "project.base_branch",
                 f"no base branch is configured; {recorded} is recorded locally as "
-                "the remote's own default",
+                "the default of every remote",
             )
             return
         current = _git_lines(project_root, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -1263,7 +1455,8 @@ class _Doctor:
         self.warn(
             "project.base_branch",
             "no base branch can be determined locally"
-            + (" (the project has a remote, so the checked-out branch is not evidence)"
+            + (" (the project has a remote whose recorded default is missing or "
+               "contested, so the checked-out branch is not evidence)"
                if remotes else " (the checkout is detached)"),
             'name one explicitly with "base_branch" in .helm/project.json',
         )
@@ -1276,6 +1469,8 @@ class _Doctor:
         `git remote set-head` updates -- no network. Disagreement between two
         remotes is not an answer, exactly as it is not one at registration.
         """
+        if not remotes:
+            return ""
         candidates: set[str] = set()
         for remote in remotes:
             symbolic = _git_lines(
@@ -1283,8 +1478,13 @@ class _Doctor:
                 f"refs/remotes/{remote}/HEAD",
             )
             prefix = f"{remote}/"
-            if symbolic and symbolic[0].startswith(prefix):
-                candidates.add(symbolic[0][len(prefix):])
+            if not symbolic or not symbolic[0].startswith(prefix):
+                # A remote with no recorded HEAD is missing evidence, not
+                # absent from the vote. Skipping it would let one configured
+                # remote speak for a repository whose other remote might well
+                # disagree -- which is agreement inferred from silence.
+                return ""
+            candidates.add(symbolic[0][len(prefix):])
         if len(candidates) != 1:
             return ""
         branch = next(iter(candidates))
@@ -1305,13 +1505,18 @@ class _Doctor:
             self._unchecked("project.domains", "domains/ is a symlink")
             return
         domain_root = self.root / "domains"
-        missing = [name for name in declared if not (domain_root / name).is_dir()]
+        missing = [
+            name
+            for name in declared
+            if name in self._unusable_domains or not (domain_root / name).is_dir()
+        ]
         if missing:
             self.error(
                 "project.domains",
-                f"declared domain(s) do not exist: {', '.join(sorted(missing))}",
-                "add the domain under domains/, or correct the project's "
-                '"domains" setting',
+                "declared domain(s) do not exist or are unreadable: "
+                + ", ".join(sorted(missing)),
+                "add the domain under domains/, fix the one root.domains named, "
+                'or correct the project\'s "domains" setting',
             )
             return
         thin = sorted(

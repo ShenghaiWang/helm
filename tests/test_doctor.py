@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from helm import cli, doctor, preferences
-from helm.core import Coordinator, StateStore, canonical
+from helm.core import Coordinator, SafetyError, StateStore, canonical
 
 from tests.support import SHIPPED_DOMAINS, HelmTestCase
 
@@ -39,7 +39,12 @@ class DoctorTestCase(HelmTestCase):
         return destination
 
     def report(self, helm_root: Path, project: str | None = None) -> doctor.Report:
-        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        # read_only mirrors how `helm doctor` opens the store. A test that
+        # opened a repairing store would silently be testing a different
+        # command from the one shipped.
+        coordinator = Coordinator(
+            StateStore(helm_root / "state", helm_root=helm_root, read_only=True)
+        )
         return doctor.run(coordinator, helm_root, project)
 
     def finding(self, report: doctor.Report, check_id: str) -> doctor.Finding:
@@ -602,7 +607,7 @@ class ReviewRegressionTests(DoctorTestCase):
 
     # 1 -- state permissions must report what was found, not what Helm repaired.
 
-    def test_exposed_state_permissions_survive_helms_own_repair(self) -> None:
+    def test_exposed_state_permissions_are_reported_and_left_alone(self) -> None:
         helm_root, _ = self.sound_root()
         state_dir = helm_root / "state"
         state_file = state_dir / "state.json"
@@ -618,10 +623,11 @@ class ReviewRegressionTests(DoctorTestCase):
         finding = self.finding(report, "root.state")
         self.assertEqual(finding.severity, doctor.WARNING)
         self.assertIn("readable beyond its owner", finding.message)
-        self.assertIn("restricted it on open", finding.message)
-        # Helm still repairs on open -- doctor simply no longer reads its own
-        # repair back and calls the root healthy.
-        self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
+        # The exposure it reports is the exposure that is still there, so the
+        # remediation is an action rather than reassurance.
+        self.assertIn("chmod 700", finding.remediation)
+        self.assertEqual(state_dir.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(state_file.stat().st_mode & 0o777, 0o644)
 
     # 2 -- git probes must not execute a checkout's configured helpers.
 
@@ -912,7 +918,7 @@ class ReviewRegressionTests(DoctorTestCase):
         )
         finding = self.finding(self.report(helm_root), "root.profiles")
         self.assertEqual(finding.severity, doctor.ERROR)
-        self.assertIn("availability check", finding.message)
+        self.assertIn("availability-check", finding.message)
 
     def test_a_missing_ambient_worker_command_is_an_error_without_its_value(self) -> None:
         helm_root, _ = self.sound_root()
@@ -1071,3 +1077,396 @@ class ReviewRegressionTests(DoctorTestCase):
             )
         finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
         self.assertEqual(finding.severity, doctor.WARNING)
+
+
+class SecondReviewRegressionTests(DoctorTestCase):
+    """One case per finding from the second independent review.
+
+    The theme of round two is that *reporting* a hazard accurately is not the
+    same as *not being* one. Doctor described the state permissions it had
+    already changed, refused a preferences redirect it then followed by another
+    route, and hardened the git config it passed while leaving the environment
+    free to point git at other files entirely.
+    """
+
+    # 1 -- read-only means the command does not write, not that it says so.
+
+    def test_the_doctor_cli_does_not_change_state_permissions(self) -> None:
+        helm_root, _ = self.sound_root()
+        state_dir = helm_root / "state"
+        state_file = state_dir / "state.json"
+        os.chmod(state_dir, 0o755)
+        os.chmod(state_file, 0o644)
+
+        code, out, _ = self.run_cli("--root", str(helm_root), "doctor")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(state_dir.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(state_file.stat().st_mode & 0o777, 0o644)
+        self.assertIn("readable beyond its owner", out)
+
+    def test_a_read_only_store_refuses_every_write(self) -> None:
+        helm_root, _ = self.sound_root()
+        store = StateStore(helm_root / "state", helm_root=helm_root, read_only=True)
+        with self.assertRaises(SafetyError):
+            store.save(store.load())
+        with self.assertRaises(SafetyError):
+            with store.locked():
+                pass
+        with self.assertRaises(SafetyError):
+            store.initialize_root(helm_root)
+        # Reading is untouched.
+        self.assertIsInstance(store.load(), dict)
+
+    def test_an_ordinary_store_still_repairs_permissions(self) -> None:
+        """The repair is right for a command about to write; only doctor opts out."""
+        helm_root, _ = self.sound_root()
+        os.chmod(helm_root / "state", 0o755)
+        StateStore(helm_root / "state", helm_root=helm_root)
+        self.assertEqual((helm_root / "state").stat().st_mode & 0o777, 0o700)
+
+    def test_doctor_leaves_a_lock_file_uncreated(self) -> None:
+        helm_root, _ = self.sound_root()
+        lock = helm_root / "state" / ".lock"
+        if lock.exists():
+            lock.unlink()
+        self.run_cli("--root", str(helm_root), "doctor", "--project", "ghost")
+        self.assertFalse(lock.exists())
+
+    # 2 -- a refused redirect must not be reached by another route.
+
+    def test_a_preferences_redirect_is_not_opened_through_exclusions(self) -> None:
+        helm_root, _ = self.sound_root()
+        planted = Path(self.temp.name) / "auth.json"
+        planted.write_text(
+            json.dumps(
+                {"version": preferences.PREFERENCES_VERSION, "agent": {"exclude": ["codex"]}}
+            ),
+            encoding="utf-8",
+        )
+        opened: list[str] = []
+        with mock.patch.dict(os.environ, {preferences.PREFERENCES_ENV: str(planted)}):
+            with self.watch_reads(opened):
+                report = self.report(helm_root)
+        self.assertNotIn(
+            str(planted), opened, "doctor reached the redirected file indirectly"
+        )
+        # And it says so rather than asserting against an empty preference set.
+        runtimes_finding = self.finding(report, "root.runtimes")
+        self.assertEqual(runtimes_finding.severity, doctor.WARNING)
+        self.assertTrue(runtimes_finding.message.startswith("not checked: "))
+
+    def test_the_pinned_preferences_are_the_roots_own_file(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, agent={"exclude": ["codex"]})
+        elsewhere = Path(self.temp.name) / "other-preferences.json"
+        elsewhere.write_text(
+            json.dumps({"version": preferences.PREFERENCES_VERSION}), encoding="utf-8"
+        )
+        # With a redirect in play doctor pins the empty set, so no core method
+        # called on its behalf can reach the redirected file. It says so rather
+        # than passing the empty set off as the root's answer.
+        redirected = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        with mock.patch.dict(os.environ, {preferences.PREFERENCES_ENV: str(elsewhere)}):
+            doctor.run(redirected, helm_root)
+            self.assertEqual(redirected.preferences().excluded_agents, frozenset())
+
+        # With no redirect it pins the root's own file, which is what every
+        # later exclusion and pairing check then reads.
+        pinned = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        doctor.run(pinned, helm_root)
+        self.assertEqual(pinned.preferences().excluded_agents, frozenset({"codex"}))
+
+    # 3 -- git must not be redirected by the inherited environment.
+
+    def test_git_path_environment_variables_are_dropped(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        planted = Path(self.temp.name) / "planted-gitconfig"
+        planted.write_text("[core]\n\tfsmonitor = /nonexistent/helper\n", encoding="utf-8")
+        stray = Path(self.temp.name) / "stray-index"
+
+        opened: list[str] = []
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_GLOBAL": str(planted),
+                "GIT_INDEX_FILE": str(stray),
+                "GIT_DIR": str(Path(self.temp.name) / "nonexistent-git-dir"),
+                "GIT_WORK_TREE": str(self.temp.name),
+            },
+        ):
+            with self.watch_reads(opened):
+                report = self.report(helm_root, "alpha")
+
+        # The redirects are gone, so the real repository still answers.
+        self.assertEqual(self.finding(report, "project.git").severity, doctor.OK)
+        self.assertFalse(stray.exists())
+
+    def test_the_git_environment_keeps_nothing_from_the_git_namespace(self) -> None:
+        seen: dict[str, str] = {}
+        real_run = subprocess.run
+
+        def capture(command, **kwargs):  # type: ignore[no-untyped-def]
+            seen.update(
+                {k: v for k, v in (kwargs.get("env") or {}).items() if k.startswith("GIT_")}
+            )
+            return real_run(command, **kwargs)
+
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/x"}):
+            with mock.patch("helm.doctor.subprocess.run", capture):
+                doctor._git_lines(Path(self.temp.name), "rev-parse", "--show-toplevel")
+
+        self.assertTrue(seen, "no git environment was captured")
+        self.assertNotIn("GIT_CONFIG_COUNT", seen)
+        self.assertNotIn("GIT_ALTERNATE_OBJECT_DIRECTORIES", seen)
+        self.assertEqual(seen.get("GIT_CONFIG_GLOBAL"), os.devnull)
+
+    # 4 -- a configured executable is file content and is never quoted.
+
+    def test_a_profile_executable_value_never_reaches_output(self) -> None:
+        helm_root, _ = self.sound_root()
+        (helm_root / "agents.json").write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {
+                            "id": "configured",
+                            "command": ["/opt/sk-secret-token-binary", "--run"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        report = self.report(helm_root)
+        rendered = doctor.render_json(report)
+        finding = self.finding(report, "root.profiles")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertNotIn("sk-secret-token-binary", rendered)
+        # The profile id is enough to find the offending entry.
+        self.assertIn("configured", finding.message)
+
+    # 5 -- a supported version is still not a usable shape.
+
+    def test_a_malformed_config_section_is_a_finding_not_a_traceback(self) -> None:
+        helm_root, _ = self.sound_root()
+        broken = StateStore.empty() | {"config": []}
+        (helm_root / "state" / "state.json").write_text(
+            json.dumps(broken), encoding="utf-8"
+        )
+        code, out, err = self.run_cli("--root", str(helm_root), "doctor", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        document = json.loads(out)
+        entry = next(f for f in document["findings"] if f["id"] == "root.state")
+        self.assertEqual(entry["severity"], "error")
+        self.assertIn("config", entry["message"])
+
+    def test_malformed_list_sections_are_findings_too(self) -> None:
+        helm_root, _ = self.sound_root()
+        broken = StateStore.empty() | {
+            "config": {"helm_root": str(helm_root)},
+            "messages": {},
+        }
+        (helm_root / "state" / "state.json").write_text(
+            json.dumps(broken), encoding="utf-8"
+        )
+        code, out, err = self.run_cli("--root", str(helm_root), "doctor", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        entry = next(
+            f for f in json.loads(out)["findings"] if f["id"] == "root.state"
+        )
+        self.assertEqual(entry["severity"], "error")
+        self.assertIn("messages", entry["message"])
+
+    # 6 -- the launch that would actually happen is what gets validated.
+
+    def test_a_profile_inheriting_a_restricted_runtime_is_an_error(self) -> None:
+        """The launcher refuses this; a presence check cannot see it."""
+        helm_root, _ = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            model={"default": "claude-opus-5", "runtimes": {"claude": ["pi"]}},
+        )
+        (helm_root / "agents.json").write_text(
+            json.dumps({"agents": [{"id": "worker", "runtime": "codex"}]}),
+            encoding="utf-8",
+        )
+        report = self.report(helm_root)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("worker", finding.message)
+        self.assertEqual(report.exit_code, 1)
+
+    def test_a_profile_command_baking_a_forbidden_model_is_an_error(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, model={"runtimes": {"claude": ["pi"]}})
+        (helm_root / "agents.json").write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {
+                            "id": "codex",
+                            "runtime": "codex",
+                            "command": ["git", "--model", "claude-opus-5"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        finding = self.finding(self.report(helm_root), "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("claude", finding.message)
+
+    def test_a_custom_argv_that_cannot_carry_the_model_is_an_error(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, model={"default": "claude-opus-5"})
+        with mock.patch.dict(os.environ, {"HELM_WORKER_COMMAND": "git status"}):
+            report = self.report(helm_root)
+            rendered = doctor.render_json(report)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("HELM_WORKER_COMMAND", finding.message)
+        self.assertNotIn("git status", rendered)
+
+    def test_a_sound_runtime_and_model_pairing_stays_ok(self) -> None:
+        """The simulation must not condemn a configuration that would launch."""
+        helm_root, _ = self.sound_root()
+        self.write_preferences(
+            helm_root,
+            agent={"default": "claude"},
+            model={"default": "claude-opus-5", "runtimes": {"claude": ["claude"]}},
+        )
+        with mock.patch.object(
+            Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
+        ):
+            report = self.report(helm_root)
+        self.assertEqual(self.finding(report, "root.runtimes").severity, doctor.OK)
+
+    def test_a_configured_profile_cannot_carry_a_resolved_model(self) -> None:
+        """Core refuses this at launch, so the preflight has to say so.
+
+        Only a built-in runtime publishes a model flag. A configured profile
+        supplies its own command, so Helm has nothing to insert and refuses
+        rather than silently dropping a model the commander is paying for.
+        """
+        helm_root, _ = self.sound_root()
+        self.write_preferences(helm_root, model={"default": "claude-opus-5"})
+        (helm_root / "agents.json").write_text(
+            json.dumps({"agents": [{"id": "worker", "runtime": "claude"}]}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            Coordinator, "_check_command", staticmethod(lambda *a, **k: (True, "ok"))
+        ):
+            report = self.report(helm_root)
+        finding = self.finding(report, "root.runtimes")
+        self.assertEqual(finding.severity, doctor.ERROR)
+        self.assertIn("worker", finding.message)
+
+    # 7 -- symlink scope, at the CLI precheck and inside project.domains.
+
+    def test_an_empty_linked_projects_directory_still_reports_the_symlink(self) -> None:
+        helm_root, _ = self.sound_root()
+        outside = Path(self.temp.name) / "empty-outside"
+        outside.mkdir()
+        shutil.rmtree(helm_root / "projects")
+        (helm_root / "projects").symlink_to(outside)
+
+        code, out, err = self.run_cli(
+            "--root", str(helm_root), "doctor", "--project", "alpha", "--json"
+        )
+
+        self.assertEqual(code, 1, f"expected a report, got stderr={err!r}")
+        self.assertEqual(err, "")
+        document = json.loads(out)
+        by_id = {f["id"]: f["severity"] for f in document["findings"]}
+        self.assertEqual(by_id["root.symlinks"], "error")
+        self.assertEqual(by_id["project.location"], "error")
+
+    def test_an_unknown_project_under_a_real_projects_directory_still_exits_two(self) -> None:
+        helm_root, _ = self.sound_root()
+        code, _, err = self.run_cli(
+            "--root", str(helm_root), "doctor", "--project", "ghost"
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("unknown project ghost", err)
+
+    def test_a_symlinked_declared_domain_is_not_followed_by_project_scope(self) -> None:
+        helm_root, _ = self.sound_root()
+        outside = Path(self.temp.name) / "outside-domain"
+        outside.mkdir()
+        (outside / "knowledge.md").write_text("planted", encoding="utf-8")
+        (outside / "guardrails.md").write_text("planted", encoding="utf-8")
+        (helm_root / "domains" / "linked").symlink_to(outside)
+        project_root = self.add_project(helm_root, "alpha")
+        (project_root / ".helm").mkdir()
+        (project_root / ".helm" / "project.json").write_text(
+            json.dumps({"domains": ["linked"]}), encoding="utf-8"
+        )
+
+        report = self.report(helm_root, "alpha")
+
+        self.assertEqual(self.finding(report, "root.domains").severity, doctor.ERROR)
+        project_domains = self.finding(report, "project.domains")
+        self.assertEqual(project_domains.severity, doctor.ERROR)
+        self.assertIn("linked", project_domains.message)
+
+    # 8 -- incomplete remote evidence is not agreement.
+
+    def test_a_remote_without_a_recorded_head_is_missing_evidence(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        branch = self._run_git(project_root, "symbolic-ref", "--short", "HEAD")
+        for remote in ("origin", "mirror"):
+            subprocess.run(
+                ["git", "-C", str(project_root), "remote", "add", remote,
+                 f"https://helm.invalid/{remote}.git"],
+                check=True,
+            )
+        # Only origin has a recorded default; mirror is silent.
+        subprocess.run(
+            ["git", "-C", str(project_root), "symbolic-ref",
+             "refs/remotes/origin/HEAD", f"refs/remotes/origin/{branch}"],
+            check=True,
+        )
+        finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("missing or contested", finding.message)
+
+    def test_every_remote_agreeing_is_still_an_answer(self) -> None:
+        helm_root, _ = self.sound_root()
+        project_root = self.add_project(helm_root, "alpha")
+        branch = self._run_git(project_root, "symbolic-ref", "--short", "HEAD")
+        for remote in ("origin", "mirror"):
+            subprocess.run(
+                ["git", "-C", str(project_root), "remote", "add", remote,
+                 f"https://helm.invalid/{remote}.git"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(project_root), "symbolic-ref",
+                 f"refs/remotes/{remote}/HEAD", f"refs/remotes/{remote}/{branch}"],
+                check=True,
+            )
+        finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
+        self.assertEqual(finding.severity, doctor.OK)
+        self.assertIn(branch, finding.message)
+
+    def test_a_failed_remote_probe_is_not_read_as_no_remotes(self) -> None:
+        helm_root, _ = self.sound_root()
+        self.add_project(helm_root, "alpha")
+        real = doctor._git_lines
+
+        def failing(root: Path, *args: str):
+            if args[:1] == ("remote",):
+                return None
+            return real(root, *args)
+
+        with mock.patch("helm.doctor._git_lines", failing):
+            finding = self.finding(self.report(helm_root, "alpha"), "project.base_branch")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("could not list the remotes", finding.message)

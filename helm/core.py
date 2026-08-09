@@ -1424,6 +1424,7 @@ class StateStore:
         state_dir: str | os.PathLike[str] | None = None,
         *,
         helm_root: str | os.PathLike[str] | None = None,
+        read_only: bool = False,
     ):
         configured = state_dir or os.environ.get("HELM_STATE_DIR") or "~/.helm"
         requested_directory = Path(configured).expanduser()
@@ -1433,23 +1434,29 @@ class StateStore:
         self._helm_root = canonical(helm_root) if helm_root else None
         self.state_file = self.directory / "state.json"
         self.lock_file = self.directory / ".lock"
+        #: A store that must not change the root it is opened against. Opening
+        #: a store normally *repairs* it -- the permissions below are tightened
+        #: on the way in -- which is right for a command about to write, and
+        #: wrong for one whose whole contract is that it changes nothing. A
+        #: read-only store performs no repair and refuses every write, so
+        #: "inspect without touching" is a property of the object rather than a
+        #: promise each caller has to keep.
+        self.read_only = read_only
         self._validate_open()
-        #: The permission bits found on the way in, before the repair below
-        #: tightens them. Opening a store is what every command does first, so
-        #: by the time anything could look at the disk the exposure is already
-        #: gone -- and a permission check that reads back its own repair is a
-        #: check that can only ever say "fine". `helm doctor` reports from this
-        #: record instead. Captured, never acted on: this changes nothing about
-        #: what the repair does.
+        #: The permission bits found on the way in. A read-only store leaves
+        #: them exactly as found; an ordinary one repairs them immediately
+        #: below, so anything wanting to report on the *found* state has to
+        #: read it here rather than off the disk afterwards.
         self.opened_modes: dict[str, int] = {}
         if self.directory.exists():
             for path in (self.directory, self.state_file, self.lock_file):
                 with contextlib.suppress(OSError):
                     if path.exists() and not path.is_symlink():
                         self.opened_modes[str(path)] = path.stat().st_mode & 0o777
-            _private_dir(self.directory)
-            _private_file(self.state_file)
-            _private_file(self.lock_file)
+            if not read_only:
+                _private_dir(self.directory)
+                _private_file(self.state_file)
+                _private_file(self.lock_file)
 
     @staticmethod
     def empty() -> dict[str, Any]:
@@ -1531,11 +1538,18 @@ class StateStore:
         # an AttributeError from whichever caller iterates it first. That is a
         # traceback where every other corrupt-state path gives a clear refusal,
         # so the containers are checked here, once, for everybody.
-        for key in ("projects", "tasks", "workers"):
+        for key in ("projects", "tasks", "workers", "config", "approval_grants",
+                    "integrations"):
             if not isinstance(data.get(key), dict):
                 raise HelmError(
                     f"unusable Helm state shape in {self.state_file}: "
                     f"{key} is not an object"
+                )
+        for key in ("messages", "artifacts", "learning_proposals"):
+            if not isinstance(data.get(key), list):
+                raise HelmError(
+                    f"unusable Helm state shape in {self.state_file}: "
+                    f"{key} is not a list"
                 )
         version = int(data.get("version") or 1)
         if version != SCHEMA_VERSION:
@@ -1567,6 +1581,7 @@ class StateStore:
 
     def initialize_root(self, root: str | os.PathLike[str]) -> Path:
         """Create the root layout while preserving existing projects and state."""
+        self._refuse_if_read_only("initializing a root")
         helm_root = canonical(root)
         if self.directory != helm_root / "state":
             raise SafetyError(
@@ -1606,7 +1621,20 @@ class StateStore:
                     if candidate.stat().st_mtime < cutoff:
                         candidate.unlink()
 
+    def _refuse_if_read_only(self, operation: str) -> None:
+        """A read-only store fails loudly rather than quietly writing.
+
+        Enforced here, not left to each caller, because "this command does not
+        write" is exactly the kind of claim that stays true only until someone
+        adds a line to it.
+        """
+        if self.read_only:
+            raise SafetyError(
+                f"this Helm state store was opened read-only; {operation} is refused"
+            )
+
     def save(self, data: dict[str, Any]) -> None:
+        self._refuse_if_read_only("saving state")
         self._validate_open()
         _private_dir(self.directory)
         _private_file(self.state_file)
@@ -1627,6 +1655,10 @@ class StateStore:
 
     @contextlib.contextmanager
     def locked(self) -> Iterator[dict[str, Any]]:
+        # Refused rather than merely unused: taking the lock creates and
+        # chmods the lock file, which is a write to the root before the block
+        # body has done anything at all.
+        self._refuse_if_read_only("taking the state lock")
         self._validate_open()
         _private_dir(self.directory)
         _private_file(self.lock_file)
@@ -1644,6 +1676,23 @@ class StateStore:
 class Coordinator:
     def __init__(self, store: StateStore | None = None):
         self.store = store or StateStore()
+        #: Set by `use_preferences` to pin the preferences every method below
+        #: reads. None means "resolve them normally", which is what every
+        #: ordinary command wants.
+        self._preferences_source: prefs.Preferences | None = None
+
+    def use_preferences(self, preferences: prefs.Preferences | None) -> None:
+        """Read preferences from `preferences` instead of resolving them.
+
+        `preferences_path` honours `HELM_PREFERENCES_FILE`, which is right for
+        Helm at large and wrong for a caller whose contract is that it opens
+        only what the root's layout names. Such a caller resolves the file
+        itself, structurally, and pins the result here -- otherwise a redirect
+        it explicitly refused would still be followed by any method that
+        happens to consult preferences on its behalf, which is a guarantee that
+        holds only until the next call is added.
+        """
+        self._preferences_source = preferences
 
     def initialize_root(self, root: str | os.PathLike[str]) -> Path:
         """Initialize the configured root layout through the coordinator API."""
@@ -2472,6 +2521,8 @@ class Coordinator:
         `prefs.EMPTY`, which is the shipped default -- generic Helm imposes no
         operator choice on anyone.
         """
+        if self._preferences_source is not None:
+            return self._preferences_source
         try:
             root = self.store.configured_root()
         except SafetyError:
