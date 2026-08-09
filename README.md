@@ -214,6 +214,13 @@ That holds for their non-Claude models. A Claude-family model runs only under
 the built-in `claude` runtime — see “Claude models run only on Claude Code”
 below.
 
+Which models those runtimes actually reach is never guessed at: `helm agent
+models` queries each launchable, non-excluded runtime's own catalogue command
+near dispatch time and reports the ids verbatim, with cost classified only
+from an explicit free marker in the id — and only when `helm prefs set
+model.free prefer` has asked for cost awareness, never otherwise. The
+`model-selection` domain pack carries the decision order.
+
 The runtime for a task is resolved most-specific-first:
 
 1. the task's own choice — “use Codex for this one”, or `--agent codex`;
@@ -370,6 +377,7 @@ helm --root <helm-root> prefs path      # where the file is
 helm --root <helm-root> prefs set agent.default claude
 helm --root <helm-root> prefs set agent.exclude codex omp
 helm --root <helm-root> prefs set model.runtimes.claude claude
+helm --root <helm-root> prefs set model.free prefer   # cost evidence, fit first
 helm --root <helm-root> prefs unset agent.exclude
 helm --root <helm-root> prefs migrate   # legacy state.config exclusions into the file
 ```
@@ -1330,7 +1338,7 @@ and isolation checks. Details belong in the optional
 helm init [ROOT]
 helm run PROJECT [TASK] [--domain DOMAIN] [--agent PROFILE] [--no-herdr] [--async]
 helm project add|list|status|note|action|domain
-helm agent list|check
+helm agent list|check|models
 helm doctor [--project PROJECT_ID] [--json]
 helm prefs path|show|keys|set KEY VALUE...|unset KEY|migrate
 helm task create|allocate|inspect|approve|merge|deliver|pr|pr-status|pr-sync|outcome

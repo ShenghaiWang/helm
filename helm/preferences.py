@@ -75,6 +75,12 @@ KEY_AGENT_DEFAULT = "agent.default"
 KEY_AGENT_EXCLUDE = "agent.exclude"
 KEY_MODEL_DEFAULT = "model.default"
 KEY_MODEL_RUNTIMES = "model.runtimes"
+KEY_MODEL_FREE = "model.free"
+
+#: The whole vocabulary `model.free` understands. Deliberately enumerated:
+#: a narrow preference cannot be stretched into a standing order to downgrade
+#: work, and an unknown value is refused rather than half-understood.
+FREE_MODEL_VALUES = ("prefer", "off")
 
 #: key -> (takes a list?, one-line description). Printed by `helm prefs keys`
 #: and quoted in every "unknown key" error, so this is the documentation.
@@ -95,6 +101,13 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         True,
         "restrict a model family to named runtimes; families: "
         + ", ".join(runtimes.model_family_ids()),
+    ),
+    KEY_MODEL_FREE: (
+        False,
+        "prefer an explicitly-free model when the dispatcher judges it competent; "
+        "fit is always filtered before cost, and a pin always wins (values: "
+        + ", ".join(FREE_MODEL_VALUES)
+        + ")",
     ),
 }
 
@@ -152,6 +165,10 @@ class Preferences:
     default_model: str | None = None
     excluded_agents: frozenset[str] = frozenset()
     model_runtimes: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: `prefer` asks the dispatcher to prefer an explicitly-free model it has
+    #: judged competent; `off` records the opposite, explicitly; None is the
+    #: shipped default of no opinion. Never a model id and never an order.
+    free_model: str | None = None
 
     def constraint_for(self, model: str | None) -> tuple[str, frozenset[str]] | None:
         """The family restriction that applies to a model, if any is enabled.
@@ -185,6 +202,8 @@ class Preferences:
                 family: sorted(allowed)
                 for family, allowed in sorted(self.model_runtimes.items())
             }
+        if self.free_model:
+            model["free"] = self.free_model
         if model:
             document["model"] = model
         return document
@@ -204,6 +223,8 @@ class Preferences:
             rows.append((KEY_MODEL_DEFAULT, self.default_model))
         for family, allowed in sorted(self.model_runtimes.items()):
             rows.append((f"{KEY_MODEL_RUNTIMES}.{family}", ", ".join(sorted(allowed))))
+        if self.free_model:
+            rows.append((KEY_MODEL_FREE, self.free_model))
         return rows
 
 
@@ -278,10 +299,15 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
     )
 
     model = _object(document.get("model"), "model", where)
-    _reject_unknown(model, {"default", "runtimes"}, "model", where)
+    _reject_unknown(model, {"default", "runtimes", "free"}, "model", where)
     default_model = (
         _model_id(model["default"], "model.default", where)
         if model.get("default") is not None
+        else None
+    )
+    free_model = (
+        _free_value(model["free"], "model.free", where)
+        if model.get("free") is not None
         else None
     )
     runtimes_by_family: dict[str, frozenset[str]] = {}
@@ -311,6 +337,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         default_model=default_model,
         excluded_agents=excluded,
         model_runtimes=runtimes_by_family,
+        free_model=free_model,
     )
 
 
@@ -364,6 +391,17 @@ def _model_id(value: Any, name: str, where: str) -> str:
         return runtimes.validate_model_id(value)
     except ValueError as exc:
         raise PreferencesError(f"{name}{where}: {exc}") from exc
+
+
+def _free_value(value: Any, name: str, where: str) -> str:
+    """Accept only the enumerated vocabulary `model.free` understands."""
+    if not isinstance(value, str) or value not in FREE_MODEL_VALUES:
+        raise PreferencesError(
+            f"{name}{where} must be one of "
+            + ", ".join(repr(item) for item in FREE_MODEL_VALUES)
+            + f", not {value!r}"
+        )
+    return value
 
 
 # ---------- writing ----------
@@ -440,6 +478,11 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
             model.pop("default", None)
         else:
             model["default"] = listed[0]
+    elif key == KEY_MODEL_FREE:
+        if listed is None:
+            model.pop("free", None)
+        else:
+            model["free"] = listed[0]
     else:
         raise _unknown_key(key)
 

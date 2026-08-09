@@ -28,6 +28,7 @@ from .core import (
     worker_environment,
 )
 from . import doctor as doctor_module
+from . import models
 from . import preferences
 from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter
 
@@ -120,8 +121,18 @@ def _print_agents(coordinator: Coordinator, *, check: bool = False) -> None:
         # No profile file is the normal case, not a broken one: list the
         # runtimes a task would actually be delegated to.
         for runtime in coordinator.builtin_runtime_availability():
-            marker = " <- this session" if runtime["detected"] else ""
-            state = "available" if runtime["available"] else "unavailable"
+            marker = ""
+            if runtime["detected"]:
+                marker = " <- this session"
+            elif runtime["default"]:
+                marker = " <- root default"
+            state = (
+                "excluded"
+                if runtime["excluded"]
+                else "available"
+                if runtime["available"]
+                else "unavailable"
+            )
             herdr = ""
             if runtime.get("herdr_integration"):
                 herdr = f", herdr={runtime['herdr_integration']}"
@@ -133,7 +144,13 @@ def _print_agents(coordinator: Coordinator, *, check: bool = False) -> None:
         if check:
             state = "available" if profile["available"] else "unavailable"
             if profile.get("builtin"):
-                marker = " <- this session" if profile.get("detected") else ""
+                marker = ""
+                if profile.get("detected"):
+                    marker = " <- this session"
+                elif profile.get("default"):
+                    marker = " <- root default"
+                if profile.get("excluded"):
+                    state = "excluded"
                 herdr = ""
                 if profile.get("herdr_integration"):
                     herdr = f", herdr={profile['herdr_integration']}"
@@ -153,6 +170,151 @@ def _print_agents(coordinator: Coordinator, *, check: bool = False) -> None:
                 + f" source={profile['source']}"
             )
     print_herdr_only_integrations()
+
+
+def _model_cost(entry: Any) -> str:
+    """The only two statements Helm makes about cost."""
+    return "free" if entry.free else "unknown"
+
+
+def _agent_models_report(coordinator: Coordinator) -> dict[str, Any]:
+    """One deterministic report: readiness per runtime plus live catalogues.
+
+    Catalogue queries run only for runtimes that are launchable *and* not
+    excluded by this root -- an excluded runtime's catalogue is not queried,
+    because its whole catalogue is unusable with it. `claude`, `codex` and
+    `omp` publish no safe catalogue command and are reported unsupported
+    rather than guessed at.
+    """
+    readiness = coordinator.builtin_runtime_availability()
+    preference = coordinator.preferences().free_model
+    queried: dict[str, Any] = {}
+    for entry in readiness:
+        if entry["available"] and not entry["excluded"]:
+            queried[entry["id"]] = models.query_catalogue(entry["id"])
+    runtimes_report = []
+    by_id = {entry["id"]: entry for entry in readiness}
+    for entry in readiness:
+        query = queried.get(entry["id"])
+        if query is not None:
+            catalogue = {
+                "command": list(query.command),
+                "supported": query.supported,
+                "available": query.available,
+                "reason": query.reason,
+                "models": [
+                    {"id": model.id, "cost": _model_cost(model)}
+                    for model in query.models
+                ],
+            }
+        elif not by_id[entry["id"]]["available"]:
+            catalogue = {
+                "command": [],
+                "supported": models.catalogue_command(entry["id"]) is not None,
+                "available": False,
+                "reason": entry["reason"],
+                "models": [],
+            }
+        elif entry["excluded"]:
+            catalogue = {
+                "command": list(models.catalogue_command(entry["id"]) or ()),
+                "supported": models.catalogue_command(entry["id"]) is not None,
+                "available": False,
+                "reason": "skipped: this root excludes the runtime",
+                "models": [],
+            }
+        else:
+            catalogue = {
+                "command": [],
+                "supported": False,
+                "available": False,
+                "reason": models.UNSUPPORTED_REASON,
+                "models": [],
+            }
+        runtimes_report.append({
+            "id": entry["id"],
+            "name": entry["name"],
+            "builtin": True,
+            "launchable": entry["available"],
+            "excluded": entry["excluded"],
+            "default": entry["default"],
+            "detected": entry["detected"],
+            "catalogue": catalogue,
+        })
+    free_evidence = [
+        {"id": model["id"], "runtime": entry["id"]}
+        for entry in runtimes_report
+        for model in entry["catalogue"]["models"]
+        if model["cost"] == "free"
+    ]
+    return {
+        "schema_version": 1,
+        "preference": (
+            {"key": preferences.KEY_MODEL_FREE, "value": preference}
+            if preference
+            else None
+        ),
+        "decision_order": list(coordinator.MODEL_SELECTION_ORDER),
+        "rules": list(coordinator.MODEL_SELECTION_RULES),
+        "runtimes": runtimes_report,
+        "free_evidence": free_evidence,
+        "note": (
+            "Cost is classified only from an explicit free marker in the "
+            "catalogue id; every other model is unknown. Helm reads no "
+            "credential store and reports no prices."
+        ),
+    }
+
+
+def _print_agent_models(coordinator: Coordinator, *, as_json: bool) -> None:
+    report = _agent_models_report(coordinator)
+    if as_json:
+        print(json.dumps(report, sort_keys=True))
+        return
+    if report["preference"]:
+        print(
+            f"preference: {report['preference']['key']} = "
+            f"{report['preference']['value']}"
+        )
+    else:
+        print("preference: none (no free-model preference set)")
+    print("decision order: " + " > ".join(report["decision_order"]))
+    print()
+    print(f"{'runtime':<10} {'catalogue':<20} {'status':<12} {'models':<7} {'free'}")
+    for entry in report["runtimes"]:
+        catalogue = entry["catalogue"]
+        command = " ".join(catalogue["command"]) if catalogue["command"] else "(none)"
+        if not catalogue["supported"]:
+            status = "unsupported"
+        elif not entry["launchable"]:
+            status = "unavailable"
+        elif catalogue["available"]:
+            status = "ok"
+        else:
+            status = catalogue["reason"][:12]
+        marks = ""
+        if entry["excluded"]:
+            marks = " [excluded by root]"
+        elif entry["default"]:
+            marks = " [root default]"
+        elif entry["detected"]:
+            marks = " [this session]"
+        print(
+            f"{entry['id']:<10} {command:<20} {status:<12} "
+            f"{len(catalogue['models']):<7} "
+            f"{sum(1 for m in catalogue['models'] if m['cost'] == 'free')}"
+            f"{marks}"
+        )
+    if report["free_evidence"]:
+        print()
+        print("free (explicit catalogue evidence only):")
+        for entry in report["free_evidence"]:
+            print(f"  {entry['id']}  ({entry['runtime']})")
+    else:
+        print()
+        print("no explicitly-free models reported by any launchable catalogue")
+    print()
+    print(report["note"])
 
 
 def _open_pull_request(
@@ -887,6 +1049,21 @@ def _build_parser() -> argparse.ArgumentParser:
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     agent_commands.add_parser("list", help="list configured profiles without launching anything")
     agent_commands.add_parser("check", help="check profile commands and live availability checks")
+    agent_models = agent_commands.add_parser(
+        "models",
+        help="query live model catalogues and classify explicitly-free models (read-only)",
+        description=(
+            "Query the catalogue commands the launchable built-in runtimes "
+            "publish (pi --list-models, opencode models) with a bounded "
+            "timeout, and report exact model ids. Free is classified only "
+            "from an explicit marker in the id itself; everything else is "
+            "unknown. Reads no credential store and writes nothing."
+        ),
+    )
+    agent_models.add_argument(
+        "--json", dest="agent_models_json", action="store_true",
+        help="emit the machine-readable report",
+    )
 
     # Read-only, so it is deliberately open to every caller: a worker that can
     # tell a broken root from a broken brief escalates the right one.
@@ -2128,7 +2305,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "agent":
-            _print_agents(coordinator, check=args.agent_command == "check")
+            if args.agent_command == "models":
+                _print_agent_models(coordinator, as_json=args.agent_models_json)
+            else:
+                _print_agents(coordinator, check=args.agent_command == "check")
             return 0
 
         if args.command == "prefs":

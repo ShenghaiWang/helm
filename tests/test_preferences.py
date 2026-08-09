@@ -164,7 +164,13 @@ class PreferenceSchemaTests(HelmTestCase):
         """`prefs keys` is the documentation, so it has to be complete."""
         self.assertEqual(
             set(preferences.SUPPORTED_KEYS),
-            {"agent.default", "agent.exclude", "model.default", "model.runtimes.<family>"},
+            {
+                "agent.default",
+                "agent.exclude",
+                "model.default",
+                "model.free",
+                "model.runtimes.<family>",
+            },
         )
         for family in runtimes.model_family_ids():
             self.assertEqual(

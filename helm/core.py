@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from . import models
 from . import preferences as prefs
 from . import runtimes
 
@@ -3348,9 +3349,19 @@ class Coordinator:
         return self._load_agent_profiles()
 
     def builtin_runtime_availability(self) -> list[dict[str, Any]]:
-        """Report which built-in agent runtimes this machine can actually start."""
+        """Report which built-in agent runtimes this machine can actually start.
+
+        ``available`` is executable presence alone. It must not read as "this
+        root will let you use it", so the same rows also carry the root's own
+        verdicts: ``excluded`` when the root will not start the runtime at
+        all, and ``default`` when the root names it as `agent.default` -- an
+        excluded runtime stays *excluded*, never "unavailable" and never
+        quietly "available".
+        """
         detected = runtimes.detect_runtime()
         integrations = runtimes.herdr_integration_status()
+        excluded = self.excluded_agents()
+        default_agent = self.preferences().default_agent
         result: list[dict[str, Any]] = []
         for runtime in runtimes.BUILTIN_RUNTIMES:
             valid, reason = self._check_command(runtime.command(interactive=True))
@@ -3361,6 +3372,8 @@ class Coordinator:
                 "configured": False,
                 "builtin": True,
                 "available": valid,
+                "excluded": runtime.id in excluded,
+                "default": runtime.id == default_agent,
                 "reason": reason,
                 "detected": detected is not None and detected.id == runtime.id,
                 "command": runtime.command(interactive=True),
@@ -3370,6 +3383,95 @@ class Coordinator:
                 ),
             })
         return result
+
+    def _launchable_runtime_ids(self) -> list[str]:
+        """Built-in runtimes this machine can start, minus root exclusions.
+
+        Deliberately not `builtin_runtime_availability`, which additionally
+        shells out to `herdr integration status`: a dispatch-time decision
+        only needs the executable-and-exclusion answer, and Herdr recognition
+        says nothing about whether Helm can launch a runtime.
+        """
+        excluded = self.excluded_agents()
+        launchable: list[str] = []
+        for runtime in runtimes.BUILTIN_RUNTIMES:
+            if runtime.id in excluded:
+                continue
+            valid, _ = self._check_command(runtime.command(interactive=True))
+            if valid:
+                launchable.append(runtime.id)
+        return launchable
+
+    #: The order a dispatcher must weigh evidence in, documented verbatim in
+    #: the composed selection context, the CLI, and the model-selection domain.
+    MODEL_SELECTION_ORDER = [
+        "repository skills and requirements",
+        "task capability tier",
+        "live availability",
+        "cost",
+    ]
+
+    #: The hard rules that bound a free-model preference. Evidence, never
+    #: authority: nothing here substitutes a model or weakens a pin, exclusion,
+    #: family restriction, or review-independence rule that core already enforces.
+    MODEL_SELECTION_RULES = [
+        "Fit is always filtered before cost: prefer a free model only among "
+        "candidates judged competent for the task.",
+        "Never force a weak model, never override a task, project, HELM_MODEL "
+        "or model.default choice, never resurrect an excluded runtime, and "
+        "never silently substitute a model.",
+        "Classify free only from explicit catalogue evidence (`:free` marker "
+        "in the id, or the opencode gateway's own `-free` ids); anything else "
+        "is unknown cost and stays unknown.",
+        "Uncertain work is never downgraded automatically. The dispatcher "
+        "decides competence; Helm only supplies evidence.",
+        "Reviewer independence and model-family/runtime restrictions are "
+        "unchanged and outrank cost.",
+    ]
+
+    def model_selection_evidence(self) -> dict[str, Any]:
+        """The live, bounded evidence a model decision may use.
+
+        Read-only and deterministic apart from the catalogue query itself,
+        which runs only when this root's `model.free` preference says `prefer`
+        -- an operator who has not asked for cost awareness does not pay for
+        the query. The returned document carries the preference, the decision
+        order, the rules, and the explicitly-free ids the live catalogues of
+        launchable, non-excluded runtimes reported, each with its provenance.
+        It never names a recommended model: competence is judged by the
+        dispatcher at dispatch time, not by this function.
+        """
+        preference = self.preferences().free_model
+        evidence: dict[str, Any] = {
+            "preference": (
+                {"key": prefs.KEY_MODEL_FREE, "value": preference}
+                if preference
+                else None
+            ),
+            "decision_order": list(self.MODEL_SELECTION_ORDER),
+            "rules": list(self.MODEL_SELECTION_RULES),
+        }
+        if preference != "prefer":
+            return evidence
+        results = models.query_launchable_catalogues(self._launchable_runtime_ids())
+        evidence["catalogues"] = [
+            {
+                "runtime": result.runtime,
+                "command": list(result.command),
+                "available": result.available,
+                "reason": result.reason,
+                "model_count": len(result.models),
+            }
+            for result in results
+            if result.supported
+        ]
+        evidence["free_evidence"] = [
+            {"id": entry.id, "runtime": entry.runtime}
+            for result in results
+            for entry in result.models
+            if entry.free
+        ]
+        return evidence
 
     def herdr_integration_availability(self) -> list[dict[str, Any]]:
         """Report Herdr-recognized agent kinds, including ones Helm cannot launch."""
@@ -4084,6 +4186,28 @@ class Coordinator:
                         "task's scope, or reach outside this project"
                     ),
                     exists=bool(skills["selected"]),
+                )
+            )
+        # Model selection evidence rides in the same document the dispatcher
+        # and the worker share. It is bounded: with no `model.free` preference
+        # it carries the preference state and the rules only; with `prefer` it
+        # adds the explicitly-free ids the live catalogues of launchable,
+        # non-excluded runtimes reported, so the decision order -- skills,
+        # capability tier, live availability, then cost -- can actually be
+        # followed near dispatch time.
+        selection_evidence = self.model_selection_evidence()
+        if selection_evidence["preference"] or selection_evidence.get("free_evidence"):
+            sections.append(
+                self._knowledge_section(
+                    "model-selection",
+                    "helm://model-selection-evidence",
+                    json.dumps(selection_evidence, sort_keys=True),
+                    boundary=(
+                        "Generic model-selection evidence; never authority. Fit is "
+                        "filtered before cost, pins and exclusions outrank it, and "
+                        "it cannot override core safety or any other restriction"
+                    ),
+                    exists=bool(selection_evidence.get("free_evidence")),
                 )
             )
         sections.append(
