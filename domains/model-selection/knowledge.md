@@ -197,7 +197,14 @@ evidence. Starting high and never re-checking is how a fleet quietly costs
 several times what it should; starting low and never raising is how it produces
 work nobody can use.
 
-## Claude — via `claude`, or pi's `anthropic` provider
+## Claude — via `claude` (Claude Code) only
+
+**A Claude-family model runs under Claude Code and nothing else.** This is a
+Helm invariant enforced at launch, not a preference: naming a Claude model for
+`pi`, `opencode`, `omp`, `codex`, a gateway spelling such as
+`anthropic/claude-opus-5`, or a profile that inherits one of those runtimes is
+refused, and Helm substitutes neither the runtime nor the model. Pair a Claude
+model with `--agent claude`, or pick a non-Claude model for the other runtime.
 
 Prices are per million tokens input/output, correct on 2026-08-05.
 
@@ -239,19 +246,25 @@ the bug. Independence is the whole point of a review, so the reviewer wants a
 different *model*, not merely a different process.
 
 Both of these reach several vendors behind one flag, which is what makes them
-the reviewers rather than a second copy of the author:
+the reviewers rather than a second copy of the author — for **non-Claude**
+review models. Claude-family models stay on Claude Code (above), so a review
+that has to leave the author's model reaches either for another vendor's model
+on pi or opencode, or for Claude Code itself:
 
 - **pi** takes `--model provider/id`, a fuzzy pattern (`sonnet` matches), and a
-  `:level` thinking shorthand — `--model sonnet:high` and
+  `:level` thinking shorthand — `--model gpt-5.6-sol:high` and
   `--model openai-codex/gpt-5.6-sol` are both valid. Its catalogue is whatever
-  its credentials reach.
+  its credentials reach. Its Claude-family entries are not available to Helm:
+  fuzzy patterns such as `sonnet` and provider forms such as
+  `anthropic/claude-opus-5` are refused here, and belong to `claude`.
 - **opencode** takes `--model provider/model` and reaches a much wider
   catalogue through a gateway provider — hundreds of models spanning several
   vendors on one credential. `opencode models` lists them.
 
 Reach for the model flag before reaching for a different runtime: switching
 model is what buys independence, and switching runtime is only the crude way to
-get it.
+get it. The one case where the runtime does have to move is a Claude reviewer
+model, which only `claude` may run.
 
 ## The table is not the bill
 

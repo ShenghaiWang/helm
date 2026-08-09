@@ -209,6 +209,9 @@ launch command, environment passthrough, and any availability check it needs.
 `pi` and `opencode` both reach several vendors' models behind one flag, which
 makes them the useful reviewers: an independent review wants a different model
 from the one that wrote the change, and those two put one a `--model` away.
+That holds for their non-Claude models. A Claude-family model runs only under
+the built-in `claude` runtime — see “Claude models run only on Claude Code”
+below.
 
 The runtime for a task is resolved most-specific-first:
 
@@ -253,6 +256,39 @@ rather than dropped** — silently ignoring it would leave the coordinator
 believing it had instructed a model it never sent, and the bill is the only
 place that difference would show up. Which model suits which task is knowledge,
 not policy, and lives in the `model-selection` domain.
+
+#### Claude models run only on Claude Code
+
+A Claude-family model may only be launched through the built-in `claude`
+runtime. Helm checks the pairing at launch, wherever the model came from — the
+task's `--model`, a project `"model"` pin, `HELM_MODEL`, or a review's
+`--reviewer-model` — and for both ordinary workers and reviewers. It recognizes
+plain ids (`claude-opus-5`), provider-qualified and gateway spellings
+(`anthropic/claude-opus-5`, `openrouter/anthropic/claude-3.5-sonnet`,
+`us.anthropic.claude-sonnet-4-v1:0`), and the bare family aliases agent CLIs
+accept (`opus`, `sonnet-4-5`, `haiku`); it does not classify an unrelated
+string that merely contains one of those words.
+
+Pointing `pi`, `opencode`, `omp`, `codex`, or a profile that inherits one of
+them at such a model is **refused, naming the runtime required** — Helm
+substitutes neither the runtime nor the model, for the same reason it refuses
+rather than drops a model above. Pair the model with `--agent claude`, or give
+the cross-provider runtime a non-Claude model.
+
+A model does not have to arrive through Helm's model field, so the launch
+command is inspected too: a profile or a caller-supplied command that selects a
+Claude model itself — `--model claude-opus-5` or `--model=claude-opus-5` — is
+refused on a non-Claude runtime. Only `--model` is inspected, because that is
+the flag every built-in runtime publishes and Helm does not guess a short form
+that may mean something else to the command being run.
+
+The limit of that check is exact and worth stating: **Helm reads argv, and
+nothing else.** A command that is an opaque wrapper — a shell script, an alias,
+or a launcher that picks its model from its own config file or an environment
+variable — can still reach a model Helm never sees, because Helm cannot execute
+or introspect it to find out. Configuring a runtime with its own command is a
+deliberate act by whoever set up the root, and the pairing inside that command
+stays theirs to keep.
 
 ```sh
 helm --root <helm-root> run api "Fix the failing import" --agent pi

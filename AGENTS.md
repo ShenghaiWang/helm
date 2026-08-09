@@ -443,7 +443,23 @@ For review the rule is sharper: **an independent review means a different
 model, not merely a different process.** A reviewer running the author's model
 shares the blind spots that produced the bug. `pi` and `opencode` both reach
 several vendors behind one `--model`, which is what makes them the reviewers
-here; `codex` is excluded on cost, and Helm refuses to start it.
+here — for **non-Claude** review models; `codex` is excluded on cost, and Helm
+refuses to start it.
+
+**A Claude-family model runs only under the built-in `claude` runtime.** Helm
+enforces the pairing at launch, for ordinary workers and reviewers alike and
+whichever source named the model — `--model` on the task, a project pin,
+`HELM_MODEL`, or `--reviewer-model`. Provider-qualified and gateway spellings
+count (`anthropic/claude-opus-5`, `us.anthropic.claude-...`), as do the bare
+family aliases agent CLIs accept (`opus`, `sonnet-4-5`, `haiku`), and so does a
+configured profile that inherits `pi`, `opencode`, `omp`, or `codex`. The
+refusal names the required runtime; Helm substitutes neither the runtime nor
+the model, because a silent substitution hides which of the two you actually
+got. So pair a Claude model with `--agent claude`, or give the cross-provider
+runtime a non-Claude model. A launch command that selects the model itself
+(`--model claude-opus-5`, `--model=claude-opus-5`) is refused the same way;
+what Helm cannot see is an opaque wrapper that picks its own model, and that
+limit is stated in the check rather than papered over.
 
 Rules that do not bend: a runtime is *named*, never invented — an unknown name
 is an error listing the known agents, and a named runtime whose executable is

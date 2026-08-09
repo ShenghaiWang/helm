@@ -2400,6 +2400,41 @@ class Coordinator:
         return None, ""
 
     @staticmethod
+    def _launch_runtime_id(profile: dict[str, Any], command: Sequence[str]) -> str | None:
+        """Name the runtime a command will actually start, when it is knowable.
+
+        argv[0] wins whenever it names a runtime Helm knows, because that is
+        the program that will actually run: a profile is metadata, and metadata
+        claiming to be `claude` over a command that starts `pi` would hand the
+        boundary the one answer that lets the launch through. Profile metadata
+        is consulted only where the executable says nothing -- an opaque
+        wrapper -- and an unrecognized program is treated as evidence of
+        nothing at all rather than as evidence of Claude Code.
+        """
+        if command:
+            executable = Path(str(command[0])).name
+            if runtimes.builtin_runtime(executable) is not None:
+                return executable
+        named = profile.get("runtime") or profile.get("id")
+        if runtimes.builtin_runtime(named) is not None:
+            return str(named)
+        return None
+
+    @staticmethod
+    def _require_claude_runtime(
+        model: str | None, runtime_id: str | None, reason: str = ""
+    ) -> None:
+        """Refuse a Claude-family model on anything but Claude Code.
+
+        The pairing is a Helm invariant, so it is checked wherever a model and
+        a runtime meet -- ordinary worker selection and both reviewer paths --
+        rather than at the one entry point somebody happened to notice.
+        """
+        if runtimes.is_claude_model(model) and runtime_id != runtimes.CLAUDE_RUNTIME_ID:
+            assert model is not None
+            raise HelmError(runtimes.claude_pairing_error(model, runtime_id, reason))
+
+    @staticmethod
     def _with_model(
         profile: dict[str, Any], command: Sequence[str], model: str | None, reason: str
     ) -> list[str]:
@@ -2413,8 +2448,36 @@ class Coordinator:
         difference would show up.
         """
         actual = list(command)
+        launch_runtime = Coordinator._launch_runtime_id(profile, actual)
+        if launch_runtime != runtimes.CLAUDE_RUNTIME_ID:
+            # A model does not have to arrive through Helm's model field. A
+            # profile or a caller-supplied command can put `--model` straight
+            # into argv, and a boundary checked only where Helm places a model
+            # itself would be one the command walks past. Checked whether or
+            # not a model was also resolved, and before the model below, since
+            # the argv is what would actually be launched.
+            baked = runtimes.claude_model_in_command(actual)
+            if baked is not None:
+                raise HelmError(
+                    runtimes.claude_pairing_error(
+                        baked,
+                        launch_runtime or profile["id"],
+                        "its launch command selects that model",
+                    )
+                )
         if not model:
             return actual
+        # A Claude-family model is bound to Claude Code whatever chose it --
+        # the CLI, the task, the project pin, or HELM_MODEL. Checked before the
+        # flag question below, because for a profile that inherits a built-in
+        # runtime "no model flag" would be the wrong reason to refuse.
+        effective = profile.get("runtime") or profile.get("id")
+        if (
+            runtimes.is_claude_model(model)
+            and runtimes.builtin_runtime(effective) is not None
+            and effective != runtimes.CLAUDE_RUNTIME_ID
+        ):
+            raise HelmError(runtimes.claude_pairing_error(model, profile["id"], reason))
         runtime = runtimes.builtin_runtime(profile["id"])
         if runtime is None or not profile.get("builtin"):
             raise HelmError(
@@ -3446,6 +3509,7 @@ class Coordinator:
                     "Remove it from config.review_exclude_agents (or set "
                     "HELM_REVIEW_EXCLUDE_AGENTS) to allow it again."
                 )
+            self._require_claude_runtime(model, explicit, f"explicit reviewer {explicit}")
             runtime = runtimes.builtin_runtime(explicit)
             command = (
                 runtime.with_model(model, interactive=interactive) if runtime else None
@@ -3465,6 +3529,21 @@ class Coordinator:
             for entry in self.builtin_runtime_availability()
             if entry["available"] and entry["id"] not in excluded
         ]
+        if runtimes.is_claude_model(model):
+            # Independence is chosen from what may actually run this model, so
+            # a Claude reviewer model never quietly lands on a cross-provider
+            # runtime that would happily accept the name and bill for it.
+            available = [
+                candidate
+                for candidate in available
+                if candidate == runtimes.CLAUDE_RUNTIME_ID
+            ]
+            if not available and author_agent_id != runtimes.CLAUDE_RUNTIME_ID:
+                raise HelmError(
+                    runtimes.claude_pairing_error(
+                        model, None, "no installed reviewer runtime is Claude Code"
+                    )
+                )
         for candidate in available:
             if candidate != author_agent_id:
                 runtime = runtimes.builtin_runtime(candidate)
@@ -3476,6 +3555,9 @@ class Coordinator:
                 }
         runtime = runtimes.builtin_runtime(author_agent_id)
         if runtime is not None and model:
+            self._require_claude_runtime(
+                model, author_agent_id, "it is the only installed runtime"
+            )
             return {
                 "agent": author_agent_id,
                 "command": runtime.with_model(model, interactive=interactive),

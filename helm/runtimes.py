@@ -247,6 +247,117 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
 
 _BY_ID = {runtime.id: runtime for runtime in BUILTIN_RUNTIMES}
 
+# ---------- the Claude-family / Claude Code pairing ----------
+
+# A Claude-family model runs under Claude Code and nothing else. Several
+# runtimes here can reach several vendors behind one ``--model``, so pointing
+# one of them at a Claude model is a launch Helm can build and a bill the
+# commander pays, for a pairing this root does not allow. Helm refuses it at
+# the point of launch rather than substituting a runtime or a model, because a
+# silent substitution hides which of the two the caller actually got.
+CLAUDE_RUNTIME_ID = "claude"
+
+# Segments are split on the separators gateways and provider-qualified ids use:
+# ``anthropic/claude-opus-4``, ``openrouter/anthropic/claude-3.5-sonnet``,
+# ``vertex:claude-sonnet-4``, ``bedrock/us.anthropic.claude-sonnet-4-v1:0``.
+_MODEL_SEGMENTS = re.compile(r"[/:@|,]+")
+
+# The provider whose whole catalogue is Claude. A path segment naming it is
+# enough on its own, which is what catches gateway spellings whose model half
+# is abbreviated past recognition.
+_ANTHROPIC_SEGMENT = "anthropic"
+
+# ``claude`` anywhere at the head of a segment, plus the bare family aliases
+# agent CLIs accept in place of a full id. The aliases are deliberately narrow:
+# they match alone or with a version-shaped suffix, so ``opus-4.1`` and
+# ``sonnet-4-5`` are Claude while ``opus-magnum`` and ``sonnetize`` are not.
+_CLAUDE_NAME = re.compile(r"^claude(?:[-._].*)?$")
+_CLAUDE_ALIAS = re.compile(r"^(?:opus|sonnet|haiku|fable)(?:[-._]?\d[a-z0-9._-]*)?$")
+
+# Some gateways flatten the provider into the model half of one segment rather
+# than keeping it as its own path element: ``azure/anthropic-claude-sonnet-4``
+# has no ``anthropic`` segment at all. So a segment's own ``-``/``.``/``_``
+# tokens are checked too. Token equality, never a substring: ``myanthropic``
+# and ``claudette`` are single tokens that match nothing.
+_PROVIDER_TOKENS = re.compile(r"[-._]+")
+_CLAUDE_TOKENS = frozenset({_ANTHROPIC_SEGMENT, "claude"})
+
+
+def is_claude_model(model: str | None) -> bool:
+    """Report whether a model identifier names a Claude-family model.
+
+    Narrow on purpose. Matching a bare substring would classify any string
+    that happens to contain ``haiku`` as Claude and refuse a launch nobody
+    asked to restrict, so every test here is anchored to a whole segment of
+    the identifier.
+    """
+    if not model:
+        return False
+    for segment in _MODEL_SEGMENTS.split(model.strip().lower()):
+        if not segment:
+            continue
+        if _CLAUDE_NAME.match(segment) or _CLAUDE_ALIAS.match(segment):
+            return True
+        # Bedrock-style ids carry the family inside one dotted segment, and
+        # provider-prefixed gateway ids carry it inside a dashed one.
+        if _CLAUDE_TOKENS & set(_PROVIDER_TOKENS.split(segment)):
+            return True
+    return False
+
+
+# Flags that select a model in the CLIs Helm knows how to launch. Every
+# built-in runtime publishes ``--model``; none of them establishes a short
+# form here, so none is guessed -- an invented ``-m`` would refuse launches for
+# a flag that may mean something else entirely to the command being run.
+_MODEL_FLAGS = frozenset({runtime.model_flag for runtime in BUILTIN_RUNTIMES})
+
+
+def claude_model_in_command(command: Sequence[str]) -> str | None:
+    """Find a Claude model a command selects for itself, if it is visible.
+
+    A model does not have to arrive through Helm's model field: a configured
+    profile or a caller-supplied command can bake ``--model`` straight into
+    argv, which would otherwise walk past a boundary checked only where Helm
+    places a model itself.
+
+    **This reads argv and nothing else, which is the exact limit of it.** A
+    command that is an opaque wrapper -- a shell script, an alias, a launcher
+    that reads its own config file or an environment variable, or one that
+    spells the selection in a form not listed here -- can still choose a model
+    Helm never sees, and Helm does not pretend otherwise: it cannot execute or
+    introspect the wrapper to find out. Naming a runtime with its own command
+    is a deliberate act by whoever configured this root, and the pairing there
+    is theirs to keep. What is *visible* is refused.
+    """
+    parts = list(command)
+    for index, part in enumerate(parts):
+        flag, joined, inline = part.partition("=")
+        if flag not in _MODEL_FLAGS:
+            continue
+        if joined:
+            # `--model=` states an empty value. The next argument is the
+            # prompt, not the model, and reading it as one would refuse a
+            # launch over whatever the brief happened to mention.
+            value = inline
+        else:
+            value = parts[index + 1] if index + 1 < len(parts) else ""
+        if value and is_claude_model(value):
+            return value
+    return None
+
+
+def claude_pairing_error(model: str, runtime_id: str | None, reason: str = "") -> str:
+    """The one message every rejected Claude/runtime pairing uses."""
+    named = runtime_id or "an unnamed runtime"
+    return (
+        f"model {model} is a Claude-family model and may only be launched through "
+        f"Helm's built-in {CLAUDE_RUNTIME_ID} runtime (Claude Code), but "
+        f"{named} was selected"
+        + (f" because {reason}" if reason else "")
+        + f". Name --agent {CLAUDE_RUNTIME_ID}, or choose a non-Claude model for "
+        f"{named}. Helm will not substitute a runtime or a model for you."
+    )
+
 
 def builtin_runtime(runtime_id: str | None) -> AgentRuntime | None:
     if not runtime_id:
