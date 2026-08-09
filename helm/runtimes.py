@@ -22,7 +22,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 # A launch command may carry this token once; Helm replaces it with the
 # assignment's bootstrap prompt after the worker's context document exists.
@@ -247,15 +247,55 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
 
 _BY_ID = {runtime.id: runtime for runtime in BUILTIN_RUNTIMES}
 
-# ---------- the Claude-family / Claude Code pairing ----------
+# ---------- naming an agent and a model ----------
+#
+# Both of these end up in an argv, so the only question either one answers is
+# "can this turn into shell, or into another argument". Neither validates that
+# the thing named exists: that is the runtime's answer to give, and a list of
+# valid models baked in here would go stale the first week. They live in this
+# module because it is the one place that owns the vocabulary of agents and
+# models, and because the preferences layer needs them without importing core.
 
-# A Claude-family model runs under Claude Code and nothing else. Several
-# runtimes here can reach several vendors behind one ``--model``, so pointing
-# one of them at a Claude model is a launch Helm can build and a bill the
-# commander pays, for a pairing this root does not allow. Helm refuses it at
-# the point of launch rather than substituting a runtime or a model, because a
-# silent substitution hides which of the two the caller actually got.
-CLAUDE_RUNTIME_ID = "claude"
+_AGENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~/-]{0,127}")
+
+
+def validate_agent_id(agent_id: object) -> str:
+    """Accept a runtime/profile id without letting it become a command."""
+    if not isinstance(agent_id, str) or not _AGENT_ID.fullmatch(agent_id):
+        raise ValueError(
+            "agent id must be 1-64 characters: letters, numbers, '.', '_' or '-' only"
+        )
+    return agent_id
+
+
+def validate_model_id(model_id: object) -> str:
+    """Accept a model name without letting it become a command.
+
+    Deliberately wider than an agent id: real model names carry slashes and
+    colons -- ``openrouter/~vendor/model-latest``, ``model:high`` -- so the
+    check is that it cannot turn into shell or another argument, not that it
+    matches any one vendor's spelling.
+    """
+    if not isinstance(model_id, str) or not _MODEL_ID.fullmatch(model_id):
+        raise ValueError(
+            "model must be 1-128 characters: letters, numbers, '.', '_', ':', "
+            "'~', '/' or '-' only"
+        )
+    return model_id
+
+
+# ---------- model families: generic technical metadata ----------
+#
+# Which vendor's family a model identifier belongs to is a *fact* about the
+# identifier, not a policy about what may run it. Helm ships the classifier
+# because gateway spellings make the question genuinely hard, and because a
+# root that wants to restrict a family needs something reliable to name.
+#
+# Nothing here refuses anything. A family becomes a restriction only when a
+# root's own ``preferences.json`` says so -- see ``helm/preferences.py``. That
+# separation is the point: shipped Helm imposes no operator's runtime choice on
+# anybody who clones it.
 
 # Segments are split on the separators gateways and provider-qualified ids use:
 # ``anthropic/claude-opus-4``, ``openrouter/anthropic/claude-3.5-sonnet``,
@@ -305,6 +345,25 @@ def is_claude_model(model: str | None) -> bool:
     return False
 
 
+# family id -> classifier. One entry today; the shape is the contract, so a
+# second vendor family is a function and a line here rather than a new boundary
+# threaded through core. A root names these ids in `model.runtimes.<family>`.
+MODEL_FAMILIES: dict[str, "Callable[[str | None], bool]"] = {
+    "claude": is_claude_model,
+}
+
+
+def model_family_ids() -> list[str]:
+    return sorted(MODEL_FAMILIES)
+
+
+def model_families(model: str | None) -> tuple[str, ...]:
+    """Every family a model identifier belongs to, in stable order."""
+    if not model:
+        return ()
+    return tuple(family for family in model_family_ids() if MODEL_FAMILIES[family](model))
+
+
 # Flags that select a model in the CLIs Helm knows how to launch. Every
 # built-in runtime publishes ``--model``; none of them establishes a short
 # form here, so none is guessed -- an invented ``-m`` would refuse launches for
@@ -312,8 +371,8 @@ def is_claude_model(model: str | None) -> bool:
 _MODEL_FLAGS = frozenset({runtime.model_flag for runtime in BUILTIN_RUNTIMES})
 
 
-def claude_model_in_command(command: Sequence[str]) -> str | None:
-    """Find a Claude model a command selects for itself, if it is visible.
+def model_in_command(command: Sequence[str]) -> str | None:
+    """Find the model a command selects for itself, if it is visible.
 
     A model does not have to arrive through Helm's model field: a configured
     profile or a caller-supplied command can bake ``--model`` straight into
@@ -341,21 +400,37 @@ def claude_model_in_command(command: Sequence[str]) -> str | None:
             value = inline
         else:
             value = parts[index + 1] if index + 1 < len(parts) else ""
-        if value and is_claude_model(value):
+        if value:
             return value
     return None
 
 
-def claude_pairing_error(model: str, runtime_id: str | None, reason: str = "") -> str:
-    """The one message every rejected Claude/runtime pairing uses."""
+def family_pairing_error(
+    model: str,
+    family: str,
+    allowed: Iterable[str],
+    runtime_id: str | None,
+    reason: str = "",
+) -> str:
+    """The one message every rejected model-family/runtime pairing uses.
+
+    It names the preference that produced the refusal, because the refusal is
+    a *local* choice: somebody reading it on another machine, or six months
+    later, has to be able to tell that Helm did not decide this and to find the
+    one command that changes it.
+    """
     named = runtime_id or "an unnamed runtime"
+    permitted = ", ".join(sorted(allowed))
+    first = sorted(allowed)[0]
     return (
-        f"model {model} is a Claude-family model and may only be launched through "
-        f"Helm's built-in {CLAUDE_RUNTIME_ID} runtime (Claude Code), but "
-        f"{named} was selected"
+        f"model {model} is in the {family} model family, which this Helm root's "
+        f"preferences restrict to the {permitted} runtime(s), but {named} was "
+        "selected"
         + (f" because {reason}" if reason else "")
-        + f". Name --agent {CLAUDE_RUNTIME_ID}, or choose a non-Claude model for "
-        f"{named}. Helm will not substitute a runtime or a model for you."
+        + f". Name --agent {first}, or choose a model outside the {family} family "
+        f"for {named}. Helm will not substitute a runtime or a model for you. "
+        f"This restriction is local to this root: remove it with "
+        f"`helm prefs unset model.runtimes.{family}`."
     )
 
 

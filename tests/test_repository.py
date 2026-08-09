@@ -319,14 +319,21 @@ class RepositoryTests(HelmTestCase):
         self.assertIn("docs/agent-adapters.md", readme)
 
     def test_runtime_selection_rules_are_documented_where_agents_read_them(self) -> None:
-        readme = Path("README.md").read_text(encoding="utf-8")
-        agents = Path("AGENTS.md").read_text(encoding="utf-8")
+        # Flattened, because these are prose sentences that are hard-wrapped in
+        # the source. Matching the wrapping makes every reflow a false failure
+        # and tempts the next reader to weaken the assertion to a fragment.
+        readme = self._flat(Path("README.md").read_text(encoding="utf-8"))
+        agents = self._flat(Path("AGENTS.md").read_text(encoding="utf-8"))
         for required in (
             "Choosing the worker's agent runtime",
             '"agent": "codex"',
             "HELM_AGENT",
-            "same runtime the",
+            "same runtime the coordinator is running under",
             "never invented",
+            # A restriction is a root's own choice, not a shipped rule, and the
+            # surface agents read has to say so or they will assert it as one.
+            "helm prefs set model.runtimes.<family>",
+            "Root-local operator preferences",
         ):
             self.assertIn(required, agents)
         for required in (
@@ -334,6 +341,7 @@ class RepositoryTests(HelmTestCase):
             "helm/runtimes.py",
             "--agent pi",
             "interactive form inside a Herdr pane",
+            "prefs set model.runtimes.<family>",
         ):
             self.assertIn(required, readme)
         # The built-in table is the documented list, so the docs must not

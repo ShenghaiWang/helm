@@ -26,6 +26,7 @@ from .core import (
     project_glyph,
     worker_environment,
 )
+from . import preferences
 from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter
 
 
@@ -878,6 +879,28 @@ def _build_parser() -> argparse.ArgumentParser:
     agent_commands.add_parser("list", help="list configured profiles without launching anything")
     agent_commands.add_parser("check", help="check profile commands and live availability checks")
 
+    prefs_cmd = commands.add_parser(
+        "prefs",
+        help="inspect and update this root's local operator preferences",
+        description=(
+            "Root-local, Git-ignored, non-secret operator preferences. Only the "
+            "keys listed by `helm prefs keys` are accepted; anything else is "
+            "refused rather than stored, so this never becomes a credential file."
+        ),
+    )
+    prefs_commands = prefs_cmd.add_subparsers(dest="prefs_command", required=True)
+    prefs_commands.add_parser("path", help="print where this root's preferences file lives")
+    prefs_commands.add_parser("show", help="show the effective preferences and their sources")
+    prefs_commands.add_parser("keys", help="list the supported preference keys")
+    prefs_set = prefs_commands.add_parser("set", help="set one preference, atomically")
+    prefs_set.add_argument("key", help="a key from `helm prefs keys`")
+    prefs_set.add_argument("value", nargs="+", help="one value, or several for a list key")
+    prefs_unset = prefs_commands.add_parser("unset", help="remove one preference")
+    prefs_unset.add_argument("key")
+    prefs_commands.add_parser(
+        "migrate", help="copy legacy state.config exclusions into the preferences file"
+    )
+
     herdr = commands.add_parser("herdr", help="present tasks in Herdr when available")
     herdr_commands = herdr.add_subparsers(dest="herdr_command", required=True)
     herdr_launch = herdr_commands.add_parser("launch", help="launch a task in a project Herdr workspace")
@@ -1391,12 +1414,110 @@ def _ensure_foreman(coordinator: Coordinator, project_id: str, *, herdr: bool = 
     )
 
 
+def _prefs_command(
+    coordinator: Coordinator, helm_root: Path | None, args: argparse.Namespace
+) -> int:
+    """Locate, inspect and update this root's operator preferences.
+
+    Everything printed here is rebuilt from validated fields, never echoed
+    from the file, so a value Helm did not understand can never be read back
+    out of it. That is what keeps `helm prefs show` from being a way to print
+    whatever somebody parked in the file.
+    """
+    path = preferences.preferences_path(helm_root)
+    try:
+        current = preferences.load(path)
+    except preferences.PreferencesError as exc:
+        raise HelmError(str(exc)) from exc
+
+    if args.prefs_command == "path":
+        if path is None:
+            raise HelmError(
+                "no Helm root is configured, so there is no preferences file. "
+                "Run helm init first."
+            )
+        print(f"{path} ({'present' if current.present else 'not created yet'})")
+        return 0
+
+    if args.prefs_command == "keys":
+        print("Supported preference keys (non-secret values only):")
+        for line in preferences.key_help():
+            print(f"  {line}")
+        return 0
+
+    if args.prefs_command == "show":
+        print(f"file: {path or '(no Helm root configured)'}")
+        entries = current.entries()
+        if entries:
+            for key, value in entries:
+                print(f"  {key} = {value}")
+        else:
+            print("  (nothing set; Helm imposes no operator defaults of its own)")
+        # Environment overrides and legacy state are shown beside the file
+        # because "why is this runtime excluded" is otherwise a hunt through
+        # three places, and the answer decides which one to edit.
+        for variable in ("HELM_AGENT", "HELM_MODEL", "HELM_EXCLUDE_AGENTS",
+                         "HELM_REVIEW_EXCLUDE_AGENTS"):
+            value = os.environ.get(variable)
+            if value is not None:
+                print(f"  session override {variable}={value}")
+        legacy = coordinator.legacy_excluded_agents()
+        if legacy:
+            print(
+                "  legacy state.config exclusions: "
+                + ", ".join(sorted(legacy))
+                + " (run `helm prefs migrate` to move them into the file)"
+            )
+        print(f"effective excluded agents: {', '.join(sorted(coordinator.excluded_agents())) or 'none'}")
+        return 0
+
+    if args.prefs_command == "migrate":
+        legacy = coordinator.legacy_excluded_agents()
+        if not legacy:
+            print("Nothing to migrate: no legacy state.config exclusions are recorded.")
+            return 0
+        merged = sorted(set(current.excluded_agents) | legacy)
+        try:
+            # The legacy entry is deliberately left in place. Removing it would
+            # change behaviour for an older Helm still reading this root, and
+            # the two sources are unioned anyway, so keeping it is a no-op the
+            # operator can undo when they are ready.
+            written = preferences.save(
+                preferences.apply(current, preferences.KEY_AGENT_EXCLUDE, merged)
+            )
+        except preferences.PreferencesError as exc:
+            raise HelmError(str(exc)) from exc
+        print(f"Migrated {', '.join(sorted(legacy))} into {written}")
+        print("  state.config is unchanged; the two sources are unioned.")
+        return 0
+
+    key = args.key
+    values = args.value if args.prefs_command == "set" else None
+    try:
+        updated = preferences.apply(current, key, values)
+        written = preferences.save(updated)
+    except preferences.PreferencesError as exc:
+        raise HelmError(str(exc)) from exc
+    shown = dict(updated.entries()).get(key, "(unset)")
+    print(f"{key} = {shown}")
+    print(f"  written to {written}")
+    return 0
+
+
 # Commands no agent Helm started may run, whatever its role. Each either
 # authorizes a protected action or changes what Helm itself trusts, and those
 # belong to the human at the root -- a worker's text is data, and so is a
 # worker's command line.
 _ROOT_ONLY_COMMANDS = frozenset({
     ("init", None),
+    # A preference is the commander's own cost and safety policy for this
+    # machine. An agent that could write one could lift the exclusion that
+    # stops it starting an expensive runtime, which is the same shape of
+    # self-authorization as approving its own merge. Reading them is fine and
+    # is left available: `path`, `show` and `keys` are not listed here.
+    ("prefs", "set"),
+    ("prefs", "unset"),
+    ("prefs", "migrate"),
     ("project", "add"),
     ("task", "approve"),
     ("task", "merge"),
@@ -1908,6 +2029,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "agent":
             _print_agents(coordinator, check=args.agent_command == "check")
             return 0
+
+        if args.command == "prefs":
+            return _prefs_command(coordinator, helm_root, args)
 
         if args.command == "herdr":
             adapter = HerdrAdapter(coordinator)

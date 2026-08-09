@@ -90,10 +90,10 @@ Enumerate rather than assume here too: an agent is available only when its
 executable is on `PATH`, and the presentation layer integrating an agent does
 not mean Helm can launch it.
 
-## Inventory the laptop before choosing
+## Inventory the machine before choosing
 
 Treat every machine as different. Before dispatching meaningful work on a fresh
-or changed laptop, enumerate the launchable agents and model catalogues that
+or changed machine, enumerate the launchable agents and model catalogues that
 exist **there**, then choose from that live set rather than from memory.
 
 Runtime inventory is a two-column question:
@@ -117,8 +117,8 @@ dispatch, especially for reviewers and expensive tasks:
 
 The dispatch decision is then: repository assumptions and skills first, task
 shape second, live model availability third, cost fourth. If the best-fit model
-is not present on this laptop, choose the nearest available tier and report that
-substitution in the task status.
+is not reachable from the machine doing the work, choose the nearest available
+tier and report that substitution in the task status.
 
 ## Effort is the first lever
 
@@ -144,9 +144,9 @@ opencode has no ladder of its own at all: `--variant` passes the level through
 to whichever provider the model came from, so the valid values change with the
 model rather than with the runtime.
 
-A level does not transfer even within one vendor: OpenAI states plainly that no
-exact mapping exists between GPT-5.5 and GPT-5.6 efforts. Re-tune when the model
-changes rather than carrying the old rung across.
+A level does not transfer even within one vendor: vendors say plainly that no
+exact mapping exists between the effort levels of successive model generations.
+Re-tune when the model changes rather than carrying the old rung across.
 
 At the top of any ladder, give the run a large output budget. Reasoning and
 answer share one ceiling, so a budget sized for the answer alone truncates
@@ -178,13 +178,18 @@ after training, not that it is wrong.
 Read down the left column until a row describes the work, then take the tier on
 that row. The tiers are what matter; the names in them change.
 
-| The task looks like | Tier | Today that means |
-| --- | --- | --- |
-| Classification, extraction, formatting, a short lookup, a mechanical rename | cheapest | `claude-haiku-4-5`, `gpt-5.6-luna` |
-| Routine implementation, a well-specified fix, high-volume coding, a first-pass summary | middle | `claude-sonnet-5`, `gpt-5.6-terra` |
-| Multi-file change, a refactor, debugging something that is not reproducing, work that must run unattended for a while | top | `claude-opus-5`, `gpt-5.6-sol` |
-| A problem that has already defeated the tier below, or the longest autonomous runs | frontier | `claude-fable-5` |
-| Reviewing a change | at least the tier that wrote it, on a **different model** | whatever the author was not |
+| The task looks like | Tier |
+| --- | --- |
+| Classification, extraction, formatting, a short lookup, a mechanical rename | cheapest |
+| Routine implementation, a well-specified fix, high-volume coding, a first-pass summary | middle |
+| Multi-file change, a refactor, debugging something that is not reproducing, work that must run unattended for a while | top |
+| A problem that has already defeated the tier below, or the longest autonomous runs | frontier |
+| Reviewing a change | at least the tier that wrote it, on a **different model** |
+
+Deliberately no "today that means" column. A committed list of model names goes
+stale in months, and a stale name asserted confidently is a failed launch. Map
+the tier onto a real id at dispatch time from the live catalogue, using the
+commands above.
 
 Two rows deserve their exceptions stated. **Difficulty you cannot yet judge is
 not cheap work** — an underspecified brief belongs a tier above where its word
@@ -197,46 +202,49 @@ evidence. Starting high and never re-checking is how a fleet quietly costs
 several times what it should; starting low and never raising is how it produces
 work nobody can use.
 
-## Claude — via `claude` (Claude Code) only
+## What a tier costs is read, not recalled
 
-**A Claude-family model runs under Claude Code and nothing else.** This is a
-Helm invariant enforced at launch, not a preference: naming a Claude model for
-`pi`, `opencode`, `omp`, `codex`, a gateway spelling such as
-`anthropic/claude-opus-5`, or a profile that inherits one of those runtimes is
-refused, and Helm substitutes neither the runtime nor the model. Pair a Claude
-model with `--agent claude`, or pick a non-Claude model for the other runtime.
+Vendor rates change, and they are not the bill anyway. Two things have to be
+checked at dispatch time rather than remembered:
 
-Prices are per million tokens input/output, correct on 2026-08-05.
+- **The rate.** Read it from the vendor's own current pricing, or from the
+  catalogue command for the runtime that will run the work. A price written
+  into a committed file is true on one day and misleading after it.
+- **How the runtime is authenticated.** API-key billing and a consumer
+  subscription behave completely differently: per-worker cost under a
+  subscription has little to do with a per-token rate, and a fleet of workers
+  can cost far more or far less than a per-token rate implies. Check which is in
+  play before reasoning about cost at all, and treat an unexplained cost as a
+  fault to investigate rather than a rate to divide.
 
-| Model | Reach for it when | Cost |
-| --- | --- | --- |
-| `claude-haiku-4-5` | Classification, extraction, formatting, short lookups. | $1 / $5 |
-| `claude-sonnet-5` | High-volume coding and agentic work; near-Opus on both. | $3 / $15 |
-| `claude-opus-5` | Complex agentic coding, long-horizon runs, deep reasoning. | $5 / $25 |
-| `claude-fable-5` | The hardest reasoning and the longest autonomous runs. | $10 / $50 |
+Within one vendor's line-up the shape is usually stable even when the names are
+not: a small fast model, an everyday workhorse, a top coding/agentic model, and
+sometimes a frontier tier above it, each roughly a multiple of the one below.
+Reason in those tiers, then resolve the tier to an id from the live catalogue.
 
-Haiku is not a cheaper Opus: smaller context window, and **no effort parameter
-at all**, so the lever above does not exist there. That makes it the wrong
-choice for anything whose difficulty is uncertain.
+Two properties worth checking rather than assuming, because they change what
+the tier is good for: whether the model exposes a reasoning-effort parameter at
+all — the cheapest tier often does not, which makes it the wrong choice for
+anything whose difficulty is uncertain — and how large its context window is.
 
-## OpenAI — via `codex`, or pi's `openai-codex` provider
+**Pinning an older model is a deliberate act with a reason** — a workload tuned
+against it, a reproduction being chased. Drifting onto one because a config was
+never revisited is not, and vendors retire models on announced dates, so a pin
+stops working rather than degrading. Check the pin against the live catalogue
+before the date somebody else discovers it as an outage.
 
-| Model | Reach for it when | Cost |
-| --- | --- | --- |
-| `gpt-5.6-luna` | Specific, repeatable work — extraction, classification. Fastest and cheapest. | $1 / $6 |
-| `gpt-5.6-terra` | The everyday workhorse; matches `gpt-5.5` for less. | $2.50 / $15 |
-| `gpt-5.6-sol` | Ambiguous, high-value work: complex coding, computer use, research, security. | $5 / $30 |
-| `gpt-5.3-codex-spark` | Near-instant coding iteration. Text-only research preview, Pro accounts. | — |
+## A root may restrict a model family to certain runtimes
 
-**`gpt-5.5`, `gpt-5.4`, and `gpt-5.4-mini` retire on 2026-08-31.** A config
-still pinned to one of them stops working on that date rather than degrading:
-`5.4` is replaced by `terra`, `5.4-mini` by `luna`, and `5.5` by `terra` or
-`sol` depending on how hard the work is. Check the pin before the date, not
-after — this is exactly the kind of thing that is discovered by an outage.
+Some installations require that a given vendor's models only ever run under
+that vendor's own agent CLI — for cost, for account, or for support reasons.
+That is a **root-local operator preference**, not a property of the model and
+not a rule Helm ships: a root sets it with `helm prefs set
+model.runtimes.<family> <runtime>...`, and Helm then refuses the pairing at
+launch rather than substituting either half.
 
-Pinning an older model is otherwise a deliberate act with a reason — a workload
-tuned against it, a reproduction being chased. Drifting onto one because a
-config was never revisited is not.
+So before reasoning about which runtime may run a model, check `helm prefs
+show`. A restriction that is in force narrows the reviewer field too, and a
+restriction that is absent means nothing is refused.
 
 ## pi and opencode are the cross-provider ones — which is why they review
 
@@ -246,34 +254,19 @@ the bug. Independence is the whole point of a review, so the reviewer wants a
 different *model*, not merely a different process.
 
 Both of these reach several vendors behind one flag, which is what makes them
-the reviewers rather than a second copy of the author — for **non-Claude**
-review models. Claude-family models stay on Claude Code (above), so a review
-that has to leave the author's model reaches either for another vendor's model
-on pi or opencode, or for Claude Code itself:
+the reviewers rather than a second copy of the author:
 
-- **pi** takes `--model provider/id`, a fuzzy pattern (`sonnet` matches), and a
-  `:level` thinking shorthand — `--model gpt-5.6-sol:high` and
-  `--model openai-codex/gpt-5.6-sol` are both valid. Its catalogue is whatever
-  its credentials reach. Its Claude-family entries are not available to Helm:
-  fuzzy patterns such as `sonnet` and provider forms such as
-  `anthropic/claude-opus-5` are refused here, and belong to `claude`.
+- **pi** takes `--model provider/id`, a fuzzy pattern, and a `:level` thinking
+  shorthand — `--model <id>:high` and `--model <provider>/<id>` are both valid.
+  Its catalogue is whatever its credentials reach.
 - **opencode** takes `--model provider/model` and reaches a much wider
-  catalogue through a gateway provider — hundreds of models spanning several
-  vendors on one credential. `opencode models` lists them.
+  catalogue through a gateway provider — many models spanning several vendors
+  on one credential. `opencode models` lists them.
 
 Reach for the model flag before reaching for a different runtime: switching
 model is what buys independence, and switching runtime is only the crude way to
-get it. The one case where the runtime does have to move is a Claude reviewer
-model, which only `claude` may run.
-
-## The table is not the bill
-
-Those are API rates. A runtime authenticated against a consumer subscription
-bills against that plan instead, and per-worker cost there has little to do with
-the per-token column — a fleet of workers on a subscription-billed runtime has
-surprised this root before. Check how the runtime is actually authenticated
-before reasoning about its cost, and treat an unexplained cost as a fault to
-investigate rather than a rate to divide.
+get it. Where a root restricts a model family (above), the runtime does have to
+move, because only the allowed runtimes may run that family at all.
 
 ## Cost and capability are the commander's trade-off
 
@@ -287,8 +280,9 @@ reach the answer.
 
 ## What this domain does not claim
 
-It repeats each vendor's positioning of its own models, plus the catalogue this
-machine can actually reach. It does **not** rank vendors against each other:
+It gives a method for choosing a tier and for reading the live catalogue and
+the live rate. It does **not** name models, quote prices, or rank vendors
+against each other:
 that comparison moves faster than a committed file can track, and a stale
 ranking asserted confidently is worse than none. When a task genuinely turns on
 a cross-vendor comparison, measure it on that task and report what was measured.

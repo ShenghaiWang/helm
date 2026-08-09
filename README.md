@@ -164,6 +164,7 @@ contents below are local and ignored:
   agents/.gitkeep                    # tracked default; profiles are local
   agents.json                        # optional advanced profile override
   agents/<agent-id>/profile.json    # optional advanced profile override
+  preferences.json                  # optional root-local operator preferences (ignored)
 ```
 
 An agent must not modify another project, `state/` records, firstmate files, or
@@ -217,8 +218,12 @@ The runtime for a task is resolved most-specific-first:
 
 1. the task's own choice — “use Codex for this one”, or `--agent codex`;
 2. the project's pin in `projects/<id>/.helm/project.json`;
-3. `HELM_AGENT`, or a configured profile when one exists;
-4. otherwise the runtime this Helm session is itself running under, detected
+3. `HELM_AGENT`, or a configured profile when one exists — an environment
+   variable is a deliberate override for this run, so it outranks the standing
+   choice below it;
+4. `agent.default` in the root-local `preferences.json`
+   (see [Root-local operator preferences](#root-local-operator-preferences));
+5. otherwise the runtime this Helm session is itself running under, detected
    from the environment.
 
 So the default is “workers use the same agent I do”, one project can be pinned
@@ -235,7 +240,8 @@ Naming a runtime does not name the model it runs, and the two are separate
 decisions: “this project runs on Codex” and “this task is mechanical, run it
 cheap” are different statements, and either can be made without the other. The
 model resolves the same way, most-specific-first — `--model` on the task, then
-the project's `"model"` pin, then `HELM_MODEL`.
+the project's `"model"` pin, then `HELM_MODEL`, then the root's `model.default`
+preference.
 
 There is deliberately **no detection step**. A wrong runtime guess fails loudly
 on a missing executable; a wrong model guess runs, bills, and answers. So when
@@ -247,7 +253,8 @@ before naming a model for important work.
 
 ```jsonc
 // projects/tickets/.helm/project.json — cheap model, because the work is mechanical
-{"label": "Tickets", "agent": "claude", "model": "claude-haiku-4-5"}
+// (resolve the tier to a real id from the live catalogue; Helm never invents one)
+{"label": "Tickets", "agent": "claude", "model": "<cheapest-tier-model-id>"}
 ```
 
 Only a built-in runtime publishes the flag that selects its model. A profile
@@ -257,32 +264,39 @@ believing it had instructed a model it never sent, and the bill is the only
 place that difference would show up. Which model suits which task is knowledge,
 not policy, and lives in the `model-selection` domain.
 
-#### Claude models run only on Claude Code
+#### Restricting a model family to certain runtimes
 
-A Claude-family model may only be launched through the built-in `claude`
-runtime. Helm checks the pairing at launch, wherever the model came from — the
-task's `--model`, a project `"model"` pin, `HELM_MODEL`, or a review's
-`--reviewer-model` — and for both ordinary workers and reviewers. It recognizes
-plain ids (`claude-opus-5`), provider-qualified and gateway spellings
-(`anthropic/claude-opus-5`, `openrouter/anthropic/claude-3.5-sonnet`,
-`us.anthropic.claude-sonnet-4-v1:0`), and the bare family aliases agent CLIs
-accept (`opus`, `sonnet-4-5`, `haiku`); it does not classify an unrelated
-string that merely contains one of those words.
+Helm ships a **classifier**, not a policy. Given a model identifier it can say
+which vendor family that identifier belongs to, recognizing plain ids,
+provider-qualified and gateway spellings (`vendor/model`,
+`gateway/vendor/model`, `region.vendor.model:0`), and the bare family aliases
+agent CLIs accept. It does not classify an unrelated string that merely
+contains one of those words. On its own the classifier refuses nothing: a fresh
+clone with no preferences file pairs every model with every runtime.
 
-Pointing `pi`, `opencode`, `omp`, `codex`, or a profile that inherits one of
-them at such a model is **refused, naming the runtime required** — Helm
-substitutes neither the runtime nor the model, for the same reason it refuses
-rather than drops a model above. Pair the model with `--agent claude`, or give
-the cross-provider runtime a non-Claude model.
+A root turns a family into a restriction itself:
 
-A model does not have to arrive through Helm's model field, so the launch
-command is inspected too: a profile or a caller-supplied command that selects a
-Claude model itself — `--model claude-opus-5` or `--model=claude-opus-5` — is
-refused on a non-Claude runtime. Only `--model` is inspected, because that is
-the flag every built-in runtime publishes and Helm does not guess a short form
-that may mean something else to the command being run.
+```sh
+helm --root <helm-root> prefs set model.runtimes.<family> <runtime> [<runtime>...]
+helm --root <helm-root> prefs keys      # which families the classifier knows
+```
 
-The limit of that check is exact and worth stating: **Helm reads argv, and
+With one set, Helm checks the pairing at launch wherever the model came from —
+the task's `--model`, a project `"model"` pin, `HELM_MODEL`, the root's
+`model.default`, or a review's `--reviewer-model` — for both ordinary workers
+and reviewers, and for a profile that inherits a runtime the restriction
+excludes. The launch command is inspected too: a profile or caller-supplied
+command that selects such a model itself (`--model <id>` or `--model=<id>`) is
+refused on a runtime the family is not allowed on. Only `--model` is inspected,
+because that is the flag every built-in runtime publishes and Helm does not
+guess a short form that may mean something else to the command being run.
+
+Refusal is **never substitution** — Helm swaps neither the runtime nor the
+model, for the same reason it refuses rather than drops a model above — and the
+message says which runtime is required, that the restriction is local to this
+root, and the one command that removes it.
+
+The limit of the check is exact and worth stating: **Helm reads argv, and
 nothing else.** A command that is an opaque wrapper — a shell script, an alias,
 or a launcher that picks its model from its own config file or an environment
 variable — can still reach a model Helm never sees, because Helm cannot execute
@@ -325,6 +339,75 @@ different agent is a one-line change. See
 
 A profile's `capacity` remains a deliberate throttle. A built-in runtime has no
 limit of its own, so several workers can run under the same runtime at once.
+
+## Root-local operator preferences
+
+Helm ships no operator choices. Which agent this machine defaults to, which
+model, which runtimes it will not pay to start, and which model families may
+only run on which runtimes are answers about **one installation**, not about
+the product — so they live in `preferences.json` at the Helm root, which
+`.gitignore` excludes. The repository carries the schema, the mechanism, the
+CLI, the docs and the tests; it never carries the answers.
+
+That leaves four distinct layers of guidance, and putting something in the
+wrong one is how a personal choice becomes a product rule:
+
+| Layer | Lives in | Tracked | What belongs there |
+| --- | --- | --- | --- |
+| Shipped product policy | [`helm/core.py`](helm/core.py), [`helm/cli.py`](helm/cli.py) | yes | invariants and the authority boundary |
+| Shared domain knowledge | `domains/<id>/` | yes | generic, transferable know-how |
+| Project-local knowledge | `projects/<id>/.helm/` | no | one project's conventions and context |
+| Root-local preferences | `<helm-root>/preferences.json` | no | this installation's defaults and restrictions |
+
+Only the first is authority. The other three are data: they may make a choice
+more specific, never wider, and **none of them can authorize a protected
+action** — no merge, push, publish or deletion — or carry a credential.
+
+```sh
+helm --root <helm-root> prefs keys      # the supported keys, and nothing else is accepted
+helm --root <helm-root> prefs show      # effective values, env overrides, legacy state
+helm --root <helm-root> prefs path      # where the file is
+helm --root <helm-root> prefs set agent.default claude
+helm --root <helm-root> prefs set agent.exclude codex omp
+helm --root <helm-root> prefs set model.runtimes.claude claude
+helm --root <helm-root> prefs unset agent.exclude
+helm --root <helm-root> prefs migrate   # legacy state.config exclusions into the file
+```
+
+**Not a credential store.** Every key is enumerated, every value passes the
+same narrow validator a runtime or model id passes everywhere else, and there
+is no free-text field and no environment block. An unknown key is refused at
+load rather than stored, so nothing Helm did not understand can be printed back
+out by `prefs show`. Credentials stay with the tool that owns them.
+
+**Versioned and atomic.** The document states a `version`, and a version this
+build does not know is refused rather than half-understood. Every write goes to
+a temporary file and lands with one `os.replace`, so a concurrent reader sees
+the old file or the new one — never a truncated one that would read as "no
+exclusions".
+
+**Precedence.** A task's own `--agent`/`--model`, then the project's pin, then
+an environment variable as a session override, then the preference file, then
+(for the runtime only) detection. A project may pin its own agent or model —
+more specific — and can neither add nor remove an exclusion or a family
+restriction, because the file is read from the root and nowhere else.
+
+Restrictions are the exception to that ladder: exclusions from the preference
+file and from any legacy `state.config` entry are **unioned**, since merging
+restrictions is the only combination that cannot accidentally widen one. An
+environment variable still replaces them outright for one session.
+
+**Writes are the commander's.** `prefs set`, `unset` and `migrate` are
+root-only, alongside `approval grant` and for the same reason: an agent that
+could write a preference could lift the exclusion stopping it from starting an
+expensive runtime. `path`, `show` and `keys` stay open, because an agent that
+cannot read the policy cannot report it either.
+
+**Backward compatible.** `HELM_AGENT`, `HELM_MODEL`, `HELM_EXCLUDE_AGENTS`,
+`HELM_REVIEW_EXCLUDE_AGENTS` and `state.config.excluded_agents` all keep working
+exactly as before. `helm prefs migrate` copies legacy exclusions into the file
+and deliberately leaves the old entry in place, so an older Helm reading the
+same root still behaves identically and nothing changes silently.
 
 ## Learning proposals
 
@@ -1223,6 +1306,7 @@ helm init [ROOT]
 helm run PROJECT [TASK] [--domain DOMAIN] [--agent PROFILE] [--no-herdr] [--async]
 helm project add|list|status|note|action|domain
 helm agent list|check
+helm prefs path|show|keys|set KEY VALUE...|unset KEY|migrate
 helm task create|allocate|inspect|approve|merge|deliver|pr|pr-status|pr-sync|outcome
 helm task cleanup TASK_ID [--delete-branch]
 helm approval grant|list|check|revoke

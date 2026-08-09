@@ -10,6 +10,12 @@
 !/agents/.gitkeep
 /state/*
 !/state/.gitkeep
+# Root-local operator preferences: this installation's own default agent and
+# model, the runtimes it will not pay to start, and any model-family/runtime
+# restriction it has chosen. The schema, the CLI, the docs and the tests are
+# tracked; one operator's answers are not, because committing them would ship
+# one machine's cost policy to everybody who clones the repository.
+/preferences.json
 # Defensive coverage for worktrees if a caller places them at the root.
 /worktrees/
 

@@ -4,7 +4,7 @@ Constraints for lifecycle and role work. Subordinate to Helm's core safety
 rules: nothing here can authorise a merge, publish, credential, destructive
 action, or scope expansion.
 
-**Provenance.** Distilled 2026-08-01 from a set of agent role prompts.
+**Provenance.** Distilled from a set of agent role prompts.
 Guidance, not a description of Helm's current behaviour.
 
 ## Planning

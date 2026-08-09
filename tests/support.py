@@ -18,8 +18,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
+from helm import preferences
 from helm.core import Coordinator, StateStore, inside
 from helm.herdr import HerdrNotFound, HerdrUnavailable
 
@@ -140,6 +142,22 @@ class HelmTestCase(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def write_preferences(self, helm_root: Path | None = None, **document: Any) -> Path:
+        """Give a root the operator preferences a test needs, and only those.
+
+        Helm ships none, so every test that expects a refusal has to enable it
+        first. That is the point of the layer and it is worth the extra line:
+        a test that passed without this call would be asserting a rule the
+        product does not actually impose on anybody who clones it.
+        """
+        root = Path(helm_root) if helm_root is not None else Path(self.temp.name)
+        path = root / preferences.PREFERENCES_FILENAME
+        path.write_text(
+            json.dumps({"version": preferences.PREFERENCES_VERSION, **document}),
+            encoding="utf-8",
+        )
+        return path
 
     def repo(self, name: str, *, non_git: bool = False) -> Path:
         root = Path(self.temp.name) / name

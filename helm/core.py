@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from . import preferences as prefs
 from . import runtimes
 
 
@@ -1227,33 +1228,28 @@ def _validate_protected_action(action: Any) -> str:
 
 
 def _validate_agent_id(agent_id: Any, source: str = "") -> str:
-    """Accept a runtime/profile id without letting it become a command."""
-    if not isinstance(agent_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", agent_id):
-        where = f": {source}" if source else ""
-        raise HelmError(
-            "agent id must be 1-64 characters: letters, numbers, '.', '_' or '-' only"
-            f"{where}"
-        )
-    return agent_id
+    """Accept a runtime/profile id without letting it become a command.
+
+    The rule itself lives in `runtimes`, which owns the vocabulary of agents
+    and models and is importable by the preferences layer without dragging in
+    core. This wrapper only adds the caller's source to the message.
+    """
+    try:
+        return runtimes.validate_agent_id(agent_id)
+    except ValueError as exc:
+        raise HelmError(f"{exc}{f': {source}' if source else ''}") from exc
 
 
 def _validate_model_id(model_id: Any, source: str = "") -> str:
     """Accept a model name without letting it become a command.
 
-    Deliberately wider than an agent id: real model names carry slashes and
-    colons -- `openrouter/~anthropic/claude-opus-latest`, `sonnet:high` -- so
-    the check is that it cannot turn into shell or another argument, not that
-    it matches any one vendor's spelling. Helm never validates a model
-    *exists*; that is the runtime's answer to give, and inventing a list here
-    would go stale the first week.
+    Helm never validates a model *exists*; that is the runtime's answer to
+    give, and inventing a list here would go stale the first week.
     """
-    if not isinstance(model_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:~/-]{0,127}", model_id):
-        where = f": {source}" if source else ""
-        raise HelmError(
-            "model must be 1-128 characters: letters, numbers, '.', '_', ':', "
-            f"'~', '/' or '-' only{where}"
-        )
-    return model_id
+    try:
+        return runtimes.validate_model_id(model_id)
+    except ValueError as exc:
+        raise HelmError(f"{exc}{f': {source}' if source else ''}") from exc
 
 
 def _validate_ticket_id(ticket_id: Any, source: str = "") -> str:
@@ -1556,9 +1552,9 @@ class StateStore:
         return helm_root
 
     #: A save that is interrupted between writing its temporary file and
-    #: renaming it leaves the temporary behind, and nothing ever collected
-    #: those: four had accumulated to 293 MB, the largest a near-complete copy
-    #: of the state file. Old enough that no live save could still own it.
+    #: renaming it leaves the temporary behind, and nothing collected those --
+    #: each is a near-complete copy of the state file, so they accumulate into
+    #: real disk. Swept only once old enough that no live save could own one.
     _ORPHAN_TEMP_AGE_SECONDS = 3600.0
 
     def _sweep_orphan_temporaries(self) -> None:
@@ -2397,6 +2393,12 @@ class Coordinator:
         configured = os.environ.get("HELM_MODEL", "").strip()
         if configured:
             return _validate_model_id(configured, "HELM_MODEL"), f"HELM_MODEL sets model {configured}"
+        # The root's own preference file sits below the environment, because a
+        # variable is a session override somebody set on purpose for this run
+        # and the file is the standing choice.
+        preferred = self.preferences().default_model
+        if preferred:
+            return preferred, f"root preferences set model {preferred}"
         return None, ""
 
     @staticmethod
@@ -2420,23 +2422,66 @@ class Coordinator:
             return str(named)
         return None
 
-    @staticmethod
-    def _require_claude_runtime(
-        model: str | None, runtime_id: str | None, reason: str = ""
-    ) -> None:
-        """Refuse a Claude-family model on anything but Claude Code.
+    def preferences(self) -> prefs.Preferences:
+        """This root's operator preferences, or the empty set.
 
-        The pairing is a Helm invariant, so it is checked wherever a model and
-        a runtime meet -- ordinary worker selection and both reviewer paths --
+        Read fresh rather than cached: the file is a few hundred bytes, and a
+        coordinator that kept a stale copy would go on excluding a runtime the
+        commander had just re-allowed. A root with no file gets
+        `prefs.EMPTY`, which is the shipped default -- generic Helm imposes no
+        operator choice on anyone.
+        """
+        try:
+            root = self.store.configured_root()
+        except SafetyError:
+            raise
+        except HelmError:
+            root = None
+        try:
+            return prefs.load(prefs.preferences_path(root))
+        except prefs.PreferencesError as exc:
+            raise HelmError(str(exc)) from exc
+
+    def _require_model_runtime(
+        self,
+        model: str | None,
+        runtime_id: str | None,
+        reason: str = "",
+        *,
+        named: str | None = None,
+    ) -> None:
+        """Refuse a model whose family this root restricts to other runtimes.
+
+        The classifier that decides a model's family is generic metadata and
+        refuses nothing by itself. The refusal exists only where a root has
+        written the constraint into its own `preferences.json`, which is why
+        this is an instance method reading that file rather than a static rule
+        compiled into the product.
+
+        Where a root *has* asked for one, it is checked wherever a model and a
+        runtime meet -- ordinary worker selection and both reviewer paths --
         rather than at the one entry point somebody happened to notice.
         """
-        if runtimes.is_claude_model(model) and runtime_id != runtimes.CLAUDE_RUNTIME_ID:
-            assert model is not None
-            raise HelmError(runtimes.claude_pairing_error(model, runtime_id, reason))
+        if not model:
+            return
+        constraint = self.preferences().constraint_for(model)
+        if constraint is None:
+            return
+        family, allowed = constraint
+        if runtime_id in allowed:
+            return
+        raise HelmError(
+            runtimes.family_pairing_error(
+                model, family, allowed, named or runtime_id, reason
+            )
+        )
 
-    @staticmethod
     def _with_model(
-        profile: dict[str, Any], command: Sequence[str], model: str | None, reason: str
+        self,
+        profile: dict[str, Any],
+        command: Sequence[str],
+        model: str | None,
+        reason: str,
     ) -> list[str]:
         """Put a resolved model into a launch command, or refuse to guess.
 
@@ -2449,35 +2494,31 @@ class Coordinator:
         """
         actual = list(command)
         launch_runtime = Coordinator._launch_runtime_id(profile, actual)
-        if launch_runtime != runtimes.CLAUDE_RUNTIME_ID:
-            # A model does not have to arrive through Helm's model field. A
-            # profile or a caller-supplied command can put `--model` straight
-            # into argv, and a boundary checked only where Helm places a model
-            # itself would be one the command walks past. Checked whether or
-            # not a model was also resolved, and before the model below, since
-            # the argv is what would actually be launched.
-            baked = runtimes.claude_model_in_command(actual)
-            if baked is not None:
-                raise HelmError(
-                    runtimes.claude_pairing_error(
-                        baked,
-                        launch_runtime or profile["id"],
-                        "its launch command selects that model",
-                    )
-                )
+        # A model does not have to arrive through Helm's model field. A profile
+        # or a caller-supplied command can put `--model` straight into argv,
+        # and a constraint checked only where Helm places a model itself would
+        # be one the command walks past. Checked whether or not a model was
+        # also resolved, and before the model below, since the argv is what
+        # would actually be launched.
+        baked = runtimes.model_in_command(actual)
+        if baked is not None:
+            self._require_model_runtime(
+                baked,
+                launch_runtime,
+                "its launch command selects that model",
+                named=launch_runtime or profile["id"],
+            )
         if not model:
             return actual
-        # A Claude-family model is bound to Claude Code whatever chose it --
-        # the CLI, the task, the project pin, or HELM_MODEL. Checked before the
-        # flag question below, because for a profile that inherits a built-in
-        # runtime "no model flag" would be the wrong reason to refuse.
+        # A restricted family is bound to its runtimes whatever chose the model
+        # -- the CLI, the task, the project pin, or HELM_MODEL. Checked before
+        # the flag question below, because for a profile that inherits a
+        # built-in runtime "no model flag" would be the wrong reason to refuse.
         effective = profile.get("runtime") or profile.get("id")
-        if (
-            runtimes.is_claude_model(model)
-            and runtimes.builtin_runtime(effective) is not None
-            and effective != runtimes.CLAUDE_RUNTIME_ID
-        ):
-            raise HelmError(runtimes.claude_pairing_error(model, profile["id"], reason))
+        if runtimes.builtin_runtime(effective) is not None:
+            self._require_model_runtime(
+                model, str(effective), reason, named=profile["id"]
+            )
         runtime = runtimes.builtin_runtime(profile["id"])
         if runtime is None or not profile.get("builtin"):
             raise HelmError(
@@ -3446,6 +3487,9 @@ class Coordinator:
             if configured.lower() == "none":
                 return None, "HELM_AGENT=none requires an explicitly named agent"
             return _validate_agent_id(configured, "HELM_AGENT"), "HELM_AGENT root default"
+        preferred = self.preferences().default_agent
+        if preferred:
+            return preferred, f"root preferences default to agent {preferred}"
         detected = runtimes.detect_runtime()
         if detected is not None:
             return detected.id, f"same runtime as this Helm session ({detected.name})"
@@ -3455,8 +3499,17 @@ class Coordinator:
         """Runtimes this root will not start at all.
 
         Which runtimes are worth paying for is the human's call and changes
-        without Helm changing, so it lives in the root's config rather than in
-        this code.  `HELM_EXCLUDE_AGENTS` overrides it for one session.
+        without Helm changing, so it lives in the root's own files rather than
+        in this code. Helm ships no exclusion at all: a clone of this
+        repository starts every runtime it can find.
+
+        Three sources, in precedence order. `HELM_EXCLUDE_AGENTS` is a session
+        override and replaces the rest outright, including with an empty value,
+        so a deliberate one-off run is possible. Otherwise the root's
+        `preferences.json` and any legacy `state.config` entry are *unioned* --
+        a cost limit is a restriction, and merging restrictions is the only
+        combination that cannot accidentally widen one. A project file appears
+        nowhere in this list and cannot.
 
         This is deliberately about *starting* a runtime, not about reviewing.
         Scoping it to reviews left the expensive runtime one `--agent` away, or
@@ -3466,16 +3519,31 @@ class Coordinator:
         raw = os.environ.get("HELM_EXCLUDE_AGENTS")
         if raw is None:
             raw = os.environ.get("HELM_REVIEW_EXCLUDE_AGENTS")
-        if raw is None:
-            config = self.store.load().get("config", {})
-            config = config if isinstance(config, dict) else {}
-            # `review_exclude_agents` is the narrower name this policy was
-            # first written under; roots configured that way keep working.
-            configured = config.get("excluded_agents", config.get("review_exclude_agents"))
-            if isinstance(configured, list):
-                raw = ",".join(str(item) for item in configured)
-            else:
-                raw = str(configured or "")
+        if raw is not None:
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        excluded = set(self.preferences().excluded_agents)
+        config = self.store.load().get("config", {})
+        config = config if isinstance(config, dict) else {}
+        # `review_exclude_agents` is the narrower name this policy was first
+        # written under; roots configured either way keep working untouched,
+        # and `helm prefs migrate` moves them into the file when they are ready.
+        configured = config.get("excluded_agents", config.get("review_exclude_agents"))
+        if isinstance(configured, list):
+            legacy = ",".join(str(item) for item in configured)
+        else:
+            legacy = str(configured or "")
+        excluded.update(part.strip() for part in legacy.split(",") if part.strip())
+        return excluded
+
+    def legacy_excluded_agents(self) -> set[str]:
+        """Exclusions still held in `state.config`, for the migration path."""
+        config = self.store.load().get("config", {})
+        config = config if isinstance(config, dict) else {}
+        configured = config.get("excluded_agents", config.get("review_exclude_agents"))
+        if isinstance(configured, list):
+            raw = ",".join(str(item) for item in configured)
+        else:
+            raw = str(configured or "")
         return {part.strip() for part in raw.split(",") if part.strip()}
 
     def review_excluded_agents(self) -> set[str]:
@@ -3506,10 +3574,10 @@ class Coordinator:
                 # human edit to the root's config, not a flag on one review.
                 raise HelmError(
                     f"reviewer {explicit} is excluded from reviews in this Helm root. "
-                    "Remove it from config.review_exclude_agents (or set "
-                    "HELM_REVIEW_EXCLUDE_AGENTS) to allow it again."
+                    f"Run `helm prefs set agent.exclude ...` without {explicit} (or "
+                    "set HELM_REVIEW_EXCLUDE_AGENTS) to allow it again."
                 )
-            self._require_claude_runtime(model, explicit, f"explicit reviewer {explicit}")
+            self._require_model_runtime(model, explicit, f"explicit reviewer {explicit}")
             runtime = runtimes.builtin_runtime(explicit)
             command = (
                 runtime.with_model(model, interactive=interactive) if runtime else None
@@ -3529,19 +3597,25 @@ class Coordinator:
             for entry in self.builtin_runtime_availability()
             if entry["available"] and entry["id"] not in excluded
         ]
-        if runtimes.is_claude_model(model):
+        constraint = self.preferences().constraint_for(model)
+        if constraint is not None:
             # Independence is chosen from what may actually run this model, so
-            # a Claude reviewer model never quietly lands on a cross-provider
-            # runtime that would happily accept the name and bill for it.
+            # a restricted reviewer model never quietly lands on a
+            # cross-provider runtime that would happily accept the name and
+            # bill for it.
+            family, permitted = constraint
             available = [
-                candidate
-                for candidate in available
-                if candidate == runtimes.CLAUDE_RUNTIME_ID
+                candidate for candidate in available if candidate in permitted
             ]
-            if not available and author_agent_id != runtimes.CLAUDE_RUNTIME_ID:
+            if not available and author_agent_id not in permitted:
+                assert model is not None
                 raise HelmError(
-                    runtimes.claude_pairing_error(
-                        model, None, "no installed reviewer runtime is Claude Code"
+                    runtimes.family_pairing_error(
+                        model,
+                        family,
+                        permitted,
+                        None,
+                        "no installed reviewer runtime may run that model family",
                     )
                 )
         for candidate in available:
@@ -3555,7 +3629,7 @@ class Coordinator:
                 }
         runtime = runtimes.builtin_runtime(author_agent_id)
         if runtime is not None and model:
-            self._require_claude_runtime(
+            self._require_model_runtime(
                 model, author_agent_id, "it is the only installed runtime"
             )
             return {
@@ -3597,8 +3671,8 @@ class Coordinator:
             # different runtime would hide that the request was overridden.
             raise HelmError(
                 f"agent {explicit} is excluded from this Helm root and will not be "
-                "started. Remove it from config.excluded_agents (or set "
-                "HELM_EXCLUDE_AGENTS) to allow it again."
+                f"started. Run `helm prefs set agent.exclude ...` without {explicit} "
+                "(or set HELM_EXCLUDE_AGENTS) to allow it again."
             )
         if explicit is not None:
             profile = self._profile_for_agent_id(profiles, explicit, interactive=interactive)
@@ -3659,7 +3733,8 @@ class Coordinator:
             raise HelmError(
                 f"agent {named} is excluded from this Helm root and will not be "
                 f"started, but was selected because {named_reason or 'it was the default'}. "
-                "Name a different agent, or remove it from config.excluded_agents."
+                "Name a different agent, or drop it from this root's agent.exclude "
+                "preference."
             )
         if named is not None:
             profile = self._profile_for_agent_id(profiles, named, interactive=interactive)

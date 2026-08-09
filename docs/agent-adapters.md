@@ -21,7 +21,8 @@ Delegation is mandatory, so use this order to find a worker runtime:
    configure `HELM_WORKER_COMMAND` or `agents.json`;
 2. otherwise use a built-in runtime from [`helm/runtimes.py`](../helm/runtimes.py),
    resolved most-specific-first: the task's named agent, the project's
-   `.helm/project.json` pin, `HELM_AGENT` or a configured profile, and finally
+   `.helm/project.json` pin, `HELM_AGENT` or a configured profile, the root's
+   own `agent.default` preference (`helm prefs show`), and finally
    the runtime this Helm session is itself running under;
 3. when inside Herdr (`HERDR_ENV=1` and an available `herdr` executable), run
    that worker in the project's one Helm-owned Herdr workspace, reusing the

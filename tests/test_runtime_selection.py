@@ -33,8 +33,16 @@ class RuntimeSelectionTests(HelmTestCase):
             executable.chmod(0o755)
         return bin_dir
 
-    def _runtime_root(self, project_id: str, settings: dict[str, object] | None = None) -> Path:
+    def _runtime_root(
+        self,
+        project_id: str,
+        settings: dict[str, object] | None = None,
+        *,
+        prefs: dict[str, object] | None = None,
+    ) -> Path:
         helm_root = self._helm_root(f"helm-{project_id}")
+        if prefs is not None:
+            self.write_preferences(helm_root, **prefs)
         project_root = self.repo(f"repo-{project_id}")
         destination = helm_root / "projects" / project_id
         shutil.move(str(project_root), str(destination))
@@ -302,12 +310,14 @@ class RuntimeSelectionTests(HelmTestCase):
             with self.subTest(model=model):
                 self.assertFalse(runtimes.is_claude_model(model))
 
-    def test_a_claude_model_launches_on_claude_code_and_nowhere_else(self) -> None:
+    CLAUDE_ONLY = {"model": {"runtimes": {"claude": ["claude"]}}}
+
+    def test_a_restricted_family_launches_on_its_runtime_and_nowhere_else(self) -> None:
         """A cross-provider runtime would accept the name and bill for it.
 
-        So the pairing is enforced where the model and the runtime meet, for
-        every source that can name a model, rather than at whichever entry
-        point somebody happened to notice.
+        So where a root has asked for the restriction, it is enforced wherever
+        the model and the runtime meet, for every source that can name a model,
+        rather than at whichever entry point somebody happened to notice.
         """
         bin_dir = self._fake_agent_cli("claude", "pi", "opencode", "omp", "codex")
         env = {
@@ -318,7 +328,7 @@ class RuntimeSelectionTests(HelmTestCase):
         }
 
         # Accepted: the built-in claude runtime is the one that may run these.
-        helm_root = self._runtime_root("claudeok")
+        helm_root = self._runtime_root("claudeok", prefs=self.CLAUDE_ONLY)
         ok = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
         project = ok.discover_project(helm_root, "claudeok")
         for model in ("claude-opus-5", "anthropic/claude-opus-5", "sonnet-4-5"):
@@ -337,35 +347,42 @@ class RuntimeSelectionTests(HelmTestCase):
                 project["id"], "Port the parser", model="claude-opus-5", agent=agent
             )
             with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
-                HelmError, r"may only be launched through Helm's built-in claude runtime"
+                HelmError, r"restrict to the claude runtime"
             ) as caught:
                 ok.prepare_external_worker(task["id"], None, execution="herdr")
             self.assertIn(agent, str(caught.exception))
+            # The refusal has to say the restriction is this root's, and how
+            # to remove it, or it reads as a product rule nobody chose.
+            self.assertIn("helm prefs unset model.runtimes.claude", str(caught.exception))
 
         # A project pin and HELM_MODEL are the same attempt by another route.
         pinned_root = self._runtime_root(
-            "claudepin", {"agent": "pi", "model": "anthropic/claude-opus-5"}
+            "claudepin",
+            {"agent": "pi", "model": "anthropic/claude-opus-5"},
+            prefs=self.CLAUDE_ONLY,
         )
         pinned = Coordinator(StateStore(pinned_root / "state", helm_root=pinned_root))
         pinned_project = pinned.discover_project(pinned_root, "claudepin")
         pinned_task = pinned.create_task(pinned_project["id"], "Port the parser")
         with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
-            HelmError, r"anthropic/claude-opus-5 is a Claude-family model"
+            HelmError, r"anthropic/claude-opus-5 is in the claude model family"
         ):
             pinned.prepare_external_worker(pinned_task["id"], None, execution="herdr")
 
-        ambient_root = self._runtime_root("claudeambient", {"agent": "opencode"})
+        ambient_root = self._runtime_root(
+            "claudeambient", {"agent": "opencode"}, prefs=self.CLAUDE_ONLY
+        )
         ambient = Coordinator(StateStore(ambient_root / "state", helm_root=ambient_root))
         ambient_project = ambient.discover_project(ambient_root, "claudeambient")
         ambient_task = ambient.create_task(ambient_project["id"], "Port the parser")
         with mock.patch.dict(
             os.environ, {**env, "HELM_MODEL": "opus-4.1"}
-        ), self.assertRaisesRegex(HelmError, r"built-in claude runtime"):
+        ), self.assertRaisesRegex(HelmError, r"restrict to the claude runtime"):
             ambient.prepare_external_worker(ambient_task["id"], None, execution="herdr")
 
-    def test_a_profile_inheriting_a_runtime_cannot_smuggle_a_claude_model(self) -> None:
+    def test_a_profile_inheriting_a_runtime_cannot_smuggle_a_restricted_model(self) -> None:
         """A profile is a name for a runtime, not a way around its pairing."""
-        helm_root = self._runtime_root("profiled")
+        helm_root = self._runtime_root("profiled", prefs=self.CLAUDE_ONLY)
         (helm_root / "agents.json").write_text(
             json.dumps({"agents": [{"id": "reviewer", "runtime": "pi"}]})
         )
@@ -377,17 +394,17 @@ class RuntimeSelectionTests(HelmTestCase):
         )
         env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_MODEL": ""}
         with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
-            HelmError, r"may only be launched through Helm's built-in claude runtime"
+            HelmError, r"restrict to the claude runtime"
         ):
             coordinator.prepare_external_worker(task["id"], None, execution="herdr")
 
-    def test_a_command_that_bakes_a_claude_model_into_argv_is_refused(self) -> None:
+    def test_a_command_that_bakes_a_restricted_model_into_argv_is_refused(self) -> None:
         """A boundary checked only where Helm places a model is one argv walks past.
 
         A profile or a caller-supplied command can select the model itself, so
         the visible argv forms are inspected at launch rather than trusted.
         """
-        helm_root = self._runtime_root("baked")
+        helm_root = self._runtime_root("baked", prefs=self.CLAUDE_ONLY)
         (helm_root / "agents.json").write_text(
             json.dumps({
                 "agents": [
@@ -423,7 +440,7 @@ class RuntimeSelectionTests(HelmTestCase):
         direct = coordinator.create_task(project["id"], "Port the parser")
         coordinator.allocate_task(direct["id"])
         with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
-            HelmError, r"claude-opus-5 is a Claude-family model"
+            HelmError, r"claude-opus-5 is in the claude model family"
         ):
             coordinator.prepare_external_worker(
                 direct["id"],
@@ -452,23 +469,22 @@ class RuntimeSelectionTests(HelmTestCase):
         no way to keep.
         """
         self.assertIsNone(
-            runtimes.claude_model_in_command(["/usr/local/bin/run-agent.sh", "{prompt}"])
+            runtimes.model_in_command(["/usr/local/bin/run-agent.sh", "{prompt}"])
         )
-        self.assertIn("opaque wrapper", runtimes.claude_model_in_command.__doc__ or "")
+        self.assertIn("opaque wrapper", runtimes.model_in_command.__doc__ or "")
         # And what is visible is still found, in both spellings.
         self.assertEqual(
-            runtimes.claude_model_in_command(["pi", "--model", "sonnet-4-5"]), "sonnet-4-5"
+            runtimes.model_in_command(["pi", "--model", "sonnet-4-5"]), "sonnet-4-5"
         )
         self.assertEqual(
-            runtimes.claude_model_in_command(["pi", "--model=claude-opus-5"]), "claude-opus-5"
+            runtimes.model_in_command(["pi", "--model=claude-opus-5"]), "claude-opus-5"
         )
-        self.assertIsNone(runtimes.claude_model_in_command(["pi", "--model", "gpt-5.6-sol"]))
         # `--model=` states an empty value; the argument after it is the
         # prompt, and reading it as a model would refuse a launch over
         # whatever the brief happened to mention.
         self.assertIsNone(
-            runtimes.claude_model_in_command(
-                ["pi", "--model=", "Rewrite the claude-opus-5 migration notes"]
+            runtimes.model_in_command(
+                ["pi", "--model=", "Rewrite the migration notes for opus-4.1"]
             )
         )
 
@@ -479,6 +495,10 @@ class RuntimeSelectionTests(HelmTestCase):
         the label won, the boundary would accept the one answer that lets a
         Claude model launch on another vendor's CLI.
         """
+        restricted_root = self._runtime_root("identity", prefs=self.CLAUDE_ONLY)
+        restricted = Coordinator(
+            StateStore(restricted_root / "state", helm_root=restricted_root)
+        )
         claude_label = {"id": "claude", "builtin": True}
         for executable in ("pi", "opencode", "/usr/local/bin/omp"):
             with self.subTest(executable=executable):
@@ -491,7 +511,7 @@ class RuntimeSelectionTests(HelmTestCase):
                 with self.assertRaisesRegex(
                     HelmError, r"its launch command selects that model"
                 ):
-                    Coordinator._with_model(
+                    restricted._with_model(
                         claude_label, [executable, "--model", "claude-opus-5"], None, ""
                     )
         # A profile that names its runtime rather than being one loses to argv
@@ -510,7 +530,7 @@ class RuntimeSelectionTests(HelmTestCase):
             "claude",
         )
         self.assertEqual(
-            Coordinator._with_model(
+            restricted._with_model(
                 pi_label, ["claude", "--model", "claude-opus-5", "{prompt}"], None, ""
             ),
             ["claude", "--model", "claude-opus-5", "{prompt}"],
@@ -524,18 +544,19 @@ class RuntimeSelectionTests(HelmTestCase):
             Coordinator._launch_runtime_id({"id": "default"}, ["/usr/local/bin/wrapper.sh"])
         )
 
-    def test_a_claude_reviewer_model_only_ever_runs_on_claude_code(self) -> None:
+    def test_a_restricted_reviewer_model_only_ever_runs_on_its_runtime(self) -> None:
         """Review is the path most likely to reach for a cross-provider runtime.
 
         `--reviewer-model` exists precisely to buy independence through the
         model, so it is exactly where a Claude model would otherwise land on pi
         or opencode.
         """
+        self.write_preferences(**self.CLAUDE_ONLY)
         bin_dir = self._fake_agent_cli("claude", "pi", "opencode")
         with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
             # Named explicitly: refused, and the required runtime is named.
             with self.assertRaisesRegex(
-                HelmError, r"may only be launched through Helm's built-in claude runtime"
+                HelmError, r"restrict to the claude runtime"
             ):
                 self.coordinator.pick_reviewer_agent(
                     "codex", explicit="pi", model="anthropic/claude-opus-5"
@@ -557,7 +578,7 @@ class RuntimeSelectionTests(HelmTestCase):
         with mock.patch.dict(os.environ, {"PATH": str(without_claude)}):
             # No substitution: say the pairing cannot be honoured here.
             with self.assertRaisesRegex(
-                HelmError, r"no installed reviewer runtime is Claude Code"
+                HelmError, r"no installed reviewer runtime may run that model family"
             ):
                 self.coordinator.pick_reviewer_agent("pi", model="claude-opus-5")
 
@@ -570,7 +591,7 @@ class RuntimeSelectionTests(HelmTestCase):
         only_pi = self._fake_agent_cli("pi")
         with mock.patch.dict(os.environ, {"PATH": str(only_pi)}):
             # ...but it must not quietly become pi running a Claude model.
-            with self.assertRaisesRegex(HelmError, r"built-in claude runtime"):
+            with self.assertRaisesRegex(HelmError, r"restrict to the claude runtime"):
                 self.coordinator.pick_reviewer_agent("pi", model="claude-opus-5")
 
     def test_a_model_is_refused_rather_than_dropped_when_helm_cannot_place_it(self) -> None:

@@ -63,7 +63,7 @@ Splitting these used to be rejected on the grounds that a task would then
 receive half the material. Domain composition removed that objection: the chain
 loads in full, and each piece stays reusable on its own.
 
-**Provenance.** Distilled 2026-08-01 from a set of role prompts for a
+**Provenance.** Distilled from a set of role prompts for a
 planner, coder, reviewer and verifier, plus their messaging protocol. Not
 executed or independently verified against Helm's behaviour; treat it as
 guidance rather than as a description of what Helm does.

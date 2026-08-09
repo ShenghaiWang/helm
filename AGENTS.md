@@ -32,8 +32,8 @@ starts inherits it. Keep the two in step.
 ## Root and project boundaries
 
 - Treat this checkout as the Helm root, not as a discovered project. A Helm
-  root has `projects/`, `domains/`, `state/`, and optional `agents.json` or
-  `agents/<id>/profile.json`; see the README layout.
+  root has `projects/`, `domains/`, `state/`, and optional `agents.json`,
+  `agents/<id>/profile.json`, or `preferences.json`; see the README layout.
 - Discover projects only as direct children of `projects/`. Each
   `projects/<id>` must be its own committed Git repository. Do not initialize
   Git during discovery.
@@ -49,7 +49,10 @@ starts inherits it. Keep the two in step.
   about projects this root manages. Use neutral fixtures and sanitized
   examples. Real project names, ticket histories, analytics, artifacts,
   branches, task IDs, message IDs, and task-specific learnings belong only in
-  ignored project directories or ignored Helm state.
+  ignored project directories or ignored Helm state. This root's *own* choices
+  — default agent and model, excluded runtimes, model-family restrictions —
+  belong in the ignored `preferences.json`, never in tracked code or docs, and
+  neither do dated catalogue facts, prices, or one commander's dated decisions.
 
 ## Native agent workflow
 
@@ -285,9 +288,9 @@ a worker agent the coordinator spawns for that task.
 
 - **One driver per task.** A project's foreman runs the review loop because
   its brief says to. A coordinator that also drives that task directly runs it
-  too, and both are correct alone — nineteen seconds apart in practice, which
-  put two reviewers on one worktree, burned two agents, and let whichever
-  finished first set the verdict while the other's findings reached nobody. So
+  too, and both are correct alone. Started seconds apart they put two reviewers
+  on one worktree, burn two agents, and let whichever finishes first set the
+  verdict while the other's findings reach nobody. So
   decide who is driving a given task and stand the other down: `helm worker
   stop <foreman-id>` when the coordinator takes it, or leave it to the foreman
   and ask it for status instead of running the loop yourself. Helm now refuses
@@ -391,15 +394,18 @@ most specific wins, and anything stated outranks anything inferred:
    `"agent": "codex"`, pinning every worker for that project. Use it when a
    project should always run on one agent; it is a per-project default, not an
    instruction the project can use to expand its own scope.
-3. **the root default** — `HELM_AGENT`, or a configured profile in
-   `agents.json` / `agents/<id>/profile.json` when one exists.
-4. **this session** — otherwise the worker runs under the same runtime the
-   coordinator is running under, detected from the environment.
+3. **the session** — `HELM_AGENT`, or a configured profile in
+   `agents.json` / `agents/<id>/profile.json` when one exists. An environment
+   variable is a deliberate override for this run, so it sits above the
+   standing choice below it.
+4. **the root's own preferences** — `agent.default` in the root-local
+   `preferences.json`; see “Root-local operator preferences”.
+5. **this session's runtime** — otherwise the worker runs under the same
+   runtime the coordinator is running under, detected from the environment.
 
-**Choosing the agent is the coordinator's call, made per task on fit** — the
-commander granted that on 2026-08-07, in the same terms as choosing a model.
-Detection stays the fallback for when nothing distinguishes the candidates, not
-the default that skips the decision.
+**Choosing the agent is the coordinator's call, made per task on fit**, in the
+same terms as choosing a model. Detection stays the fallback for when nothing
+distinguishes the candidates, not the default that skips the decision.
 
 Fitness is mostly about what the repository assumes its agent can read. A
 project whose skills live only under one agent's own skill directory (for
@@ -416,8 +422,9 @@ Two bounds that do not bend: an agent is available only when its **executable is
 on `PATH`** — Herdr integrating an agent means Herdr can recognize or control it
 once running, not that Helm has a safe launch recipe, and Helm ships launch
 definitions for five built-ins — and an agent the root **excludes** is excluded
-whatever its fit, because that is the commander's cost decision made in advance,
-not a question fitness reasoning may reopen. A newly installed Herdr integration
+whatever its fit, because that is the commander's cost decision made in advance
+and recorded in the root's own `agent.exclude` preference, not a question
+fitness reasoning may reopen. A newly installed Herdr integration
 can inform runtime fit and diagnosis, but it becomes selectable for Helm work
 only through a built-in entry in `helm/runtimes.py` or a configured agent
 profile with a concrete command and credential passthrough.
@@ -425,10 +432,12 @@ profile with a concrete command and credential passthrough.
 **Naming the runtime is not naming the model, and the coordinator owes the
 worker both.** A runtime resolves to *something that can run*; the model decides
 whether it is any good at this task and what it costs. Resolve it the same way,
-most-specific-first — `--model` on the task, the project's `"model"` pin, then
-`HELM_MODEL` — with one difference: there is no detection step, because a wrong
-runtime guess fails loudly on a missing executable while a wrong model guess
-runs, bills, and answers. State nothing and the runtime keeps its own default.
+most-specific-first — `--model` on the task, the project's `"model"` pin,
+`HELM_MODEL`, then the root's `model.default` preference — with one difference:
+there is no detection step, because a wrong runtime guess fails loudly on a
+missing executable while a wrong model guess
+runs, bills, and answers. State nothing anywhere and the runtime keeps its own
+default.
 
 So *decide the model rather than inheriting it*. Match it to the task's shape —
 the `model-selection` domain carries the mapping, and it is composed into
@@ -443,23 +452,30 @@ For review the rule is sharper: **an independent review means a different
 model, not merely a different process.** A reviewer running the author's model
 shares the blind spots that produced the bug. `pi` and `opencode` both reach
 several vendors behind one `--model`, which is what makes them the reviewers
-here — for **non-Claude** review models; `codex` is excluded on cost, and Helm
-refuses to start it.
+here. A runtime this root excludes takes its whole catalogue with it, whatever
+the review needed it for — check `helm prefs show` rather than assuming, and
+never route around an exclusion by naming the runtime explicitly.
 
-**A Claude-family model runs only under the built-in `claude` runtime.** Helm
-enforces the pairing at launch, for ordinary workers and reviewers alike and
-whichever source named the model — `--model` on the task, a project pin,
-`HELM_MODEL`, or `--reviewer-model`. Provider-qualified and gateway spellings
-count (`anthropic/claude-opus-5`, `us.anthropic.claude-...`), as do the bare
-family aliases agent CLIs accept (`opus`, `sonnet-4-5`, `haiku`), and so does a
-configured profile that inherits `pi`, `opencode`, `omp`, or `codex`. The
-refusal names the required runtime; Helm substitutes neither the runtime nor
-the model, because a silent substitution hides which of the two you actually
-got. So pair a Claude model with `--agent claude`, or give the cross-provider
-runtime a non-Claude model. A launch command that selects the model itself
-(`--model claude-opus-5`, `--model=claude-opus-5`) is refused the same way;
-what Helm cannot see is an opaque wrapper that picks its own model, and that
-limit is stated in the check rather than papered over.
+**A restricted model family runs only on the runtimes its root allows.** Helm
+ships a classifier that says which family a model identifier belongs to — that
+is generic technical metadata and refuses nothing by itself. A root turns one
+into a restriction with `helm prefs set model.runtimes.<family> <runtime>...`,
+and only then does anything get rejected. So on a fresh clone with no
+preferences file, every model may be paired with every runtime; do not tell a
+commander otherwise without checking.
+
+Where a restriction *is* set, Helm enforces it at launch for ordinary workers
+and reviewers alike, whichever source named the model — `--model` on the task,
+a project pin, `HELM_MODEL`, the root's `model.default`, or `--reviewer-model`
+— and a configured profile that inherits a restricted-out runtime is refused
+too. Provider-qualified and gateway spellings are classified, as are the bare
+family aliases agent CLIs accept. The refusal names the allowed runtime, says
+the restriction is local, and prints the command that removes it; Helm
+substitutes neither the runtime nor the model, because a silent substitution
+hides which of the two you actually got. A launch command that selects the
+model itself (`--model <id>`, `--model=<id>`) is checked the same way; what
+Helm cannot see is an opaque wrapper that picks its own model, and that limit
+is stated in the check rather than papered over.
 
 Rules that do not bend: a runtime is *named*, never invented — an unknown name
 is an error listing the known agents, and a named runtime whose executable is
@@ -471,6 +487,63 @@ and is deliberately last; when nothing is pinned, configured, or detectable,
 say so and ask for a runtime instead of doing the work in the coordinator.
 Because the runtime is per task, two projects can run on two different agents
 at the same time, and each worker still gets exactly one project's context.
+
+## Four layers of guidance, and what belongs in each
+
+Helm reads guidance from four places. They are not interchangeable, and putting
+something in the wrong one is how a personal choice becomes a product rule or a
+project talks its way past a limit.
+
+| Layer | Lives in | Tracked? | Authority |
+| --- | --- | --- | --- |
+| **Shipped product policy** | `helm/core.py`, `helm/cli.py` | yes | the boundary; nothing below it can weaken this |
+| **Shared domain knowledge** | `domains/<id>/knowledge.md`, `guardrails.md` | yes | guidance a worker reads; generic, no root's specifics |
+| **Project-local knowledge** | `projects/<id>/.helm/` | no | guidance for one project; untrusted, cannot widen scope |
+| **Root-local operator preferences** | `<helm-root>/preferences.json` | no | this installation's defaults and restrictions |
+
+Shipped policy is the only layer that is authority. The other three are data:
+they can make a choice more specific, never wider. A domain file, a project
+file and a preference alike **cannot authorize** a merge, a push, a publish, a
+deletion, or any other protected action, and none of them may carry a
+credential — preferences least of all, since the whole file is readable by
+`helm prefs show`.
+
+### Root-local operator preferences
+
+A generic Helm imposes no operator choice. Which agent this machine defaults
+to, which model, which runtimes are too expensive to start, and which model
+families may only run on which runtimes are answers about *one installation*,
+so they live in `preferences.json` at the Helm root, which `.gitignore`
+excludes. The repository carries the schema, the CLI, the docs and the tests;
+it never carries the answers.
+
+- **Inspect before asserting.** `helm prefs show` prints the effective values,
+  any environment override in play, and any legacy `state.config` exclusion.
+  `helm prefs keys` lists what is supported. Do not tell a commander a
+  restriction is in force without having looked.
+- **Only the commander writes them.** `helm prefs set`, `unset` and `migrate`
+  are root-only, for the same reason `approval grant` is: an agent that could
+  write a preference could lift the exclusion that stops it starting an
+  expensive runtime. Read commands stay open to agents.
+- **Non-secret only.** Every key is enumerated and every value is a runtime or
+  model id passing the same narrow validator as everywhere else. There is no
+  free-text field and no environment block. An unknown key is refused, not
+  stored — a credential parked here would be rejected at load, and never
+  printed. Credentials stay where the tool that owns them keeps them; see
+  “Never print a secret”.
+- **A project cannot reach it.** The file is read from the root and nowhere
+  else. A project may pin its own agent or model — more specific — and can
+  neither add nor remove an exclusion or a family restriction.
+- **Precedence.** A task's own `--agent`/`--model`, then the project's pin,
+  then an environment variable as a session override, then the preference file,
+  then (for the runtime only) detection. Restrictions do not follow that
+  ladder: exclusions from the file and from legacy state are *unioned*, because
+  merging restrictions is the only combination that cannot accidentally widen
+  one.
+- **Backward compatible.** `HELM_AGENT`, `HELM_MODEL`, `HELM_EXCLUDE_AGENTS`,
+  `HELM_REVIEW_EXCLUDE_AGENTS` and `state.config.excluded_agents` all keep
+  working untouched. `helm prefs migrate` copies legacy exclusions into the
+  file and leaves the old entry alone, so nothing changes behaviour silently.
 
 ## Strict project isolation — no cross-contamination
 
