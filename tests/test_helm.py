@@ -3980,6 +3980,79 @@ class HelmCoordinatorTests(unittest.TestCase):
         self.coordinator.refresh_finalization_decisions(project["id"])
         self.assertEqual(self._finalizations(project["id"]), [])
 
+    def test_retained_state_is_read_from_the_record_not_probed_from_disk(self) -> None:
+        """Status and watch must not scan git or the filesystem for this.
+
+        A probe per delivered task is a cost on every refresh, and every way
+        of failing to see a resource -- a moved root, an unreadable checkout,
+        a git that errors -- looks exactly like the resource being gone, which
+        would close this gate on work that is still there.
+        """
+        root, project, task = self._completed_task_awaiting_approval("noprobe")
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+        self.assertEqual(len(self._finalizations(project["id"])), 1)
+
+        # No git anywhere in the refresh the attention surfaces run.
+        with mock.patch("helm.core._git", side_effect=AssertionError("probed git")):
+            items = self.coordinator.project_status(project["id"])["action_items"]
+            self.coordinator.project_updates_for_watch(project["id"])
+        self.assertEqual(
+            [i["kind"] for i in items if i["kind"] == FINALIZATION_ACTION_KIND],
+            [FINALIZATION_ACTION_KIND],
+        )
+        # And no existence check either: the record alone answers this. (The
+        # store's own file reads are outside the scope being asserted, so the
+        # detection is exercised directly rather than through them.)
+        data = self.coordinator.store.load()
+        with mock.patch.object(Path, "exists", side_effect=AssertionError("probed disk")), \
+                mock.patch.object(Path, "is_dir", side_effect=AssertionError("probed disk")):
+            retained = self.coordinator.task_retained_resources(
+                data["tasks"][task["id"]], data
+            )
+        self.assertIn("its task worktree", retained)
+
+    def test_resources_gone_outside_helm_hold_the_gate_until_cleanup(self) -> None:
+        """Being wrong costs one line; the other direction loses the work."""
+        root, project, task = self._completed_task_awaiting_approval("movedroot")
+        self.coordinator.approve_task(task["id"], "reviewed")
+        merged = self.coordinator.merge_task(task["id"])
+        self.assertEqual(len(self._finalizations(project["id"])), 1)
+
+        # The project root moves and the worktree is removed by hand. Neither
+        # is Helm recording that it let go, so the gate stands.
+        shutil.rmtree(Path(merged["workspace"]), ignore_errors=True)
+        with self.coordinator.store.locked() as data:
+            data["projects"][project["id"]]["root"] = str(root / "gone-elsewhere")
+        self.assertEqual(len(self._finalizations(project["id"])), 1)
+
+        # Cleanup is the reconciliation point: it marks the absent worktree
+        # removed even though the directory was taken from under it.
+        with self.coordinator.store.locked() as data:
+            data["projects"][project["id"]]["root"] = str(root)
+        self.coordinator.cleanup_task(task["id"])
+        self.assertEqual(self._finalizations(project["id"]), [])
+
+    def test_a_changed_retained_set_keeps_the_item_and_stamps_it(self) -> None:
+        """Same decision, said more accurately -- not a new one to re-read."""
+        root, project, task = self._completed_task_awaiting_approval("restamp")
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+        first = self._finalizations(project["id"])[0]
+        self.assertIn("its task worktree", first["text"])
+        self.assertIsNone(first.get("updated_at"))
+
+        # One piece is shed; the rest are still held.
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["workspace_removed"] = True
+        second = self._finalizations(project["id"])[0]
+
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(second["at"], first["at"])
+        self.assertNotIn("its task worktree", second["text"])
+        self.assertTrue(second["updated_at"])
+        self.assertGreaterEqual(second["updated_at"], first["at"])
+
     def test_a_ticketed_task_branch_is_counted_and_shed_like_any_other(self) -> None:
         """The ticket is in the branch name, and both sides must know it.
 

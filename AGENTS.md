@@ -184,7 +184,10 @@ a worker agent the coordinator spawns for that task.
   release <id>`); it repeats in `helm status` and `helm watch` until it is
   answered. Relay it and get the commander's approval — cleanup deletes a
   checkout and a branch, so Helm never runs it by itself, and it is never
-  raised for a task that holds nothing. It resolves only for what cleanup
+  raised for a task that holds nothing. What it names comes from Helm's record
+  of what the task owns, not from probing the disk, so a moved or unreadable
+  project root can never read as "already cleaned" — cleanup is what reconciles
+  a resource somebody removed outside Helm. It resolves only for what cleanup
   actually shed, so a branch kept because it carries unmerged commits leaves
   the item open naming just that branch. A task is not finished until that
   approved cleanup decision is resolved.

@@ -1039,10 +1039,18 @@ helm task cleanup <task> --delete-branch   # also discard a branch with unmerged
 helm project release <id>                  # the same, task by task, reporting what it kept
 ```
 
+What it names is read from Helm's own record of what this task owns, not from
+a live look at the disk: `helm status` and `helm watch` run no git or
+filesystem probe for it, and a project root that has moved or gone unreadable
+cannot be mistaken for "the branch is already gone". A resource is held until
+Helm records letting go of it, and `helm task cleanup` is the only thing that
+does -- including for resources removed outside Helm, which it reconciles as
+removed on the way past.
+
 Like the delivery decision it is derived rather than flagged, so it is raised
 once however many times it is recomputed, it is never raised for a task that
-holds nothing, and it resolves itself as soon as the residue is gone. It
-resolves only for what cleanup actually shed: a branch kept because it holds
+holds nothing, and it resolves itself as soon as the record says the residue
+is gone. It resolves only for what cleanup actually shed: a branch kept because it holds
 unmerged commits leaves the item open, now naming just the branch. Cleanup
 stays explicit -- Helm never runs it for you -- and its refusals are unchanged:
 a dirty workspace, a live session, work still awaiting approval, and an

@@ -6263,36 +6263,46 @@ class Coordinator:
         return resolved
 
     def task_retained_resources(
-        self, task: dict[str, Any], project: dict[str, Any], data: dict[str, Any]
+        self, task: dict[str, Any], data: dict[str, Any]
     ) -> list[str]:
-        """What this task still occupies on disk, in the reader's terms.
+        """What this task still holds, read from Helm's own record.
 
-        Read-only, and deliberately concrete: a worktree, a branch and a
-        worker directory are three different things to let go of, and the two
-        that survive a plain `helm task cleanup` -- an unmerged branch, a
-        directory belonging to a session still alive -- are exactly the ones a
-        commander needs named rather than implied.
+        Deliberately state-driven rather than a live look at the disk. Probing
+        git and the filesystem on every `helm status` and `helm watch` costs a
+        scan per delivered task, and -- worse -- makes every way of *failing*
+        to see a resource look exactly like the resource being gone: a project
+        root that has moved, an unreadable checkout, a git that errors would
+        each have quietly closed this gate on work that is still there.
+
+        So a resource is held until Helm records letting go of it, which only
+        `helm task cleanup` does. Cleanup is also the reconciliation point for
+        anything removed outside Helm: it already marks an absent worktree,
+        branch, or worker directory as removed. Being wrong in this direction
+        costs one line asking about a task that is already clean, and it is
+        answered by running the cleanup that was going to be run anyway.
+
+        Concrete about which of the three: a worktree, a branch and a worker
+        directory are different things to let go of, and the two a plain
+        cleanup can leave behind -- an unmerged branch, a directory belonging
+        to a session still alive -- are the ones a commander needs named.
         """
         retained: list[str] = []
-        workspace = task.get("workspace")
-        if workspace and not task.get("workspace_removed"):
-            with contextlib.suppress(OSError):
-                if canonical(workspace).exists():
-                    retained.append("its task worktree")
-        branch = task.get("branch")
-        if task_owns_branch(task):
-            with contextlib.suppress(OSError, HelmError):
-                root = canonical(project["root"])
-                if _git(root, "show-ref", "--verify", f"refs/heads/{branch}", check=False):
-                    retained.append(f"its task branch {branch}")
+        if task.get("workspace") and not task.get("workspace_removed"):
+            retained.append("its task worktree")
+        if task_owns_branch(task) and not task.get("branch_removed"):
+            retained.append(f"its task branch {task['branch']}")
         directories = 0
         for worker in self._task_workers(data, task["id"]):
             config_file = worker.get("config_file")
             if not config_file or worker.get("directory_removed"):
                 continue
+            # Ownership still has to hold: a directory outside Helm's own
+            # state is not Helm's to shed, so it is not Helm's to count. That
+            # is a question about the path, not about what is on disk now --
+            # requiring it to exist would put the probe straight back.
             with contextlib.suppress(OSError):
                 worker_dir = canonical(Path(config_file).parent)
-                if overlaps(worker_dir, self.store.directory / "workers") and worker_dir.is_dir():
+                if overlaps(worker_dir, self.store.directory / "workers"):
                     directories += 1
         if directories:
             retained.append(f"{directories} worker directory/directories")
@@ -6314,7 +6324,6 @@ class Coordinator:
         live-session refusals untouched.
         """
         data = self.store.load() if data is None else data
-        project = self._project(data, project_id)
         raised: list[dict[str, Any]] = []
         resolved: list[dict[str, Any]] = []
         wanted: dict[str, str] = {}
@@ -6323,7 +6332,7 @@ class Coordinator:
                 continue
             if task.get("status") not in DELIVERED_TASK_STATES:
                 continue
-            retained = self.task_retained_resources(task, project, data)
+            retained = self.task_retained_resources(task, data)
             if retained:
                 wanted[task["id"]] = finalization_text(task["id"], retained)
         status = self._load_status(project_id)
@@ -6344,8 +6353,11 @@ class Coordinator:
             elif item.get("text") != text:
                 # What is retained changes as pieces are shed -- a branch
                 # deleted while the worktree stays. A stale list is worse than
-                # none, because it is the part a reader acts on.
+                # none, because it is the part a reader acts on. The item keeps
+                # its id: this is the same decision, said more accurately, and
+                # a reader who noted the id must not have it renumbered.
                 item["text"] = text
+                item["updated_at"] = now()
                 dirty = True
         if dirty:
             self._save_status(project_id, status)
