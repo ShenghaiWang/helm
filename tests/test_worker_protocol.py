@@ -96,8 +96,18 @@ class WorkerProtocolTests(HelmTestCase):
             ),
         ]
         worker = self.coordinator.launch_worker(task["id"], command)
-        self.assertEqual(worker["status"], "completed")
+        # It reported a blocker and then exited cleanly. The blocker is the
+        # outcome -- of the task and of the worker -- and the orderly exit is
+        # kept beside it as evidence rather than read back as success.
+        # docs/worker-lifecycle.md is the contract; tests/test_worker_lifecycle.py
+        # holds it in both orders.
+        self.assertEqual(worker["status"], "failed")
+        self.assertEqual(worker["protocol_outcome"], "blocker")
+        self.assertEqual(worker["process_exit_code"], 0)
         inspected = self.coordinator.inspect_task(task["id"])
+        self.assertTrue(
+            any(message["kind"] == "exit-evidence" for message in inspected["messages"])
+        )
         self.assertEqual(inspected["project"]["id"], "messages")
         self.assertEqual(inspected["task"]["status"], "blocked")
         self.assertTrue(any(message["kind"] == "blocker" for message in inspected["messages"]))

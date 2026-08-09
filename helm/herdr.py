@@ -856,6 +856,10 @@ class HerdrAdapter:
             current_worker["status"] = "running"
             current_worker["exit_code"] = None
             current_worker["ended_at"] = None
+            # A new round is a new lifecycle episode: this round's verdict must
+            # not be folded away as a duplicate of the last one, and the next
+            # exit is a fresh observation. See docs/worker-lifecycle.md.
+            self.coordinator.begin_worker_episode(current_worker)
             current_worker["reopened_at"] = reopened_at
             current_task["status"] = "running"
         return True

@@ -362,8 +362,9 @@ agent does not need to run this script.
 ### Running the tests
 
 The suite lives in `tests/`, split by subsystem — task lifecycle, runtime
-selection, worker protocol, approvals, delivery, review, domains and skills,
-Herdr, CLI surfaces, and the repository contract — over the shared fixtures in
+selection, worker protocol, the worker lifecycle state machine, approvals,
+delivery, review, domains and skills, Herdr, CLI surfaces, and the repository
+contract — over the shared fixtures in
 [`tests/support.py`](tests/support.py). Run the whole thing with discovery, and
 a single subsystem by naming its module:
 
@@ -795,6 +796,12 @@ because nobody looked. `helm status` prints the same attention list.
 Repair stops at the unambiguous. A finished worker is settled; a stalled one is
 reported and nudged once, never silently failed, because its pane is the
 evidence needed to diagnose it.
+
+How a worker's own `result`, `blocker` or `failure` combines with what the
+operating system observed — which wins, in which order, and what is kept as
+evidence when they disagree — is one state machine with a normative
+specification: [`docs/worker-lifecycle.md`](docs/worker-lifecycle.md). Read it
+before changing `poll_worker`, `_ingest_worker_event` or `_apply_process_exit`.
 
 Abandoning a task is a decision, so it has a command:
 

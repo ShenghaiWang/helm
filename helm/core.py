@@ -4301,6 +4301,15 @@ class Coordinator:
             "started_at": now(),
             "ended_at": None,
             "exit_code": None,
+            # The lifecycle contract keeps the worker's own verdict and the
+            # process observation apart, because they arrive independently and
+            # can disagree. See docs/worker-lifecycle.md.
+            "protocol_outcome": None,
+            "outcome_source": None,
+            "process_settled": False,
+            "exit_observed": False,
+            "process_exit_code": None,
+            "process_exited_at": None,
         }
         data["workers"][worker_id] = worker
         task["status"] = "running"
@@ -4584,6 +4593,15 @@ class Coordinator:
             raise
         if wait:
             result = self.wait_worker(worker["id"])
+            if process.poll() is None and result.get("exit_observed") is not True:
+                # The worker settled on its own terminal message and its
+                # session is deliberately still open. Blocking on that process
+                # here would undo the wait path's whole point, so the runner is
+                # detached exactly as `--async` detaches it: it owns its output
+                # and its exit record, and this invocation must not retain a
+                # Popen for a child that outlives it.
+                process._child_created = False  # type: ignore[attr-defined]
+                return result
             # Keep the Popen object's returncode in sync as well as recording
             # the durable exit record; otherwise Python warns when the object
             # is collected after the runner has already exited.
@@ -4612,6 +4630,21 @@ class Coordinator:
             task["status"] = "failed"
             self._message(data, project, task, worker, "failure", f"Worker launch failed: {detail}", {})
             return worker
+
+    def _child_alive(self, worker: dict[str, Any]) -> bool:
+        """Whether a worker Helm launched itself is still actually running.
+
+        A finished child that nobody has reaped is a zombie, and `kill(pid, 0)`
+        answers "alive" for one -- so an unreaped runner read as live forever
+        and its task never settled. Reaping without blocking is what tells the
+        two apart, and it is also the cleanup: after this, the pid is either
+        gone or genuinely still working. A child this process does not own
+        (an async launch reparented when its coordinator exited) is not
+        waitable, and falls back to the signal test unchanged.
+        """
+        pid = worker.get("pid")
+        self._reap_child(pid, blocking=False)
+        return self._pid_alive(pid)
 
     @staticmethod
     def _pid_alive(pid: int | None) -> bool:
@@ -5051,6 +5084,104 @@ class Coordinator:
         task["status"] = "approval-needed"
         return hold
 
+    #: What the record says when a hold outlived the session that asked for it.
+    #: One phrasing, because the reconciliation below compares against it.
+    _HOLD_ABANDONED_NOTE = (
+        "approval hold abandoned: its session ended before the authorization "
+        "was used"
+    )
+
+    def _hold_abandoned_situation(self, task: dict[str, Any]) -> str:
+        return self._situation_line(
+            f"worker: task {task['id']} [{task.get('status')}] ",
+            self._HOLD_ABANDONED_NOTE,
+        )
+
+    def _hold_resolved_event(
+        self, task: dict[str, Any], worker: dict[str, Any], hold_id: str
+    ) -> dict[str, Any]:
+        """The unlocked half of abandoning a hold nobody can answer.
+
+        Exit observation runs entirely under the lock, so without this the
+        commander kept an "Authorize or refuse" item for a hold that had
+        already been abandoned and a task that had already failed.
+        """
+        event = self._noop_event(task, worker, "approval-abandoned")
+        event["resolve_key"] = hold_id
+        event["situation"] = self._hold_abandoned_situation(task)
+        return event
+
+    def _reconcile_hold_attention(self, event: dict[str, Any]) -> None:
+        """Make the commander's view true whatever order the effects ran in.
+
+        The request's own effects run with the state lock released, so a poll
+        can abandon that hold in between -- resolving an action item that does
+        not exist yet, after which this thread creates it and appends
+        "Approval request" as the newest word on a task that has already
+        failed. Both halves are then wrong, and neither is at fault.
+
+        So the request re-reads the hold once its effects have landed: if it is
+        no longer open, the item it just created is closed and the abandonment
+        is restated as the latest line. Idempotent and order-free -- whichever
+        of the two runs last leaves the same record, and a run where nothing
+        raced does nothing.
+        """
+        hold_id = event.get("action_item_key")
+        if event.get("hold_event") != "request" or not hold_id:
+            return
+        data = self.store.load()
+        task = data.get("tasks", {}).get(event["task_id"]) or {}
+        holds = task.get("holds") if isinstance(task.get("holds"), list) else []
+        hold = next((h for h in holds if h.get("id") == hold_id), None)
+        if hold is None or hold.get("status") in HOLD_OPEN_STATUSES:
+            return
+        project_id = event["project_id"]
+        with contextlib.suppress(HelmError, OSError):
+            self.resolve_project_action_items(project_id, hold_id)
+        line = self._hold_abandoned_situation(task)
+        with contextlib.suppress(HelmError, OSError):
+            status = self.project_status(project_id)
+            live = [
+                entry for entry in status.get("situation", [])
+                if not entry.get("superseded_by")
+            ]
+            if live and live[-1].get("text") == line:
+                return
+        with contextlib.suppress(HelmError, OSError):
+            self.record_situation(project_id, line)
+
+    @staticmethod
+    def _noop_event(
+        task: dict[str, Any], worker: dict[str, Any], kind: str
+    ) -> dict[str, Any]:
+        """An event that moved nothing, in the shape the effects pass expects.
+
+        Every side effect is off: an event Helm deliberately did not record
+        must not raise a second action item, a second situation line, a second
+        learning proposal or a second delivery decision.
+        """
+        return {
+            "kind": kind,
+            "task_id": task["id"],
+            "project_id": task["project_id"],
+            "worker_id": worker["id"],
+            "role": task.get("role", "worker"),
+            "task_status": task.get("status"),
+            "hold_id": None,
+            "hold_status": None,
+            "hold_event": "",
+            "terminal": False,
+            "situation": None,
+            "source": "worker",
+            "action_item": None,
+            "action_item_key": None,
+            "resolve_key": None,
+            "capture_evidence": False,
+            "learning": False,
+            "delivery_decision_task": None,
+            "delivery_decision_project": False,
+        }
+
     def _ingest_worker_event(
         self,
         data: dict[str, Any],
@@ -5059,8 +5190,14 @@ class Coordinator:
         text: str,
         payload: dict[str, Any],
         requested_status: str | None,
+        *,
+        late: bool = False,
     ) -> dict[str, Any]:
         """Record one worker event and move everything it moves. Call under lock.
+
+        `late` marks an event that lost the lock race with its own process
+        exit: the worker was already settled by observation alone, and this is
+        the word it was trying to get out. See docs/worker-lifecycle.md.
 
         The single intake point for both paths: a `helm worker message` push and
         a JSON protocol line parsed out of a worker's stdout. They used to be
@@ -5071,6 +5208,27 @@ class Coordinator:
         """
         task = self._task(data, worker["task_id"])
         project = self._project(data, worker["project_id"])
+        settled = self.terminal_protocol_outcome(worker)
+        if (
+            settled is not None
+            and kind in self._TERMINAL_MESSAGE_TASK_STATE
+            and worker.get("status") != "running"
+        ):
+            # The worker has already given its verdict. Saying it again -- a
+            # duplicate push, or the same line read twice -- must record
+            # nothing new, and a *different* second verdict must not overwrite
+            # the first: first word wins, and the disagreement is kept once as
+            # evidence. Both routes reach here, so a duplicate JSON line in one
+            # poll is covered as well as a duplicate push.
+            if kind != settled and not worker.get("protocol_conflict_recorded"):
+                worker["protocol_conflict_recorded"] = True
+                self._message(
+                    data, project, task, worker, "protocol-conflict",
+                    f"Worker reported {kind} after {settled}; the {settled} "
+                    f"stands as the task outcome",
+                    {"outcome": settled, "conflicting": kind, "text": _safe_text(text)},
+                )
+            return self._noop_event(task, worker, kind)
         message = self._message(
             data, project, task, worker, kind, text, payload, status=requested_status
         )
@@ -5096,6 +5254,14 @@ class Coordinator:
             worker["status"] = "completed" if kind == "result" else "failed"
             worker["exit_code"] = 0 if kind == "result" else 1
             worker["ended_at"] = now()
+            # The authoritative record, and the only writer of it: a synthesized
+            # fallback message never sets this. Arriving after a process exit
+            # overrides the fallback outcome without rewriting the observation.
+            worker["protocol_outcome"] = kind
+            worker["outcome_source"] = "protocol"
+            if late:
+                task["status"] = self._TERMINAL_MESSAGE_TASK_STATE[kind]
+            self._exit_mismatch_evidence(data, project, task, worker, kind)
         worker["last_reported_at"] = now()
         latest = self.latest_hold(task)
         return self._event_metadata(
@@ -5297,6 +5463,10 @@ class Coordinator:
         if event["resolve_key"]:
             with contextlib.suppress(HelmError, OSError):
                 self.resolve_project_action_items(project_id, event["resolve_key"])
+        # Reconcile the pause against what the state says *now*, because these
+        # effects ran with the lock released and the hold may have been
+        # abandoned in between.
+        self._reconcile_hold_attention(event)
         if event["capture_evidence"]:
             # Preserve terminal output as evidence before a later cleanup or
             # provider teardown can remove its pane/log. A pause is captured
@@ -5329,6 +5499,30 @@ class Coordinator:
                     project_id, source=event["source"]
                 )
 
+    def _late_delivery(self, worker: dict[str, Any], kind: str) -> str:
+        """What to do with a push that arrived after the worker settled.
+
+        `accept` for the word the worker was trying to get out when its own
+        process exit won the lock race -- including a repeat of a verdict
+        already given, which the one intake then folds away -- `noop` for a
+        second late `approval-needed`, and `refuse` otherwise. Narrow on purpose: only a worker settled
+        by observation alone qualifies, because an explicit stop, a foreman
+        stand-down and `settle_reported_worker` are decisions rather than
+        races. See docs/worker-lifecycle.md.
+        """
+        if kind in self._TERMINAL_MESSAGE_TASK_STATE and self.terminal_protocol_outcome(worker):
+            # Already gave a verdict, whichever way it settled. Admitted rather
+            # than refused so the one intake decides: a repeat records nothing,
+            # a contradiction is kept once as evidence and changes no outcome.
+            return "accept"
+        if not worker.get("exit_observed") or not worker.get("process_settled"):
+            return "refuse"
+        if kind in self._TERMINAL_MESSAGE_TASK_STATE:
+            return "accept"
+        if kind == self.HOLD_MESSAGE_KIND:
+            return "noop" if worker.get("late_hold_recorded") else "accept"
+        return "refuse"
+
     def record_worker_message(
         self,
         worker_id: str,
@@ -5355,11 +5549,42 @@ class Coordinator:
             worker = data["workers"].get(worker_id)
             if worker is None:
                 raise HelmError(f"unknown worker: {worker_id}")
+            late = False
             if worker["status"] != "running":
-                raise HelmError("worker is no longer running")
+                verdict = self._late_delivery(worker, kind)
+                if verdict == "refuse":
+                    raise HelmError("worker is no longer running")
+                if verdict == "noop":
+                    # Already recorded in this exact form. Saying so again must
+                    # not append a second outcome or a second diagnostic.
+                    return dict(self._task(data, worker["task_id"]))
+                late = True
             event = self._ingest_worker_event(
-                data, worker, kind, text, payload, requested_status
+                data, worker, kind, text, payload, requested_status, late=late
             )
+            if late and kind == self.HOLD_MESSAGE_KIND:
+                # Evidence preservation, not a revived worker: the reason the
+                # worker paused is recorded, and then abandoned against the
+                # session that has already ended -- the same durable reason and
+                # the same failed task the approval-first order produces.
+                worker["late_hold_recorded"] = True
+                self._abandon_open_hold(
+                    data,
+                    self._project(data, worker["project_id"]),
+                    self._task(data, worker["task_id"]),
+                    "its session ended before the authorization was used",
+                )
+                # The hold was open when the metadata was built, so the effects
+                # pass is still carrying an "Authorize or refuse" item for a
+                # hold nobody can answer, and a situation line announcing a
+                # pause on a task this same call has just failed. Neither may
+                # reach the commander: the item is resolved instead, and the
+                # abandonment is what the record's newest line says.
+                settled_task = self._task(data, worker["task_id"])
+                event["resolve_key"] = event["action_item_key"]
+                event["action_item"] = None
+                event["task_status"] = settled_task.get("status")
+                event["situation"] = self._hold_abandoned_situation(settled_task)
             task = dict(self._task(data, worker["task_id"]))
         self._apply_event_effects(event)
         return task
@@ -5421,8 +5646,221 @@ class Coordinator:
             )
             return None
 
+    @staticmethod
+    def _read_exit_record(worker: dict[str, Any]) -> int | None:
+        """The return code the runner *observed*, or None if there is none yet.
+
+        An unreadable or malformed record is a failed exit, not an absent one:
+        the runner writes it last, so its presence is the completion signal.
+
+        A record Helm asserted rather than observed -- `helm worker stop` and
+        `mark_worker_lost` write `{"returncode": null, "stopped": true}` -- is
+        deliberately not an observation and returns None. Reading it as exit 1
+        would let a commanded stop masquerade as the process fallback, and the
+        late-delivery path is only ever open to a worker settled by a real
+        observation.
+        """
+        exit_path = Path(worker["exit_file"])
+        _private_file(exit_path)
+        if not exit_path.exists():
+            return None
+        try:
+            record = json.loads(exit_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return 1
+        if not isinstance(record, dict):
+            return 1
+        if record.get("stopped") or record.get("returncode") is None:
+            return None
+        try:
+            return int(record["returncode"])
+        except (ValueError, KeyError, TypeError):
+            return 1
+
+    #: Everything the lifecycle contract records about one *episode* of a
+    #: worker's life -- its verdict and the observation of its session ending.
+    #: A reopened worker starts a new one, so these are cleared rather than
+    #: carried across: a reviewer kept live for a second round must be able to
+    #: give that round its own verdict, and a revived session's next exit is a
+    #: new observation rather than one already folded in.
+    _EPISODE_FIELDS = (
+        "protocol_outcome",
+        "outcome_source",
+        "process_settled",
+        "exit_observed",
+        "process_exit_code",
+        "process_exited_at",
+        "exit_mismatch_recorded",
+        "protocol_conflict_recorded",
+        "late_hold_recorded",
+    )
+
+    #: The subset of those that are flags, so clearing means False, not None.
+    _EPISODE_FLAGS = frozenset({
+        "process_settled",
+        "exit_observed",
+        "exit_mismatch_recorded",
+        "protocol_conflict_recorded",
+        "late_hold_recorded",
+    })
+
+    @classmethod
+    def begin_worker_episode(cls, worker: dict[str, Any]) -> None:
+        """Clear one episode's lifecycle record as a worker is put back to work.
+
+        Called by every path that returns a settled worker to `running`. See
+        docs/worker-lifecycle.md.
+        """
+        for field in cls._EPISODE_FIELDS:
+            worker[field] = False if field in cls._EPISODE_FLAGS else None
+
+    def episode_outcome(
+        self, data: dict[str, Any], worker: dict[str, Any]
+    ) -> str | None:
+        """This episode's terminal outcome, for readers that judge liveness.
+
+        Message history is cumulative and an episode is not: a reviewer kept
+        live for round two still has round one's `result` in the record, and a
+        reader that scans for one classifies the new round as already reported
+        -- or settles it on the previous round's verdict. The persisted
+        `protocol_outcome` is the authority, including when it is None.
+
+        The scan survives only as a fallback for a worker recorded before that
+        field existed, which is why the test is `in` rather than truthiness:
+        present-and-None is an answer, not a missing value.
+        """
+        if "protocol_outcome" in worker:
+            return self.terminal_protocol_outcome(worker)
+        for message in reversed(data.get("messages", [])):
+            if (
+                message.get("worker_id") == worker["id"]
+                and message.get("kind") in self._TERMINAL_MESSAGE_TASK_STATE
+            ):
+                return str(message["kind"])
+        return None
+
+    @staticmethod
+    def terminal_protocol_outcome(worker: dict[str, Any]) -> str | None:
+        """The terminal outcome this worker itself reported, if any.
+
+        Read from the worker's durable `protocol_outcome`, never by scanning
+        message kinds: the process fallback synthesizes `result` and `failure`
+        messages so a task's history reads the same either way, and scanning
+        would read Helm's own fallback back as the worker's word. See
+        docs/worker-lifecycle.md.
+        """
+        outcome = worker.get("protocol_outcome")
+        return outcome if isinstance(outcome, str) else None
+
+    def _exit_mismatch_evidence(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        outcome: str,
+    ) -> None:
+        """Record, once, that the return code disagrees with the outcome.
+
+        The disagreement is real information and is kept (rule 6); it never
+        moves the outcome (rule 2). Guarded by `exit_mismatch_recorded` so it
+        reads the same whichever order the two events arrived in and does not
+        repeat on a duplicate.
+        """
+        if not worker.get("exit_observed") or worker.get("exit_mismatch_recorded"):
+            return
+        exit_code = worker.get("process_exit_code")
+        if exit_code is None or (exit_code == 0) == (outcome == "result"):
+            return
+        worker["exit_mismatch_recorded"] = True
+        self._message(
+            data, project, task, worker, "exit-evidence",
+            f"Session exited with code {exit_code} against its {outcome} "
+            f"message; the {outcome} stands as the task outcome",
+            {"exit_code": exit_code, "outcome": outcome},
+        )
+
+    def _apply_process_exit(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        exit_code: int | None,
+    ) -> str | None:
+        """Fold one process-exit observation into the lifecycle. Under lock.
+
+        The single place an exit moves anything, so the outcome cannot depend on
+        whether Helm saw the worker's own terminal message first. Observation is
+        recorded once (`exit_observed`); a second poll of the same worker is a
+        no-op rather than a second failure message. `exit_code` is None when the
+        session is known to be gone but left no return code -- evidence with no
+        verdict in it, so it is recorded and nothing is concluded from it.
+
+        Returns the id of a hold this abandoned, so the caller can clear the
+        commander's action item for it once the lock is released.
+        """
+        if worker.get("exit_observed"):
+            return None
+        worker["exit_observed"] = True
+        worker["process_exit_code"] = exit_code
+        worker["process_exited_at"] = now()
+        held = (self.task_hold(task) or {}).get("id")
+        outcome = self.terminal_protocol_outcome(worker)
+        if outcome is not None:
+            # Contract rule 2: the worker's word already decided the task, and
+            # the return code cannot overwrite it -- only stand beside it.
+            if exit_code is None:
+                self._message(
+                    data, project, task, worker, "exit-evidence",
+                    f"Session is gone with no completion record after its "
+                    f"{outcome} message; the {outcome} stands as the task outcome",
+                    {"exit_code": None, "outcome": outcome},
+                )
+            else:
+                self._exit_mismatch_evidence(data, project, task, worker, outcome)
+            self._abandon_open_hold(
+                data, project, task,
+                "its session ended before the authorization was used",
+            )
+            return held
+        exit_code = 1 if exit_code is None else exit_code
+        worker["outcome_source"] = "process"
+        worker["process_settled"] = True
+        worker["status"] = "completed" if exit_code == 0 else "failed"
+        worker["exit_code"] = exit_code
+        worker["ended_at"] = now()
+        if exit_code != 0:
+            task["status"] = "failed"
+            self._message(
+                data, project, task, worker, "failure",
+                f"Worker exited with code {exit_code}",
+                {"exit_code": exit_code, "source": "process-fallback"},
+            )
+            self._abandon_open_hold(
+                data, project, task, f"its session exited with code {exit_code}"
+            )
+        elif task["status"] in {"created", "allocated", "running"}:
+            task["status"] = "completed"
+            self._message(
+                data, project, task, worker, "result",
+                "Worker completed; explicit approval is still required before merge",
+                {"status": "completed", "source": "process-fallback"},
+            )
+        # A session that has ended cannot answer or act on anything, so no hold
+        # survives it -- including the one belonging to a task sitting in
+        # `approval-needed`, which is the state that used to be permanently
+        # unreleasable and uncleanable. Rule 4: never silent, always with the
+        # reason recorded.
+        self._abandon_open_hold(
+            data, project, task,
+            "its session ended before the authorization was used",
+        )
+        return held
+
     def poll_worker(self, worker_id: str) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
+        settled: dict[str, Any]
         with self.store.locked() as data:
             worker = data["workers"].get(worker_id)
             if worker is None:
@@ -5430,105 +5868,112 @@ class Coordinator:
             task = self._task(data, worker["task_id"])
             project = self._project(data, worker["project_id"])
             if worker["status"] != "running":
-                return worker
-            log_path = Path(worker["log_file"])
-            _private_file(log_path)
-            lines: list[str] = []
-            if log_path.exists():
-                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            start = int(worker.get("processed_lines", 0))
-            for line in lines[start:]:
-                event = self._parse_output_line(data, project, task, worker, line)
-                if event is not None:
-                    events.append(event)
-            worker["processed_lines"] = len(lines)
+                # Settled on its own terminal message. Its exit record is still
+                # worth reading once -- as evidence, per the lifecycle contract
+                # -- but its log is not drained again, so a line written after
+                # the terminal message cannot reopen a settled task.
+                resolve_key = None
+                if (
+                    not worker.get("exit_observed")
+                    and self.terminal_protocol_outcome(worker) is not None
+                ):
+                    recorded = self._read_exit_record(worker)
+                    if recorded is None and worker.get("external") is not True:
+                        # A worker Helm launched itself, whose pid is gone with
+                        # nothing written: the session ending is still a fact
+                        # worth keeping, it just carries no return code. An
+                        # asserted stop is excluded -- it writes a record that
+                        # `_read_exit_record` deliberately does not observe --
+                        # by the pid check, since stop kills the process it owns
+                        # only after recording the decision.
+                        if not self._pid_alive(worker.get("pid")):
+                            resolve_key = self._apply_process_exit(
+                                data, project, task, worker, None
+                            )
+                    elif recorded is not None:
+                        resolve_key = self._apply_process_exit(
+                            data, project, task, worker, recorded
+                        )
+                if resolve_key:
+                    events.append(self._hold_resolved_event(task, worker, resolve_key))
+                settled = dict(worker)
+            else:
+                log_path = Path(worker["log_file"])
+                _private_file(log_path)
+                lines: list[str] = []
+                if log_path.exists():
+                    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                start = int(worker.get("processed_lines", 0))
+                for line in lines[start:]:
+                    event = self._parse_output_line(data, project, task, worker, line)
+                    if event is not None:
+                        events.append(event)
+                worker["processed_lines"] = len(lines)
 
-            exit_path = Path(worker["exit_file"])
-            _private_file(exit_path)
-            finished = False
-            exit_code: int | None = None
-            if exit_path.exists():
-                try:
-                    exit_data = json.loads(exit_path.read_text(encoding="utf-8"))
-                    exit_code = int(exit_data["returncode"])
-                except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                    exit_code = 1
-                finished = True
-            elif worker.get("external") is not True and not self._pid_alive(worker.get("pid")):
-                # The record is checked again before the process's absence is
-                # believed. The runner writes its exit record and *then*
-                # exits, so between the check above and this one it can have
-                # done both -- and the pid can also vanish early, because
-                # anything else creating a subprocess in this interpreter may
-                # reap an already-finished child. Concluding "no completion
-                # record" from that ordering failed workers that had exited 0.
-                if exit_path.exists():
-                    try:
-                        exit_data = json.loads(exit_path.read_text(encoding="utf-8"))
-                        exit_code = int(exit_data["returncode"])
-                    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                finished = False
+                exit_code: int | None = self._read_exit_record(worker)
+                if exit_code is not None:
+                    finished = True
+                elif worker.get("external") is not True and not self._child_alive(worker):
+                    # The record is checked again before the process's absence is
+                    # believed. The runner writes its exit record and *then*
+                    # exits, so between the check above and this one it can have
+                    # done both -- and the pid can also vanish early, because
+                    # anything else creating a subprocess in this interpreter may
+                    # reap an already-finished child. Concluding "no completion
+                    # record" from that ordering failed workers that had exited 0.
+                    recorded = self._read_exit_record(worker)
+                    finished = True
+                    if recorded is not None:
+                        exit_code = recorded
+                    else:
                         exit_code = 1
-                    finished = True
-                else:
-                    finished = True
-                    exit_code = 1
-                    self._message(
-                        data,
-                        project,
-                        task,
-                        worker,
-                        "failure",
-                        "Worker runner exited without a completion record",
-                        {},
+                        if self.terminal_protocol_outcome(worker) is None:
+                            # No completion record and no word from the worker: the
+                            # runner died. With a terminal outcome this is only
+                            # evidence, and `_apply_process_exit` records it as
+                            # such -- writing a `failure` message here would forge
+                            # a protocol outcome the worker never sent.
+                            self._message(
+                                data,
+                                project,
+                                task,
+                                worker,
+                                "failure",
+                                "Worker runner exited without a completion record",
+                                {"source": "process-fallback"},
+                            )
+                if finished:
+                    resolved = self._apply_process_exit(
+                        data, project, task, worker, exit_code
                     )
-            if finished:
-                worker["status"] = "completed" if exit_code == 0 else "failed"
-                worker["exit_code"] = exit_code
-                worker["ended_at"] = now()
-                if exit_code != 0:
-                    task["status"] = "failed"
-                    self._message(
-                        data,
-                        project,
-                        task,
-                        worker,
-                        "failure",
-                        f"Worker exited with code {exit_code}",
-                        {"exit_code": exit_code},
-                    )
-                    self._abandon_open_hold(
-                        data, project, task, f"its session exited with code {exit_code}"
-                    )
-                elif task["status"] in {"created", "allocated", "running"}:
-                    task["status"] = "completed"
-                    self._message(
-                        data,
-                        project,
-                        task,
-                        worker,
-                        "result",
-                        "Worker completed; explicit approval is still required before merge",
-                        {"status": "completed"},
-                    )
-                # A session that has ended cannot answer or act on anything, so
-                # no hold survives it -- including the one belonging to a task
-                # sitting in `approval-needed`, which is the state that used to
-                # be permanently unreleasable and uncleanable.
-                self._abandon_open_hold(
-                    data, project, task,
-                    "its session ended before the authorization was used",
-                )
-            settled = dict(worker)
+                    if resolved:
+                        events.append(self._hold_resolved_event(task, worker, resolved))
+                settled = dict(worker)
+        return self._settled(settled, events)
+
+    def _settled(
+        self, worker: dict[str, Any], events: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Run one poll's unlocked effects and return the settled worker.
+
+        A local child whose exit has been observed is also reaped here, without
+        blocking. Polling used to record the exit and leave the zombie for
+        whoever called `wait_worker` next -- and nothing has to, so a coordinator
+        that only ever polls accumulated one per worker.
+        """
+        if worker.get("exit_observed") and worker.get("external") is not True:
+            self._reap_child(worker.get("pid"), blocking=False)
         for event in events:
             self._apply_event_effects(event)
-        return settled
+        return worker
 
     @staticmethod
-    def _reap_child(pid: int | None) -> None:
+    def _reap_child(pid: int | None, *, blocking: bool = True) -> None:
         if not pid:
             return
         try:
-            os.waitpid(int(pid), 0)
+            os.waitpid(int(pid), 0 if blocking else os.WNOHANG)
         except (ChildProcessError, ProcessLookupError, OSError):
             # Async CLI launches are reparented when their coordinator exits;
             # those children are not waitable from a later invocation.
@@ -5539,7 +5984,19 @@ class Coordinator:
         while True:
             worker = self.poll_worker(worker_id)
             if worker["status"] != "running":
-                self._reap_child(worker.get("pid"))
+                # Waiting is waiting for the *assignment*, which a terminal
+                # protocol message settles whether or not the session exits --
+                # so this returns on that, promptly, including the default
+                # `timeout=None`. An interactive agent that reports and keeps
+                # its session open is finished, and blocking on its pid was the
+                # contract being contradicted by the wait path.
+                #
+                # A caller that additionally needs the *session* gone -- only
+                # cleanup does, because it removes the directory the session
+                # sits in -- has its own gate in `_session_still_live`.
+                self._reap_child(
+                    worker.get("pid"), blocking=bool(worker.get("exit_observed"))
+                )
                 return worker
             if timeout is not None and time.monotonic() - started >= timeout:
                 return worker
@@ -5679,11 +6136,7 @@ class Coordinator:
             # stalled.  Calling that "attention" every time would train the
             # reader to ignore the list, which is the failure this whole check
             # exists to prevent.
-            delivered = any(
-                message.get("worker_id") == worker["id"]
-                and message.get("kind") in self._TERMINAL_MESSAGE_TASK_STATE
-                for message in data.get("messages", [])
-            )
+            delivered = self.episode_outcome(data, worker) is not None
             # Paused on a human, not finished and not stuck. Its own session is
             # alive and correct to be idle, so every other signal here would
             # call it stalled or reported -- and neither says the thing the
@@ -5866,19 +6319,18 @@ class Coordinator:
                 return worker
             task = self._task(data, worker["task_id"])
             project = self._project(data, worker["project_id"])
-            delivered = [
-                message
-                for message in data.get("messages", [])
-                if message.get("worker_id") == worker_id
-                and message.get("kind") in self._TERMINAL_MESSAGE_TASK_STATE
-            ]
-            if not delivered:
+            kind = self.episode_outcome(data, worker)
+            if kind is None:
+                # Including a reopened worker whose previous round reported:
+                # settling this round on last round's verdict would be the same
+                # fabrication as inventing one.
                 raise HelmError(
                     "worker has not delivered a terminal message; nothing to settle"
                 )
-            kind = delivered[-1]["kind"]
             worker["status"] = "completed" if kind == "result" else "failed"
             worker["exit_code"] = 0 if kind == "result" else 1
+            worker["protocol_outcome"] = kind
+            worker["outcome_source"] = "protocol"
             worker["ended_at"] = now()
             if task["status"] in {"created", "allocated", "running"}:
                 task["status"] = self._TERMINAL_MESSAGE_TASK_STATE[kind]
@@ -7975,6 +8427,7 @@ class Coordinator:
                 worker["status"] = "running"
                 worker["exit_code"] = None
                 worker["ended_at"] = None
+                self.begin_worker_episode(worker)
                 self._message(
                     data, project, task, worker, "status",
                     "Worker revived on provider evidence that its session is live",

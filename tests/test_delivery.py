@@ -38,7 +38,9 @@ class DeliveryTests(HelmTestCase):
             task["id"], [sys.executable, "-c", "import time; time.sleep(2)"], wait=False
         )
         self.coordinator.record_worker_message(worker["id"], "result", "done")
-        self.coordinator.wait_worker(worker["id"])
+        # Cleanup removes the directory the session sits in, so this waits for
+        # the session, which is not what settling the worker means.
+        self.await_session_exit(worker)
         return root, task
 
     def _branches(self, root: Path) -> list[str]:
@@ -441,7 +443,9 @@ class DeliveryTests(HelmTestCase):
             task["id"], [sys.executable, "-c", "import time; time.sleep(2)"], wait=False
         )
         self.coordinator.record_worker_message(worker["id"], "result", "done")
-        self.coordinator.wait_worker(worker["id"])
+        # Cleanup removes the directory the session sits in, so this waits for
+        # the session, which is not what settling the worker means.
+        self.await_session_exit(worker)
         workspace = Path(task["workspace"])
         (workspace / "unsaved.txt").write_text("work nobody committed", encoding="utf-8")
 
@@ -468,7 +472,9 @@ class DeliveryTests(HelmTestCase):
             task["id"], [sys.executable, "-c", "import time; time.sleep(2)"], wait=False
         )
         self.coordinator.record_worker_message(worker["id"], "result", "done")
-        self.coordinator.wait_worker(worker["id"])
+        # Cleanup removes the directory the session sits in, so this waits for
+        # the session, which is not what settling the worker means.
+        self.await_session_exit(worker)
 
         # Removed by hand, or by a tool that got there first. The record then
         # claimed a worktree that was gone, and cleanup -- the only command
@@ -505,7 +511,9 @@ class DeliveryTests(HelmTestCase):
             foreman["id"], [sys.executable, "-c", ""], wait=False
         )
         self.coordinator.record_worker_message(worker["id"], "result", "driven")
-        self.coordinator.wait_worker(worker["id"])
+        # Cleanup removes the directory the session sits in, so this waits for
+        # the session, which is not what settling the worker means.
+        self.await_session_exit(worker)
         workspace = Path(self.coordinator.inspect_task(foreman["id"])["task"]["workspace"])
         self.assertTrue(workspace.is_dir())
 

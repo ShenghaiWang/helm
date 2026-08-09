@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -153,6 +154,26 @@ class HelmTestCase(unittest.TestCase):
         subprocess.run(["git", "-C", str(root), "commit", "-qm", "initial"], check=True)
         self.repos.append(root)
         return root
+
+    def await_session_exit(self, worker: dict, timeout: float = 30.0) -> dict:
+        """Wait for a worker's *session* to end, not for its assignment.
+
+        `wait_worker` returns as soon as the worker settles, which a terminal
+        protocol message does whether or not the session exits -- that is the
+        lifecycle contract (docs/worker-lifecycle.md). Cleanup is the one
+        operation that additionally needs the process gone, because it removes
+        the directory the process is sitting in, so a test that goes on to
+        clean up waits for the runner's own exit record here instead.
+        """
+        exit_file = Path(worker["exit_file"])
+        deadline = time.monotonic() + timeout
+        while not exit_file.exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"worker {worker['id']} wrote no exit record within {timeout}s"
+                )
+            time.sleep(0.02)
+        return self.coordinator.poll_worker(worker["id"])
 
     def commit_on_task_branch(self, task: dict, text: str = "worker change") -> None:
         """Put a commit on a task branch so there is something to review.
