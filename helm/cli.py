@@ -22,10 +22,12 @@ from .core import (
     SafetyError,
     StateStore,
     _private_file,
+    _validate_project_id,
     _write_private_text,
     project_glyph,
     worker_environment,
 )
+from . import doctor as doctor_module
 from . import preferences
 from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter
 
@@ -878,6 +880,26 @@ def _build_parser() -> argparse.ArgumentParser:
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     agent_commands.add_parser("list", help="list configured profiles without launching anything")
     agent_commands.add_parser("check", help="check profile commands and live availability checks")
+
+    # Read-only, so it is deliberately open to every caller: a worker that can
+    # tell a broken root from a broken brief escalates the right one.
+    doctor_cmd = commands.add_parser(
+        "doctor",
+        help="read-only preflight of this Helm root, and optionally one project",
+        description=(
+            "Inspect a Helm root without changing it. Exits 0 when nothing is "
+            "an error (warnings do not change that), 1 when an error was found, "
+            "and 2 when doctor could not run. Reports executable presence for "
+            "named runtimes; it never runs a provider auth, status, or model "
+            "command, and never reads a credential store. See docs/doctor.md."
+        ),
+    )
+    doctor_cmd.add_argument(
+        "--project", dest="doctor_project", help="also run checks for one managed project"
+    )
+    doctor_cmd.add_argument(
+        "--json", dest="doctor_json", action="store_true", help="emit the machine-readable report"
+    )
 
     prefs_cmd = commands.add_parser(
         "prefs",
@@ -2435,6 +2457,29 @@ def main(argv: list[str] | None = None) -> int:
                         "as the root."
                     )
             return 0
+        if args.command == "doctor":
+            project_id = args.doctor_project
+            if project_id is not None:
+                if helm_root is None:
+                    raise HelmError(
+                        "--project needs a Helm root; run helm doctor --root <path>"
+                    )
+                # An id naming nothing at all is a mistyped invocation, not a
+                # finding about the root, so it exits 2 like every other
+                # command's unknown project rather than reading as a fault.
+                if not (helm_root / "projects" / _validate_project_id(project_id)).exists():
+                    raise HelmError(
+                        f"unknown project {project_id}; expected a Git project at "
+                        f"{helm_root / 'projects' / project_id}"
+                    )
+            report = doctor_module.run(coordinator, helm_root, project_id)
+            if args.doctor_json:
+                print(doctor_module.render_json(report))
+            else:
+                for line in doctor_module.render_text(report):
+                    print(line)
+            return report.exit_code
+
         if args.command == "review":
             outcome = HerdrAdapter(coordinator).run_review_cycle(
                 args.task_id,

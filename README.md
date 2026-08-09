@@ -473,6 +473,29 @@ helm --root <helm-root> project list
 helm --root <helm-root> inspect <task-id>
 ```
 
+### Preflight: `helm doctor`
+
+`helm doctor` inspects a root without changing it — layout and root identity,
+the tracked/ignored boundary around local state and preferences, preference and
+domain validity, state safety, executable availability for the runtimes this
+root *names*, and Herdr readiness. `--project <id>` adds one managed project's
+checks: direct-child registration and isolation, a committed Git repository, its
+config, its base branch resolved locally, its declared domains and pinned
+skills, and any task still holding a worktree, branch, or worker directory.
+
+```sh
+helm --root <helm-root> doctor
+helm --root <helm-root> doctor --project <project-id> --json
+```
+
+It is read-only: it never initializes, registers, repairs, cleans, or fetches,
+so a broken root stays broken until a human fixes it. It exits `0` when nothing
+is an error (warnings do not change that), `1` when an error was found, and `2`
+when it could not run. Runtime readiness there is *executable presence* — doctor
+runs no provider auth, status, or model command, and reads no credential store.
+The full contract, including every check id and the JSON schema, is in
+[`docs/doctor.md`](docs/doctor.md).
+
 The idempotent [`scripts/setup.sh`](scripts/setup.sh) checks Python and prints
 manual steps by default. `--install` and `--init --root PATH` are explicit
 opt-ins; setup never installs software or changes projects by default. A native
@@ -1306,6 +1329,7 @@ helm init [ROOT]
 helm run PROJECT [TASK] [--domain DOMAIN] [--agent PROFILE] [--no-herdr] [--async]
 helm project add|list|status|note|action|domain
 helm agent list|check
+helm doctor [--project PROJECT_ID] [--json]
 helm prefs path|show|keys|set KEY VALUE...|unset KEY|migrate
 helm task create|allocate|inspect|approve|merge|deliver|pr|pr-status|pr-sync|outcome
 helm task cleanup TASK_ID [--delete-branch]

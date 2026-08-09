@@ -31,6 +31,13 @@ starts inherits it. Keep the two in step.
 
 ## Root and project boundaries
 
+- **Check the root before blaming the brief.** `helm doctor` is a read-only
+  preflight of the root — layout, the tracked/ignored boundary around local
+  state and preferences, preference and domain validity, named-runtime
+  executables, Herdr readiness — and `--project <id>` adds one project's own
+  checks. It changes nothing, exits 0 on warnings and 1 on errors, and runs no
+  provider auth or model command, so it answers "is this root sound" without
+  paying for it. See [`docs/doctor.md`](docs/doctor.md).
 - Treat this checkout as the Helm root, not as a discovered project. A Helm
   root has `projects/`, `domains/`, `state/`, and optional `agents.json`,
   `agents/<id>/profile.json`, or `preferences.json`; see the README layout.
