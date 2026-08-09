@@ -215,20 +215,14 @@ def _agent_models_report(coordinator: Coordinator) -> dict[str, Any]:
                 "reason": entry["reason"],
                 "models": [],
             }
-        elif entry["excluded"]:
+        else:
+            # entry["excluded"] is the only remaining case: every launchable,
+            # non-excluded runtime was already queried above.
             catalogue = {
                 "command": list(models.catalogue_command(entry["id"]) or ()),
                 "supported": models.catalogue_command(entry["id"]) is not None,
                 "available": False,
                 "reason": "skipped: this root excludes the runtime",
-                "models": [],
-            }
-        else:
-            catalogue = {
-                "command": [],
-                "supported": False,
-                "available": False,
-                "reason": models.UNSUPPORTED_REASON,
                 "models": [],
             }
         runtimes_report.append({
@@ -239,6 +233,51 @@ def _agent_models_report(coordinator: Coordinator) -> dict[str, Any]:
             "excluded": entry["excluded"],
             "default": entry["default"],
             "detected": entry["detected"],
+            "catalogue": catalogue,
+        })
+    # Same resolved id `builtin_runtime_availability` used above for the
+    # built-in rows' own `default` flag, reused here so a profile can be
+    # named as the root default too (e.g. `HELM_AGENT=<profile id>`).
+    default_agent_id, _ = coordinator._root_agent_default()
+    for profile in coordinator.list_agent_profiles():
+        # A profile's command is never executed here -- it is only compared,
+        # by basename, against the built-in runtimes Helm already proved
+        # launchable above. A match reuses that catalogue query verbatim;
+        # anything else (a wrapper, an opaque script, no command at all) is
+        # reported unsupported rather than run to find out what it is.
+        command = profile.get("command") or []
+        runtime_id = Path(str(command[0])).name if command else None
+        query = queried.get(runtime_id) if runtime_id else None
+        if query is not None:
+            catalogue = {
+                "command": list(query.command),
+                "supported": query.supported,
+                "available": query.available,
+                "reason": query.reason,
+                "models": [
+                    {"id": model.id, "cost": _model_cost(model)}
+                    for model in query.models
+                ],
+            }
+        else:
+            catalogue = {
+                "command": [],
+                "supported": False,
+                "available": False,
+                "reason": (
+                    f"configured command does not provably invoke a built-in "
+                    f"runtime's catalogue command: {' '.join(command) or '(none)'}"
+                ),
+                "models": [],
+            }
+        runtimes_report.append({
+            "id": profile["id"],
+            "name": profile["name"],
+            "builtin": False,
+            "launchable": None,
+            "excluded": False,
+            "default": profile["id"] == default_agent_id,
+            "detected": False,
             "catalogue": catalogue,
         })
     free_evidence = [
@@ -286,12 +325,12 @@ def _print_agent_models(coordinator: Coordinator, *, as_json: bool) -> None:
         command = " ".join(catalogue["command"]) if catalogue["command"] else "(none)"
         if not catalogue["supported"]:
             status = "unsupported"
-        elif not entry["launchable"]:
+        elif entry["builtin"] and not entry["launchable"]:
             status = "unavailable"
         elif catalogue["available"]:
             status = "ok"
         else:
-            status = catalogue["reason"][:12]
+            status = "unavailable"
         marks = ""
         if entry["excluded"]:
             marks = " [excluded by root]"
@@ -305,6 +344,8 @@ def _print_agent_models(coordinator: Coordinator, *, as_json: bool) -> None:
             f"{sum(1 for m in catalogue['models'] if m['cost'] == 'free')}"
             f"{marks}"
         )
+        if status != "ok":
+            print(f"    reason: {catalogue['reason']}")
     if report["free_evidence"]:
         print()
         print("free (explicit catalogue evidence only):")

@@ -3361,7 +3361,7 @@ class Coordinator:
         detected = runtimes.detect_runtime()
         integrations = runtimes.herdr_integration_status()
         excluded = self.excluded_agents()
-        default_agent = self.preferences().default_agent
+        default_agent, default_reason = self._root_agent_default()
         result: list[dict[str, Any]] = []
         for runtime in runtimes.BUILTIN_RUNTIMES:
             valid, reason = self._check_command(runtime.command(interactive=True))
@@ -3373,7 +3373,12 @@ class Coordinator:
                 "builtin": True,
                 "available": valid,
                 "excluded": runtime.id in excluded,
-                "default": runtime.id == default_agent,
+                # An excluded runtime never reads as the effective default:
+                # dispatch refuses it outright (see `_default_agent_id`), so
+                # a report that still marked it "default" would describe a
+                # choice the root cannot actually act on.
+                "default": runtime.id == default_agent and runtime.id not in excluded,
+                "default_reason": default_reason if runtime.id == default_agent else "",
                 "reason": reason,
                 "detected": detected is not None and detected.id == runtime.id,
                 "command": runtime.command(interactive=True),
@@ -3676,6 +3681,17 @@ class Coordinator:
         pinned = self._project_agent(project)
         if pinned:
             return pinned, f"project {project['id']} pins agent {pinned}"
+        return self._root_agent_default()
+
+    def _root_agent_default(self) -> tuple[str | None, str]:
+        """The runtime a task would get with no project pin in play.
+
+        Shared by `_default_agent_id` (per-task resolution) and any
+        root-level report that has no single project to consult: `HELM_AGENT`
+        as a session override, then this root's own `agent.default`
+        preference, then the runtime this Helm session appears to be running
+        under. Detection is last because it is a guess.
+        """
         configured = os.environ.get("HELM_AGENT", "").strip()
         if configured:
             if configured.lower() == "none":

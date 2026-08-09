@@ -217,9 +217,11 @@ below.
 Which models those runtimes actually reach is never guessed at: `helm agent
 models` queries each launchable, non-excluded runtime's own catalogue command
 near dispatch time and reports the ids verbatim, with cost classified only
-from an explicit free marker in the id — and only when `helm prefs set
-model.free prefer` has asked for cost awareness, never otherwise. The
-`model-selection` domain pack carries the decision order.
+from an explicit free marker in the id. That query runs unconditionally for
+this explicit, read-only command; the same evidence rides into a worker's
+composed context only when `helm prefs set model.free prefer` has asked for
+cost awareness, never otherwise. The `model-selection` domain pack carries the
+decision order.
 
 The runtime for a task is resolved most-specific-first:
 

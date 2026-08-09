@@ -295,13 +295,37 @@ class ReadinessAndCliTests(HelmTestCase):
         self.write_preferences(
             helm_root, agent={"default": "pi"}, model={"free": "prefer"}
         )
-        with mock.patch.dict(os.environ, {"HELM_EXCLUDE_AGENTS": "opencode"}):
+        # setUp forces HELM_AGENT=none for isolation; clear it here so the
+        # root preference is the thing under test, not the harness default.
+        with mock.patch.dict(
+            os.environ, {"HELM_EXCLUDE_AGENTS": "opencode", "HELM_AGENT": ""}
+        ):
             rows = coordinator.builtin_runtime_availability()
         by_id = {row["id"]: row for row in rows}
         self.assertTrue(by_id["pi"]["default"])
         self.assertFalse(by_id["pi"]["excluded"])
         self.assertTrue(by_id["opencode"]["excluded"])
         self.assertFalse(by_id["claude"]["excluded"])
+
+    def test_runtime_default_prefers_helm_agent_over_preferences(self) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, agent={"default": "pi"})
+        with mock.patch.dict(os.environ, {"HELM_AGENT": "opencode"}):
+            rows = coordinator.builtin_runtime_availability()
+        by_id = {row["id"]: row for row in rows}
+        self.assertTrue(by_id["opencode"]["default"])
+        self.assertFalse(by_id["pi"]["default"])
+
+    def test_runtime_default_never_marks_an_excluded_runtime(self) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, agent={"default": "pi"})
+        with mock.patch.dict(
+            os.environ, {"HELM_AGENT": "pi", "HELM_EXCLUDE_AGENTS": "pi"}
+        ):
+            rows = coordinator.builtin_runtime_availability()
+        by_id = {row["id"]: row for row in rows}
+        self.assertTrue(by_id["pi"]["excluded"])
+        self.assertFalse(by_id["pi"]["default"])
 
     def test_agent_models_queries_only_launchable_non_excluded_catalogues(self) -> None:
         coordinator, helm_root = self._root()
@@ -324,6 +348,48 @@ class ReadinessAndCliTests(HelmTestCase):
             by_id["pi"]["catalogue"]["models"][1],
             {"id": "alpha-1:free", "cost": "free"},
         )
+
+    def test_agent_models_maps_a_profile_only_to_a_provable_builtin_invocation(
+        self,
+    ) -> None:
+        coordinator, helm_root = self._root()
+        self.write_preferences(helm_root, model={"free": "prefer"})
+        (helm_root / "agents.json").write_text(
+            json.dumps(
+                {
+                    "agents": [
+                        {"id": "pi-alias", "command": ["pi", "--agent-mode"]},
+                        {"id": "opaque", "command": ["some-wrapper-script"]},
+                    ]
+                }
+            )
+        )
+        queried: list[str] = []
+        buffer = io.StringIO()
+        with mock.patch(
+            "helm.cli.models.query_catalogue",
+            side_effect=self._fake_query(raise_for=set(), queried=queried),
+        ), mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")), \
+            contextlib.redirect_stdout(buffer):
+            report = cli._agent_models_report(coordinator)
+            queried.clear()
+            cli._print_agent_models(coordinator, as_json=False)
+        # The profile's own command is never run -- only compared by
+        # basename -- so "pi" is queried exactly once for both rows.
+        self.assertEqual(queried.count("pi"), 1)
+        by_id = {entry["id"]: entry for entry in report["runtimes"]}
+        self.assertTrue(by_id["pi-alias"]["catalogue"]["available"])
+        self.assertEqual(
+            by_id["pi-alias"]["catalogue"]["models"],
+            by_id["pi"]["catalogue"]["models"],
+        )
+        self.assertFalse(by_id["opaque"]["catalogue"]["supported"])
+        self.assertIn(
+            "does not provably invoke a built-in runtime",
+            by_id["opaque"]["catalogue"]["reason"],
+        )
+        self.assertIn("pi-alias   ", buffer.getvalue())
+        self.assertRegex(buffer.getvalue(), r"pi-alias\s+.*\s+ok\s")
 
     def test_agent_models_json_is_stable_and_deterministic(self) -> None:
         coordinator, helm_root = self._root()
