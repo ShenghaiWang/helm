@@ -359,6 +359,26 @@ manual steps by default. `--install` and `--init --root PATH` are explicit
 opt-ins; setup never installs software or changes projects by default. A native
 agent does not need to run this script.
 
+### Running the tests
+
+The suite lives in `tests/`, split by subsystem — task lifecycle, runtime
+selection, worker protocol, approvals, delivery, review, domains and skills,
+Herdr, CLI surfaces, and the repository contract — over the shared fixtures in
+[`tests/support.py`](tests/support.py). Run the whole thing with discovery, and
+a single subsystem by naming its module:
+
+```sh
+# The canonical full run.
+NO_COLOR=1 python3 -m unittest discover -s tests -p 'test_*.py'
+
+# One subsystem while working on it.
+NO_COLOR=1 python3 -m unittest tests.test_approvals
+```
+
+`NO_COLOR=1` keeps assertions about rendered output independent of the
+terminal. Every module is self-contained: it passes on its own and does not
+depend on the order discovery happens to pick.
+
 ### Optional CLI worker automation
 
 `helm run` and `helm worker launch` are automation interfaces for an external
