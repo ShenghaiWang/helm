@@ -127,6 +127,24 @@ a worker agent the coordinator spawns for that task.
   continue a task inline because it looks small. “It is only one file” is not
   an exception; neither is a failed or blocked worker, which is replaced by a
   new worker for a new task, not finished by the coordinator.
+- **A foreman clears two gates before a state-changing worker launches.** It
+  proposes a requirement contract, then a technical solution, with `helm gate
+  propose <foreman-task> --type requirement|solution --text "..."`, and only
+  the root decides each with `helm gate decide ... --confirm|--skip`. `helm
+  task create` refuses a state-changing worker task until both are decided
+  unless it is `--read-only`. One confirmed pair authorizes exactly one new
+  state-changing task — spent at that task's creation, recorded on the
+  foreman task as `gates.bound_task_id` so the spend is visible even if the
+  worker never successfully launches. A second, separate state-changing task
+  needs the requirement or solution gate proposed and reconfirmed again; do
+  not read "the gates are confirmed" as a standing green light for more than
+  the one task that consumed it. Every `helm task continue <task-id> --brief
+  "..."` call must say `--read-only` or `--state-changing` explicitly — there
+  is no default and a round never inherits the kind of the round before it.
+  Continuing the *same* task for another round is not a new authorization and
+  does not re-prompt the commander, because it is the task that already holds
+  the binding. See
+  [README.md](README.md#the-requirement-and-solution-gates).
 - **Put the worker in the project's one Helm-owned Herdr space, reusing what
   already exists.** A project gets exactly one workspace, holding one tab per
   worker plus the overview pane its routed messages print into — there is no

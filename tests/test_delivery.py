@@ -327,6 +327,27 @@ class DeliveryTests(HelmTestCase):
         with self.assertRaisesRegex(SafetyError, r"uncommitted changes"):
             self.coordinator.publish_task_branch(third["id"], confirm=True)
 
+    def test_a_read_only_task_cannot_be_published(self) -> None:
+        """Same invariant as approve_task/merge_task: a read-only task was
+        never a candidate for delivery, and publish is the one delivery path
+        that leaves the machine, so --confirm must not reach the push."""
+        root = self.repo("readonlypublish")
+        bare = Path(self.temp.name) / "readonlypublish-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(bare)], check=True)
+        current_branch = self._run_git(root, "symbolic-ref", "--short", "HEAD")
+        self._run_git(root, "push", "-q", "origin", current_branch)
+        project = self.coordinator.register_project(
+            "ReadOnlyPublish", str(root), project_id="readonlypublish"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "just look around", read_only=True
+        )
+        self.coordinator.allocate_task(task["id"])
+
+        with self.assertRaisesRegex(SafetyError, "read-only.*cannot be published"):
+            self.coordinator.publish_task_branch(task["id"], confirm=True)
+
     def test_pr_delivery_stays_open_until_the_pr_is_merged(self) -> None:
         root = self.repo("prflow")
         project = self.coordinator.register_project(

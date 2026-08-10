@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -168,6 +169,20 @@ WHAT YOU OWN
 - Answering a worker's question from the task goal and this project's own
   files, nudging a silent one, and deciding routine confirmations so nobody
   waits on a human for them.
+- Before any project-changing task, clearing two commander confirmation gates
+  in order. First, read-only discovery/clarification, then propose a concise
+  requirement contract (goal, scope, exclusions, acceptance evidence) with
+  `helm gate propose <your-task-id> --type requirement --text "..."` and wait
+  -- do not spawn a worker yet. Once the commander confirms or explicitly
+  skips it (you will see it decided on `helm project status`), propose the
+  technical solution (approach, affected boundaries, verification, risks)
+  with `--type solution` and wait for that same decision too. Only after both
+  are decided may you run `helm task create` for a state-changing worker; Helm
+  refuses it otherwise. A material change to either one invalidates it --
+  propose it again rather than treating a stale decision as still good. Pure
+  read-only investigation is exempt: create that task with `--read-only` and
+  skip the gates entirely, but never use `--read-only` for work that edits
+  anything.
 - Running the review loop, so a change is checked by someone other than its
   author before anyone is asked to trust it.
 - Keeping the project's record honest: `helm project note <id> "..."` at each
@@ -240,6 +255,12 @@ FOREMAN_DOMAIN = "driving-delegated-work"
 # tasks. Keeping them apart in the record is what lets Helm show a foreman as
 # the project's driver instead of as unmerged work nobody can find.
 TASK_ROLES = frozenset({"worker", "foreman", "reviewer"})
+#: The two human confirmation gates a foreman's driving task carries before it
+#: may launch a state-changing worker. `requirement` is the goal/scope/exclusions
+#: contract; `solution` is the approach/verification/risk plan built on top of a
+#: confirmed requirement. Both are the commander's to decide -- a foreman can
+#: propose either, never confirm or skip its own.
+GATE_TYPES = ("requirement", "solution")
 #: What a learning may be drawn from: what the worker reported and produced,
 #: and the outcome of reviewing it. Not its terminal output, and not Helm's own
 #: bookkeeping.
@@ -372,10 +393,18 @@ DELIVERY_DECISION_KIND = "delivery-decision"
 #: cleanup design is that a human asks for that explicitly.
 FINALIZATION_ACTION_KIND = "finalization"
 FOLLOW_UP_ACTION_KIND = "follow-up"
+#: A foreman's requirement/solution proposal, waiting on the commander's
+#: confirm-or-skip decision before a state-changing worker may launch. See
+#: `Coordinator.propose_gate`/`decide_gate`.
+REQUIREMENT_GATE_KIND = "requirement-gate"
+SOLUTION_GATE_KIND = "solution-gate"
 #: The item kinds that are gates rather than notes: they keep showing until
 #: they are answered, because a gate surfaced once and then hidden is how
 #: finished-looking work stops being anybody's problem.
-GATE_ACTION_KINDS = frozenset({DELIVERY_DECISION_KIND, FINALIZATION_ACTION_KIND})
+GATE_ACTION_KINDS = frozenset({
+    DELIVERY_DECISION_KIND, FINALIZATION_ACTION_KIND,
+    REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND,
+})
 DELIVERY_DECISION_TASK_TEXT = (
     "Delivery decision needed: read this task's result, then choose review, "
     "another round, local merge, PR delivery, or cleanup"
@@ -2870,6 +2899,7 @@ class Coordinator:
         role: str = "worker",
         reviews: str | None = None,
         ticket: str | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         brief = _safe_text(brief).strip()
         if not brief:
@@ -2899,6 +2929,15 @@ class Coordinator:
             # effect behind for a task that was never created.
             with self.store.locked() as data:
                 project = self._project(data, project_id)
+                # Scoped to a foreman caller: the gate stops an agent driving
+                # a project from launching state-changing work unconfirmed. A
+                # root/commander call already carries full authority -- the
+                # same reason root skips every other foreman-only restriction
+                # in `_authority_refusal` -- so root creating a task directly
+                # (`helm run`, `helm task create`, or a test's direct call)
+                # is not gated behind its own confirmation.
+                if role == "worker" and not read_only and self.caller_role() == "foreman":
+                    self._require_gates_confirmed(data, project_id)
                 selected_domain, domain_reason = self.resolve_domain(
                     project, brief, explicit=domain, no_domain=no_domain
                 )
@@ -2960,6 +2999,21 @@ class Coordinator:
                             f"(change it with helm project domain {project['id']} <domain-id>)"
                         )
                     task_id = new_id("t")
+                    if role == "worker" and not read_only and self.caller_role() == "foreman":
+                        # The authoritative check-and-consume: phase 1 above
+                        # already fast-failed on an unsettled or already-spent
+                        # pair before paying for a network fetch, but only
+                        # this pass, holding the lock at the moment the task
+                        # id it binds to actually exists, can consume it
+                        # without a window where two concurrent creates both
+                        # see the pair as free. A failed launch after this
+                        # point still leaves the binding on this task's own
+                        # id in the foreman's gates record -- an auditable
+                        # trail, not a silently spent authorization, since
+                        # the task that spent it is right there to inspect.
+                        self._require_gates_confirmed(
+                            data, project_id, consume_for_task_id=task_id
+                        )
                     if role in WORKTREELESS_ROLES:
                         # These roles drive or read; they never edit. Handing
                         # one a checkout and a task branch invites it to do
@@ -3032,6 +3086,18 @@ class Coordinator:
                         # `approval`, which is the reviewed-branch gate that
                         # precedes a merge.
                         "hold": None,
+                        # Explicitly represented so a pure investigation task
+                        # (read-only work, exempt from the confirmation gates
+                        # below) is never indistinguishable from one that just
+                        # happens not to have changed anything yet.
+                        "read_only": bool(read_only),
+                        # The two commander confirmation gates a foreman task
+                        # drives before it may launch a state-changing worker.
+                        # None until the foreman proposes one; see
+                        # `propose_gate`/`decide_gate`. Only meaningful on a
+                        # foreman task -- a worker/reviewer task never gates
+                        # itself.
+                        "gates": {gate_type: None for gate_type in GATE_TYPES},
                         "delivery": {
                             "policy": policy,
                             "state": "worktree",
@@ -3117,10 +3183,15 @@ class Coordinator:
                 {"status": "allocated", "workspace": str(workspace)},
             )
             populate = task.get("role") not in WORKTREELESS_ROLES
+            read_only = bool(task.get("read_only"))
         # Deliberately outside the lock: cloning submodules takes minutes, and
         # the state lock is what every worker's message push waits on.
         if populate:
             self._populate_submodules(task_id)
+            if read_only:
+                # After submodules, not before: populating one writes into the
+                # worktree, and locking first would only make that fail too.
+                self._lock_down_read_only_workspace(task_id)
         return task
 
     def _populate_submodules(self, task_id: str) -> None:
@@ -3170,6 +3241,83 @@ class Coordinator:
                 "it as reading only",
                 {"submodules_pending": len(pending)},
             )
+
+    #: Directory/file permission pairs a read-only workspace is locked to.
+    #: Read and traverse stay available -- an agent still has to look around --
+    #: only the write bit is gone, so `open(..., "w")`, `mkdir`, `unlink`, and
+    #: every git operation that needs to touch a tracked file all fail at the
+    #: filesystem itself rather than on a flag nothing downstream reads.
+    #:
+    #: Locking and unlocking mask/restore only the write bits (0o222) against
+    #: whatever mode a path already had, rather than stamping a fixed mode --
+    #: a fixed mode would silently drop an executable bit on a script or a
+    #: private (owner-only) mode on a file that had one before the lock, and
+    #: neither of those is what a read-only guard is supposed to change.
+
+    @classmethod
+    def _set_workspace_writable(cls, workspace: Path, *, writable: bool) -> None:
+        """Flip every path under a task's own worktree between locked and normal.
+
+        This is the actual enforcement for a `read_only` task: `read_only` is
+        a label nothing else on the write path consulted, so a foreman could
+        brief a read-only task to "implement X and commit it" and the worker
+        would simply do it. Removing the write bit from the whole tree makes
+        authoring new content -- writing, editing, or deleting a tracked file
+        in the worktree -- impossible at the OS level rather than trusting a
+        worker to respect a flag it was merely told about.
+
+        This does not by itself make the branch unable to gain a commit: the
+        index and object store for a linked worktree live under the project's
+        own `.git/worktrees/<branch>`, outside this directory, so `git rm
+        --cached` (an index-only removal) followed by `git commit` succeeds
+        with no worktree write at all -- the lock never engages because
+        nothing here was touched. The same is true of `git hash-object -w`
+        plus `git update-index --cacheinfo`. That gap is why `approve_task`
+        and `merge_task` refuse a `read_only` task outright rather than
+        relying on this lock alone: a read-only task is never a candidate for
+        delivery, so what a locked worktree cannot prevent, delivery refuses
+        regardless of how a commit was produced. It does not touch the shared
+        `.git` object store or per-worktree admin files for the same reason
+        those live outside this directory and outside what this lock reaches.
+        """
+        if not workspace.is_dir():
+            return
+
+        def _locked(mode: int) -> int:
+            # Strip every write bit (owner/group/other); leave read, exec,
+            # and any setuid/setgid/sticky bit exactly as they were.
+            return mode & ~0o222
+
+        def _unlocked_file(mode: int) -> int:
+            # Restore only the owner write bit. A file that was never
+            # owner-writable stays that way; this only undoes the lock.
+            return mode | 0o200
+
+        def _unlocked_dir(mode: int) -> int:
+            # Directories need write *and* exec/search to accept new or
+            # removed entries; restore both on the owner bit only.
+            return mode | 0o300
+
+        # Bottom-up: a directory already stripped of its write bit refuses to
+        # have entries removed or added, but `os.walk` only needs to list it,
+        # and the mode is set on the way back up so descending is never
+        # blocked by a parent this pass already locked.
+        for dirpath, dirnames, filenames in os.walk(workspace, topdown=False):
+            for name in filenames:
+                path = Path(dirpath) / name
+                with contextlib.suppress(OSError):
+                    if not path.is_symlink():
+                        current = stat.S_IMODE(path.stat().st_mode)
+                        os.chmod(path, _unlocked_file(current) if writable else _locked(current))
+            with contextlib.suppress(OSError):
+                current = stat.S_IMODE(os.stat(dirpath).st_mode)
+                os.chmod(dirpath, _unlocked_dir(current) if writable else _locked(current))
+
+    def _lock_down_read_only_workspace(self, task_id: str) -> None:
+        data = self.store.load()
+        task = self._task(data, task_id)
+        workspace = canonical(task["workspace"])
+        self._set_workspace_writable(workspace, writable=False)
 
     # ---------- isolation ----------
 
@@ -4234,10 +4382,47 @@ class Coordinator:
             self._knowledge_section(
                 "task",
                 "helm://current-task",
-                json.dumps({"id": task["id"], "brief": task["brief"], "workspace": task["workspace"], "branch": task["branch"]}, sort_keys=True),
+                json.dumps(
+                    {
+                        "id": task["id"],
+                        "brief": task["brief"],
+                        "workspace": task["workspace"],
+                        "branch": task["branch"],
+                        "read_only": bool(task.get("read_only")),
+                    },
+                    sort_keys=True,
+                ),
                 boundary="The bounded current assignment; do not expand scope",
             )
         )
+        if task.get("read_only"):
+            # The lock is real without this -- `_set_workspace_writable` is
+            # what actually stops a write -- but a worker that only discovers
+            # the restriction by an `open()` or `git commit` failing part-way
+            # through cannot tell a locked worktree from a broken one. Stating
+            # it up front in the worker's own context lets it read status,
+            # investigate, and report back without spending a round finding
+            # the wall by hitting it.
+            sections.append(
+                self._knowledge_section(
+                    "read-only",
+                    "helm://read-only-task",
+                    "This task is read-only: pure investigation, status-gathering, or "
+                    "clarification that changes nothing. Its assigned worktree has no "
+                    "write permission at all -- every file and directory in it had "
+                    "the write bit removed before this worker started, so attempting "
+                    "to create, edit, or delete any tracked file, or to `git add`/"
+                    "`git commit`/`git rm` anything, will fail at the filesystem with "
+                    "a permission error, not merely be discouraged. Do the reading and "
+                    "reporting this task asks for; do not attempt to write, stage, or "
+                    "commit anything in this worktree, and do not treat a permission "
+                    "error here as a bug to work around.",
+                    boundary=(
+                        "Helm control rule for this specific task; not a project or "
+                        "domain preference and not overridable by either"
+                    ),
+                )
+            )
         domain_payload = {
             "id": domain_id,
             "selection": task.get("domain_selection"),
@@ -4250,7 +4435,11 @@ class Coordinator:
             # Keep the assignment schema version stable: these are additive
             # sections on the existing context document.
             "schema_version": 1,
-            "precedence": ["core-safety", "domain-knowledge", "domain-guardrails", "project-knowledge", "skills", "task"],
+            "precedence": (
+                ["core-safety", "domain-knowledge", "domain-guardrails", "project-knowledge", "skills", "task", "read-only"]
+                if task.get("read_only")
+                else ["core-safety", "domain-knowledge", "domain-guardrails", "project-knowledge", "skills", "task"]
+            ),
             "safety_rules": {"source": "helm://core-safety-rules", "content": CORE_SAFETY_RULES},
             "domain": domain_payload,
             # Base-first composition order, so a worker can see exactly which
@@ -4827,7 +5016,9 @@ class Coordinator:
     #: already landed.
     _CONTINUABLE_TASK_STATES = frozenset({"completed", "approved"})
 
-    def continue_task(self, task_id: str, brief: str) -> dict[str, Any]:
+    def continue_task(
+        self, task_id: str, brief: str, *, read_only: bool = False
+    ) -> dict[str, Any]:
         """Reopen a finished task for another round in the same worktree.
 
         A second round on one change -- a revision after review, a fix after a
@@ -4842,6 +5033,16 @@ class Coordinator:
         tree that was reviewed, so a task that is about to be edited again no
         longer has one -- keeping it would let a later round inherit a human's
         agreement to something they never saw.
+
+        `read_only` classifies *this* round explicitly; it is never inherited
+        from the round before. Leaving a prior round's flag in place let a
+        finished read-only investigation be continued with a state-changing
+        brief while the task record still called it read-only and the gate
+        check that only fires for `create_task` never ran. So every call
+        states the round's own kind, defaulting to state-changing -- the
+        gated, safer reading -- and a state-changing round on a project a
+        foreman is driving is refused the same way a fresh worker task is,
+        until the requirement and solution gates are decided.
         """
         brief = _safe_text(brief).strip()
         if not brief:
@@ -4870,11 +5071,28 @@ class Coordinator:
                     f"task {task_id} no longer has its workspace; a round needs the "
                     "directory the first one left behind"
                 )
+            if (
+                task.get("role") == "worker"
+                and not read_only
+                and self.caller_role() == "foreman"
+            ):
+                # Consumed for this same task's own id: a continuation round
+                # is never a *new* state-changing task, so if the pair is
+                # already bound here (the common case -- this task is what
+                # spent it) this is a no-op check, not a re-prompt. A task
+                # that reached state-changing rounds without ever consuming a
+                # pair (e.g. created directly by root, which bypasses the
+                # gate) binds it here instead of refusing.
+                self._require_gates_confirmed(
+                    data, task["project_id"], consume_for_task_id=task_id
+                )
             project = self._project(data, task["project_id"])
+            was_read_only = bool(task.get("read_only"))
             rounds = task.setdefault("rounds", [])
             rounds.append({"brief": task["brief"], "ended_at": now()})
             task["brief"] = brief
             task["status"] = "allocated"
+            task["read_only"] = bool(read_only)
             if task.get("approval") is not None:
                 task["approval"] = None
                 self._message(
@@ -4883,7 +5101,8 @@ class Coordinator:
                 )
             self._message(
                 data, project, task, None, "status",
-                f"Round {len(rounds) + 1} opened in the same worktree", {},
+                f"Round {len(rounds) + 1} opened in the same worktree "
+                f"({'read-only' if read_only else 'state-changing'})", {},
             )
             # Continuing IS the decision. The task goes straight back into an
             # unresolved state, so nothing derived would ever close the gate --
@@ -4893,7 +5112,15 @@ class Coordinator:
             self.resolve_delivery_decisions(
                 project["id"], task_id=task["id"], reason="continued", data=data
             )
-            return dict(task)
+            workspace = canonical(task["workspace"])
+            result = dict(task)
+        # The lock/unlock touches the filesystem and must not hold the state
+        # lock while it walks a potentially large worktree.
+        if read_only and not was_read_only:
+            self._set_workspace_writable(workspace, writable=False)
+        elif was_read_only and not read_only:
+            self._set_workspace_writable(workspace, writable=True)
+        return result
 
     def launch_worker(
         self,
@@ -6567,6 +6794,21 @@ class Coordinator:
                     "its process is gone and it wrote no exit record; "
                     "any work it did is uncommitted in its worktree",
                 )
+                if task_record.get("read_only"):
+                    # A read-only task's worktree is locked to every write, and
+                    # some runtimes create a settings/cache directory in their
+                    # own cwd on startup -- which is this worktree. Without this
+                    # hint that failure looks identical to an ordinary crash, and
+                    # the read-only lock is exactly the kind of thing a human
+                    # investigating "why did my worker just die" would not think
+                    # to suspect first.
+                    detail += (
+                        "; this task is read-only and its worktree has no write "
+                        "permission at all -- if this runtime writes a "
+                        "settings/cache directory into its own working "
+                        "directory on startup, that write fails immediately "
+                        "and can look exactly like this"
+                    )
             elif not delivered and self.worker_prompts(worker["id"]):
                 verdict, detail = (
                     "waiting-on-a-prompt",
@@ -7446,6 +7688,255 @@ class Coordinator:
     TERMINAL_REPORT_KINDS = frozenset(
         {"result", "blocker", "failure", "approval-needed"}
     )
+
+    @staticmethod
+    def _live_foreman_task_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
+        """The task record of the project's running foreman, from state in hand.
+
+        Gates live on the foreman's own driving task, not on the worker task
+        they eventually clear -- one foreman drives one requirement/solution
+        cycle at a time, and a worker task only ever consumes that decision.
+        """
+        for worker in data.get("workers", {}).values():
+            if worker.get("project_id") != project_id or worker.get("status") != "running":
+                continue
+            task = data.get("tasks", {}).get(worker.get("task_id"))
+            if (task or {}).get("role") == "foreman":
+                return task
+        return None
+
+    def _require_gates_confirmed(
+        self,
+        data: dict[str, Any],
+        project_id: str,
+        *,
+        consume_for_task_id: str | None = None,
+    ) -> None:
+        """Refuse a state-changing worker task until both gates are settled.
+
+        Helm never reasons about whether the requirement or the solution is
+        *right* -- that is the foreman's and the commander's business. It only
+        enforces that both decisions were made before anything can change
+        project state.
+
+        A confirmed requirement/solution pair authorizes exactly one *new*
+        state-changing task, not an open-ended stream of them: once both
+        gates are settled, `gates["bound_task_id"]` records which task spent
+        that authorization. `consume_for_task_id` is how a caller both checks
+        and spends it in the same locked pass -- pass the task this
+        confirmation is for (a brand-new task's id in `create_task`, or the
+        same task's own id in `continue_task`, which is never a *new*
+        authorization). Binding to the same task twice is a no-op, so a
+        continuation round on the task that already holds the binding never
+        re-prompts; binding to a second, different task while the pair is
+        still held by the first is refused until the foreman materially
+        changes scope -- proposing either gate again clears the binding along
+        with the stale confirmation, see `propose_gate`. Passing `None`
+        checks without consuming, for a caller that only needs to know
+        whether the gates are currently settled.
+        """
+        foreman_task = self._live_foreman_task_in(data, project_id)
+        if foreman_task is None:
+            raise HelmError(
+                "no live foreman for this project; a state-changing worker task "
+                "needs its project's foreman to propose the requirement and "
+                "solution gates and have the commander decide each one first "
+                "(helm foreman <project>; helm gate propose/decide) -- or pass "
+                "--read-only for investigation-only work that changes nothing"
+            )
+        gates = dict(foreman_task.get("gates") or {})
+        for gate_type in GATE_TYPES:
+            gate = gates.get(gate_type)
+            if gate is None:
+                raise HelmError(
+                    f"the {gate_type} gate has not been proposed yet for this "
+                    f"project's foreman task {foreman_task['id']}; the foreman "
+                    f"must run `helm gate propose {foreman_task['id']} --type "
+                    f"{gate_type} --text \"...\"` and wait for the commander's "
+                    "decision before a state-changing worker can launch"
+                )
+            if gate.get("confirmed_at") is None and not gate.get("skipped"):
+                raise HelmError(
+                    f"the {gate_type} gate for foreman task {foreman_task['id']} "
+                    "is still waiting on the commander (helm gate decide "
+                    f"{foreman_task['id']} --type {gate_type} --confirm|--skip); "
+                    "no state-changing worker can launch until it is decided"
+                )
+        bound_task_id = gates.get("bound_task_id")
+        if bound_task_id is not None and bound_task_id != consume_for_task_id:
+            raise HelmError(
+                "the confirmed requirement/solution pair for foreman task "
+                f"{foreman_task['id']} already authorized task {bound_task_id}; "
+                "it authorizes one new state-changing task only -- propose the "
+                f"requirement or solution gate again on {foreman_task['id']} "
+                "and have the commander reconfirm it to authorize another"
+            )
+        if consume_for_task_id is not None and bound_task_id != consume_for_task_id:
+            gates["bound_task_id"] = consume_for_task_id
+            gates["bound_at"] = now()
+            foreman_task["gates"] = gates
+
+    def propose_gate(self, task_id: str, gate_type: str, text: str) -> dict[str, Any]:
+        """Record a foreman's requirement or solution proposal for the commander.
+
+        This is the foreman's half of the gate: it states what it wants
+        decided, it never decides it. Proposing `requirement` always resets
+        both gates -- a fresh requirement invalidates any solution built on
+        the old one. Proposing `solution` requires a settled requirement and
+        resets only the solution gate, so a material solution change never
+        silently keeps a stale confirmation.
+        """
+        if gate_type not in GATE_TYPES:
+            raise HelmError(f"gate type must be one of {sorted(GATE_TYPES)}")
+        text = _safe_text(text).strip()
+        if not text:
+            raise HelmError("a gate proposal needs --text describing it")
+        # Identified before the lock, same as `authority()` elsewhere: reading
+        # it from the store this transaction is about to mutate would be
+        # circular, and the identity itself never changes within one call.
+        identity = self.caller_identity()
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            if task.get("role") != "foreman":
+                raise HelmError("only a project's foreman task carries confirmation gates")
+            if identity["role"] != "root":
+                # Strict project isolation: a foreman proposes gates only for
+                # the one project it drives. Without this, a foreman task's
+                # `role == "foreman"` check alone let any live foreman write
+                # (and, via requirement re-proposal, invalidate) another
+                # project's gates -- a cross-project write this root-only
+                # `decide_gate` boundary does not otherwise catch, since the
+                # commander still decides either way.
+                caller_worker = data.get("workers", {}).get(identity["worker_id"]) or {}
+                caller_task = data.get("tasks", {}).get(caller_worker.get("task_id")) or {}
+                if caller_task.get("project_id") != task["project_id"]:
+                    raise SafetyError(
+                        "a foreman may only propose gates for the project it "
+                        f"drives ({caller_task.get('project_id') or 'unknown'}), "
+                        f"not {task['project_id']}"
+                    )
+            proposal = {
+                "text": text,
+                "proposed_at": now(),
+                "confirmed_at": None,
+                "skipped": False,
+                "note": "",
+            }
+            gates = dict(task.get("gates") or {})
+            # Any new proposal is a material change in what is being
+            # confirmed, so a binding this pair already spent on an earlier
+            # task no longer describes what the commander is about to decide.
+            # Clearing it here (rather than only where a pair is consumed)
+            # means re-proposing is the one and only way to free the pair for
+            # another task, matching the refusal message in
+            # `_require_gates_confirmed`.
+            gates["bound_task_id"] = None
+            gates["bound_at"] = None
+            if gate_type == "requirement":
+                gates["requirement"] = proposal
+                gates["solution"] = None
+            else:
+                requirement = gates.get("requirement")
+                if requirement is None or (
+                    requirement.get("confirmed_at") is None and not requirement.get("skipped")
+                ):
+                    raise HelmError(
+                        "the requirement gate must be decided before a solution "
+                        "can be proposed"
+                    )
+                gates["solution"] = proposal
+            task["gates"] = gates
+            project = self._project(data, task["project_id"])
+            self._message(
+                data, project, task, None, "status",
+                f"Foreman proposed the {gate_type} gate; waiting on the commander",
+                {"gate": gate_type, "text": text},
+            )
+            project_id = task["project_id"]
+            result = dict(task)
+        kind = REQUIREMENT_GATE_KIND if gate_type == "requirement" else SOLUTION_GATE_KIND
+        self._close_gate_action_item(project_id, task_id, gate_type, reason="re-proposed")
+        if gate_type == "requirement":
+            self._close_gate_action_item(project_id, task_id, "solution", reason="reset")
+        # The full proposal is already durable in the task's own `gates` field
+        # and in the message just recorded above; this line only has to stay
+        # under the action-item limit, not carry the whole contract. A
+        # realistic requirement/solution text (goal, scope, exclusions,
+        # acceptance evidence) regularly runs past SITUATION_LINE_LIMIT, and
+        # `record_project_action_item` refuses rather than truncates -- so
+        # building it unbounded made the decision silently vanish from
+        # `open_action_items()` while the foreman was told it was waiting.
+        with contextlib.suppress(HelmError, OSError):
+            self.record_project_action_item(
+                project_id,
+                self._situation_line(
+                    f"Decide the {gate_type} gate for foreman task {task_id}: ", text
+                ),
+                source="foreman",
+                task_id=task_id,
+                key=f"{task_id}:{gate_type}",
+                kind=kind,
+            )
+        return result
+
+    def decide_gate(
+        self, task_id: str, gate_type: str, *, confirm: bool, skip: bool, note: str = ""
+    ) -> dict[str, Any]:
+        """Record the commander's decision on a proposed gate. Root-only.
+
+        Exactly one of `confirm`/`skip` must be true. Neither a foreman, a
+        worker, nor any project or domain text can call this: `self.authority`
+        is the same boundary that guards approve/merge/grant.
+        """
+        if confirm == skip:
+            raise HelmError("decide exactly one of --confirm or --skip")
+        if gate_type not in GATE_TYPES:
+            raise HelmError(f"gate type must be one of {sorted(GATE_TYPES)}")
+        self.authority(f"deciding the {gate_type} gate")
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            if task.get("role") != "foreman":
+                raise HelmError("only a project's foreman task carries confirmation gates")
+            gates = dict(task.get("gates") or {})
+            gate = gates.get(gate_type)
+            if gate is None:
+                raise HelmError(
+                    f"no {gate_type} gate has been proposed yet on task {task_id}"
+                )
+            gate = dict(gate)
+            gate["confirmed_at"] = None if skip else now()
+            gate["skipped"] = bool(skip)
+            gate["note"] = _safe_text(note).strip()
+            gates[gate_type] = gate
+            task["gates"] = gates
+            project = self._project(data, task["project_id"])
+            verb = "skipped" if skip else "confirmed"
+            self._message(
+                data, project, task, None, "status",
+                f"Commander {verb} the {gate_type} gate",
+                {"gate": gate_type, "decision": verb},
+            )
+            project_id = task["project_id"]
+            result = dict(task)
+        self._close_gate_action_item(project_id, task_id, gate_type, reason=verb)
+        return result
+
+    def _close_gate_action_item(
+        self, project_id: str, task_id: str, gate_type: str, *, reason: str
+    ) -> None:
+        """Close the commander-visible decision an already-decided gate raised.
+
+        A re-proposed gate also reaches here first, since a stale open item
+        naming the old text would otherwise sit next to the fresh one under
+        the same key.
+        """
+        marker = f"{task_id}:{gate_type}"
+        with contextlib.suppress(OSError):
+            with self._status_transaction(project_id) as status:
+                for item in status["action_items"]:
+                    if item.get("key") == marker and item.get("status", "open") == "open":
+                        item["status"] = reason
+                        item["resolved_at"] = now()
 
     @staticmethod
     def _live_foreman_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
@@ -8859,12 +9350,32 @@ class Coordinator:
                 "hold": dict(open_hold),
             }
 
+    @staticmethod
+    def _refuse_read_only_delivery(task: dict[str, Any], verb: str) -> None:
+        """Refuse a `read_only` task at every reachable delivery path.
+
+        The locked worktree stops a worker from *authoring* new content, but
+        an index-only commit (`git rm --cached` + commit, or
+        `hash-object`/`update-index`) needs no worktree write and so is not
+        stopped by it. A read-only task was never meant to reach delivery at
+        all -- not local merge, not a PR push, not artifact copy-out, and not
+        recording a PR opened or merged against its branch -- so every one of
+        those entry points refuses it here regardless of how a commit landed
+        on its branch.
+        """
+        if task.get("read_only"):
+            raise SafetyError(
+                f"task {task['id']} is read-only and was never a candidate for "
+                f"delivery; a --read-only task cannot be {verb}"
+            )
+
     def approve_task(
         self, task_id: str, note: str = "", *, grant_id: str | None = None
     ) -> dict[str, Any]:
         authority = self.authority("approving a reviewed branch")
         with self.store.locked() as data:
             task = self._task(data, task_id)
+            self._refuse_read_only_delivery(task, "approved")
             project = self._project(data, task["project_id"])
             worker = self._require_terminal_worker(
                 data, task, "approval", require_completed=True
@@ -8952,6 +9463,7 @@ class Coordinator:
         """
         data = self.store.load()
         task = self._task(data, task_id)
+        self._refuse_read_only_delivery(task, "delivered")
         project = self._project(data, task["project_id"])
         workspace = canonical(task["workspace"])
         if not workspace.is_dir():
@@ -9035,6 +9547,7 @@ class Coordinator:
         data = self.store.load()
         task = self._task(data, task_id)
         project = self._project(data, task["project_id"])
+        self._refuse_read_only_delivery(task, "published")
         if not confirm:
             grant = (
                 data.get("approval_grants", {}).get(grant_id)
@@ -9122,6 +9635,7 @@ class Coordinator:
             raise HelmError("PR URL is required")
         with self.store.locked() as data:
             task = self._task(data, task_id)
+            self._refuse_read_only_delivery(task, "recorded as a PR")
             project = self._project(data, task["project_id"])
             if task["delivery_policy"] != "pr":
                 raise SafetyError(
@@ -9176,6 +9690,7 @@ class Coordinator:
             raise HelmError("PR state must be open, merged, or closed")
         with self.store.locked() as data:
             task = self._task(data, task_id)
+            self._refuse_read_only_delivery(task, "recorded as a PR")
             project = self._project(data, task["project_id"])
             if task["delivery_policy"] != "pr":
                 raise SafetyError(
@@ -9334,6 +9849,7 @@ class Coordinator:
         self.authority("merging a task branch")
         with self.store.locked() as data:
             task = self._task(data, task_id)
+            self._refuse_read_only_delivery(task, "merged")
             project = self._project(data, task["project_id"])
             if task["delivery_policy"] != "local":
                 raise SafetyError("PR delivery has no merge automation in v1; merge it through the approved external flow")
@@ -9703,6 +10219,12 @@ class Coordinator:
             # them. The check --force overrides is git's own dirty check, and
             # Helm has already done that itself two lines above and refused;
             # so this widens nothing, it only gets past the submodule refusal.
+            # A read-only task's directory tree was locked to keep an agent
+            # from writing into it; removal is Helm's own doing and needs the
+            # write bit back first, or `rmtree`/`worktree remove` cannot even
+            # unlink the files it just confirmed are clean.
+            if task.get("read_only"):
+                self._set_workspace_writable(workspace, writable=True)
             if task.get("role") in WORKTREELESS_ROLES:
                 # A plain Helm-owned directory, so there is no worktree to
                 # deregister -- and _verify_workspace_record has just confirmed

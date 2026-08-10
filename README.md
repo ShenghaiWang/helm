@@ -1022,6 +1022,52 @@ stalled worker costs one task, while a stalled foreman costs everything the
 project was going to do next, because it is the thing that would have noticed
 the stalled worker.
 
+#### The requirement and solution gates
+
+Before a foreman may launch a state-changing worker, it clears two
+commander-decided gates on its own driving task, in order:
+
+```
+helm gate propose <foreman-task> --type requirement --text "goal, scope, exclusions, acceptance evidence"
+helm gate decide   <foreman-task> --type requirement --confirm   # or --skip; root only
+helm gate propose <foreman-task> --type solution     --text "approach, boundaries, verification, risks"
+helm gate decide   <foreman-task> --type solution     --confirm   # or --skip; root only
+```
+
+The foreman proposes; only the root (the commander, or a capability the root
+configured) may confirm or skip — the same authority boundary that guards
+`approval release`. `helm task create` refuses a `worker`-role task for that
+project until both gates on its foreman are decided, unless the task is
+`--read-only` (pure investigation that changes nothing). A material change to
+the requirement invalidates both gates; a material change to the solution
+invalidates only the solution gate — propose it again rather than reusing a
+stale decision. The gate applies to a foreman's own task creation; it does not
+add a second confirmation on top of the root's own authority, which already
+governs `approve`/`merge`/`grant` directly.
+
+A confirmed requirement/solution pair authorizes exactly one *new*
+state-changing task, not an open stream of them — the pair is spent on the
+task that consumes it, and `helm task inspect <foreman-task>` shows which one
+under `gates: bound_task_id`. A second, separate `helm task create` for the
+same project is refused with "already authorized task ..." until the foreman
+proposes the requirement or solution gate again and the root reconfirms it,
+even if the first task's worker never launched — spending happens at task
+creation, not at a successful launch, so the binding is always on the record
+either way. This does not gate `helm task continue` on the same task: a
+continuation round is the same task asking for another pass, never a new one,
+so it rides on the binding it already holds and does not re-prompt the
+commander.
+
+Every `helm task continue` call must say which kind of round it is opening —
+`--read-only` or `--state-changing` — there is no default and no inheritance
+from the round before. A state-changing round on a project with a live
+foreman is gated exactly like a fresh worker task above: it is refused until
+the requirement and solution gates are decided (or, if this is the task that
+already holds the current binding, it proceeds without re-prompting; see
+above). Leaving the round kind unstated would let a finished read-only
+investigation silently continue as state-changing work, or a state-changing
+round quietly inherit a lock its predecessor never asked for.
+
 Workers start in their assigned `helm/<project>/<task>` worktree and may also
 emit one JSON object per line on stdout:
 

@@ -872,6 +872,26 @@ def _print_inspect(report: dict[str, Any]) -> None:
         print(f"  agent: {task['agent_id']} ({task.get('agent_reason', '')})")
     if task.get("approval"):
         print(f"  approval: {_json(task['approval'])}")
+    if task.get("read_only"):
+        print("  read-only: exempt from the requirement/solution gates")
+    gates = task.get("gates") or {}
+    if any(gates.values()):
+        print("  gates:")
+        for gate_type in ("requirement", "solution"):
+            gate = gates.get(gate_type)
+            if gate is None:
+                print(f"    {gate_type}: not proposed")
+            elif gate.get("skipped"):
+                print(f"    {gate_type}: skipped -- {gate['text']}")
+            elif gate.get("confirmed_at"):
+                print(f"    {gate_type}: confirmed at {gate['confirmed_at']} -- {gate['text']}")
+            else:
+                print(f"    {gate_type}: proposed, waiting on the commander -- {gate['text']}")
+        if gates.get("bound_task_id"):
+            print(
+                f"    confirmed pair already authorized task {gates['bound_task_id']}; "
+                "propose and reconfirm a gate to authorize another"
+            )
     if report["workers"]:
         print("Workers:")
         for worker in report["workers"]:
@@ -1038,6 +1058,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="model this task runs on; overrides the project pin and HELM_MODEL")
     create.add_argument("--ticket",
         help="tracker id for this work; goes in the branch name so a human can find it")
+    create.add_argument(
+        "--read-only", action="store_true",
+        help="pure investigation/status work that changes nothing; exempt from the "
+        "requirement/solution confirmation gates. Never pass this for work that edits anything",
+    )
     for name in ("allocate", "inspect", "approve", "merge"):
         task_commands.add_parser(name).add_argument("task_id")
     continue_cmd = task_commands.add_parser(
@@ -1047,6 +1072,17 @@ def _build_parser() -> argparse.ArgumentParser:
     continue_cmd.add_argument("task_id")
     continue_cmd.add_argument(
         "--brief", required=True, help="what this round is for"
+    )
+    continue_round_kind = continue_cmd.add_mutually_exclusive_group(required=True)
+    continue_round_kind.add_argument(
+        "--read-only", dest="read_only", action="store_true",
+        help="this round is pure investigation/status work that changes nothing; "
+        "the worktree is locked so it cannot write to it",
+    )
+    continue_round_kind.add_argument(
+        "--state-changing", dest="read_only", action="store_false",
+        help="this round may edit and commit; gated by the requirement/solution "
+        "decisions the same as a fresh worker task",
     )
     cleanup_cmd = task_commands.add_parser(
         "cleanup", help="remove a settled task's worktree and its own branch"
@@ -1398,6 +1434,31 @@ def _build_parser() -> argparse.ArgumentParser:
     repair_hold.add_argument(
         "--note", default="", help="why it is being repaired; recorded on the task"
     )
+
+    gate = commands.add_parser(
+        "gate",
+        help="propose (foreman) and decide (commander) the requirement/solution gates",
+    )
+    gate_commands = gate.add_subparsers(dest="gate_command", required=True)
+    gate_propose = gate_commands.add_parser(
+        "propose", help="foreman: propose the requirement or solution contract for a task"
+    )
+    gate_propose.add_argument("task_id", help="the foreman task driving the project")
+    gate_propose.add_argument("--type", dest="gate_type", required=True,
+        choices=("requirement", "solution"))
+    gate_propose.add_argument("--text", required=True,
+        help="the concise contract: for requirement, goal/scope/exclusions/acceptance "
+        "evidence; for solution, approach/boundaries/verification/risks")
+    gate_decide = gate_commands.add_parser(
+        "decide", help="commander: confirm or skip a proposed gate"
+    )
+    gate_decide.add_argument("task_id")
+    gate_decide.add_argument("--type", dest="gate_type", required=True,
+        choices=("requirement", "solution"))
+    gate_decide_choice = gate_decide.add_mutually_exclusive_group(required=True)
+    gate_decide_choice.add_argument("--confirm", action="store_true")
+    gate_decide_choice.add_argument("--skip", action="store_true")
+    gate_decide.add_argument("--note", default="", help="why, if useful to record")
 
     authority = commands.add_parser(
         "authority",
@@ -1890,6 +1951,10 @@ _ROOT_ONLY_COMMANDS = frozenset({
     # because an agent that imports Coordinator never reaches CLI dispatch.
     ("approval", "release"),
     ("approval", "repair"),
+    # Deciding a gate is the same shape as releasing an approval hold: it is
+    # the commander's confirmation itself, so a foreman proposing it can
+    # never also be the one who decides it.
+    ("gate", "decide"),
     ("authority", None),
     ("learning", "approve"),
     ("learning", "reject"),
@@ -1909,6 +1974,9 @@ _FOREMAN_ONLY_COMMANDS = frozenset({
     ("worker", "answer"),
     ("herdr", "launch"),
     ("review", None),
+    # Proposing a gate is the foreman's own reasoning about the project it
+    # drives, same as spawning the worker that will act on it.
+    ("gate", "propose"),
 })
 
 
@@ -2102,6 +2170,7 @@ def main(argv: list[str] | None = None) -> int:
                     model=args.model,
                     ticket=args.ticket,
                     no_domain=args.no_domain,
+                    read_only=args.read_only,
                 )
                 print(f"Created task {task['id']} [{task['status']}] project={task['project_id']} policy={task['delivery_policy']}")
             elif args.task_command == "allocate":
@@ -2177,7 +2246,9 @@ def main(argv: list[str] | None = None) -> int:
                     _print_delivery(coordinator.deliver_task_artifacts(args.task_id))
                 _release_finished_space(coordinator, task)
             elif args.task_command == "continue":
-                task = coordinator.continue_task(args.task_id, args.brief)
+                task = coordinator.continue_task(
+                    args.task_id, args.brief, read_only=args.read_only
+                )
                 print(
                     f"Task {task['id']} reopened for round {len(task.get('rounds', [])) + 1} "
                     f"in {task['workspace']}"
@@ -2792,6 +2863,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 _print_approval_grants(coordinator, include_revoked=args.include_revoked)
+            return 0
+        if args.command == "gate":
+            if args.gate_command == "propose":
+                task = coordinator.propose_gate(args.task_id, args.gate_type, args.text)
+                print(
+                    f"Proposed the {args.gate_type} gate on task {task['id']}; "
+                    "waiting on the commander: helm gate decide "
+                    f"{task['id']} --type {args.gate_type} --confirm|--skip"
+                )
+            else:
+                task = coordinator.decide_gate(
+                    args.task_id, args.gate_type,
+                    confirm=args.confirm, skip=args.skip, note=args.note,
+                )
+                verb = "Skipped" if args.skip else "Confirmed"
+                print(f"{verb} the {args.gate_type} gate on task {task['id']}")
             return 0
         if args.command == "authority":
             if args.authority_command == "init":
