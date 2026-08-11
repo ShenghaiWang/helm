@@ -128,6 +128,33 @@ class RouteCommandTests(HelmTestCase):
         self.assertIn("clean up the flaky test", foreman_task["brief"])
         self.assertIn("REQUESTS ROUTED TO YOU", foreman_task["brief"])
 
+    def test_route_shows_what_the_project_said_before_handing_over(self) -> None:
+        """Routing on top of an unread report is usually the wrong request.
+
+        And the section only works if it is readable: standing delivery
+        decisions are not what a router needs, and a dozen identical ones
+        pushed the foreman's actual report off the top of the output that
+        exists to prevent exactly that.
+        """
+        helm_root = self._helm_root("route-updates-root")
+        coordinator, project = self._project_root(helm_root, "route-updates")
+        command = shlex.join([sys.executable, "-c", ""])
+        coordinator.record_situation(
+            project["id"], "DECISION REQUIRED: Delivery decision needed: read this result"
+        )
+        coordinator.record_situation(
+            project["id"], "Foreman report: investigation COMPLETE, four decisions outstanding"
+        )
+
+        _, output = self._route(helm_root, project["id"], "next thing", "--command", command)
+        surfaced = output.split("Before routing")[1].split("\n\n")[0]
+        self.assertIn("four decisions outstanding", surfaced)
+        self.assertNotIn("DECISION REQUIRED", surfaced)
+
+        # Shown once: the next route must not replay it.
+        _, again = self._route(helm_root, project["id"], "another thing", "--command", command)
+        self.assertNotIn("four decisions outstanding", again)
+
     def test_a_routed_request_reaches_a_live_foremans_status_read(self) -> None:
         """The other half: a foreman that was already live when the request landed.
 

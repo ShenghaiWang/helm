@@ -2792,6 +2792,13 @@ def main(argv: list[str] | None = None) -> int:
                 coordinator,
                 args.project_id,
                 heading="Before routing -- new from this project since you last looked:",
+                # Same filter as `status`, for a sharper reason: what a router
+                # needs is what the project SAID, and a standing delivery
+                # decision is neither new nor answerable here. Unfiltered, a
+                # dozen identical decision lines pushed the foreman's actual
+                # report off the top of the very output meant to prevent
+                # routing on top of it -- observed, not hypothesised.
+                skip_decisions=True,
             )
             if not coordinator.project_wants_foreman(args.project_id):
                 raise HelmError(
