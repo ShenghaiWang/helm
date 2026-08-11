@@ -117,6 +117,49 @@ class RouteCommandTests(HelmTestCase):
         self.assertTrue(recorded)
         self.assertIn("clean up the flaky test", recorded[-1]["text"])
 
+        # The half this test used to assert only in its docstring. Recording
+        # the request somewhere in the store is not the guarantee -- reaching
+        # the document the foreman actually reads is. A foreman appointed by
+        # this very call has its brief composed before the message exists, so
+        # `route` writes the request into that brief directly; anything that
+        # breaks that path leaves the foreman coming up to a quiet project and
+        # standing down on top of an unanswered request.
+        foreman_task = coordinator.store.load()["tasks"][foreman["task_id"]]
+        self.assertIn("clean up the flaky test", foreman_task["brief"])
+        self.assertIn("REQUESTS ROUTED TO YOU", foreman_task["brief"])
+
+    def test_a_routed_request_reaches_a_live_foremans_status_read(self) -> None:
+        """The other half: a foreman that was already live when the request landed.
+
+        Its brief was composed long before, so the brief cannot carry this.
+        The request has to surface in the record it is told to re-read --
+        `helm project status` -- until it has actually acted on it.
+        """
+        helm_root = self._helm_root("route-live-root")
+        coordinator, project = self._project_root(helm_root, "route-live")
+        command = shlex.join([sys.executable, "-c", ""])
+        self._route(helm_root, project["id"], "first request", "--command", command)
+        foreman = coordinator.foreman_for(project["id"])
+        self.assertIsNotNone(foreman)
+
+        coordinator.record_worker_message(foreman["id"], "status", "picked up the first one")
+        self.assertEqual(coordinator.pending_foreman_requests(project["id"]), [])
+
+        coordinator.record_worker_message(foreman["id"], "answer", "now investigate TICKET-9")
+        pending = coordinator.pending_foreman_requests(project["id"])
+        self.assertEqual(len(pending), 1)
+        self.assertIn("TICKET-9", pending[0]["text"])
+        self.assertIn(
+            "TICKET-9",
+            "".join(
+                e["text"] for e in coordinator.project_status(project["id"])["pending_requests"]
+            ),
+        )
+
+        # Acting on it is what clears it -- the foreman's own next push.
+        coordinator.record_worker_message(foreman["id"], "status", "on it")
+        self.assertEqual(coordinator.pending_foreman_requests(project["id"]), [])
+
     def test_route_passes_through_agent_and_model_when_appointing_a_foreman(self) -> None:
         """`route` must offer the same fit/restriction controls `helm foreman` does.
 

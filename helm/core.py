@@ -5355,6 +5355,10 @@ class Coordinator:
 
     #: The one worker message that pauses a task instead of ending it.
     HOLD_MESSAGE_KIND = "approval-needed"
+    #: Helm's own inbound push -- a reply to a worker's question, or a request
+    #: `helm route` hands to a foreman. Named because "is this message one the
+    #: worker sent, or one it was sent" decides both liveness and pendingness.
+    ANSWER_MESSAGE_KIND = "answer"
 
     @staticmethod
     def _content_digest(path: Path) -> str:
@@ -8085,6 +8089,71 @@ class Coordinator:
             status["evidence"][worker_id] = entry
         return entry
 
+    def pending_foreman_requests(
+        self, project_id: str, *, data: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Requests routed to this project's foreman that it has not acted on.
+
+        ``helm route`` records the commander's request as an ``answer`` on the
+        foreman's own task, then relies on the foreman reading it when it comes
+        up. That read had nowhere to happen: the record a foreman is told to
+        re-read is built from tasks, situation, action items and evidence, and
+        never looked at its own inbound messages. A foreman appointed by the
+        same ``route`` call was the case that always lost -- its brief is
+        composed while it is being appointed, which is strictly before the
+        request is recorded, so the request could appear in neither. It came
+        up, correctly saw nothing in flight, and stood down while the commander
+        had been told the request was safely recorded.
+
+        Pending is derived rather than marked, for the same reason the rest of
+        this record is: a ``seen`` flag would be written by whoever happened to
+        read the status, and the root reads it far more often than the foreman
+        does. A request counts as acted on once the foreman itself has spoken
+        after it arrived -- any push of its own is evidence it read the record
+        that carried the request. Nothing is stored, so this cannot drift.
+        """
+        data = data if data is not None else self.store.load()
+        foreman_tasks = {
+            task["id"]
+            for task in data.get("tasks", {}).values()
+            if task.get("project_id") == project_id and task.get("role") == "foreman"
+        }
+        if not foreman_tasks:
+            return []
+        # Only a live foreman can still act on one. A stood-down foreman's
+        # unread request is not pending on anybody -- it is lost, and it
+        # surfaces to the commander as an undriven project instead.
+        live = self.foreman_for(project_id)
+        if live is None:
+            return []
+        # Ordered by position, not by `created_at`. Timestamps here are
+        # second-resolution, and a foreman answering promptly lands its reply
+        # inside the same second as the request -- which read as "already
+        # replied" and hid the request, reintroducing the bug this exists to
+        # close. Append order is the actual sequence and has no ties.
+        messages = data.get("messages", [])
+        replied_at = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("worker_id") == live["id"]
+                and message.get("kind") != self.ANSWER_MESSAGE_KIND
+            ),
+            default=-1,
+        )
+        return [
+            {
+                "message_id": message["id"],
+                "task_id": message.get("task_id"),
+                "at": message.get("created_at"),
+                "text": message.get("text", ""),
+            }
+            for index, message in enumerate(messages)
+            if index > replied_at
+            and message.get("kind") == self.ANSWER_MESSAGE_KIND
+            and message.get("task_id") in foreman_tasks
+        ]
+
     def project_status(self, project_id: str) -> dict[str, Any]:
         """Everything a coordinator needs to take this project over mid-stream.
 
@@ -8152,6 +8221,7 @@ class Coordinator:
                 if e.get("status", "open") == "open"
             ],
             "situation": [e for e in status["situation"] if not e.get("superseded_by")],
+            "pending_requests": self.pending_foreman_requests(project_id, data=data),
             "evidence": list(pruned.values()),
             "history_entries": len(status["history"]),
         }
@@ -8258,7 +8328,7 @@ class Coordinator:
                         entry["surfaced_at"] = seen_at
         return updates
 
-    def foreman_brief(self, project_id: str) -> str:
+    def foreman_brief(self, project_id: str, *, request: str | None = None) -> str:
         """The role document a project's foreman is started with.
 
         A foreman is a bounded delegate, not a second coordinator: it drives
@@ -8272,10 +8342,34 @@ class Coordinator:
             FOREMAN_RULES,
             "",
             f"PROJECT: {project.get('name')} ({project_id})",
+        ]
+        # A foreman appointed *by* a `route` call is the case that always lost
+        # the request: its brief is composed here, during appointment, which is
+        # strictly before `route` can record the request against a worker that
+        # does not exist yet. So the request is passed in and written into the
+        # document directly. Nothing derived, nothing to read later, nothing to
+        # race: the agent cannot come up without it in front of it.
+        pending = list(status["pending_requests"])
+        if request and (request or "").strip():
+            pending.insert(0, {"at": now(), "text": request})
+        if pending:
+            # First, and before the state of play, because it is the only part
+            # of this document that is someone waiting on an answer. A foreman
+            # whose brief opened with a quiet project read "nothing to drive"
+            # and stood down on top of an unread request.
+            lines.append("")
+            lines.append(
+                "REQUESTS ROUTED TO YOU -- ACT ON THESE. The commander sent "
+                "these to this project and is waiting; they are not a summary "
+                "of past work. Do not stand down while one is unanswered:"
+            )
+            for entry in pending:
+                lines.append(f"- [{entry['at'][:10]}] {entry['text']}")
+        lines.extend([
             "",
             "CURRENT STATE OF PLAY (re-read it with `helm project status "
             f"{project_id}` rather than trusting this snapshot):",
-        ]
+        ])
         for entry in status["situation"]:
             lines.append(f"- {entry['at'][:10]} {entry['text']}")
         if status["needs_attention"]:
@@ -8293,7 +8387,12 @@ class Coordinator:
         return "\n".join(lines)
 
     def create_foreman_task(
-        self, project_id: str, *, agent: str | None = None, model: str | None = None
+        self,
+        project_id: str,
+        *,
+        agent: str | None = None,
+        model: str | None = None,
+        request: str | None = None,
     ) -> dict[str, Any]:
         """Create the task a project's foreman runs as.
 
@@ -8304,7 +8403,7 @@ class Coordinator:
         a driver carrying `software-delivery` would leak it into every task it
         creates, including the ones that are not code.
         """
-        brief = self.foreman_brief(project_id)
+        brief = self.foreman_brief(project_id, request=request)
         return self.create_task(
             project_id,
             brief,

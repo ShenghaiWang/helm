@@ -668,6 +668,13 @@ def _print_project_status(status: dict[str, Any]) -> None:
     print(f"{p['glyph']} {p['name']} ({p['id']})")
     counts = " ".join(f"{k}={v}" for k, v in status["counts"].items())
     print(f"  tasks: {counts or 'none'}")
+    if status.get("pending_requests"):
+        # Above the action items: an unanswered routed request is the one thing
+        # here that a foreman is supposed to be acting on right now.
+        print("  routed requests awaiting the foreman:")
+        for entry in status["pending_requests"]:
+            first = entry["text"].strip().splitlines()[0][:120]
+            print(f"    {entry['at'][:10]} {first} (task={entry['task_id']})")
     if status["action_items"]:
         print("  action items:")
         for entry in status["action_items"]:
@@ -1767,8 +1774,11 @@ def _start_foreman(
     command: str | None = None,
     agent: str | None = None,
     model: str | None = None,
+    request: str | None = None,
 ) -> dict[str, Any]:
-    task = coordinator.create_foreman_task(project_id, agent=agent, model=model)
+    task = coordinator.create_foreman_task(
+        project_id, agent=agent, model=model, request=request
+    )
     if herdr:
         worker = HerdrAdapter(coordinator).launch_task(task["id"], command, wait=False)
     else:
@@ -1784,6 +1794,7 @@ def _ensure_foreman(
     command: str | None = None,
     agent: str | None = None,
     model: str | None = None,
+    request: str | None = None,
 ) -> dict[str, Any] | None:
     """Appoint a declared project's foreman if it has none.
 
@@ -1801,7 +1812,8 @@ def _ensure_foreman(
         if coordinator.foreman_for(project_id) is not None:
             return None
         started = _start_foreman(
-            coordinator, project_id, herdr=herdr, command=command, agent=agent, model=model
+            coordinator, project_id, herdr=herdr, command=command, agent=agent,
+            model=model, request=request,
         )
     except (HelmError, SafetyError, OSError) as exc:
         print(
@@ -2719,7 +2731,12 @@ def main(argv: list[str] | None = None) -> int:
             if existing is None:
                 started = _ensure_foreman(
                     coordinator, args.project_id, herdr=args.herdr,
-                    command=args.worker_command_text, agent=args.agent, model=args.model,
+                    command=args.worker_command_text, agent=args.agent,
+                    model=args.model,
+                    # The request goes into the brief this appointment composes,
+                    # so a foreman started by this very call comes up already
+                    # holding it rather than hoping to read it afterwards.
+                    request=args.text,
                 )
                 foreman = coordinator.foreman_for(args.project_id)
             else:
@@ -2776,8 +2793,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
                     f"newly appointed foreman {foreman['id']} task={task['id']} "
-                    "[recorded; foreman is still starting -- it will read this from its own "
-                    "status once it comes up, not a live pane send]"
+                    "[recorded, and written into the brief this appointment composed; the "
+                    "foreman is still starting and comes up holding the request, "
+                    "not a live pane send]"
                 )
                 return 0
             if not reachable:
