@@ -1079,3 +1079,369 @@ class ApprovalTests(HelmTestCase):
             self.coordinator.cleanup_task(task["id"])
         with self.assertRaises(SafetyError):
             adapter.cleanup_task(task["id"])
+
+
+class EscalationReconciliationTests(ApprovalTests):
+    """`open_escalations` must reflect current unresolved state, not replay history."""
+
+    def _running_task(self, name: str) -> tuple[dict, dict, dict]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "do the work")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        return project, task, worker
+
+    def _escalation_task_ids(self, project_id: str | None = None) -> set[str]:
+        return {
+            e["task_id"] for e in self.coordinator.open_escalations(project_id)
+        }
+
+    def test_a_live_question_stays_in_the_queue(self) -> None:
+        project, task, worker = self._running_task("live-question")
+        self.coordinator.record_worker_message(worker["id"], "question", "which branch?")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        items = self.coordinator.open_escalations()
+        entry = next(e for e in items if e["task_id"] == task["id"])
+        self.assertEqual(entry["kind"], "question")
+
+    def test_an_answered_question_leaves_the_queue(self) -> None:
+        project, task, worker = self._running_task("answered-question")
+        self.coordinator.record_worker_message(worker["id"], "question", "which branch?")
+        self.coordinator.record_worker_message(worker["id"], "answer", "main")
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+    def test_a_question_moot_after_the_task_moves_on_without_an_answer(self) -> None:
+        """A worker can report a terminal message without anybody ever answering.
+
+        Replaying the old question after the task has finished would send a
+        reader to a prompt nothing is still waiting on.
+        """
+        project, task, worker = self._running_task("moot-question")
+        self.coordinator.record_worker_message(worker["id"], "question", "which branch?")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        self.coordinator.record_worker_message(worker["id"], "result", "went with main")
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+    def test_a_live_blocker_stays_in_the_queue(self) -> None:
+        project, task, worker = self._running_task("live-blocker")
+        self.coordinator.record_worker_message(worker["id"], "blocker", "needs a credential")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "blocked"
+        )
+        self.assertIn(task["id"], self._escalation_task_ids())
+
+    def test_an_abandoned_approval_hold_leaves_the_queue(self) -> None:
+        """A session that can never be told anything is abandoned, not left
+        asking for an answer forever."""
+        project, task, worker = self._paused_on_approval("abandon-approval", execution="process")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        repaired = self.coordinator.repair_task_hold(task["id"], session_live=False)
+        self.assertEqual(repaired["outcome"], "abandoned")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "failed"
+        )
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+    def test_only_the_newest_pending_ask_per_worker_is_shown(self) -> None:
+        project, task, worker = self._running_task("repeat-asks")
+        # A running worker can ask more than once before either is answered.
+        # Only the current ask is a live prompt; an earlier one from the same
+        # session is superseded by construction.
+        self.coordinator.record_worker_message(worker["id"], "question", "first question")
+        self.coordinator.record_worker_message(worker["id"], "question", "second, different question")
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        self.assertEqual(len(items), 1)
+        self.assertIn("different question", items[0]["text"])
+
+    def test_an_approval_hold_stays_in_the_queue_until_released(self) -> None:
+        project, task, worker = self._paused_on_approval("live-approval")
+        self.assertIn(task["id"], self._escalation_task_ids())
+
+    def test_a_released_and_delivered_approval_leaves_the_queue_without_an_answer(self) -> None:
+        """DEFECT: `open_escalations` only ever cleared on an `answer` message,
+        so a hold released and delivered through `helm approval release` --
+        never answered directly -- kept replaying the original prompt forever.
+        """
+        project, task, worker = self._paused_on_approval("released-approval")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        # Authorized but not yet spent: still a live pause, still visible.
+        self.assertIn(task["id"], self._escalation_task_ids())
+        self.coordinator.start_authorized_action(worker["id"])
+        # The session has spent the authorization and moved on; the original
+        # approval-needed prompt is no longer anything to answer.
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+        self.coordinator.record_worker_message(worker["id"], "result", "published it")
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+    def test_escalations_stay_scoped_to_their_project(self) -> None:
+        _, task_a, worker_a = self._running_task("proj-a")
+        _, task_b, worker_b = self._running_task("proj-b")
+        self.coordinator.record_worker_message(worker_a["id"], "question", "for a?")
+        self.coordinator.record_worker_message(worker_b["id"], "question", "for b?")
+        only_a = self._escalation_task_ids("proj-a")
+        self.assertIn(task_a["id"], only_a)
+        self.assertNotIn(task_b["id"], only_a)
+
+    def test_a_question_stays_visible_while_the_task_is_paused_on_an_approval(self) -> None:
+        """A live worker can ask a plain question while its own task sits in
+        `approval-needed` on an unrelated hold. Task status is not a valid
+        proxy for whether that worker's question is still live, and the
+        still-open hold must not be lost either -- both are distinct asks
+        from the same live session.
+        """
+        project, task, worker = self._paused_on_approval("question-during-hold")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "approval-needed"
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "question", "should the artifact include the changelog?"
+        )
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        kinds = {e["kind"] for e in items}
+        self.assertEqual(kinds, {"question", "approval-needed"})
+
+    def test_a_settled_rounds_question_never_returns_under_a_later_round(self) -> None:
+        """Round one's worker asks and is never answered, then reports a
+        result of its own accord. Round two reopens the same task under a
+        fresh worker and the task returns to `running` -- the old question
+        must not resurface just because task status matches again.
+        """
+        root = self.repo("round-question")
+        project = self.coordinator.register_project(
+            "RoundQuestion", str(root), project_id="round-question"
+        )
+        task = self.coordinator.create_task(project["id"], "first pass")
+        worker_one = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker_one["id"], "question", "which base?")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        self.coordinator.record_worker_message(worker_one["id"], "result", "used main anyway")
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+        self.coordinator.continue_task(task["id"], "second pass")
+        worker_two = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "running"
+        )
+        # Task status matches round one's question again, but round one's
+        # own worker is settled -- its question must stay gone.
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+        items = self.coordinator.open_escalations()
+        self.assertFalse(any(e["worker_id"] == worker_one["id"] for e in items))
+
+        # A fresh question from round two's own live worker is unaffected.
+        self.coordinator.record_worker_message(worker_two["id"], "question", "which base now?")
+        self.assertIn(task["id"], self._escalation_task_ids())
+
+    def test_an_unrelated_answer_does_not_clear_a_still_open_approval_hold(self) -> None:
+        """A foreman or commander routinely sends `answer` text into a paused
+        worker's session without that touching its hold at all -- the hold's
+        own status is what decides whether the protected-action decision is
+        still open, not the presence of any later `answer` message.
+        """
+        project, task, worker = self._paused_on_approval("answer-does-not-clear-hold")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        self.coordinator.record_worker_message(worker["id"], "answer", "looking at it")
+        self.assertIn(task["id"], self._escalation_task_ids())
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        self.assertEqual([e["kind"] for e in items], ["approval-needed"])
+        # The hold's own resolution still clears it.
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        self.coordinator.start_authorized_action(worker["id"])
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+    def test_a_missing_worker_record_is_surfaced_not_silently_dropped(self) -> None:
+        """An ask whose worker record has gone missing cannot be proven
+        resolved, so it must not vanish from the queue the way a genuinely
+        answered one does.
+        """
+        project, task, worker = self._running_task("orphaned-worker")
+        self.coordinator.record_worker_message(worker["id"], "question", "which branch?")
+        with self.coordinator.store.locked() as data:
+            del data["workers"][worker["id"]]
+        items = [
+            e for e in self.coordinator.open_escalations() if e["worker_id"] == worker["id"]
+        ]
+        self.assertEqual(len(items), 1)
+        entry = items[0]
+        self.assertEqual(entry["kind"], "question")
+        self.assertEqual(entry["project_id"], project["id"])
+        self.assertEqual(entry["task_id"], task["id"])
+        self.assertIn("diagnostic", entry)
+        # Still correctly scoped to its project, even without a worker record.
+        self.assertTrue(
+            any(e["worker_id"] == worker["id"] for e in self.coordinator.open_escalations(project["id"]))
+        )
+
+    def test_a_missing_task_record_is_surfaced_not_silently_dropped(self) -> None:
+        project, task, worker = self._running_task("orphaned-task")
+        self.coordinator.record_worker_message(worker["id"], "blocker", "needs a credential")
+        with self.coordinator.store.locked() as data:
+            del data["tasks"][task["id"]]
+        items = [
+            e for e in self.coordinator.open_escalations() if e["worker_id"] == worker["id"]
+        ]
+        self.assertEqual(len(items), 1)
+        self.assertIn("diagnostic", items[0])
+        self.assertEqual(items[0]["task_id"], task["id"])
+        self.assertEqual(items[0]["project_id"], project["id"])
+
+    def test_a_restated_approval_stays_a_single_live_entry(self) -> None:
+        """A worker repeating the exact same unanswered request appends a new
+        `approval-needed` message without moving the hold's own `message_id`.
+        Matching against "the latest approval-needed message" would miss the
+        restated one entirely; this must still show as one live entry.
+        """
+        project, task, worker = self._paused_on_approval("restated-approval")
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready to publish the rendered file",
+            payload={"action": "publish"},
+        )
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["kind"], "approval-needed")
+
+    def test_a_new_rounds_approval_hold_never_resurrects_an_old_rounds(self) -> None:
+        """End to end across two rounds on one task: round one's hold is
+        released, spent, and the worker reports its result; round two is then
+        continued under a fresh worker that opens its own, different hold.
+        Only round two's approval-needed message may appear -- round one's
+        already-settled request must never come back just because the task
+        is `approval-needed` again.
+        """
+        project, task, worker_one = self._paused_on_approval(
+            "multi-round-approval", action="publish"
+        )
+        self.assertIn(task["id"], self._escalation_task_ids())
+
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        self.coordinator.start_authorized_action(worker_one["id"])
+        self.coordinator.record_worker_message(
+            worker_one["id"], "result", "published round one",
+            payload={"receipt": "round-one-receipt"},
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
+        )
+        self.assertNotIn(task["id"], self._escalation_task_ids())
+
+        self.coordinator.continue_task(task["id"], "round two: remove the stale export")
+        worker_two = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.coordinator.record_worker_message(
+            worker_two["id"], "approval-needed", "ready to delete the stale export",
+            payload={"action": "delete"},
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "approval-needed"
+        )
+
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        self.assertEqual(len(items), 1)
+        entry = items[0]
+        self.assertEqual(entry["kind"], "approval-needed")
+        self.assertEqual(entry["worker_id"], worker_two["id"])
+        self.assertIn("delete the stale export", entry["text"])
+        # Round one's own worker never reappears, under any kind.
+        self.assertFalse(any(e["worker_id"] == worker_one["id"] for e in items))
+
+    def test_a_hold_pointing_at_a_foreign_message_falls_into_the_diagnostic_path(self) -> None:
+        """A hold's `message_id` resolving to a real message that belongs to
+        someone else's ask -- wrong kind, wrong task, wrong worker, or wrong
+        project -- must never lend that message's text or timestamp to this
+        hold's escalation. The hold's own fields are the only thing trusted
+        once that mismatch is detected.
+        """
+        project, task, worker = self._paused_on_approval("foreign-message")
+        other_project, other_task, other_worker = self._paused_on_approval(
+            "foreign-message-other"
+        )
+        with self.coordinator.store.locked() as data:
+            hold = data["tasks"][task["id"]]["holds"][-1]
+            foreign_id = data["tasks"][other_task["id"]]["holds"][-1]["message_id"]
+            hold["message_id"] = foreign_id
+
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        self.assertEqual(len(items), 1)
+        entry = items[0]
+        self.assertEqual(entry["kind"], "approval-needed")
+        self.assertEqual(entry["worker_id"], worker["id"])
+        self.assertIn("diagnostic", entry)
+        # Never the foreign task's text -- only this hold's own recorded text.
+        self.assertNotIn(other_task["id"], entry["text"])
+        self.assertIn("ready to publish", entry["text"])
+        # The other project's genuine escalation is unaffected.
+        other_items = [
+            e for e in self.coordinator.open_escalations() if e["task_id"] == other_task["id"]
+        ]
+        self.assertEqual(len(other_items), 1)
+        self.assertNotIn("diagnostic", other_items[0])
+
+    def test_a_removed_tasks_restated_approval_history_collapses_to_one_row(self) -> None:
+        """A worker can restate the same unanswered request more than once
+        before its task record is later removed entirely -- by state cleanup
+        outside Helm, or corruption. Every one of those historical messages
+        still names the same worker; they must collapse to a single
+        diagnostic row, not one per historical message.
+        """
+        project, task, worker = self._paused_on_approval("removed-task-restated")
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready to publish the rendered file",
+            payload={"action": "publish"},
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready to publish the rendered file",
+            payload={"action": "publish"},
+        )
+        approval_needed_count = sum(
+            1
+            for m in self.coordinator.store.load()["messages"]
+            if m.get("kind") == "approval-needed" and m.get("worker_id") == worker["id"]
+        )
+        self.assertEqual(approval_needed_count, 3)
+        with self.coordinator.store.locked() as data:
+            del data["tasks"][task["id"]]
+
+        items = [
+            e for e in self.coordinator.open_escalations() if e["worker_id"] == worker["id"]
+        ]
+        self.assertEqual(len(items), 1)
+        self.assertIn("diagnostic", items[0])
+        self.assertEqual(items[0]["kind"], "approval-needed")
+
+    def test_a_live_hold_with_a_missing_worker_record_appears_exactly_once(self) -> None:
+        """The hold itself is genuinely still open -- the task's own record
+        says so -- but the worker behind it is gone. That must not be shown
+        twice: once from the hold's own liveness and once again from a
+        separate orphan pass over messages. It stays actionable (the hold is
+        real) and is marked unverified rather than silently trusted or
+        dropped, and the CLI must say so plainly.
+        """
+        project, task, worker = self._paused_on_approval("missing-worker-live-hold")
+        with self.coordinator.store.locked() as data:
+            del data["workers"][worker["id"]]
+
+        items = [e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]]
+        self.assertEqual(len(items), 1)
+        entry = items[0]
+        self.assertEqual(entry["kind"], "approval-needed")
+        self.assertEqual(entry["worker_id"], worker["id"])
+        self.assertIn("diagnostic", entry)
+        self.assertIn("ready to publish", entry["text"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_status(self.coordinator, None)
+        printed = output.getvalue()
+        self.assertIn("Needs you (1)", printed)
+        self.assertIn("UNVERIFIED", printed)
+        self.assertEqual(
+            sum(1 for line in printed.splitlines() if worker["id"] in line), 1
+        )

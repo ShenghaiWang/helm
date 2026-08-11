@@ -10060,40 +10060,249 @@ class Coordinator:
         listed them: `helm status` prints every message in full, and a page of
         prose hides an escalation exactly as well as dropping it would.
 
-        Answered means an `answer` reached that worker after the escalation.
-        Anything still open is returned newest first, because the reader wants
-        what is waiting now, not the order it arrived in.
+        Liveness is judged per kind, because each kind is answered a different
+        way and a worker can have more than one open ask at once:
+
+        - A `question` pauses nothing; it is live for as long as the worker
+          that asked it is still running its session, whatever the *task's*
+          status says -- a worker can ask a question while its own task sits
+          in `approval-needed` on an unrelated hold, and that question must
+          not be hidden just because the task is not `running`. Once that
+          worker settles -- reports a terminal message, or is settled by
+          observation -- its question is done being live even if the task is
+          later reopened for another round under a different worker: a new
+          round's worker is a new worker record, and an old round's question
+          must never resurface under it.
+        - A `blocker` is live only while the task is still `blocked`; the
+          task-status route to worker recovery does not exist in this state
+          machine, but a task no longer `blocked` (superseded by a harder
+          terminal message from the same worker, or state repaired outside
+          Helm) is no longer waiting on this particular blocker.
+        - An `approval-needed` message is live only while its *own* hold is
+          still open. "Some hold is open on this task" is not enough: a task
+          continued for another round drops its approval on the way through
+          and can open a brand new hold for a different action, and matching
+          only on task status would resurrect the earlier round's already
+          settled request under the new one. A task carries at most one open
+          hold, so this is derived per task, from that hold, rather than by
+          scanning messages -- one entry per task no matter how many
+          historical approval-needed messages or restatements it has. A hold
+          records the id of the exact message that opened it, so equality on
+          `message_id` is checked first, and that resolved message is then
+          checked against the hold and task it claims to belong to (kind,
+          task, worker, project) before its text or timestamp is trusted --
+          a corrupted or foreign id must never lend an escalation someone
+          else's ask. A hold from before `message_id` existed falls back to
+          matching the hold's own `worker_id` against the message's, which is
+          still specific to one worker's one ask rather than "a hold exists
+          somewhere on this task". The hold record is the truth here, not an
+          `answer` message: a foreman or commander routinely sends `answer`
+          text to a paused worker ("looking at it") without that touching the
+          hold at all, and treating that as resolving the escalation would
+          hide a still-open protected-action decision.
+
+        `question` and `blocker` treat a later `answer` to the same worker as
+        resolving it, same as before; `approval-needed` does not, per above.
+        Only the newest pending ask *of each kind* per worker is considered --
+        an older one is superseded by construction -- but a live question and
+        a live approval-needed hold on the same worker are two different
+        asks and both stay visible.
+
+        A worker or task record that has gone missing or unreadable is not
+        silently treated as resolved: liveness cannot be verified either way,
+        so it is surfaced as its own diagnostic entry rather than invented
+        away, using only what the message itself already recorded (its own
+        `project_id` and `task_id`, stamped at write time) -- nothing here
+        guesses at facts the missing record can no longer confirm. A live
+        hold whose worker record has gone missing appears exactly once, still
+        actionable (the hold itself says it is open) but marked unverified,
+        rather than once from the hold and again from a separate orphan scan.
+
+        Nothing here deletes or rewrites the underlying message -- the full
+        history stays exactly as recorded; this only decides what still needs
+        a human now. Anything still open is returned newest first, because
+        the reader wants what is waiting now, not the order it arrived in.
         """
         data = self.store.load()
-        answers: dict[str, str] = {}
-        for message in data.get("messages", []):
+        messages = data.get("messages", [])
+        workers = data.get("workers", {})
+        tasks = data.get("tasks", {})
+        message_by_id = {m["id"]: m for m in messages if m.get("id")}
+        # Indexed by position in the log rather than by `created_at`: two
+        # messages recorded in the same second compare equal as timestamps,
+        # and an escalation immediately followed by its own answer must not
+        # be mistaken for arriving before it.
+        last_answer_index: dict[str, int] = {}
+        for index, message in enumerate(messages):
             if message.get("kind") == "answer":
-                worker_id = str(message.get("worker_id") or "")
-                stamp = str(message.get("created_at") or "")
-                if stamp >= answers.get(worker_id, ""):
-                    answers[worker_id] = stamp
+                last_answer_index[str(message.get("worker_id") or "")] = index
+
         open_items: list[dict[str, Any]] = []
-        for message in data.get("messages", []):
-            if message.get("kind") not in {"question", "blocker", "approval-needed"}:
+
+        # --- question / blocker: latest message of each kind per worker ---
+        # A question and a blocker from the same worker are different asks
+        # and must not collapse into one another, but two blockers -- or two
+        # questions -- from the same worker are the same ask restated, and
+        # only the newest matters.
+        latest: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
+        for index, message in enumerate(messages):
+            kind = message.get("kind")
+            if kind not in {"question", "blocker"}:
                 continue
             worker_id = str(message.get("worker_id") or "")
-            created = str(message.get("created_at") or "")
-            if answers.get(worker_id, "") > created:
+            latest[(worker_id, kind)] = (index, message)
+
+        for (worker_id, kind), (index, message) in latest.items():
+            msg_project_id = message.get("project_id")
+            if project_id and msg_project_id != project_id:
                 continue
-            worker = data.get("workers", {}).get(worker_id, {})
-            task = data.get("tasks", {}).get(worker.get("task_id"), {})
-            if project_id and task.get("project_id") != project_id:
+            answered = index <= last_answer_index.get(worker_id, -1)
+            worker = workers.get(worker_id)
+            task = tasks.get(str(message.get("task_id") or ""))
+            if worker is None or task is None:
+                # Cannot be proven resolved without the record that would
+                # prove it -- surfaced rather than dropped, and not answered
+                # for it either: an `answer` alone is not the same claim as
+                # the record itself confirming the ask is done.
+                open_items.append(self._orphaned_escalation(message, worker_id))
                 continue
+            status = task.get("status")
+            if kind == "question":
+                if worker.get("status") != "running" or answered:
+                    continue
+            elif kind == "blocker":
+                if status != "blocked" or answered:
+                    continue
             open_items.append({
-                "kind": message.get("kind"),
-                "project_id": task.get("project_id"),
+                "kind": kind,
+                "project_id": msg_project_id,
                 "role": task.get("role", "worker"),
                 "worker_id": worker_id,
-                "task_id": worker.get("task_id"),
-                "created_at": created,
+                "task_id": message.get("task_id"),
+                "created_at": str(message.get("created_at") or ""),
                 "text": str(message.get("text", "")),
             })
+
+        # --- approval-needed: bound to each task's own currently open hold ---
+        # "Some hold is open on this task" is not enough: a task continued for
+        # another round drops its approval on the way through and can open a
+        # brand new hold on a new worker for a different action, and matching
+        # on task status alone would resurrect the earlier round's already
+        # settled request under the new one. So this is never derived by
+        # picking "the latest approval-needed message" -- a restated request
+        # appends a new message without moving the hold's own `message_id` --
+        # it is always resolved from the hold record itself, and a task holds
+        # at most one open hold, so this produces at most one entry per task
+        # no matter how many historical approval-needed messages it has.
+        #
+        # A message a hold points to is trusted only after it is checked
+        # against the hold and task it is supposed to belong to: a corrupted
+        # or foreign `message_id` must never lend its text or timestamp to an
+        # escalation for a different ask.
+        for task in tasks.values():
+            if project_id and task.get("project_id") != project_id:
+                continue
+            if task.get("status") != "approval-needed":
+                continue
+            hold = self.task_hold(task)
+            if hold is None:
+                continue
+            hold_worker_id = str(hold.get("worker_id") or "")
+            hold_message_id = hold.get("message_id")
+            message = message_by_id.get(hold_message_id) if hold_message_id else None
+            if message is not None and (
+                message.get("kind") != "approval-needed"
+                or str(message.get("task_id") or "") != task["id"]
+                or str(message.get("worker_id") or "") != hold_worker_id
+                or message.get("project_id") != task.get("project_id")
+            ):
+                # The id resolved to a real message, but not to the one this
+                # hold actually opened -- trusting its text or timestamp
+                # would be answering this hold with someone else's ask.
+                message = None
+            elif message is None and hold_message_id is None:
+                # A hold recorded before `message_id` existed: fall back to
+                # the newest approval-needed message from the same worker on
+                # this task, which is still specific to one worker's one ask
+                # rather than "a hold exists somewhere on this task".
+                candidates = [
+                    m for m in messages
+                    if m.get("kind") == "approval-needed"
+                    and str(m.get("task_id") or "") == task["id"]
+                    and str(m.get("worker_id") or "") == hold_worker_id
+                ]
+                message = candidates[-1] if candidates else None
+            worker = workers.get(hold_worker_id)
+            entry = {
+                "kind": "approval-needed",
+                "project_id": task.get("project_id"),
+                "role": task.get("role", "worker"),
+                "worker_id": hold_worker_id,
+                "task_id": task["id"],
+                "created_at": (
+                    str(message.get("created_at") or "")
+                    if message is not None
+                    else str(hold.get("requested_at") or "")
+                ),
+                "text": (
+                    str(message.get("text", "")) if message is not None
+                    else str(hold.get("text") or "")
+                ),
+            }
+            if message is None:
+                entry["diagnostic"] = (
+                    "this hold's own escalation message could not be found or "
+                    "does not match its record; liveness could not be verified"
+                )
+            elif worker is None:
+                # The ask itself is genuine and its hold is still open --
+                # still actionable -- but the worker record behind it is
+                # gone, so this stays visible exactly once, marked as unable
+                # to be fully verified rather than duplicated by a separate
+                # orphan pass.
+                entry["diagnostic"] = "worker record is missing; liveness could not be verified"
+            open_items.append(entry)
+
+        # An approval-needed ask whose *task* record itself is gone cannot be
+        # reached by the hold-driven pass above at all -- there is no task to
+        # iterate. Surfaced separately, collapsed to the newest ask per
+        # worker so a restated request or several rounds of history under one
+        # worker do not each mint their own row.
+        latest_taskless: dict[str, tuple[int, dict[str, Any]]] = {}
+        for index, message in enumerate(messages):
+            if message.get("kind") != "approval-needed":
+                continue
+            if tasks.get(str(message.get("task_id") or "")) is not None:
+                continue
+            worker_id = str(message.get("worker_id") or "")
+            latest_taskless[worker_id] = (index, message)
+        for worker_id, (_, message) in latest_taskless.items():
+            msg_project_id = message.get("project_id")
+            if project_id and msg_project_id != project_id:
+                continue
+            open_items.append(self._orphaned_escalation(message, worker_id))
+
         return sorted(open_items, key=lambda item: item["created_at"], reverse=True)
+
+    @staticmethod
+    def _orphaned_escalation(message: dict[str, Any], worker_id: str) -> dict[str, Any]:
+        """An ask whose worker or task record is missing or unreadable.
+
+        Liveness cannot be proven either way without that record, so this is
+        surfaced as its own diagnostic entry rather than silently dropped --
+        using only what the message itself already recorded at write time,
+        never a guess at what the missing record would have said.
+        """
+        return {
+            "kind": message.get("kind"),
+            "project_id": message.get("project_id"),
+            "role": "worker",
+            "worker_id": worker_id,
+            "task_id": message.get("task_id"),
+            "created_at": str(message.get("created_at") or ""),
+            "text": str(message.get("text", "")),
+            "diagnostic": "worker or task record is missing; liveness could not be verified",
+        }
 
     def release_project(self, project_id: str) -> dict[str, Any]:
         """Release what a finished project still holds, and report what it kept.

@@ -57,6 +57,34 @@ class CliStatusTests(HelmTestCase):
         again = {e["worker_id"]: e for e in self.coordinator.worker_health()}
         self.assertEqual(again[worker["id"]]["verdict"], "awaiting-answer")
 
+    def test_needs_you_marks_an_orphaned_escalation_as_unverified(self) -> None:
+        """A diagnostic entry -- its worker or task record is missing -- must
+        read differently from an ordinary, verified escalation: printing it
+        the same way would claim a liveness check that never happened.
+        """
+        root = self.repo("orphan-cli")
+        project = self.coordinator.register_project("OrphanCli", str(root), project_id="orphan-cli")
+        task = self.coordinator.create_task(project["id"], "ask and vanish")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "question", "which option?")
+        with self.coordinator.store.locked() as data:
+            del data["workers"][worker["id"]]
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_status(self.coordinator, None)
+        printed = output.getvalue()
+        self.assertIn("Needs you (1)", printed)
+        self.assertIn("UNVERIFIED", printed)
+        self.assertIn(worker["id"], printed)
+        # The line stays concise -- one row, no dumped history or invented
+        # project/task facts beyond what the message itself already recorded.
+        self.assertEqual(
+            sum(1 for line in printed.splitlines() if worker["id"] in line), 1
+        )
+
     def test_all_palette_colours_map_to_unique_nonempty_glyphs(self) -> None:
         # Several projects report into one session and a line without its
         # project is ambiguous, so the glyph is the separator. The palette held

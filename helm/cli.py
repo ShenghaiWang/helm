@@ -726,8 +726,13 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
             first = next(
                 (line.strip() for line in item["text"].splitlines() if line.strip()), ""
             )
+            # A diagnostic entry could not be checked against a live record --
+            # its worker or task is missing -- so the line says that plainly
+            # rather than presenting it as an ordinary, verified escalation.
+            mark = " [UNVERIFIED: worker or task record missing]" if item.get("diagnostic") else ""
             print(
-                f"  {glyph} {item['kind']:15} {item['role']:8} {item['worker_id']}  {first[:88]}"
+                f"  {glyph} {item['kind']:15} {item['role']:8} {item['worker_id']}  "
+                f"{first[:88]}{mark}"
             )
         print()
     # A worker result nobody merged is not an escalation -- no agent is stuck
