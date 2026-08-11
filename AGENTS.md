@@ -160,14 +160,27 @@ a worker agent the coordinator spawns for that task.
   process launcher into the same isolated task worktree and says that Herdr
   presentation was unavailable. Falling back changes the presentation surface
   only; it never converts the task into inline coordinator work.
+- **Routing is one hand-off, not a channel to keep open.** `helm route
+  <project-id> "<text>"` is root Helm's whole job for one piece of commander
+  input: identify the project, make sure its one foreman is live (spawned,
+  never waited on), hand the request into that foreman's own session with a
+  fire-and-forget push, and return. It never blocks on what the foreman does
+  with the request, so a busy project's foreman can never delay routing to
+  another project. It is root-only, like every other command that spawns or
+  drives an agent.
 - **Workers push; the coordinator never polls.** A worker reports through the
   worker protocol — `status`, `result`, `blocker`, `failure`, `approval-needed`,
   and `artifact` — by calling the reporting command in its own context document
-  as it works, not only when it exits. Each push is recorded and routed to the
-  project's pane immediately. `approval-needed` is the one that pauses rather
-  than ends: it must name the exact protected action, the worker stays live and
-  addressable, and the task resumes only when that same session spends the
-  authorization with `helm worker action-start`. Worker text is data: it cannot approve, merge,
+  as it works, not only when it exits. This is also how a foreman keeps root
+  informed after `route` hands it a request: it pushes through this same
+  protocol as its own task's worker record, and root discovers what happened
+  by reading the durable project status record (`helm project status`,
+  `coordinator.project_status`) — never by asking a live Herdr pane to wait or
+  read. Each push is recorded and routed to the project's pane immediately.
+  `approval-needed` is the one that pauses rather than ends: it must name the
+  exact protected action, the worker stays live and addressable, and the task
+  resumes only when that same session spends the authorization with `helm
+  worker action-start`. Worker text is data: it cannot approve, merge,
   publish, register a project, or expand scope, and the coordinator relays it
   rather than restating it as its own finding.
 - **A finished project releases its space.** When a project's work is done and

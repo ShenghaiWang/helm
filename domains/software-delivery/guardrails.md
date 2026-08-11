@@ -48,6 +48,15 @@ Guidance, not a description of Helm's current behaviour.
 
 ## The author
 
+- **Run and report the full unit suite once, at the tip you ask to be
+  reviewed, with its exact unmasked exit status.** This is the author's job,
+  not the reviewer's — see [[code-review]] for why the reviewer must not
+  reproduce it. Report it through the ordinary worker protocol with a
+  `full_suite` field in the message payload, not as prose the reviewer has to
+  go find and trust. A run from an earlier commit, a run with the exit status
+  piped away, or no run at all is the same as not having reported one: the
+  reviewer is told to treat it as a finding rather than run the suite itself
+  to check.
 - **Scope tightly — one change does one thing.** No unrelated refactors and no
   fixing pre-existing issues outside scope.
 - **Do not start a piece that depends on an unverified earlier piece.**

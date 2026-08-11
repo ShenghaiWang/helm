@@ -306,6 +306,108 @@ class ReviewTests(HelmTestCase):
             ).stdout,
         )
 
+    def test_the_reviewer_brief_forbids_rerunning_the_full_suite(self) -> None:
+        """Reviewer guidance must prohibit duplicated full-suite runs.
+
+        The author is the one required to run and report the full unit
+        suite; the reviewer's brief must say plainly not to rerun it, that
+        focused/risk-targeted tests are the reviewer's own allowance, and
+        that missing/stale/masked/failed author evidence is a finding, not
+        something the reviewer resolves by running the suite itself.
+        """
+        root = self.repo("noduprun")
+        project = self.coordinator.register_project(
+            "NoDup", str(root), project_id="noduprun"
+        )
+        task = self.coordinator.create_task(project["id"], "add a helper")
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.commit_on_task_branch(task)
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("already ran and reported the FULL unit suite", brief)
+        self.assertIn("Do NOT rerun the full suite", brief)
+        self.assertIn("focused, risk-targeted tests", brief)
+        self.assertIn("do not run the suite yourself", brief)
+        self.assertIn("report that as a finding instead", brief)
+
+    def test_the_reviewer_brief_quotes_the_authors_reported_full_suite_evidence(self) -> None:
+        """The reviewer must be able to judge the author's own full-suite report.
+
+        Prohibiting a rerun only works if the reviewer can actually see what
+        the author claims -- otherwise the rule just hides the evidence
+        instead of removing the duplicate work.
+        """
+        task, worker = self._artifact_task("suiteevidence")
+        self.coordinator.record_worker_message(
+            worker["id"],
+            "status",
+            "ready for review",
+            payload={
+                "summary": True,
+                "full_suite": "pytest -q: 547 passed, 0 failed, exit 0",
+            },
+        )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("AUTHOR'S FULL-SUITE EVIDENCE", brief)
+        self.assertIn(json.dumps("pytest -q: 547 passed, 0 failed, exit 0"), brief)
+        self.assertNotIn("MISSING", brief)
+
+    def test_the_reviewer_brief_reports_a_real_timestamp_for_the_full_suite_evidence(self) -> None:
+        """The reported time must come from the message's own record, not read blank.
+
+        The message store's field is `created_at`; a mismatched key here
+        would silently quote an empty string forever, which a reviewer has
+        no way to notice is wrong -- it still looks like a normal-shaped
+        brief. Pin it to the actual `created_at` this test itself observes,
+        not just "is non-empty", so a future field rename is caught here
+        rather than by a reviewer trusting a lie.
+        """
+        task, worker = self._artifact_task("suitetimestamp")
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "ready for review",
+            payload={"summary": True, "full_suite": "pytest -q: 12 passed, 0 failed, exit 0"},
+        )
+        messages = self.coordinator.store.load()["messages"]
+        reported = next(
+            m for m in messages
+            if m.get("worker_id") == worker["id"] and (m.get("payload") or {}).get("full_suite")
+        )
+        created_at = reported["created_at"]
+        self.assertTrue(created_at)
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn(f"Reported at {json.dumps(created_at)}", brief)
+
+    def test_the_reviewer_brief_uses_the_latest_full_suite_report_on_the_task(self) -> None:
+        """A stale early report must not shadow a fresher one from the same task."""
+        task, worker = self._artifact_task("suitelatest")
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "first pass",
+            payload={"summary": True, "full_suite": "pytest -q: 3 failed, exit 1"},
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "fixed and reran",
+            payload={"summary": True, "full_suite": "pytest -q: 547 passed, 0 failed, exit 0"},
+        )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn(json.dumps("pytest -q: 547 passed, 0 failed, exit 0"), brief)
+        self.assertNotIn(json.dumps("pytest -q: 3 failed, exit 1"), brief)
+
+    def test_the_reviewer_brief_marks_full_suite_evidence_explicitly_missing(self) -> None:
+        """Absence must read as a stated fact, not as silence the reviewer has to notice."""
+        task, worker = self._artifact_task("suitemissing")
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("AUTHOR'S FULL-SUITE EVIDENCE: MISSING", brief)
+        self.assertIn("report the absence as a finding", brief)
+
     def test_the_reviewer_brief_stays_quiet_when_no_artifact_was_reported(self) -> None:
         """No artifacts means no paragraph, not an empty list to read past."""
         root = self.repo("noartifact")
@@ -764,7 +866,7 @@ class ReviewTests(HelmTestCase):
         for mandatory in (
             "FIRST WORD",
             "APPROVED or CHANGES-REQUESTED",
-            "You MAY run the test suite",
+            "Do NOT rerun the full suite",
             "code-review domain",
         ):
             self.assertIn(mandatory, brief, mandatory)

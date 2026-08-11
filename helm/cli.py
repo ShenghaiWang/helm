@@ -1333,6 +1333,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="start the foreman as a plain process instead of in the project's space",
     )
 
+    route = commands.add_parser(
+        "route",
+        help="hand a request to one project's foreman and return immediately",
+    )
+    route.add_argument("project_id")
+    route.add_argument("text", help="the request text for that project's foreman")
+    route.add_argument("--agent",
+        help="agent runtime or configured profile for a foreman route appoints "
+        "(built in: claude, codex, pi, opencode); ignored if the project already has one")
+    route.add_argument("--model",
+        help="model for a foreman route appoints; overrides the project pin and HELM_MODEL; "
+        "ignored if the project already has one")
+    route.add_argument("--command", dest="worker_command_text",
+        help="foreman command, parsed without a shell; only used if route appoints a foreman")
+    route.add_argument(
+        "--no-herdr", dest="herdr", action="store_false", default=True,
+        help="appoint a missing foreman as a plain process instead of in the project's space",
+    )
+
     board = commands.add_parser(
         "board", help="write a single page showing what every agent produced"
     )
@@ -1736,17 +1755,31 @@ def _runner_failure(config_path: str, detail: str) -> int:
 
 
 def _start_foreman(
-    coordinator: Coordinator, project_id: str, *, herdr: bool = True
+    coordinator: Coordinator,
+    project_id: str,
+    *,
+    herdr: bool = True,
+    command: str | None = None,
+    agent: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
-    task = coordinator.create_foreman_task(project_id)
+    task = coordinator.create_foreman_task(project_id, agent=agent, model=model)
     if herdr:
-        worker = HerdrAdapter(coordinator).launch_task(task["id"], None, wait=False)
+        worker = HerdrAdapter(coordinator).launch_task(task["id"], command, wait=False)
     else:
-        worker = coordinator.launch_worker(task["id"], None, wait=False)
+        worker = coordinator.launch_worker(task["id"], command, wait=False)
     return {"task": task, "worker": worker}
 
 
-def _ensure_foreman(coordinator: Coordinator, project_id: str, *, herdr: bool = True) -> None:
+def _ensure_foreman(
+    coordinator: Coordinator,
+    project_id: str,
+    *,
+    herdr: bool = True,
+    command: str | None = None,
+    agent: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any] | None:
     """Appoint a declared project's foreman if it has none.
 
     The project states this once in its own file, so the coordinator does not
@@ -1759,16 +1792,18 @@ def _ensure_foreman(coordinator: Coordinator, project_id: str, *, herdr: bool = 
     """
     try:
         if not coordinator.project_wants_foreman(project_id):
-            return
+            return None
         if coordinator.foreman_for(project_id) is not None:
-            return
-        started = _start_foreman(coordinator, project_id, herdr=herdr)
+            return None
+        started = _start_foreman(
+            coordinator, project_id, herdr=herdr, command=command, agent=agent, model=model
+        )
     except (HelmError, SafetyError, OSError) as exc:
         print(
             f"helm: {project_id} asks for a foreman and has none; could not start one: {exc}",
             file=sys.stderr,
         )
-        return
+        return None
     # Say where the decision actually came from. This claimed
     # ".helm/project.json" unconditionally, including for the projects that
     # have no such file -- asserting a declaration the user never wrote, about
@@ -1785,6 +1820,7 @@ def _ensure_foreman(coordinator: Coordinator, project_id: str, *, herdr: bool = 
         f"{_glyph_for(coordinator, project_id)} {project_id} appointed foreman "
         f"{started['worker']['id']} ({source})"
     )
+    return started
 
 
 def _doctor_command(
@@ -1960,6 +1996,11 @@ _ROOT_ONLY_COMMANDS = frozenset({
     ("learning", "reject"),
     ("learning", "apply"),
     ("foreman", None),
+    # Routing is root Helm's own job: identify the project, ensure its
+    # foreman is live, hand off, and return without waiting on that
+    # foreman's own work. A worker or foreman routing on its own behalf
+    # would be the second driver this file elsewhere refuses.
+    ("route", None),
 })
 # Delegation is one level deep: a foreman spawns workers, a worker spawns
 # nothing. Everything that starts or drives another agent is therefore the
@@ -2644,6 +2685,125 @@ def main(argv: list[str] | None = None) -> int:
             # A non-zero exit lets a scheduled check page a human without
             # anyone reading the output.
             return 1 if attention else 0
+
+        if args.command == "route":
+            # Root Helm's whole job for one input: identify the project,
+            # make sure its one foreman is live, hand the request off, and
+            # come straight back -- never wait for that foreman to act on
+            # it. Ensuring the foreman only ever spawns (wait=False); the
+            # handoff itself is a pane send-text plus Enter, not a call that
+            # blocks on the foreman's own work. Neither step waits on what
+            # the foreman does with the request, so this command never
+            # becomes the thing that makes one busy project's input hold up
+            # another project's -- independent of how long either step
+            # itself happens to take.
+            #
+            # Truthful, not optimistic: the project's own decision to decline
+            # a foreman is reported as exactly that, not folded into the
+            # generic "could not start one" path used for an actual failure.
+            coordinator.get_project(args.project_id)  # truthful "unknown project" first
+            if not coordinator.project_wants_foreman(args.project_id):
+                raise HelmError(
+                    f'{args.project_id} has declined a foreman ("foreman": false in its '
+                    "own record or .helm/project.json); there is nothing for route to hand "
+                    "this request to. Appoint one explicitly with helm foreman "
+                    f"{args.project_id} first if you want to route to it anyway."
+                )
+            existing = coordinator.foreman_for(args.project_id)
+            started = None
+            if existing is None:
+                started = _ensure_foreman(
+                    coordinator, args.project_id, herdr=args.herdr,
+                    command=args.worker_command_text, agent=args.agent, model=args.model,
+                )
+                foreman = coordinator.foreman_for(args.project_id)
+            else:
+                foreman = existing
+            if foreman is None:
+                raise HelmError(
+                    f"{args.project_id} has no live foreman to route to; appointing one "
+                    "failed -- see the message above for why"
+                )
+            # Record first, always, while the worker is still whatever it
+            # currently is: the request is part of the project's durable
+            # record whether or not a presentation surface can deliver it,
+            # the same guarantee `helm worker answer` gives a worker's
+            # reply. This is safe to do before checking reachability
+            # because `record_worker_message` no longer touches this
+            # worker's `last_reported_at` for an `answer` push -- that field
+            # is the worker's own liveness signal, and an outbound message
+            # Helm is delivering is not evidence the worker is alive, let
+            # alone that it received it. Recording after the reachability
+            # check would instead let `session_reachable`'s own
+            # reconciliation of a dead Herdr pane (it settles the worker to
+            # "failed" -- the strongest evidence available that the session
+            # is over) run first and leave no running worker left to record
+            # onto, silently dropping the request while still saying
+            # "recorded". Recording first closes that gap: the request
+            # survives in the durable record regardless of what
+            # reachability turns out to be.
+            task = coordinator.record_worker_message(foreman["id"], "answer", args.text)
+            # Reachability is checked after recording, and is unaffected by
+            # having just recorded: `session_reachable` asks whether there
+            # is a live Herdr pane, with a provider that confirms it, for
+            # this worker right now -- not whether it has spoken recently.
+            # It is correct for a plain-process foreman too (no `helm herdr`
+            # input channel to send into at all) and for a foreman mid-task
+            # or quietly idle (both reachable, neither is what this checks).
+            # A foreman appointed by this very call is a separate case,
+            # handled below via `started is not None` -- its process was
+            # just spawned and cannot have a ready pane yet regardless of
+            # what `session_reachable` would say.
+            reachable = started is None and HerdrAdapter(coordinator).session_reachable(
+                foreman["id"]
+            )
+            if started is not None:
+                # A foreman appointed this call cannot have a ready pane yet
+                # -- the agent process was just spawned and has not had time
+                # to start reading, let alone attach a shell it can accept
+                # text into. Sending into it now is a race that would either
+                # be silently swallowed by a not-yet-listening pane or wedge
+                # ahead of the agent's own startup output; either way a
+                # "delivered" claim here would be false. The record above is
+                # what makes the request survive regardless: the foreman's
+                # own brief-time status read (`foreman_brief`,
+                # `helm project status`) surfaces it once it comes up.
+                print(
+                    f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
+                    f"newly appointed foreman {foreman['id']} task={task['id']} "
+                    "[recorded; foreman is still starting -- it will read this from its own "
+                    "status once it comes up, not a live pane send]"
+                )
+                return 0
+            if not reachable:
+                # A live worker record with nothing that can actually
+                # receive text: a plain-process foreman with no Herdr pane
+                # at all, or a Herdr pane the provider says is gone or was
+                # closed by hand. Neither is "unhealthy" in the sense
+                # `worker_health` reports (a busy or quietly idle foreman
+                # is not that), so this checks reachability directly rather
+                # than reusing that verdict. Never claim a delivery that
+                # could not have happened; one foreman per project is
+                # preserved -- this does not stop or replace it, only says
+                # how to if that is wanted.
+                print(
+                    f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
+                    f"foreman {foreman['id']} task={task['id']} "
+                    "[recorded only; its foreman has no reachable session to send into -- "
+                    "either a plain process with no input channel, or its Herdr pane is gone. "
+                    f"Replace it with: helm worker stop {foreman['id']} --reason \"...\" "
+                    f"&& helm foreman {args.project_id}]"
+                )
+                return 0
+            delivered = False
+            with contextlib.suppress(HelmError, OSError):
+                delivered = HerdrAdapter(coordinator).answer_worker(foreman["id"], args.text)
+            print(
+                f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
+                f"foreman {foreman['id']} task={task['id']} "
+                f"[{'delivered' if delivered else 'recorded only; the send itself failed'}]"
+            )
+            return 0
 
         if args.command == "foreman":
             existing = coordinator.foreman_for(args.project_id)

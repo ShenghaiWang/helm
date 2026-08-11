@@ -972,6 +972,64 @@ correct it; anything keyed on a live worker is then wrong permanently. The log
 and worktree are kept as evidence — `helm task cleanup` removes those
 deliberately, afterwards.
 
+### `route` hands one input to one project's foreman, and returns
+
+```sh
+helm route PROJECT "the request, in the commander's own words" [--agent ...] [--model ...] [--no-herdr]
+```
+
+This is root Helm's whole job for one piece of commander input: identify the
+project, make sure its one foreman is live, hand the request off, and come
+straight back. It never waits on what the foreman does with the request — a
+missing foreman is appointed with `wait=False`, an existing one is handed the
+text with a fire-and-forget pane send, and either way the call returns without
+sitting on that foreman's own work. A busy project's foreman can never delay
+`route` for another project.
+
+For an *existing* foreman, the request is recorded on its task first, always
+— the same guarantee `helm worker answer` gives a worker's reply — and only
+then does `route` check whether anything is actually there to send it to.
+That order matters: `session_reachable` is what answers the second question,
+and one of the things it does when a Herdr pane turns out to be gone is
+settle that worker's own record to `failed` right then, as the strongest
+evidence available that its session is over. Checking reachability *before*
+recording would let that reconciliation run first and leave no running worker
+left to record onto — silently dropping the request while still claiming
+"recorded". Recording first closes that gap, and is safe to do unconditionally
+because delivering this kind of message never refreshes the worker's own
+liveness signal (`last_reported_at` reflects only what the worker itself has
+reported, never an outbound push `route`/`helm worker answer` deliver to it) —
+so recording first cannot make a dead pane read as fresher than it is.
+
+- **a foreman appointed by this call** — its agent process was just spawned
+  and cannot have a pane ready to receive text yet, so nothing is sent into
+  one. The output says `recorded` and `starting`, never `delivered`; the
+  foreman picks the request up when it reads its own status
+  (`foreman_brief`, `helm project status`).
+- **an existing foreman with a live, provider-confirmed Herdr pane** —
+  `session_reachable` is the actual question asked: is there a pane Helm
+  owns for this worker, and does the provider confirm it is really there.
+  It says nothing about how busy or quiet the foreman has been — driving its
+  project hard or sitting correctly idle both read as reachable — so both
+  get the text sent into their live session, and the output says
+  `[delivered]` only if that send itself actually succeeded (`recorded only;
+  the send itself failed` otherwise).
+- **an existing foreman with no reachable session** — a plain-process
+  foreman (no Herdr pane and no input channel Helm owns at all, so always
+  unreachable), or a Herdr pane the provider says is gone or was closed by
+  hand. Either way `route` refuses to send into a pane nobody is reading and
+  reports `recorded only`, with the request already durably on record from
+  the step above. Reconciling a dead pane may settle that foreman's worker
+  record to `failed`, in which case the output also says how to appoint a
+  replacement (`helm foreman PROJECT`) — but `route` never stops or replaces
+  it automatically; one foreman per project is preserved.
+
+Ongoing reporting from the foreman back to root stays push-based after this
+one hand-off, the same as any worker: `status`/`result`/`blocker`/
+`approval-needed` through the ordinary worker protocol, landing durably in
+the project's status record. Root reads that record; nothing about routing or
+reporting asks a live Herdr pane to wait or poll.
+
 ### A foreman drives one project's loops
 
 ```sh
@@ -1397,6 +1455,7 @@ helm learning propose|list|inspect|edit|approve|reject|apply
 helm worker launch|poll|wait|message|answer|stop
 helm herdr launch|poll|wait|relabel|cleanup|cleanup-project|cleanup-coordinator
 helm foreman PROJECT [--agent PROFILE] [--command CMD] [--no-herdr]
+helm route PROJECT TEXT [--agent PROFILE] [--model M] [--command CMD] [--no-herdr]
 helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N]
 helm skills PROJECT [--agent A] [--brief TEXT]
 helm board [--out PATH] [--open]

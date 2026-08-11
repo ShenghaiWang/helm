@@ -59,6 +59,35 @@ the diff and check both directions: does the change do what the spec says,
 and does the spec still describe what the change does. A spec that is wrong
 is a finding like any other, reported rather than quietly worked around.
 
+## Full-suite evidence belongs to the author, once
+
+The author runs the full unit suite once it believes the change is done, at
+the exact tip it is asking to be reviewed -- not an earlier commit, not a
+stale run from before the last fix -- and reports the result through the
+ordinary worker protocol with a `full_suite` field in the message payload
+(`helm worker message <id> --type result --text "..." --payload
+'{"full_suite": "<command>: <exact unmasked counts and exit status>"}'`).
+"Unmasked" means the real exit status is visible in what is reported, not
+piped through something that could swallow it (`... | tail`, a wrapper that
+always exits 0) and not simply asserted with no counts behind it. Helm quotes
+the latest such report into the reviewer's own brief automatically -- see
+`HerdrAdapter._full_suite_evidence` -- so the reviewer never has to go
+looking for it or take the author's earlier prose at its word.
+
+The reviewer's job is to inspect code and that evidence, not to reproduce it:
+rerunning the full suite is duplicated work, not independent verification,
+since a green rerun proves nothing the author's own report did not and a red
+one is not something a reviewer is positioned to triage. A reviewer may still
+run the type checker, the linter, and a small number of focused,
+risk-targeted tests aimed at the lines it is unsure of.
+
+If the author's full-suite evidence is absent, stale (predates the diff
+under review), masked (no visible exit status, or piped through something
+that could swallow one), or reports a failure, the reviewer does not run the
+suite to settle it. That gap is itself a finding: report it and hand the
+change back to the author instead of resolving it by rerunning what should
+already have been run.
+
 ## What the reviewer checks
 
 Correctness first. Then whether the tests were kept in sync with the change,

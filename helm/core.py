@@ -4735,6 +4735,20 @@ class Coordinator:
             return
         workspace = canonical(task["workspace"])
         root = canonical(project["root"])
+        if task.get("role") in WORKTREELESS_ROLES:
+            # A foreman or reviewer task never had a git worktree or branch
+            # -- allocate_task gave it a plain state directory instead (see
+            # `branch = None` above) -- so there is nothing here for a git
+            # worktree/branch command to undo. Passing `task["branch"]`
+            # (None) into `git branch -D` would crash rollback itself with
+            # a TypeError, turning a policy refusal into an unhandled
+            # exception and an orphaned worktreeless task. Only its own
+            # directory needs shedding.
+            if workspace.exists():
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(workspace)
+            task["allocated_at"] = None
+            return
         if workspace.exists():
             _git(root, "worktree", "remove", str(workspace), check=False)
         _git(root, "branch", "-D", task["branch"], check=False)
@@ -5603,6 +5617,18 @@ class Coordinator:
         "question", "answer",
     })
 
+    #: The one kind in WORKER_MESSAGE_KINDS that the worker did not send --
+    #: `answer` is Helm's own reply to a worker's question, or (via `helm
+    #: route`) a request handed to a foreman's task. Recorded on the same
+    #: worker/task for the same durable-record reasons as everything else
+    #: here, but it must never refresh `last_reported_at`: that field is the
+    #: worker's own liveness signal (`_worker_last_message_at` -- "when the
+    #: worker itself last pushed, ignoring Helm's own messages"), and an
+    #: outbound push is not evidence the worker is alive to receive it, let
+    #: alone that it did. Treating it as such let a request delivered to a
+    #: pane that had actually just died read as freshly "healthy".
+    _COORDINATOR_ORIGINATED_MESSAGE_KINDS = frozenset({"answer"})
+
     @staticmethod
     def _receipts(payload: dict[str, Any]) -> list[Any]:
         """Post-action evidence a worker reported: remote ids, URLs, tracker refs.
@@ -5882,7 +5908,8 @@ class Coordinator:
             if late:
                 task["status"] = self._TERMINAL_MESSAGE_TASK_STATE[kind]
             self._exit_mismatch_evidence(data, project, task, worker, kind)
-        worker["last_reported_at"] = now()
+        if kind not in self._COORDINATOR_ORIGINATED_MESSAGE_KINDS:
+            worker["last_reported_at"] = now()
         latest = self.latest_hold(task)
         return self._event_metadata(
             task, worker, kind, text, payload, hold_event, latest, data

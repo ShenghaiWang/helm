@@ -144,14 +144,23 @@ class DeliveryTests(HelmTestCase):
         A worker directory is scratch space as well as a log -- one spike had
         pointed Xcode's derivedDataPath at it and left 15 GB behind -- and 110
         of 126 belonged to tasks whose worktree had already been cleaned.
+
+        Prepared as an external worker rather than launched as a real
+        `wait=False` process: a real runner keeps writing into its own worker
+        directory (log rotation, config touches) for a moment after the exit
+        file and result are recorded, which raced this assertion when the
+        full suite ran fast enough for cleanup to land inside that window.
+        `prepare_external_worker` gives the same worker-directory layout
+        (config/log/exit files) with no process behind it to race, so the
+        test is deterministic without weakening what cleanup itself asserts.
         """
         root = self.repo("workerdirs")
         project = self.coordinator.register_project(
             "WorkerDirs", str(root), project_id="workerdirs"
         )
         task = self.coordinator.create_task(project["id"], "do it")
-        worker = self.coordinator.launch_worker(
-            task["id"], [sys.executable, "-c", ""], wait=False
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
         )
         worker_dir = Path(worker["config_file"]).parent
         # Scratch an agent left behind, not just its log.
