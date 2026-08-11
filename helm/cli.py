@@ -721,8 +721,73 @@ def _print_approval_grants(coordinator: Coordinator, *, include_revoked: bool = 
         )
 
 
+#: Update lines that restate a decision this view already prints in full.
+#: Echoing them above the real thing is not extra safety -- it pushes the
+#: one genuinely new line (a foreman's report) off the top of the screen
+#: behind twelve copies of a decision that is listed below anyway.
+_DECISION_UPDATE_PREFIXES = ("DECISION REQUIRED:", "ACTION REQUIRED:")
+
+
+def _print_new_project_updates(
+    coordinator: Coordinator,
+    project_id: str | None,
+    *,
+    heading: str,
+    skip_decisions: bool = False,
+) -> None:
+    """Surface foreman/worker pushes the root has not been shown yet.
+
+    A push lands in the durable record and stops there: nothing carries it
+    into the root's own session, so it reached the commander only if the
+    coordinator happened to re-read the project. That made relaying a
+    finished investigation depend on the coordinator remembering to look,
+    which is the same failure mode as every other rule that lives only in
+    prose -- and it fails silently, because an unread report and a project
+    with nothing to say are indistinguishable from the root.
+
+    So every root command that touches a project says what arrived since it
+    last looked. Marking them seen here is deliberate and matches `watch`:
+    they have now been shown to the root, and repeating them forever would
+    train the reader to skip exactly the lines that matter.
+    """
+    with contextlib.suppress(HelmError, OSError):
+        # Marking happens for everything fetched, including what is filtered
+        # out below: a decision suppressed here is still being shown to the
+        # root, in full, by the caller's own action-item list.
+        updates = coordinator.project_updates_for_watch(project_id)
+        lines = []
+        for update in updates:
+            glyph = f"{update['glyph']} " if update.get("glyph") else ""
+            first = next(
+                (
+                    line.strip()
+                    for line in str(update.get("text", "")).splitlines()
+                    if line.strip()
+                ),
+                "",
+            )
+            if skip_decisions and first.startswith(_DECISION_UPDATE_PREFIXES):
+                continue
+            lines.append(f"  {glyph}{update['project_id']}: {first[:220]}")
+        if not lines:
+            return
+        print(heading)
+        for line in lines:
+            print(line)
+        print()
+
+
 def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
     report = coordinator.status(project_id)
+    # Before anything Helm is doing: what a foreman or worker said that the
+    # root has not seen. A completed investigation nobody relayed is worse
+    # than a noisy line, because it looks like silence.
+    _print_new_project_updates(
+        coordinator,
+        project_id,
+        heading="New since you last looked:",
+        skip_decisions=True,
+    )
     # First, because it is the only part nobody else can act on. Everything
     # below is what Helm is doing; this is what it is waiting on a human for.
     escalations = coordinator.open_escalations(project_id)
@@ -2719,6 +2784,15 @@ def main(argv: list[str] | None = None) -> int:
             # a foreman is reported as exactly that, not folded into the
             # generic "could not start one" path used for an actual failure.
             coordinator.get_project(args.project_id)  # truthful "unknown project" first
+            # Routing is the moment root touches this project, so it is the
+            # moment to say what the project said while nobody was reading.
+            # Printed before the hand-off: a request routed on top of an
+            # unread "investigation complete" is usually the wrong request.
+            _print_new_project_updates(
+                coordinator,
+                args.project_id,
+                heading="Before routing -- new from this project since you last looked:",
+            )
             if not coordinator.project_wants_foreman(args.project_id):
                 raise HelmError(
                     f'{args.project_id} has declined a foreman ("foreman": false in its '

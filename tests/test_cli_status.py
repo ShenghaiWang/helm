@@ -370,6 +370,63 @@ class CliStatusTests(HelmTestCase):
             self.assertEqual(cli.main(["--root", str(helm_root), "watch"]), 0)
         self.assertNotIn("ready for merge decision", output.getvalue())
 
+    def test_status_surfaces_a_foreman_report_the_root_has_not_seen(self) -> None:
+        """A push nobody read is indistinguishable from a project with nothing to say.
+
+        `watch` already bridged the record into the root's session, but the
+        root rarely runs it, so relaying a finished investigation depended on
+        the coordinator remembering to look -- and failed silently when it
+        did not. `status` is what the root actually runs, so it has to say
+        what arrived since last time.
+        """
+        helm_root = self._helm_root("status-updates")
+        destination = helm_root / "projects" / "surfaced"
+        shutil.move(str(self.repo("status-project")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "surfaced")
+        coordinator.record_situation(
+            project["id"], "Foreman report: investigation COMPLETE, four decisions outstanding"
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(["--root", str(helm_root), "status"]), 0)
+        text = output.getvalue()
+        self.assertIn("New since you last looked:", text)
+        self.assertIn("four decisions outstanding", text)
+
+        # Shown once. Repeating it forever trains the reader to skip the
+        # section, which is the failure this exists to prevent.
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(["--root", str(helm_root), "status"]), 0)
+        self.assertNotIn("four decisions outstanding", output.getvalue())
+
+    def test_status_does_not_echo_decisions_it_already_lists_in_full(self) -> None:
+        """The new section must not bury the news under duplicates.
+
+        Delivery and cleanup decisions are printed below in full, with their
+        task ids. Echoing them here pushed the one genuinely new line off the
+        top of the screen behind twelve copies of the same decision.
+        """
+        helm_root = self._helm_root("status-updates-dedup")
+        destination = helm_root / "projects" / "deduped"
+        shutil.move(str(self.repo("dedup-project")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "deduped")
+        coordinator.record_situation(
+            project["id"], "DECISION REQUIRED: Delivery decision needed: read this task's result"
+        )
+        coordinator.record_situation(project["id"], "Foreman report: the actual news")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(["--root", str(helm_root), "status"]), 0)
+        text = output.getvalue()
+        surfaced = text.split("New since you last looked:")[1].split("\n\n")[0]
+        self.assertIn("the actual news", surfaced)
+        self.assertNotIn("DECISION REQUIRED", surfaced)
+
     def test_the_board_shows_what_a_task_produced_without_merging_it(self) -> None:
         root = self.repo("boarding")
         project = self.coordinator.register_project("Board", str(root), project_id="boarding")
