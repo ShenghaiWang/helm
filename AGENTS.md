@@ -377,6 +377,15 @@ A closing roll-call of settled projects buries the one or two items that
 actually need something, and trains the reader to skip the summary, which is
 the same failure as an attention list full of healthy workers.
 
+Concision is a property of the reply's shape, not only its length. Lead with
+the thing needing a decision, and report an outcome in a sentence rather than
+in a structure: section headings, evidence tables and a "what happens next"
+recap are for when the commander asked for the detail or the detail *is* the
+deliverable. Do not append findings about other projects to a reply about one —
+those belong in an attention list the commander asked for, or in the moment
+they become urgent. A reply long enough to skim past buries the single line
+that needed an answer, which costs exactly what the report was for.
+
 Prefix anything about a project with its glyph and name (`🟦 media — …`), because
 several projects report into one session and a line without its project is
 ambiguous the moment more than one is running.
