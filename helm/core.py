@@ -6024,17 +6024,25 @@ class Coordinator:
             if is_foreman
             else "Worker result"
             if kind == "result"
+            else "Worker failure"
+            if kind == "failure"
             else "Worker summary"
         )
         worth_recording = bool(summary) and (
             (is_foreman and kind in {"result", "blocker", "failure", "approval-needed"})
             # A worker's own final result. Without this the one message that
             # says what was actually produced reached only a pane that the
-            # clean-result path is about to release. Deliberately just the
-            # result: a blocker or failure already reaches the commander as
-            # captured evidence and an attention entry, and mirroring those
-            # here too would pad the one log that grows.
+            # clean-result path is about to release.
             or (not is_foreman and kind == "result")
+            # And its failure. This used to be left out on the grounds that a
+            # blocker or failure "already reaches the commander as captured
+            # evidence and an attention entry" -- true of a blocker, which
+            # `open_escalations` lists, and false of a failure, which lists
+            # nowhere. A failed task produced no situation line, no action
+            # item and no escalation: it showed only inside `helm project
+            # status`, under a heading nothing points at. Work that died
+            # looked exactly like work nobody had started.
+            or (not is_foreman and kind == "failure")
             or (kind == "status" and self._summary_payload(payload))
             # A gate opening or resolving is the one thing nobody should have to
             # go looking for, on either intake path.
@@ -6046,6 +6054,14 @@ class Coordinator:
                 self._action_item_from_payload(payload)
                 or self._action_item_from_summary(summary)
             )
+            if kind == "failure" and not action_item:
+                # A failure is a decision the commander owns -- retry, another
+                # round, or cleanup -- and it must not depend on the worker
+                # having phrased its report with a marker word that
+                # `_action_item_from_summary` happens to recognise. Deriving it
+                # from the wording is a denylist, and the failure nobody
+                # phrased conveniently is the one that disappears.
+                action_item = f"Task failed and needs a decision: {summary}"
             if kind == self.HOLD_MESSAGE_KIND and not action_item:
                 # A task paused on the commander is the definition of a
                 # follow-up item; it must not depend on the worker having

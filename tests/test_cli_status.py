@@ -265,6 +265,42 @@ class CliStatusTests(HelmTestCase):
         self.assertTrue(any("ACTION REQUIRED" in update["text"] for update in updates))
         self.assertEqual(self.coordinator.project_updates_for_watch(), [])
 
+    def test_a_failed_task_asks_the_commander_for_a_decision(self) -> None:
+        """A failure has to reach somebody without being phrased just so.
+
+        A blocker is listed by `open_escalations`; a failure was listed
+        nowhere. It raised no action item, no situation line and no
+        escalation, and appeared only under a heading inside `helm project
+        status` that nothing points at -- so a task that died read exactly
+        like a task nobody had started. And deriving the follow-up from marker
+        words in the worker's prose is a denylist: the failure nobody worded
+        conveniently is the one that disappears.
+        """
+        root = self.repo("failing")
+        project = self.coordinator.register_project(
+            "Failing", str(root), project_id="failing"
+        )
+        task = self.coordinator.create_task(project["id"], "do the thing")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        # Deliberately plain prose: no "follow-up", no "action required", no
+        # payload flag -- nothing for a keyword match to catch.
+        self.coordinator.record_worker_message(
+            worker["id"], "failure", "the build broke and I cannot fix it"
+        )
+
+        items = self.coordinator.open_action_items()
+        self.assertTrue(
+            any("the build broke" in item["text"] for item in items),
+            f"a failed task raised no action item: {items}",
+        )
+        situation = self.coordinator.project_status(project["id"])["situation"]
+        self.assertTrue(any("[failed]" in entry["text"] for entry in situation))
+        # And it is owed to the commander, not filed as routine progress.
+        surfaced = self.coordinator.project_updates_for_watch()
+        self.assertTrue(any("the build broke" in u["text"] for u in surfaced))
+
     def test_a_confirmation_gate_is_not_filed_among_the_follow_ups(self) -> None:
         """A gate holding a foreman still outranks a note about later.
 

@@ -875,7 +875,12 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
     needs_attention = [
         entry
         for entry in coordinator.worker_health()
-        if entry["verdict"] not in {"healthy", "settled", "reported", "starting"}
+        # Same healthy set as `watch`, `driving` included for the same reason:
+        # a foreman waiting on a worker it launched is working, and listing it
+        # as needing attention is how a real stall stops standing out.
+        if entry["verdict"] not in {
+            "healthy", "settled", "reported", "starting", "driving",
+        }
         and (project_id is None or entry["project_id"] == project_id)
     ]
     if needs_attention:
