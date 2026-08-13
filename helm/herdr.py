@@ -921,7 +921,16 @@ class HerdrAdapter:
         reviewer_worker: dict[str, Any] | None = None
         verdict = "unresolved"
 
-        for round_number in range(1, max(1, rounds) + 1):
+        # The retry is not a review round and must not be paid for out of the
+        # round budget: with `rounds=1` that would spend the only round on a
+        # reviewer that judged nothing and leave the change unreviewed with the
+        # loop reporting itself finished. So the budget grows by exactly the
+        # one retry, and only for an infrastructure death.
+        review_retried = False
+        rounds_budget = max(1, rounds)
+        round_number = 0
+        while round_number < rounds_budget:
+            round_number += 1
             before = self._message_count()
             # Taken before the reviewer is asked anything, so recovery reads
             # only what this round produced.
@@ -1071,13 +1080,48 @@ class HerdrAdapter:
                     source="Review loop",
                 )
             if round_verdict == "review-unavailable":
+                # Not a verdict. The reviewer died before judging anything --
+                # SIGKILL from the OOM killer is the observed case -- so the
+                # change is unreviewed and the loop has spent a round saying
+                # nothing about it. One retry, on a different runtime, because
+                # one runtime being killed says nothing about another; then
+                # stop, so a machine that is out of memory cannot be made to
+                # buy reviewer after reviewer. Never applied to a real
+                # CHANGES-REQUESTED: that is a judgement and stands.
+                if not review_retried:
+                    review_retried = True
+                    rounds_budget += 1
+                    previous = (reviewer_worker or {}).get("agent_id")
+                    with contextlib.suppress(HelmError, OSError):
+                        self.coordinator.record_task_progress_summary(
+                            task_id,
+                            f"review round {round_number} died on infrastructure "
+                            f"({previous or 'reviewer'} did not survive to judge "
+                            "anything); retrying once on a different runtime",
+                            source="Review loop",
+                        )
+                    with contextlib.suppress(HelmError, OSError):
+                        self.coordinator.stop_worker(reviewer_worker["id"])
+                    with contextlib.suppress(HelmError):
+                        choice = self.coordinator.pick_reviewer_agent(
+                            author.get("agent_id"),
+                            explicit=None,
+                            model=reviewer_model,
+                            exclude=[previous] if previous else None,
+                        )
+                    reviewer_worker = None
+                    continue
                 verdict = "review-unavailable"
                 break
             approved = round_verdict == "approved"
             if approved:
                 verdict = "approved"
                 break
-            if round_number >= rounds:
+            # Against the budget, not the original count: a retry consumed a
+            # `round_number` without consuming a review, so comparing to
+            # `rounds` would declare the loop out of rounds one round early and
+            # call a live disagreement unresolved.
+            if round_number >= rounds_budget:
                 # Bounded on purpose: agreement reached because one side gave
                 # up is not agreement, so the objection stands and a human
                 # decides.
@@ -1114,6 +1158,22 @@ class HerdrAdapter:
                         source="Review loop",
                     )
 
+        if verdict in {"review-unavailable", "timeout"}:
+            # The change is now UNREVIEWED, and nothing above says so where a
+            # commander looks: the loop's own progress lines are routine status
+            # pushes, which is exactly the class that does not get surfaced. So
+            # a reviewer killed by the OOM killer left work looking reviewed
+            # and finished. Raise it as the project's own action item, which is
+            # a gate rather than a note and keeps showing until it is answered.
+            with contextlib.suppress(HelmError, OSError):
+                self.coordinator.record_project_action_item(
+                    task["project_id"],
+                    f"Review did not complete for task {task_id} ({verdict}) after "
+                    f"{len(history)} round(s) -- the change on {task.get('branch')} is "
+                    "UNREVIEWED. Relaunch the review, or decide it without one.",
+                    source="Review loop",
+                    task_id=task_id,
+                )
         return {
             "task_id": task_id,
             "author_agent": author.get("agent_id"),

@@ -2756,7 +2756,15 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             attention = 0
             for entry in report:
-                healthy = entry["verdict"] in {"healthy", "settled", "reported", "starting"}
+                # `driving` belongs here: a foreman waiting on a worker it
+                # launched is doing its job, not failing. Left out, it fell to
+                # the foreman branch below and every healthy driver was stamped
+                # "nothing is driving it" -- so the one row that was fine read
+                # exactly like the two that were genuinely down, and the whole
+                # signal stopped being worth reading.
+                healthy = entry["verdict"] in {
+                    "healthy", "settled", "reported", "starting", "driving",
+                }
                 if healthy:
                     mark = ""
                 elif entry.get("role") == "foreman":

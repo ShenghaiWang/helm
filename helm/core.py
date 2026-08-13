@@ -3926,6 +3926,7 @@ class Coordinator:
         explicit: str | None = None,
         model: str | None = None,
         interactive: bool = True,
+        exclude: list[str] | None = None,
     ) -> dict[str, Any]:
         """Choose something other than the author to review the author's work.
 
@@ -3934,8 +3935,17 @@ class Coordinator:
         the `code-review` domain: a different runtime, then a different model
         on the same runtime, and a same-model review only when it is labelled
         as the weak check it is.
+
+        ``exclude`` rules out runtimes for this pick alone -- the retry after a
+        reviewer dies on infrastructure passes the one that just died, so the
+        second attempt is not the same runtime failing the same way. It is the
+        caller's situational judgement rather than the root's cost policy, so
+        it narrows the automatic search only; an `explicit` choice is still
+        refused solely by the root's own exclusions, whose message tells the
+        commander to edit a preference that would have nothing to do with this.
         """
         excluded = self.review_excluded_agents()
+        situational = {name for name in (exclude or []) if name}
         if explicit is not None:
             if explicit in excluded:
                 # A cost policy an agent could route around by naming the
@@ -3964,7 +3974,9 @@ class Coordinator:
         available = [
             entry["id"]
             for entry in self.builtin_runtime_availability()
-            if entry["available"] and entry["id"] not in excluded
+            if entry["available"]
+            and entry["id"] not in excluded
+            and entry["id"] not in situational
         ]
         constraint = self.preferences().constraint_for(model)
         if constraint is not None:
