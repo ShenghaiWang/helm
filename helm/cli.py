@@ -15,6 +15,7 @@ from typing import Any
 from .core import (
     AUTHORITY_ENV,
     DELIVERY_DECISION_KIND,
+    BLOCKING_GATE_KINDS,
     GATE_ACTION_KINDS,
     PROTECTED_ACTIONS,
     Coordinator,
@@ -811,6 +812,24 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
     # on it -- so it never reached this view, and a fresh coordinator saw a
     # quiet project instead of a change waiting on a decision.
     pending = coordinator.open_action_items(project_id)
+    # A confirmation gate is not a follow-up: a foreman is stopped behind it and
+    # can launch nothing until it is answered. Printed among the delivery and
+    # cleanup decisions it sorted level with branches nobody has swept in a
+    # week, and a list that long is one the reader learns to skip -- which is
+    # how a gate blocking live work sat unanswered while the project looked
+    # merely quiet. It goes beside the escalations, which is the section that
+    # means "nothing moves until you answer".
+    blocking = [i for i in pending if i.get("kind") in BLOCKING_GATE_KINDS]
+    pending = [i for i in pending if i.get("kind") not in BLOCKING_GATE_KINDS]
+    if blocking:
+        print(f"Waiting on your decision ({len(blocking)}):")
+        for item in blocking:
+            task = f" task={item['task_id']}" if item.get("task_id") else ""
+            print(
+                f"  {item['glyph']} {item['project_id']} GATE{task}: "
+                f"{item['text'][:110]}"
+            )
+        print()
     if pending:
         # Delivery gates first: a follow-up is somebody's note about later, and
         # a gate is work sitting still until it is answered.

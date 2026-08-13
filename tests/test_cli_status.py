@@ -265,6 +265,43 @@ class CliStatusTests(HelmTestCase):
         self.assertTrue(any("ACTION REQUIRED" in update["text"] for update in updates))
         self.assertEqual(self.coordinator.project_updates_for_watch(), [])
 
+    def test_a_confirmation_gate_is_not_filed_among_the_follow_ups(self) -> None:
+        """A gate holding a foreman still outranks a note about later.
+
+        Delivery and cleanup decisions trail finished work and can wait. A
+        proposed requirement or solution gate cannot: the foreman is stopped
+        until it is answered. Sorted into the same list they read alike, and a
+        long list is one the reader skips -- which is how a gate blocking live
+        work went unanswered while its project looked merely quiet.
+        """
+        root = self.repo("gated")
+        project = self.coordinator.register_project("Gated", str(root), project_id="gated")
+        # A delivery decision, so the two kinds are present together.
+        done = self.coordinator.create_task(project["id"], "write the change")
+        worker = self.coordinator.launch_worker(
+            done["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        foreman = self.coordinator.create_task(
+            project["id"], "drive this project", role="foreman"
+        )
+        self.coordinator.propose_gate(
+            foreman["id"], "requirement", "ship the thing, excluding the other thing"
+        )
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_status(self.coordinator, None)
+        printed = output.getvalue()
+
+        self.assertIn("Waiting on your decision (1):", printed)
+        gates = printed.split("Waiting on your decision (1):")[1].split("\n\n")[0]
+        self.assertIn(foreman["id"], gates)
+        self.assertNotIn("Delivery decision needed", gates)
+        # And it is gone from the follow-ups rather than printed in both.
+        follow_ups = printed.split("Decisions and follow-ups")[1].split("\n\n")[0]
+        self.assertNotIn(foreman["id"], follow_ups)
+
     def test_status_and_watch_put_the_pending_decision_in_front_of_a_reader(self) -> None:
         root = self.repo("surfaced")
         project = self.coordinator.register_project(

@@ -405,6 +405,13 @@ GATE_ACTION_KINDS = frozenset({
     DELIVERY_DECISION_KIND, FINALIZATION_ACTION_KIND,
     REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND,
 })
+#: The gates that hold work still *right now*: a foreman has stopped and cannot
+#: launch anything until the commander answers. Delivery and cleanup decisions
+#: are gates too, but they trail finished work and can wait a day without
+#: costing anything. Filed together they sort identically, so one blocked
+#: project reads the same as twenty old branches nobody has swept -- and the
+#: list long enough to skip is how a blocking gate goes unanswered for a day.
+BLOCKING_GATE_KINDS = frozenset({REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND})
 DELIVERY_DECISION_TASK_TEXT = (
     "Delivery decision needed: read this task's result, then choose review, "
     "another round, local merge, PR delivery, or cleanup"
