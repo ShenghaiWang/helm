@@ -301,6 +301,38 @@ class CliStatusTests(HelmTestCase):
         surfaced = self.coordinator.project_updates_for_watch()
         self.assertTrue(any("the build broke" in u["text"] for u in surfaced))
 
+    def test_a_session_that_dies_without_reporting_still_raises_the_decision(self) -> None:
+        """The larger half of failures never reported anything at all.
+
+        A worker that sends a `failure` goes through the event path. A worker
+        whose session simply ends -- killed, non-zero exit, lost -- is settled
+        by observation through an internal message that path never sees, so it
+        raised nothing: no item, no escalation. Both routes reach `failed`, so
+        both must reach the commander, and the decision is derived rather than
+        recorded at failure time so neither route can be forgotten.
+        """
+        root = self.repo("dying")
+        project = self.coordinator.register_project(
+            "Dying", str(root), project_id="dying"
+        )
+        task = self.coordinator.create_task(project["id"], "a task whose session dies")
+        self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import sys; sys.exit(3)"], wait=True
+        )
+        self.assertEqual(
+            self.coordinator.store.load()["tasks"][task["id"]]["status"], "failed"
+        )
+
+        items = self.coordinator.open_action_items()
+        self.assertTrue(
+            any(task["id"] in item["text"] for item in items),
+            f"a session that died without reporting raised nothing: {items}",
+        )
+        # Derived, so asking twice does not accumulate duplicates.
+        self.assertEqual(
+            len(self.coordinator.open_action_items()), len(items)
+        )
+
     def test_a_confirmation_gate_is_not_filed_among_the_follow_ups(self) -> None:
         """A gate holding a foreman still outranks a note about later.
 

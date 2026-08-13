@@ -405,6 +405,10 @@ GATE_ACTION_KINDS = frozenset({
     DELIVERY_DECISION_KIND, FINALIZATION_ACTION_KIND,
     REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND,
 })
+#: A task that failed, by either route -- a reported `failure`, or a session
+#: that ended and was settled by observation. See
+#: `Coordinator.refresh_failure_decisions`.
+FAILURE_ACTION_KIND = "failed-task"
 #: The gates that hold work still *right now*: a foreman has stopped and cannot
 #: launch anything until the commander answers. Delivery and cleanup decisions
 #: are gates too, but they trail finished work and can wait a day without
@@ -7584,6 +7588,70 @@ class Coordinator:
                 raised.append(item)
         return {"raised": raised, "resolved": resolved}
 
+    def refresh_failure_decisions(
+        self, project_id: str, data: dict[str, Any] | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Raise a decision for every failed task, however it failed.
+
+        Derived rather than recorded at the moment of failure, because a task
+        reaches `failed` by two routes and only one of them was ever surfaced.
+        A worker that *reports* a `failure` goes through the event path, which
+        now records it. A worker whose session simply ends -- killed, exited
+        non-zero, lost -- is settled by observation through an internal
+        message that never touches that path, so it raised nothing at all.
+        That is the larger half in practice: the failures already on this root
+        are almost all the second kind, filed under a heading in `helm project
+        status` that nothing points at.
+
+        Deriving it covers both without threading the project's file lock
+        through a path that already holds the state lock, and is idempotent:
+        running it twice raises one item, and it resolves itself when the task
+        stops being failed -- retried, continued, or cleaned up.
+        """
+        data = self.store.load() if data is None else data
+        raised: list[dict[str, Any]] = []
+        resolved: list[dict[str, Any]] = []
+        wanted: dict[str, str] = {}
+        for task in data.get("tasks", {}).values():
+            if task.get("project_id") != project_id:
+                continue
+            if task.get("status") != "failed":
+                continue
+            brief = _safe_text(task.get("brief", "")).strip().splitlines()
+            opening = brief[0][:120] if brief else "no brief recorded"
+            wanted[task["id"]] = (
+                f"Task {task['id']} FAILED and needs a decision -- retry it, "
+                f"continue it with a new worker, or clean it up: {opening}"
+            )
+        status = self._load_status(project_id)
+        dirty = False
+        for item in status.get("action_items", []):
+            if item.get("status", "open") != "open":
+                continue
+            if item.get("kind") != FAILURE_ACTION_KIND:
+                continue
+            linked = item.get("task_id")
+            if linked and wanted.pop(linked, None) is not None:
+                continue
+            item["status"] = "resolved"
+            item["resolved_at"] = now()
+            item["resolved_reason"] = "task is no longer failed"
+            resolved.append(item)
+            dirty = True
+        if dirty:
+            self._save_status(project_id, status)
+        for task_id, text in wanted.items():
+            item = self.record_project_action_item(
+                project_id,
+                text,
+                source="helm",
+                task_id=task_id,
+                kind=FAILURE_ACTION_KIND,
+            )
+            if item is not None:
+                raised.append(item)
+        return {"raised": raised, "resolved": resolved}
+
     def compose_outcome_handoff(
         self, worker_id: str, data: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
@@ -7727,6 +7795,7 @@ class Coordinator:
             with contextlib.suppress(HelmError, OSError):
                 self.resolve_delivery_decisions(project["id"], data=data)
                 self.refresh_finalization_decisions(project["id"], data=data)
+                self.refresh_failure_decisions(project["id"], data=data)
             status = self._load_status(project["id"])
             for entry in status.get("action_items", []):
                 if entry.get("status", "open") != "open":
@@ -8230,6 +8299,7 @@ class Coordinator:
         with contextlib.suppress(HelmError, OSError):
             self.resolve_delivery_decisions(project_id, data=data)
             self.refresh_finalization_decisions(project_id, data=data)
+            self.refresh_failure_decisions(project_id, data=data)
         tasks = [t for t in data.get("tasks", {}).values() if t["project_id"] == project_id]
 
         def still_worth_keeping(entry: dict[str, Any]) -> bool:
@@ -8322,6 +8392,7 @@ class Coordinator:
             with contextlib.suppress(HelmError, OSError):
                 self.resolve_delivery_decisions(project["id"], data=data)
                 self.refresh_finalization_decisions(project["id"], data=data)
+                self.refresh_failure_decisions(project["id"], data=data)
             # One transaction per project: this marks what it surfaced, so a
             # concurrent release writing the same record cannot lose either
             # change.
