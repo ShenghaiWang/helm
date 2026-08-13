@@ -6055,6 +6055,15 @@ class Coordinator:
                 if worth_recording
                 else None
             ),
+            # A terminal report is the commander's to hear, not to discover. It
+            # is the answer to "what came of it", so it is never one of the
+            # older lines a busy project's backlog quietly marks seen -- five
+            # dry research rounds went into one project's record exactly that
+            # way, and read as silence. Routine `status` pushes stay ordinary:
+            # surfacing everything is the same failure as surfacing nothing.
+            "situation_surface": (
+                kind in self.TERMINAL_REPORT_KINDS or hold_event == "request"
+            ),
             "source": source,
             "action_item": action_item,
             # The commander's attention item is keyed to the hold, so resolving
@@ -6101,7 +6110,11 @@ class Coordinator:
         project_id = event["project_id"]
         if event["situation"]:
             with contextlib.suppress(HelmError, OSError):
-                self.record_situation(project_id, event["situation"])
+                self.record_situation(
+                    project_id,
+                    event["situation"],
+                    surface=event.get("situation_surface", False),
+                )
         if event["action_item"]:
             with contextlib.suppress(HelmError, OSError):
                 self.record_project_action_item(
@@ -7158,8 +7171,19 @@ class Coordinator:
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    def record_situation(self, project_id: str, line: str, *, supersedes: str = "") -> dict[str, Any]:
+    def record_situation(
+        self,
+        project_id: str,
+        line: str,
+        *,
+        supersedes: str = "",
+        surface: bool = False,
+    ) -> dict[str, Any]:
         """Append one line of context Helm cannot derive.
+
+        ``surface`` marks the line as one the commander is owed rather than one
+        they may go looking for. It changes nothing about how the line is
+        stored; it changes what `pending_updates` is allowed to do with it.
 
         The only growing part of the record, so it is the part with a limit:
         entries beyond the most recent few roll into history that the status
@@ -7188,7 +7212,10 @@ class Coordinator:
             for entry in status["situation"]:
                 if supersedes and entry.get("id") == supersedes:
                     entry["superseded_by"] = now()
-            status["situation"].append({"id": new_id("s"), "at": now(), "text": text})
+            entry = {"id": new_id("s"), "at": now(), "text": text}
+            if surface:
+                entry["surface"] = True
+            status["situation"].append(entry)
             live = [e for e in status["situation"] if not e.get("superseded_by")]
             if len(live) > self.SITUATION_KEPT:
                 excess = len(live) - self.SITUATION_KEPT
@@ -8300,8 +8327,19 @@ class Coordinator:
                         "text": f"{marker}: {entry.get('text', '')}{names}",
                         "kind": "action",
                     })
-                shown = pending[-limit:]
-                hidden = len(pending) - len(shown)
+                # The per-project limit exists so a long-quiet root gets the
+                # current state instead of a transcript. It must not apply to a
+                # terminal report: those are shown in full, however many
+                # arrived, and only routine lines compete for the remaining
+                # room. Marking an unshown result seen is how a result is lost,
+                # and a lost result is indistinguishable from a project that
+                # never reported at all.
+                owed = [entry for entry in pending if entry.get("surface")]
+                routine = [entry for entry in pending if not entry.get("surface")]
+                room = max(0, limit - len(owed))
+                kept = routine[-room:] if room else []
+                shown = sorted(owed + kept, key=lambda e: pending.index(e))
+                hidden = len(routine) - len(kept)
                 if hidden:
                     updates.append({
                         **label,

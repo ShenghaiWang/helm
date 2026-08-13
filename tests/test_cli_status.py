@@ -402,6 +402,33 @@ class CliStatusTests(HelmTestCase):
             self.assertEqual(cli.main(["--root", str(helm_root), "status"]), 0)
         self.assertNotIn("four decisions outstanding", output.getvalue())
 
+    def test_every_terminal_report_survives_the_per_project_limit(self) -> None:
+        """A result the commander never saw must not be marked seen.
+
+        The limit exists so a long-quiet root gets the current state instead of
+        a transcript, and for routine progress that is right. Applied to
+        results it is not: a project that reported five outcomes in a row had
+        the older ones counted into "marked surfaced" and printed nowhere, so
+        the record was complete and the commander still heard nothing.
+        """
+        helm_root = self._helm_root("status-owed")
+        destination = helm_root / "projects" / "owed"
+        shutil.move(str(self.repo("owed-project")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "owed")
+        for index in range(5):
+            coordinator.record_situation(
+                project["id"], f"Worker result: round {index} DRY", surface=True
+            )
+        coordinator.record_situation(project["id"], "routine progress push")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(["--root", str(helm_root), "status"]), 0)
+        text = output.getvalue()
+        for index in range(5):
+            self.assertIn(f"round {index} DRY", text)
+
     def test_status_does_not_echo_decisions_it_already_lists_in_full(self) -> None:
         """The new section must not bury the news under duplicates.
 
