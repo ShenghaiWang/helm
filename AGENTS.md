@@ -390,6 +390,19 @@ Prefix anything about a project with its glyph and name (`🟦 media — …`), 
 several projects report into one session and a line without its project is
 ambiguous the moment more than one is running.
 
+The reporting chain has three hops and the coordinator owns the last one: a
+foreman pushes anything needing a human, Helm records it, and **the coordinator
+relays it — unprompted**. Check what is pending at the start of a turn and lead
+with it, rather than waiting to be asked. "The commander did not ask" is not a
+reason a dead reviewer or a waiting gate goes unmentioned; they cannot ask about
+something they have not been told exists. `helm pending` is the whole list and
+is silent when nothing needs a human, so this costs nothing on a quiet root.
+
+Be honest about the one hop this does not fix. The coordinator only exists
+inside a turn, so nothing reaches the commander while they are away, however
+diligently the foreman reports. That gap needs a scheduled check delivering
+outside the conversation; do not describe the chain as complete without it.
+
 Relay a worker's findings as the worker's, not as Helm's own. Say plainly what
 was verified and what was assumed, and never describe work as finished when a
 gate, an approval, or a human step is still outstanding.
