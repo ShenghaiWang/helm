@@ -897,7 +897,9 @@ def _delete_ref(root: Path, ref: str) -> str | None:
     return f"could not delete temporary ref {ref}: {detail}"
 
 
-def _resolve_task_base(root: Path, base_branch: str, *, fetch: bool) -> dict[str, Any]:
+def _resolve_task_base(
+    root: Path, base_branch: str, *, fetch: bool, local_delivery: bool = False
+) -> dict[str, Any]:
     """Resolve the immutable commit a new task's baseline is cut from.
 
     Reads refs directly and, when `fetch` is true, fetches a configured
@@ -1092,6 +1094,32 @@ def _resolve_task_base(root: Path, base_branch: str, *, fetch: bool) -> dict[str
             "base_notes": notes,
         }
     if merge_base == upstream_sha:
+        if local_delivery:
+            # Under local delivery, `helm task merge` fast-forwards into the
+            # project's own checkout and nothing pushes. So a base branch ahead
+            # of its upstream is not a mistake to reconcile -- it is what this
+            # project looks like the moment any task lands, and refusing it
+            # blocked every following task until a human pushed. That turned a
+            # merge into a hidden precondition for the next piece of work, on
+            # exactly the projects that chose not to push at all.
+            #
+            # Nothing is being guessed here: the local tip strictly CONTAINS
+            # the upstream, so it is the newer of the two and a baseline cut
+            # from it includes everything the upstream has. Divergence, where
+            # the two really have contradicted each other, still refuses below.
+            return {
+                "base_branch": base_branch,
+                "base_revision": local_sha,
+                "base_source": "local (ahead of upstream; project delivers locally)",
+                "base_upstream": upstream_label,
+                "base_fetched": True,
+                "base_resolved_at": now(),
+                "base_notes": notes + [
+                    f"local {base_branch} is ahead of {upstream_label}; accepted "
+                    "because this project's delivery is local, so unpushed merges "
+                    "are its normal state"
+                ],
+            }
         raise HelmError(
             f"base branch {base_branch} is ahead of its upstream {upstream_label}; "
             "push or reconcile it before starting a task -- Helm will not mix "
@@ -3032,7 +3060,12 @@ class Coordinator:
             # Resolution reads and, when fetching, fetches -- it never
             # switches, resets, rebases, merges, or otherwise touches the
             # project's own checkout.
-            base_info = _resolve_task_base(root, snapshot_base_branch, fetch=worktree_backed)
+            base_info = _resolve_task_base(
+                root,
+                snapshot_base_branch,
+                fetch=worktree_backed,
+                local_delivery=policy == "local",
+            )
 
             # Phase 3: write the task record. The project is re-read fresh
             # and checked against what phase 1 resolved against -- a

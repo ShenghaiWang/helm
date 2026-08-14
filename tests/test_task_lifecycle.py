@@ -716,16 +716,50 @@ class TaskLifecycleTests(HelmTestCase):
             self.coordinator.create_task(project["id"], "work with no remote")
         self.assertEqual(self.coordinator.store.load()["tasks"], {})
 
-    def test_local_branch_ahead_of_upstream_blocks(self) -> None:
+    def test_local_branch_ahead_of_upstream_blocks_a_pr_project(self) -> None:
+        """Under PR delivery, unpushed local commits are a real hazard.
+
+        The branch is meant to reach a remote, so a baseline cut from commits
+        no remote has seen is a task built on a foundation the reviewer cannot
+        fetch.
+        """
         root, _bare = self._tracked_repo("aheadlocal")
         project = self.coordinator.register_project(
-            "AheadLocal", str(root), project_id="aheadlocal"
+            "AheadLocal", str(root), project_id="aheadlocal", delivery_policy="pr"
         )
         (root / "unpushed.txt").write_text("mine, not pushed\n", encoding="utf-8")
         self._run_git(root, "add", "unpushed.txt")
         self._run_git(root, "commit", "-qm", "local-only work")
         with self.assertRaisesRegex(HelmError, "ahead of its upstream"):
             self.coordinator.create_task(project["id"], "work on top of unpushed history")
+
+    def test_local_delivery_may_start_a_task_on_its_own_unpushed_merge(self) -> None:
+        """Being ahead is the normal state of a project that never pushes.
+
+        `helm task merge` fast-forwards into the project's own checkout and
+        nothing pushes, so the first merge leaves main ahead of its upstream --
+        and refusing that blocked every following task until a human pushed by
+        hand. A merge became a hidden precondition for the next piece of work,
+        on exactly the projects that chose not to push at all.
+
+        Nothing is guessed: the local tip strictly contains the upstream, so it
+        is the newer of the two. Genuine divergence still refuses.
+        """
+        root, _bare = self._tracked_repo("aheadlocaldelivery")
+        project = self.coordinator.register_project(
+            "AheadLocalDelivery", str(root), project_id="aheadlocaldelivery"
+        )
+        self.assertEqual(project["delivery_policy"], "local")
+        (root / "merged-locally.txt").write_text("delivered, not pushed\n", encoding="utf-8")
+        self._run_git(root, "add", "merged-locally.txt")
+        self._run_git(root, "commit", "-qm", "a task merged locally")
+        local_tip = self._run_git(root, "rev-parse", "HEAD").strip()
+
+        task = self.coordinator.create_task(project["id"], "the next piece of work")
+
+        self.assertEqual(task["base_revision"], local_tip)
+        self.assertIn("ahead of upstream", task["base_source"])
+        self.assertTrue(task["base_fetched"])
 
     def test_local_branch_diverged_from_upstream_blocks(self) -> None:
         root, bare = self._tracked_repo("divergedlocal")
@@ -1340,12 +1374,14 @@ class TaskLifecycleTests(HelmTestCase):
         original = helm_core_module._resolve_task_base
         calls = {"count": 0}
 
-        def racing(root_arg, base_branch, *, fetch):
+        def racing(root_arg, base_branch, *, fetch, local_delivery=False):
             calls["count"] += 1
             if calls["count"] == 1:
                 with self.coordinator.store.locked() as data:
                     data["projects"]["racybase"]["base_branch"] = "other"
-            return original(root_arg, base_branch, fetch=fetch)
+            return original(
+                root_arg, base_branch, fetch=fetch, local_delivery=local_delivery
+            )
 
         with mock.patch("helm.core._resolve_task_base", side_effect=racing):
             task = self.coordinator.create_task(
