@@ -658,3 +658,43 @@ class HerdrTests(HelmTestCase):
             ),
             "foreman",
         )
+
+    def test_a_long_message_is_handed_over_as_a_file_not_typed_into_the_pane(self) -> None:
+        """Pasting a long brief into a live TUI destroys the pane as evidence.
+
+        The agent receives the text either way; what breaks is the pane. A
+        couple of thousand characters arriving while the agent redraws its own
+        interface interleaves the two streams character by character, and the
+        commander watching it -- or anyone diagnosing the worker later -- is
+        left with unreadable soup.
+        """
+        from helm.herdr import HerdrAdapter
+
+        root = self.repo("long-message")
+        project = self.coordinator.register_project(
+            "LongMessage", str(root), project_id="long-message"
+        )
+        task = self.coordinator.create_task(project["id"], "receive a brief")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+
+        brief = "PARAGRAPH. " * 200
+        self.assertGreater(len(brief), HerdrAdapter.INLINE_MESSAGE_LIMIT)
+        self.assertTrue(adapter.answer_worker(worker["id"], brief))
+
+        sent = " ".join(text for _pane, text in herdr.sent_text)
+        self.assertNotIn("PARAGRAPH. PARAGRAPH.", sent)
+        self.assertIn("Read that file now", sent)
+
+        inbox = self.coordinator.store.directory / "workers" / worker["id"] / "inbox"
+        notes = list(inbox.glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        self.assertIn("PARAGRAPH.", notes[0].read_text(encoding="utf-8"))
+
+        # A short answer still goes straight in: making every reply a file
+        # would put a read between the worker and a one-word direction.
+        adapter.answer_worker(worker["id"], "use main")
+        self.assertIn("use main", " ".join(t for _p, t in herdr.sent_text))

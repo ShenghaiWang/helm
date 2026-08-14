@@ -26,6 +26,7 @@ from .core import (
     _git,
     _safe_text,
     canonical,
+    new_id,
     now,
     project_glyph,
 )
@@ -1998,6 +1999,11 @@ class HerdrAdapter:
         return closed
 
     ANSWER_SETTLE_SECONDS = 1.5
+    #: Above this, a message is handed over as a file instead of typed into the
+    #: pane. Chosen to keep ordinary answers -- "yes", "use main", a sentence of
+    #: direction -- inline and instant, while the long routed briefs that
+    #: actually garble a redrawing TUI go to disk.
+    INLINE_MESSAGE_LIMIT = 400
 
     def answer_worker(self, worker_id: str, text: str) -> bool:
         """Deliver a coordinator answer into the worker's own session.
@@ -2026,7 +2032,33 @@ class HerdrAdapter:
         with contextlib.suppress(HerdrUnavailable):
             send_keys(pane, "Escape")
             time.sleep(self.ANSWER_SETTLE_SECONDS)
-        send_text(pane, text)
+        # A long message is HANDED OVER as a file rather than typed in. Pasting
+        # a couple of thousand characters into an agent that is redrawing its
+        # own interface interleaves the two streams character by character, and
+        # the pane becomes unreadable -- for the commander watching it and for
+        # anyone diagnosing the worker afterwards. The agent still received the
+        # text correctly; the pane just stopped being evidence of anything.
+        #
+        # Writing it down first also makes the brief durable and re-readable,
+        # which a paste into a scrollback never was.
+        delivered_text = text
+        if len(text) > self.INLINE_MESSAGE_LIMIT:
+            with contextlib.suppress(OSError):
+                inbox = (
+                    self.coordinator.store.directory / "workers" / worker_id / "inbox"
+                )
+                inbox.mkdir(parents=True, exist_ok=True)
+                os.chmod(inbox, 0o700)
+                note = inbox / f"{new_id('m')}.md"
+                note.write_text(text + "\n", encoding="utf-8")
+                os.chmod(note, 0o600)
+                delivered_text = (
+                    f"Helm has a message for you, written to {note} because it is "
+                    "too long to paste into a live session without garbling this "
+                    "pane. Read that file now and act on it as if it had been "
+                    "typed here."
+                )
+        send_text(pane, delivered_text)
         # And a pause before Enter. Sent immediately, the newline races the
         # text and submits a fragment of it.
         time.sleep(self.ANSWER_SETTLE_SECONDS)
