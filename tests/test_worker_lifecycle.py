@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from helm import core
 from helm.core import Coordinator, HelmError, StateStore
 
 from tests.support import HelmTestCase
@@ -700,3 +701,46 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         with self.assertRaises(ChildProcessError):
             # Already reaped by the poll, which never blocked to do it.
             os.waitpid(int(worker["pid"]), 0)
+
+    def test_a_fresh_workspace_is_trusted_before_the_runtime_asks(self) -> None:
+        """The trust dialog is certain, and it is a deadlock in a pane.
+
+        Claude Code asks whether the directory it started in is trusted, and
+        skips the question only in non-interactive mode. Every Helm task gets a
+        fresh worktree, so the answer is never already on file and an
+        interactive worker stops dead before reading its assignment --
+        `--permission-mode bypassPermissions` does not cover it and neither
+        does `--dangerously-skip-permissions`.
+
+        The write has to be surgical, because it is the commander's own file.
+        """
+        base = self._helm_root("trust")
+        config = base / "fake.claude.json"
+        config.write_text(
+            json.dumps({"projects": {"/already": {"lastCost": 3}}, "keepMe": "yes"})
+        )
+        original = core._TRUST_CONFIGS
+        core._TRUST_CONFIGS = {"claude": (config, "hasTrustDialogAccepted")}
+        try:
+            workspace = base / "fresh-worktree"
+            workspace.mkdir()
+            core._pretrust_workspace("claude", workspace)
+            written = json.loads(config.read_text())
+            self.assertTrue(
+                written["projects"][str(core.canonical(workspace))][
+                    "hasTrustDialogAccepted"
+                ]
+            )
+            # Nothing else in the commander's file is touched.
+            self.assertEqual(written["keepMe"], "yes")
+            self.assertEqual(written["projects"]["/already"], {"lastCost": 3})
+
+            # A runtime with no such dialog is left alone entirely.
+            core._pretrust_workspace("codex", base / "other")
+            self.assertEqual(len(json.loads(config.read_text())["projects"]), 2)
+
+            # And an unwritable config costs a prompt, never a launch.
+            core._TRUST_CONFIGS = {"claude": (Path("/nonexistent/dir/x.json"), "k")}
+            core._pretrust_workspace("claude", workspace)
+        finally:
+            core._TRUST_CONFIGS = original
