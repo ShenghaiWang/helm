@@ -7799,7 +7799,8 @@ class Coordinator:
         for task in data.get("tasks", {}).values():
             if task.get("project_id") != project_id:
                 continue
-            if task.get("status") != "failed":
+            state = task.get("status")
+            if state != "failed":
                 continue
             brief = _safe_text(task.get("brief", "")).strip().splitlines()
             opening = brief[0][:120] if brief else "no brief recorded"
@@ -10857,6 +10858,26 @@ class Coordinator:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
             self._require_terminal_worker(data, task, "cleanup")
+            # Cleaning up a task that escalated IS the human answering it. The
+            # ask stays live until something is recorded as an answer, and
+            # nothing was: `helm worker answer` refuses a settled session, and
+            # cleanup left the task `blocked`, so the escalation sat in the
+            # attention list permanently. Twelve of them accumulated, some for
+            # days, crowding out the asks a human could still act on -- and
+            # every one of them had already been dealt with or abandoned.
+            #
+            # Recorded as an explicit answer rather than by deleting the
+            # blocker, so what the worker reported survives in the log and the
+            # decision to stop pursuing it is visible beside it.
+            for worker in data.get("workers", {}).values():
+                if worker.get("task_id") != task["id"]:
+                    continue
+                self._message(
+                    data, project, task, worker, "answer",
+                    "Resolved by cleanup: the commander cleared this task's "
+                    "residue, so its escalation is no longer awaiting an answer.",
+                    {"source": "cleanup"},
+                )
             if (
                 task["status"] not in {"completed", "failed", "merged", "pr-merged"}
                 # The status gate protects a checkout: work not yet reviewed,
