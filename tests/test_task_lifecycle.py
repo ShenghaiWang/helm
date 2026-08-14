@@ -1406,3 +1406,59 @@ class TaskLifecycleTests(HelmTestCase):
             with self.assertRaisesRegex(HelmError, "refusing a stale base"):
                 self.coordinator.create_task(project["id"], "work while the remote hangs")
         self.assertEqual(self.coordinator.store.load()["tasks"], {})
+
+    def test_local_delivery_starts_when_the_remote_has_no_such_branch_yet(self) -> None:
+        """Naming an empty remote must not be worse than having none.
+
+        With no remote at all Helm proceeds on the local tip. A brand-new
+        project that adds its origin BEFORE the first push has a remote that
+        carries no branch -- and refusing that blocked every task on the
+        project, including read-only discovery, so adding the remote was
+        strictly worse than leaving it off. There is no upstream to be fresher
+        than the local tip, which is the same situation the local-only branch
+        already accepts.
+        """
+        root = self.repo("unpushedremote")
+        empty_remote = Path(self.temp.name) / "empty-remote.git"
+        self._run_git(Path(self.temp.name), "init", "-q", "--bare", str(empty_remote))
+        # Registered first, then the remote added -- the real sequence, and the
+        # reason the project's base branch is already known.
+        project = self.coordinator.register_project(
+            "UnpushedRemote", str(root), project_id="unpushedremote"
+        )
+        self._run_git(root, "remote", "add", "origin", str(empty_remote))
+        self.assertEqual(project["delivery_policy"], "local")
+        local_tip = self._run_git(root, "rev-parse", "HEAD").strip()
+
+        task = self.coordinator.create_task(project["id"], "the first piece of work")
+
+        self.assertEqual(task["base_revision"], local_tip)
+        self.assertIn("no remote carries this branch", task["base_source"])
+
+    def test_a_populated_remote_missing_the_branch_still_blocks(self) -> None:
+        """Empty and "missing this branch" are different, and only one is innocent.
+
+        A remote that carries other branches but not the configured one is a
+        likely misconfiguration -- a typo in base_branch, or a rename upstream
+        -- and must keep failing loudly even under local delivery. Only a
+        remote with nothing in it at all has simply never been pushed to.
+        """
+        root = self.repo("populatedremote")
+        bare = Path(self.temp.name) / "populated-remote.git"
+        self._run_git(Path(self.temp.name), "init", "-q", "--bare", str(bare))
+        seed = Path(self.temp.name) / "seed-populated"
+        self._run_git(Path(self.temp.name), "clone", "-q", str(bare), str(seed))
+        self._run_git(seed, "config", "user.email", "seed@example.invalid")
+        self._run_git(seed, "checkout", "-q", "-b", "trunk")
+        (seed / "seed.txt").write_text("seed\n", encoding="utf-8")
+        self._run_git(seed, "add", "seed.txt")
+        self._run_git(seed, "commit", "-qm", "seed the remote")
+        self._run_git(seed, "push", "-q", "origin", "trunk")
+
+        project = self.coordinator.register_project(
+            "PopulatedRemote", str(root), project_id="populatedremote"
+        )
+        self._run_git(root, "remote", "add", "origin", str(bare))
+
+        with self.assertRaisesRegex(HelmError, "none of this project's remotes"):
+            self.coordinator.create_task(project["id"], "work against a mismatched remote")

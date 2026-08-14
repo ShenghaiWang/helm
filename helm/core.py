@@ -707,6 +707,23 @@ def _remote_symbolic_default(path: Path, remote: str) -> str | None:
     return None
 
 
+def _remote_is_empty(root: Path, remote: str) -> bool | None:
+    """Whether `remote` carries no branches at all -- a repository never pushed.
+
+    Distinct from "does not have THIS branch", and the distinction decides
+    whether a missing upstream is innocent. A remote with branches that lacks
+    the configured one is a likely misconfiguration -- a typo in `base_branch`,
+    or a branch renamed upstream -- and must keep failing loudly. A remote with
+    nothing in it at all has simply never been pushed to, which is where every
+    new project starts. `None` means the probe did not complete, and is never
+    treated as either answer.
+    """
+    result = _bounded_ls_remote(root, "--heads", remote)
+    if result is None or result.returncode != 0:
+        return None
+    return not result.stdout.strip()
+
+
 def _remote_has_branch(root: Path, remote: str, branch: str) -> bool | None:
     """Whether `remote` has a branch named `branch`, read-only and bounded.
 
@@ -982,6 +999,34 @@ def _resolve_task_base(
             remote_branch = base_branch
             upstream_label = f"{remote}/{remote_branch}"
         elif not matches:
+            # Only when every remote is EMPTY, not merely missing this branch.
+            # A populated remote without the configured branch is a likely
+            # misconfiguration -- a typo, or a rename upstream -- and keeps
+            # failing loudly. A remote with nothing in it has never been pushed
+            # to, which is where every new project starts.
+            if local_delivery and all(
+                _remote_is_empty(root, remote) is True for remote in remotes
+            ):
+                # There is no upstream that could be fresher, so this is the
+                # "genuinely local-only" case above reached by another route. A
+                # new project that adds its remote BEFORE the first push landed
+                # here, and refusing it made adding the remote strictly worse
+                # than leaving it off: with no remote at all Helm proceeds on
+                # the local tip, while naming the empty one blocked every task
+                # on the project, including read-only discovery.
+                return {
+                    "base_branch": base_branch,
+                    "base_revision": local_sha,
+                    "base_source": "local (no remote carries this branch yet)",
+                    "base_upstream": None,
+                    "base_fetched": False,
+                    "base_resolved_at": now(),
+                    "base_notes": [
+                        f"none of {', '.join(remotes)} has {base_branch} yet; accepted "
+                        "because this project's delivery is local, so an unpushed "
+                        "branch is its normal state"
+                    ],
+                }
             raise HelmError(
                 f"base branch {base_branch} has no upstream configured, and none of "
                 f"this project's remotes ({', '.join(remotes)}) have a branch named "
