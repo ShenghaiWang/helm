@@ -1404,6 +1404,17 @@ def _build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show active tasks and recent results")
     status.add_argument("--project", dest="project_id")
 
+    ack = commands.add_parser(
+        "ack",
+        help="mark a project's owed reports as relayed to the commander",
+    )
+    ack.add_argument("project_id", help="project whose reports were relayed")
+    ack.add_argument(
+        "entry_ids",
+        nargs="*",
+        help="specific situation entry ids; omit to acknowledge every owed report",
+    )
+
     watch = commands.add_parser(
         "watch", help="check every running worker's health without opening its UI"
     )
@@ -2734,6 +2745,22 @@ def main(argv: list[str] | None = None) -> int:
             blocks = [e["id"] for e in catalogue if not e["selectable"]]
             if blocks:
                 print(f"Building blocks (reached only via extends): {', '.join(blocks)}")
+            return 0
+
+        if args.command == "ack":
+            done = coordinator.acknowledge_updates(
+                args.project_id, args.entry_ids or None
+            )
+            if not done:
+                print("No owed reports were waiting to be acknowledged.")
+                return 0
+            print(f"Acknowledged {len(done)} report(s) as relayed:")
+            for entry in done:
+                first = next(
+                    (line.strip() for line in entry["text"].splitlines() if line.strip()),
+                    "",
+                )
+                print(f"  {entry['id']} {first[:96]}")
             return 0
 
         if args.command == "watch":

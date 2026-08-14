@@ -333,6 +333,47 @@ class CliStatusTests(HelmTestCase):
             len(self.coordinator.open_action_items()), len(items)
         )
 
+    def test_an_owed_report_survives_a_read_that_relayed_nothing(self) -> None:
+        """Surfaced meant "something read it", which is the wrong property.
+
+        The reader is an agent, and an agent's output reaches a commander only
+        if the agent passes it on. A worker result was permanently consumed by
+        a read that piped it through a filter and dropped it, leaving the
+        record claiming the commander had been told. Two commands draining one
+        queue made it worse: whichever ran first won and the other showed an
+        empty section.
+
+        So an owed report returns until it is acknowledged. Routine lines keep
+        show-once, because repeating those is the noise that teaches a reader
+        to skip the section entirely.
+        """
+        root = self.repo("owed-ack")
+        project = self.coordinator.register_project(
+            "Owed", str(root), project_id="owed-ack"
+        )
+        self.coordinator.record_situation(
+            project["id"], "Worker result: the change is finished", surface=True
+        )
+        self.coordinator.record_situation(project["id"], "routine progress push")
+
+        first = self.coordinator.project_updates_for_watch()
+        self.assertTrue(any("the change is finished" in u["text"] for u in first))
+        self.assertTrue(any("routine progress" in u["text"] for u in first))
+
+        second = self.coordinator.project_updates_for_watch()
+        self.assertTrue(
+            any("the change is finished" in u["text"] for u in second),
+            "an owed report vanished after a read that relayed nothing",
+        )
+        self.assertFalse(any("routine progress" in u["text"] for u in second))
+
+        acknowledged = self.coordinator.acknowledge_updates(project["id"])
+        self.assertEqual(len(acknowledged), 1)
+        # Who relayed it is recorded, so "an agent read it" and "the commander
+        # was told" stop being the same claim.
+        self.assertTrue(acknowledged[0]["acknowledged_by"])
+        self.assertEqual(self.coordinator.project_updates_for_watch(), [])
+
     def test_a_confirmation_gate_is_not_filed_among_the_follow_ups(self) -> None:
         """A gate holding a foreman still outranks a note about later.
 
@@ -400,6 +441,11 @@ class CliStatusTests(HelmTestCase):
             json.dumps({"returncode": 0}) + "\n", encoding="utf-8"
         )
         self.coordinator.cleanup_task(task["id"])
+        # Answering the gate clears the gate. The worker's own result is an
+        # owed report and outlives it deliberately: it stops appearing when it
+        # has been relayed, which is a separate act from cleaning up the task
+        # it describes.
+        self.coordinator.acknowledge_updates(project["id"])
         self.assertEqual(self.coordinator.project_updates_for_watch(), [])
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

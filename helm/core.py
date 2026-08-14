@@ -8415,6 +8415,34 @@ class Coordinator:
             "history_entries": len(status["history"]),
         }
 
+    def acknowledge_updates(
+        self, project_id: str, entry_ids: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Record that an owed report was RELAYED, not merely read.
+
+        The distinction is the whole point. Reading is done by an agent, and
+        an agent's output reaches a commander only if the agent passes it on;
+        a report consumed by a read that nobody acted on is a report lost with
+        the record claiming otherwise. So relaying becomes an explicit act,
+        and an unacknowledged report keeps coming back.
+
+        Who acknowledged is recorded too, so "the coordinator saw it" and "the
+        commander was told" stop being the same sentence in the record.
+        """
+        identity = self.caller_identity()
+        acknowledged: list[dict[str, Any]] = []
+        wanted = set(entry_ids or [])
+        with self._status_transaction(project_id) as status:
+            for entry in status.get("situation", []):
+                if not entry.get("surface") or entry.get("acknowledged_at"):
+                    continue
+                if wanted and entry.get("id") not in wanted:
+                    continue
+                entry["acknowledged_at"] = now()
+                entry["acknowledged_by"] = identity.get("role") or "unknown"
+                acknowledged.append(entry)
+        return acknowledged
+
     def project_updates_for_watch(
         self,
         project_id: str | None = None,
@@ -8467,10 +8495,24 @@ class Coordinator:
                         or entry.get("kind") in GATE_ACTION_KINDS
                     )
                 ]
+                # An owed report keeps coming back until somebody ACKNOWLEDGES
+                # it, not merely until something reads it. "Surfaced" was set
+                # by any read, and the reader here is an agent whose output a
+                # commander may never see -- so a terminal report was
+                # permanently consumed by a process that piped it to a filter
+                # and dropped it, with the commander never told. Two commands
+                # draining one queue made it worse: whichever ran first won.
+                # Routine lines keep show-once; repeating those is the noise
+                # that teaches a reader to skip the section.
                 pending = [
                     entry
                     for entry in status.get("situation", [])
-                    if not entry.get("superseded_by") and not entry.get("surfaced_at")
+                    if not entry.get("superseded_by")
+                    and (
+                        not entry.get("acknowledged_at")
+                        if entry.get("surface")
+                        else not entry.get("surfaced_at")
+                    )
                 ]
                 if not pending and not action_items:
                     continue
@@ -8497,7 +8539,10 @@ class Coordinator:
                 # room. Marking an unshown result seen is how a result is lost,
                 # and a lost result is indistinguishable from a project that
                 # never reported at all.
-                owed = [entry for entry in pending if entry.get("surface")]
+                owed = [
+                    entry for entry in pending
+                    if entry.get("surface") and not entry.get("acknowledged_at")
+                ]
                 routine = [entry for entry in pending if not entry.get("surface")]
                 room = max(0, limit - len(owed))
                 kept = routine[-room:] if room else []
