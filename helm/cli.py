@@ -3256,6 +3256,48 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 verb = "Skipped" if args.skip else "Confirmed"
                 print(f"{verb} the {args.gate_type} gate on task {task['id']}")
+                # And TELL the foreman. A gate is the one thing a foreman is
+                # explicitly instructed to stop and wait for, and the decision
+                # was recorded where only a poll would find it -- so a
+                # confirmed gate left the agent sitting idle, indefinitely,
+                # having done nothing wrong. Two foremen on two projects
+                # stalled that way in one session. Delivery is best-effort:
+                # the decision is already durable, and a foreman that cannot
+                # be reached still finds it in `helm project status`.
+                notice = (
+                    f"Helm: the commander {verb.lower()} your {args.gate_type} gate"
+                    f" on task {task['id']}."
+                    + (f" Note: {args.note}" if args.note else "")
+                    + (
+                        " Proceed."
+                        if not args.skip
+                        else " It was skipped, not confirmed -- do not treat that as "
+                        "approval of the contract as proposed."
+                    )
+                )
+                delivered = False
+                with contextlib.suppress(HelmError, OSError):
+                    live = next(
+                        (
+                            worker
+                            for worker in coordinator.store.load()
+                            .get("workers", {})
+                            .values()
+                            if worker.get("task_id") == task["id"]
+                            and worker.get("status") == "running"
+                        ),
+                        None,
+                    )
+                    if live is not None:
+                        delivered = bool(
+                            HerdrAdapter(coordinator).answer_worker(live["id"], notice)
+                        )
+                if not delivered:
+                    print(
+                        "  Not delivered into a live session. The decision is "
+                        "recorded; the foreman will see it in helm project status, "
+                        "or route it a message to move it along."
+                    )
             return 0
         if args.command == "authority":
             if args.authority_command == "init":
