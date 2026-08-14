@@ -305,6 +305,14 @@ class HerdrAdapter:
         # words of that text -- "you-are-this-projects-f-fe58" -- which says
         # nothing about which pane it is. It is the foreman; name it that.
         if (task or {}).get("role") == "foreman":
+            # A dead foreman's pane is KEPT, because a blocked or failed task
+            # is diagnosed from it. Labelled the same as the live one, the
+            # corpse and the driver are typographically identical, and "which
+            # of these is running my project" becomes a question only the state
+            # file can answer -- asked twice in one session before this said so.
+            state = (task or {}).get("status")
+            if state in _EVIDENCE_TASK_STATES:
+                return f"foreman ({state})"
             return "foreman"
         slug = cls._brief_slug(task.get("brief", "") if task else "")
         suffix = str(worker["id"]).replace("w-", "")[:4]
@@ -1395,7 +1403,20 @@ class HerdrAdapter:
             if worker is None or not tab_id or worker.get("status") == "running":
                 continue
             task = data.get("tasks", {}).get(worker.get("task_id"))
-            if task is None or task.get("status") in keep:
+            if task is None:
+                continue
+            if task.get("status") in keep:
+                # Kept as evidence -- but say so on the tab. A retained pane
+                # looks exactly like a working one in the panel, which is how a
+                # stopped foreman gets mistaken for a second live driver.
+                retained = self._worker_tab_label(task, worker)
+                if retained != layout.get("label"):
+                    with contextlib.suppress(HerdrUnavailable, HerdrNotFound):
+                        self.client.tab_rename(tab_id, retained)
+                        with self.coordinator.store.locked() as live:
+                            entry = self._herdr_state(live)["workers"].get(worker_id)
+                            if entry is not None:
+                                entry["label"] = retained
                 continue
             # Evidence first, always. A pane released before its diagnosis is
             # written loses the reason it failed with nothing to recover it

@@ -628,3 +628,33 @@ class HerdrTests(HelmTestCase):
         self.assertEqual(worker["execution"], "process")
         self.assertTrue(herdr.closed_tabs)
         self.assertTrue(herdr.closed_workspaces)
+
+    def test_a_kept_pane_says_why_it_is_still_there(self) -> None:
+        """A retained pane must not look like a working one.
+
+        Helm keeps a blocked or failed task's pane because that pane is the
+        diagnosis. Labelled identically to the live driver, the corpse and the
+        driver are indistinguishable in the panel, and "which of these is
+        running my project" becomes a question only the state file can answer.
+        It was asked twice in one session before the label said so.
+        """
+        from helm.herdr import HerdrAdapter
+
+        task = {"role": "foreman", "status": "blocked"}
+        worker = {"id": "w-dead0001"}
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(task, worker), "foreman (blocked)"
+        )
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"role": "foreman", "status": "failed"}, worker
+            ),
+            "foreman (failed)",
+        )
+        # The live one keeps the plain name, so the exception stays legible.
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"role": "foreman", "status": "running"}, worker
+            ),
+            "foreman",
+        )
