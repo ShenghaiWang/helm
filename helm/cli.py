@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import watchdog as watchdog_module
+from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .core import (
     AUTHORITY_ENV,
     DELIVERY_DECISION_KIND,
@@ -1404,6 +1406,27 @@ def _build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show active tasks and recent results")
     status.add_argument("--project", dest="project_id")
 
+    watchdog = commands.add_parser(
+        "watchdog",
+        help=(
+            "the backstop when the reporting chain does not fire: check "
+            "outside a conversation and notify when something needs a human"
+        ),
+    )
+    watchdog_commands = watchdog.add_subparsers(dest="watchdog_command", required=True)
+    watchdog_run = watchdog_commands.add_parser("run", help="check now, then on an interval")
+    watchdog_run.add_argument("--interval", type=int, default=WATCHDOG_DEFAULT_INTERVAL)
+    watchdog_run.add_argument(
+        "--once", action="store_true", help="check once and exit (what a scheduler calls)"
+    )
+    watchdog_install = watchdog_commands.add_parser(
+        "install", help="generate and load this platform's scheduler entry"
+    )
+    watchdog_install.add_argument(
+        "--interval", type=int, default=WATCHDOG_DEFAULT_INTERVAL
+    )
+    watchdog_commands.add_parser("uninstall", help="remove the scheduler entry")
+
     commands.add_parser(
         "pending",
         help=(
@@ -2755,6 +2778,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Building blocks (reached only via extends): {', '.join(blocks)}")
             return 0
 
+        if args.command == "watchdog":
+            # Root resolved here so a scheduler entry carries an absolute path:
+            # a launchd agent or systemd timer has no shell, no cwd worth
+            # trusting, and no idea which Helm root it was installed for.
+            root_path = Path(args.helm_root).resolve() if args.helm_root else Path.cwd()
+            if args.watchdog_command == "run":
+                return watchdog_module.run(root_path, args.interval, once=args.once)
+            if args.watchdog_command == "install":
+                return watchdog_module.install(root_path, args.interval)
+            return watchdog_module.uninstall(root_path)
+
         if args.command == "pending":
             # Deliberately narrow and deliberately silent. This is meant to run
             # on every turn, so anything it prints when nothing is wrong is
@@ -2763,6 +2797,24 @@ def main(argv: list[str] | None = None) -> int:
             # agent that asked a human and got no answer, a gate holding work
             # still, an outcome nobody has relayed yet, and a worker that has
             # stopped producing. Everything else waits to be asked for.
+            # RECONCILE FIRST, because reporting is a push and a push can be
+            # missed: a worker killed by the OS never reports anything, and its
+            # record sat as `running` until a human happened to run `helm
+            # watch`. Polling every worker whose process is gone settles those
+            # here, so this check reflects what is TRUE rather than what was
+            # reported -- and a task that died silently becomes a failure
+            # decision on its own, without anybody noticing first.
+            #
+            # Cheap by construction: `poll_worker` on an already-settled worker
+            # is a no-op, and the loop only touches workers still marked
+            # running.
+            with contextlib.suppress(HelmError, OSError):
+                for entry in list(coordinator.store.load().get("workers", {}).values()):
+                    if entry.get("status") != "running":
+                        continue
+                    with contextlib.suppress(HelmError, OSError):
+                        coordinator.poll_worker(entry["id"])
+
             lines: list[str] = []
             for item in coordinator.open_escalations(None):
                 glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "

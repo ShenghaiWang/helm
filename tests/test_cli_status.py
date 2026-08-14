@@ -728,3 +728,38 @@ class CliStatusTests(HelmTestCase):
                 self.assertEqual(
                     cli._project_paint(first, "plain", stream=terminal), "plain"
                 )
+
+    def test_the_watchdog_stays_quiet_until_the_pending_list_changes(self) -> None:
+        """A notifier that repeats itself is one the reader learns to ignore.
+
+        The pending list carries elapsed times -- "quiet for 1137s" -- which
+        differ on every run, so hashing it raw made an unchanged backlog look
+        like fresh news every interval. The fingerprint therefore tracks WHICH
+        items are waiting, not how long they have been waiting.
+        """
+        from helm import watchdog
+
+        first = "HELM NEEDS A HUMAN (2):\n  a w-1 [quiet]: no message for 30s"
+        later = "HELM NEEDS A HUMAN (2):\n  a w-1 [quiet]: no message for 9000s"
+        self.assertEqual(watchdog._fingerprint(first), watchdog._fingerprint(later))
+
+        changed = "HELM NEEDS A HUMAN (3):\n  a w-1 [quiet]: no message for 30s\n  b GATE"
+        self.assertNotEqual(watchdog._fingerprint(first), watchdog._fingerprint(changed))
+
+    def test_the_watchdog_says_so_rather_than_pretending_on_an_unknown_platform(
+        self,
+    ) -> None:
+        """A fresh clone on Windows must not be told a scheduler was installed."""
+        from unittest import mock
+
+        from helm import watchdog
+
+        output = io.StringIO()
+        with mock.patch("helm.watchdog.platform.system", return_value="Plan9"):
+            with contextlib.redirect_stdout(output):
+                code = watchdog.install(Path(self.temp.name), 900)
+        printed = output.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("No scheduler integration", printed)
+        # And it hands over the command to run by hand instead.
+        self.assertIn("watchdog run", printed)
