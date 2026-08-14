@@ -1404,6 +1404,14 @@ def _build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show active tasks and recent results")
     status.add_argument("--project", dest="project_id")
 
+    commands.add_parser(
+        "pending",
+        help=(
+            "only what is waiting on a human, in a few lines -- silent when "
+            "nothing is. Built for an automatic per-turn check"
+        ),
+    )
+
     ack = commands.add_parser(
         "ack",
         help="mark a project's owed reports as relayed to the commander",
@@ -2745,6 +2753,52 @@ def main(argv: list[str] | None = None) -> int:
             blocks = [e["id"] for e in catalogue if not e["selectable"]]
             if blocks:
                 print(f"Building blocks (reached only via extends): {', '.join(blocks)}")
+            return 0
+
+        if args.command == "pending":
+            # Deliberately narrow and deliberately silent. This is meant to run
+            # on every turn, so anything it prints when nothing is wrong is
+            # noise that trains the reader to skip it -- the same failure as an
+            # attention list full of healthy workers. It prints four things: an
+            # agent that asked a human and got no answer, a gate holding work
+            # still, an outcome nobody has relayed yet, and a worker that has
+            # stopped producing. Everything else waits to be asked for.
+            lines: list[str] = []
+            for item in coordinator.open_escalations(None):
+                glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
+                first = next(
+                    (line.strip() for line in item["text"].splitlines() if line.strip()), ""
+                )
+                lines.append(f"{glyph} {item['kind']} {item['worker_id']}: {first[:100]}")
+            for item in coordinator.open_action_items(None):
+                if item.get("kind") not in BLOCKING_GATE_KINDS:
+                    continue
+                lines.append(
+                    f"{item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}"
+                )
+            # Owed but unrelayed outcomes. `mark_seen=False` matters: this runs
+            # unattended, and a check that consumed what it reported would be
+            # the exact hole this command exists to close.
+            for update in coordinator.project_updates_for_watch(None, mark_seen=False):
+                if update.get("kind") != "situation":
+                    continue
+                lines.append(f"{update['glyph']} {update['project_id']}: {update['text'][:100]}")
+            for entry in coordinator.worker_health():
+                if entry["verdict"] in {
+                    "healthy", "settled", "reported", "starting", "driving",
+                }:
+                    continue
+                glyph = _glyph_for(coordinator, entry["project_id"])
+                lines.append(
+                    f"{glyph} {entry['project_id']} {entry['worker_id']} "
+                    f"[{entry['verdict']}]: {entry['detail'][:80]}"
+                )
+            if not lines:
+                return 0
+            print(f"HELM NEEDS A HUMAN ({len(lines)}):")
+            for line in lines:
+                print(f"  {line}")
+            print("  (helm status for detail; helm ack <project> once relayed)")
             return 0
 
         if args.command == "ack":

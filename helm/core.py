@@ -3400,7 +3400,9 @@ class Coordinator:
     #: neither of those is what a read-only guard is supposed to change.
 
     @classmethod
-    def _set_workspace_writable(cls, workspace: Path, *, writable: bool) -> None:
+    def _set_workspace_writable(
+        cls, workspace: Path, *, writable: bool, exclude: Path | None = None
+    ) -> None:
         """Flip every path under a task's own worktree between locked and normal.
 
         This is the actual enforcement for a `read_only` task: `read_only` is
@@ -3448,6 +3450,12 @@ class Coordinator:
         # and the mode is set on the way back up so descending is never
         # blocked by a parent this pass already locked.
         for dirpath, dirnames, filenames in os.walk(workspace, topdown=False):
+            # The task's own output directory is the one place a read-only
+            # worker may write, so the lock must not reach into it.
+            if exclude is not None and (
+                Path(dirpath) == exclude or exclude in Path(dirpath).parents
+            ):
+                continue
             for name in filenames:
                 path = Path(dirpath) / name
                 with contextlib.suppress(OSError):
@@ -3458,11 +3466,29 @@ class Coordinator:
                 current = stat.S_IMODE(os.stat(dirpath).st_mode)
                 os.chmod(dirpath, _unlocked_dir(current) if writable else _locked(current))
 
+    #: The one writable place inside a locked read-only workspace. A read-only
+    #: task still has a DELIVERABLE -- a findings report, a contact sheet, a
+    #: transcript -- and with the whole worktree stripped of write bits it had
+    #: nowhere to put one: writing into the worktree failed, and Helm then
+    #: rejected the session scratchpad as outside the assigned workspace. Two
+    #: projects lost real evidence to that dead end, one of them twice. The
+    #: read-only guarantee that matters is "do not alter what is under review",
+    #: which a dedicated output directory does not touch.
+    READ_ONLY_OUTPUT_DIR = ".helm-out"
+
     def _lock_down_read_only_workspace(self, task_id: str) -> None:
         data = self.store.load()
         task = self._task(data, task_id)
         workspace = canonical(task["workspace"])
-        self._set_workspace_writable(workspace, writable=False)
+        # Made BEFORE the lock, because the lock strips the workspace root's
+        # write bit and mkdir inside it would then fail -- silently, since the
+        # failure is an OSError like any other. Excluded from the sweep so it
+        # keeps the write bits everything else is losing.
+        output = workspace / self.READ_ONLY_OUTPUT_DIR
+        with contextlib.suppress(OSError):
+            output.mkdir(exist_ok=True)
+            os.chmod(output, 0o700)
+        self._set_workspace_writable(workspace, writable=False, exclude=output)
 
     # ---------- isolation ----------
 
@@ -4546,6 +4572,29 @@ class Coordinator:
                         "workspace": task["workspace"],
                         "branch": task["branch"],
                         "read_only": bool(task.get("read_only")),
+                        # A read-only worker is told WHERE its deliverable may
+                        # go. Without this it discovers the worktree is
+                        # unwritable, falls back to a session scratchpad, and
+                        # has its artifacts rejected as outside the workspace
+                        # -- losing the one thing the round produced. Naming
+                        # the path is what turns a dead end into a convention.
+                        **(
+                            {
+                                "output_dir": str(
+                                    Path(task["workspace"]) / self.READ_ONLY_OUTPUT_DIR
+                                ),
+                                "output_note": (
+                                    "The worktree is read-only. Write every file you "
+                                    "produce -- reports, sheets, transcripts -- into "
+                                    "output_dir, which is writable and inside the "
+                                    "workspace. Do not use a session scratchpad: it is "
+                                    "outside the workspace, artifacts there are "
+                                    "rejected, and it dies with the session."
+                                ),
+                            }
+                            if task.get("read_only") and task.get("workspace")
+                            else {}
+                        ),
                     },
                     sort_keys=True,
                 ),

@@ -1462,3 +1462,33 @@ class TaskLifecycleTests(HelmTestCase):
 
         with self.assertRaisesRegex(HelmError, "none of this project's remotes"):
             self.coordinator.create_task(project["id"], "work against a mismatched remote")
+
+    def test_a_read_only_task_has_a_writable_place_for_its_deliverable(self) -> None:
+        """A read-only round still produces something, and had nowhere to put it.
+
+        Stripping write bits from the whole worktree made authoring impossible
+        -- correct -- but it also made the round's own report impossible, and
+        Helm then rejected the session scratchpad as outside the assigned
+        workspace. Two projects lost real evidence to that dead end. The
+        guarantee that matters is "do not alter what is under review", which a
+        dedicated output directory does not touch.
+        """
+        root = self.repo("readonlyout")
+        project = self.coordinator.register_project(
+            "ReadOnlyOut", str(root), project_id="readonlyout"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "look and report, change nothing", read_only=True
+        )
+        self.coordinator.allocate_task(task["id"])
+
+        workspace = Path(self.coordinator.inspect_task(task["id"])["task"]["workspace"])
+        tracked = next(p for p in workspace.iterdir() if p.is_file() and p.name != ".git")
+        with self.assertRaises(PermissionError):
+            tracked.write_text("the worktree itself stays locked\n", encoding="utf-8")
+
+        output = workspace / Coordinator.READ_ONLY_OUTPUT_DIR
+        self.assertTrue(output.is_dir(), "read-only task got no output directory")
+        report = output / "findings.md"
+        report.write_text("what the round found\n", encoding="utf-8")
+        self.assertEqual(report.read_text(encoding="utf-8"), "what the round found\n")
