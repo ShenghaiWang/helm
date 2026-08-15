@@ -2004,6 +2004,32 @@ class HerdrAdapter:
     #: direction -- inline and instant, while the long routed briefs that
     #: actually garble a redrawing TUI go to disk.
     INLINE_MESSAGE_LIMIT = 400
+    #: How long to wait for an agent to stop writing before typing into its
+    #: pane, and how still it has to be first. Text injected mid-stream
+    #: interleaves with whatever the agent is printing, and the pane -- the one
+    #: surface a human reads directly -- becomes unreadable soup. Bounded
+    #: because a busy agent may never fall silent, and a message that waits
+    #: forever is worse than one that lands untidily.
+    QUIET_WAIT_SECONDS = 8.0
+    QUIET_STILL_SECONDS = 1.2
+
+    def _wait_for_quiet(self, worker_id: str) -> None:
+        """Give the agent a gap to be spoken into, if one comes along soon."""
+        log = self.coordinator.store.directory / "workers" / worker_id / "output.log"
+        deadline = time.monotonic() + self.QUIET_WAIT_SECONDS
+        last_size = -1
+        still_since = time.monotonic()
+        while time.monotonic() < deadline:
+            try:
+                size = log.stat().st_size
+            except OSError:
+                return
+            if size != last_size:
+                last_size = size
+                still_since = time.monotonic()
+            elif time.monotonic() - still_since >= self.QUIET_STILL_SECONDS:
+                return
+            time.sleep(0.2)
 
     def answer_worker(self, worker_id: str, text: str) -> bool:
         """Deliver a coordinator answer into the worker's own session.
@@ -2029,6 +2055,9 @@ class HerdrAdapter:
         # interruption, and the session then sits in an interrupted state where
         # the next text lands in a buffer that never submits -- the answer looks
         # delivered and the worker waits forever.
+        # Wait for a gap first, so this lands between the agent's own output
+        # rather than through the middle of it.
+        self._wait_for_quiet(worker_id)
         with contextlib.suppress(HerdrUnavailable):
             send_keys(pane, "Escape")
             time.sleep(self.ANSWER_SETTLE_SECONDS)
