@@ -698,3 +698,54 @@ class HerdrTests(HelmTestCase):
         # would put a read between the worker and a one-word direction.
         adapter.answer_worker(worker["id"], "use main")
         self.assertIn("use main", " ".join(t for _p, t in herdr.sent_text))
+
+    def test_a_reviewer_the_retry_replaced_does_not_keep_its_pane(self) -> None:
+        """An infrastructure death the system already answered is not evidence.
+
+        A reviewer killed by the OOM killer leaves a failed task, and `failed`
+        keeps its pane because a failure is normally what a human has to look
+        at. But when the retry produced a real verdict on the same change, that
+        diagnosis is done -- and on a machine where reviewers are killed on
+        most reviews, holding every one of them open accumulates dead panes.
+        The log and the evidence record outlive the tab regardless.
+        """
+        from helm.herdr import HerdrAdapter
+
+        data = {
+            "tasks": {
+                "t-dead": {
+                    "id": "t-dead", "role": "reviewer",
+                    "status": "failed", "reviews": "t-author",
+                },
+                "t-live": {
+                    "id": "t-live", "role": "reviewer",
+                    "status": "completed", "reviews": "t-author",
+                },
+            }
+        }
+        self.assertTrue(
+            HerdrAdapter._superseded_reviewer(data, data["tasks"]["t-dead"])
+        )
+
+        # Nothing supersedes an AUTHOR task that failed: that is exactly the
+        # pane somebody still has to open.
+        author = {"id": "t-x", "role": "worker", "status": "failed", "reviews": None}
+        self.assertFalse(HerdrAdapter._superseded_reviewer(data, author))
+
+        # And a reviewer whose retry has not yet reached a verdict keeps its
+        # pane -- the failure is still the only account of what happened.
+        alone = {
+            "tasks": {
+                "t-dead": {
+                    "id": "t-dead", "role": "reviewer",
+                    "status": "failed", "reviews": "t-author",
+                },
+                "t-running": {
+                    "id": "t-running", "role": "reviewer",
+                    "status": "running", "reviews": "t-author",
+                },
+            }
+        }
+        self.assertFalse(
+            HerdrAdapter._superseded_reviewer(alone, alone["tasks"]["t-dead"])
+        )

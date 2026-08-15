@@ -1385,6 +1385,25 @@ class HerdrAdapter:
                 self._herdr_state(live).get("workers", {}).pop(worker_id, None)
         return stopped
 
+    @staticmethod
+    def _superseded_reviewer(data: dict[str, Any], task: dict[str, Any]) -> bool:
+        """Whether this failed reviewer was replaced by one that reached a verdict.
+
+        Only ever true for a reviewer: an author task that failed is still the
+        thing a human has to look at, and nothing supersedes it.
+        """
+        if task.get("role") != "reviewer" or task.get("status") != "failed":
+            return False
+        reviewed = task.get("reviews")
+        if not reviewed:
+            return False
+        return any(
+            other.get("reviews") == reviewed
+            and other.get("id") != task.get("id")
+            and other.get("status") == "completed"
+            for other in data.get("tasks", {}).values()
+        )
+
     def release_finished_tabs(self) -> list[str]:
         """Close the tab of every worker whose work is cleanly done.
 
@@ -1406,6 +1425,17 @@ class HerdrAdapter:
             task = data.get("tasks", {}).get(worker.get("task_id"))
             if task is None:
                 continue
+            if task.get("status") in keep and self._superseded_reviewer(data, task):
+                # A reviewer killed by the OOM killer is a failure the retry
+                # already answered: another reviewer judged the same change and
+                # returned a verdict. The pane is kept for a failure a human
+                # must diagnose, and this one has been diagnosed by the system
+                # that replaced it -- so holding the tab open just accumulates
+                # dead panes, one per infrastructure death, on a machine where
+                # that happens on most reviews. The log and the evidence record
+                # outlive the tab either way.
+                task = dict(task)
+                task["status"] = "completed"
             if task.get("status") in keep:
                 # Kept as evidence -- but say so on the tab. A retained pane
                 # looks exactly like a working one in the panel, which is how a
