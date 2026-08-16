@@ -1296,3 +1296,30 @@ class FailureScanReadsTextNotEscapesTests(HelmTestCase):
                 self.coordinator.worker_failures(worker["id"]), [report],
                 f"{report!r} is the report this check exists for",
             )
+
+    def test_the_reported_failure_contains_the_reason_not_the_line_start(self) -> None:
+        """A pane redraw is one enormous "line", and the match can be far into it.
+
+        An interactive agent rewrites its whole screen without newlines, so a
+        single line can be a hundred thousand characters. Reporting its first
+        160 gave the commander cursor programming and never the cause -- the
+        real match sat 66,611 characters in and said `command not found:
+        docker`. Evidence has to contain the thing it is evidence of.
+        """
+        root = self.repo("faraway")
+        project = self.coordinator.register_project(
+            "Faraway", str(root), project_id="faraway"
+        )
+        task = self.coordinator.create_task(project["id"], "redraw a lot")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        noise = "\x1b[>4;0m\x1b[?25l" * 4000
+        Path(worker["log_file"]).write_text(
+            f"{noise}zsh: command not found: docker{noise}\n", encoding="utf-8"
+        )
+
+        failures = self.coordinator.worker_failures(worker["id"])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("command not found: docker", failures[0])
+        self.assertLess(len(failures[0]), 400, "an excerpt, not the whole pane")

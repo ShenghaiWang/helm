@@ -7055,9 +7055,23 @@ class Coordinator:
                 if not line:
                     continue
                 for signature in self._FAILURE_SIGNATURES:
-                    if re.search(signature, line, re.IGNORECASE) and line not in found:
-                        found.append(line[:160])
-                        break
+                    match = re.search(signature, line, re.IGNORECASE)
+                    if match is None:
+                        continue
+                    # Report the MATCH with its surroundings, not the start of
+                    # the line. An interactive agent redraws its whole pane
+                    # without newlines, so "a line" can be a hundred thousand
+                    # characters and the signature can sit sixty thousand in --
+                    # a prefix then shows cursor programming and never the
+                    # reason. The evidence has to contain the thing it is
+                    # evidence of.
+                    start = max(0, match.start() - 60)
+                    excerpt = line[start:match.end() + 100].strip()
+                    if start > 0:
+                        excerpt = f"...{excerpt}"
+                    if excerpt not in found:
+                        found.append(excerpt)
+                    break
         return found
 
     @staticmethod
