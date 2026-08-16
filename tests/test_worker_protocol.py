@@ -1205,3 +1205,52 @@ class LiveButSilentWorkerTests(HelmTestCase):
 
         health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
         self.assertEqual(health[worker["id"]]["verdict"], "quiet")
+
+
+class FailureScanReadsTextNotEscapesTests(HelmTestCase):
+    """A failure signature must be matched against what a human would read.
+
+    An interactive agent emits terminal capability queries and cursor
+    programming continuously. Matching those raw bytes let an escape blob be
+    reported as a worker failure -- a reviewer that was writing 31KB every six
+    seconds was flagged as `erroring`, with `[>0q+q4d73Gi=31337,s=1,v=1,a` as
+    the stated reason. It matters in both directions: fewer false positives,
+    and a reported line a human can actually read.
+    """
+
+    def test_terminal_escapes_are_not_read_as_failures(self) -> None:
+        root = self.repo("escapes")
+        project = self.coordinator.register_project(
+            "Escapes", str(root), project_id="escapes"
+        )
+        task = self.coordinator.create_task(project["id"], "emit terminal noise")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        log = Path(worker["log_file"])
+        log.write_text(
+            "\x1b[>0q\x1b+q4d73Gi=31337,s=1,v=1,a=q\x1b[>4;0m\x1b[>5u\n"
+            "\x1b[?2026h\x1b[?25l\x1b[38;5;60mPercolating\x1b[0m\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.coordinator.worker_failures(worker["id"]), [])
+
+    def test_a_real_failure_still_reports_and_reports_readably(self) -> None:
+        root = self.repo("realfail")
+        project = self.coordinator.register_project(
+            "Realfail", str(root), project_id="realfail"
+        )
+        task = self.coordinator.create_task(project["id"], "fail for real")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        log = Path(worker["log_file"])
+        # A genuine failure, wearing the colour codes a real pane puts on it.
+        log.write_text(
+            "\x1b[?25l\x1b[31mAPI Error: overloaded, retrying\x1b[0m\x1b[?25h\n",
+            encoding="utf-8",
+        )
+        failures = self.coordinator.worker_failures(worker["id"])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0], "API Error: overloaded, retrying")
+        self.assertNotIn("\x1b", failures[0], "the reported reason must be readable")

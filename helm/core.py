@@ -7007,14 +7007,44 @@ class Coordinator:
                         break
         return found
 
+    #: Terminal control sequences: CSI/OSC/DCS escapes, and the stray control
+    #: bytes a TUI emits between them.
+    _TERMINAL_NOISE = re.compile(
+        r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC ... BEL or ST
+        r"|\x1b[P_^][^\x1b]*\x1b\\"              # DCS/APC/PM ... ST
+        r"|\x1b\[[0-9;?>=!]*[ -/]*[@-~]"          # CSI
+        r"|\x1b[()*+,\-./][A-Za-z0-9@]"            # charset designation
+        r"|\x1b[@-Z\\-_]"                          # other two-byte escapes
+        r"|[\x00-\x08\x0b-\x1f\x7f]"              # stray control bytes
+    )
+
+    @classmethod
+    def _readable(cls, line: str) -> str:
+        """What a human would actually see on that line of the pane.
+
+        A failure signature must be matched against TEXT, not against terminal
+        control sequences. An interactive agent emits capability queries and
+        cursor programming continuously, and matching raw bytes let one of
+        those blobs be reported as a worker failure -- `[>0q+q4d73Gi=31337...`
+        as the diagnosis for a reviewer that was working perfectly.
+
+        It matters in both directions. The scan gets fewer false positives, and
+        the line Helm SHOWS becomes something a human can read: an escape-soup
+        "reason" is useless even on the occasions when the match is genuine.
+        """
+        return cls._TERMINAL_NOISE.sub("", line).strip()
+
     def worker_failures(self, worker_id: str, lines: int = 60) -> list[str]:
         """Failure signatures visible in a worker's own output."""
         found: list[str] = []
         with contextlib.suppress(HelmError, OSError):
-            for line in self.worker_output(worker_id, lines=lines):
+            for raw in self.worker_output(worker_id, lines=lines):
+                line = self._readable(raw)
+                if not line:
+                    continue
                 for signature in self._FAILURE_SIGNATURES:
-                    if signature.lower() in line.lower() and line.strip() not in found:
-                        found.append(line.strip()[:160])
+                    if signature.lower() in line.lower() and line not in found:
+                        found.append(line[:160])
                         break
         return found
 
