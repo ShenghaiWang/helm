@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "//": "Arms the in-session watch. A Monitor dies with its session and nothing re-arms it, so a restarted root goes blind until somebody notices -- the exact failure this mechanism exists to prevent. Printing the instruction into the session's context makes re-arming automatic rather than remembered.",
-            "command": "printf '%s\\n' 'HELM: arm the attention watch for this session before anything else. Use the Monitor tool with persistent:true, running this command, so a gate, approval request, worker question, blocker or terminal report wakes you within 20s instead of waiting to be asked --- prev=\"\"; while true; do out=$(python3 -m helm pending 2>/dev/null || true); if [ -n \"$out\" ]; then cur=$(printf %s \"$out\" | tr -d 0-9 | shasum | cut -d\" \" -f1); if [ \"$cur\" != \"$prev\" ]; then prev=\"$cur\"; printf \"%s\\\\n\" \"$out\" | sed -n 1,7p; fi; fi; sleep 20; done --- It emits only when the set of waiting items CHANGES, so a quiet root stays quiet.'",
+            "//": "Arms the in-session watch. A Monitor dies with its session and nothing re-arms it, so a restarted root goes blind until somebody notices -- the exact failure this mechanism exists to prevent. `pending --changes` keeps the loop to one command with no shell state, so the watch cannot drift from what Helm reports.",
+            "command": "printf '%s\\n' 'HELM: arm the attention watch for this session before anything else. Use the Monitor tool with persistent:true and description \"Helm\", running: while true; do python3 -m helm pending --changes; sleep 20; done --- it prints ONLY what is new since the last check and nothing otherwise, so a gate, approval request, worker question, blocker or terminal report wakes you within 20s while a quiet root stays silent.'",
             "timeout": 10
           }
         ]

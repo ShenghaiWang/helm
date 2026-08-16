@@ -763,3 +763,44 @@ class CliStatusTests(HelmTestCase):
         self.assertIn("No scheduler integration", printed)
         # And it hands over the command to run by hand instead.
         self.assertIn("watchdog run", printed)
+
+    def test_pending_changes_prints_only_what_is_new(self) -> None:
+        """An unattended watch must not re-print what its reader already saw.
+
+        Re-printing the whole list on every poll buries the one new line under
+        things already read, and trains the reader to skip it — the same
+        failure the list itself exists to fix. And the comparison ignores
+        digits, because a line carries elapsed time ("quiet for 7481s") that
+        differs on every poll: without that, every health line reads as new,
+        forever.
+        """
+        helm_root = self._helm_root("changes-root")
+        destination = helm_root / "projects" / "changes"
+        shutil.move(str(self.repo("changes")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "changes")
+        coordinator.record_situation(
+            project["id"], "Worker result: the first thing", surface=True
+        )
+
+        first = io.StringIO()
+        with contextlib.redirect_stdout(first):
+            cli.main(["--root", str(helm_root), "pending", "--changes"])
+        self.assertIn("the first thing", first.getvalue())
+
+        # Nothing changed: silent.
+        second = io.StringIO()
+        with contextlib.redirect_stdout(second):
+            cli.main(["--root", str(helm_root), "pending", "--changes"])
+        self.assertEqual(second.getvalue().strip(), "")
+
+        # Something new: only that.
+        coordinator.record_situation(
+            project["id"], "Worker result: the second thing", surface=True
+        )
+        third = io.StringIO()
+        with contextlib.redirect_stdout(third):
+            cli.main(["--root", str(helm_root), "pending", "--changes"])
+        printed = third.getvalue()
+        self.assertIn("the second thing", printed)
+        self.assertNotIn("the first thing", printed)

@@ -1427,11 +1427,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     watchdog_commands.add_parser("uninstall", help="remove the scheduler entry")
 
-    commands.add_parser(
+    pending = commands.add_parser(
         "pending",
         help=(
             "only what is waiting on a human, in a few lines -- silent when "
             "nothing is. Built for an automatic per-turn check"
+        ),
+    )
+    pending.add_argument(
+        "--changes",
+        action="store_true",
+        help=(
+            "print only what is NEW since the last --changes call, and nothing "
+            "else. For an unattended watch, where re-printing the current state "
+            "on every poll is noise that buries the one new line"
         ),
     )
 
@@ -2869,9 +2878,32 @@ def main(argv: list[str] | None = None) -> int:
                     f"{glyph} {entry['project_id']} {entry['worker_id']} "
                     f"[{entry['verdict']}]: {entry['detail'][:80]}",
                 ))
+            lines = [text for _at, text in sorted(entries, key=lambda e: e[0], reverse=True)]
+            if args.changes:
+                # Only what is NEW since the last --changes call. An unattended
+                # watch that re-prints the whole list every poll buries the one
+                # new line under things already read, and trains its reader to
+                # skip it -- the same failure the list itself was built to fix.
+                #
+                # Compared with digits stripped, because a line carries elapsed
+                # time ("quiet for 7481s") that differs on every poll: without
+                # that, every health line reads as new, forever.
+                def _key(line: str) -> str:
+                    return "".join(c for c in line if not c.isdigit())
+
+                seen_file = coordinator.store.directory / "pending-seen.json"
+                previous: set[str] = set()
+                with contextlib.suppress(OSError, ValueError):
+                    previous = set(json.loads(seen_file.read_text()))
+                current = {_key(line) for line in lines}
+                fresh = [line for line in lines if _key(line) not in previous]
+                with contextlib.suppress(OSError):
+                    seen_file.write_text(json.dumps(sorted(current)))
+                for line in fresh:
+                    print(line.strip())
+                return 0
             if not entries:
                 return 0
-            lines = [text for _at, text in sorted(entries, key=lambda e: e[0], reverse=True)]
             print(f"HELM NEEDS A HUMAN ({len(lines)}):")
             for line in lines:
                 print(f"  {line}")
