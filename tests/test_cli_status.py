@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import io
 import os
 import json
@@ -922,3 +923,62 @@ class CliStatusTests(HelmTestCase):
         second = run([entry("w-1a2b3c4d5e6f", 460), entry("w-12ab3c4d5e6f", 400)])
         self.assertIn("w-12ab3c4d5e6f", second, "the second worker must not be swallowed")
         self.assertNotIn("w-1a2b3c4d5e6f", second, "the first is unchanged; only its clock moved")
+
+    def test_every_surfaced_line_says_how_long_it_has_been_waiting(self) -> None:
+        """A blocker from six days ago and one from this minute looked identical.
+
+        Without an age every item reads as equally urgent, which is the same
+        failure as an attention list full of healthy workers wearing different
+        clothes. Relative rather than absolute, because the question being
+        asked is "has this been ignored", not "what time was it".
+        """
+        helm_root = self._helm_root("aged-root")
+        destination = helm_root / "projects" / "aged"
+        shutil.move(str(self.repo("aged")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "aged")
+        task = coordinator.create_task(project["id"], "do a thing")
+        worker = coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        coordinator.record_worker_message(worker["id"], "blocker", "cannot reach the tracker")
+
+        # Age that escalation by six days.
+        data = coordinator.store.load()
+        stale = (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=6)
+        ).isoformat().replace("+00:00", "Z")
+        for message in data["messages"]:
+            if message.get("worker_id") == worker["id"]:
+                message["created_at"] = stale
+        coordinator.store.save(data)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.main(["--root", str(helm_root), "pending"])
+        printed = buffer.getvalue()
+        self.assertIn("cannot reach the tracker", printed)
+        self.assertIn("6d", printed, "the reader must be able to see it has been ignored")
+        # And WHEN it arrived, which an age alone cannot give back: a reader
+        # correlates a clock time against a deploy or their own memory.
+        arrived = (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=6)
+        ).astimezone()
+        self.assertIn(f"{arrived:%m-%d %H:%M}", printed)
+
+    def test_the_age_is_not_part_of_the_changes_identity(self) -> None:
+        """An age ticks on every poll; keying on it re-announces everything."""
+        helm_root = self._helm_root("ageid-root")
+        destination = helm_root / "projects" / "ageid"
+        shutil.move(str(self.repo("ageid")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "ageid")
+        coordinator.record_situation(project["id"], "Worker result: a thing happened", surface=True)
+
+        def run() -> str:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                cli.main(["--root", str(helm_root), "pending", "--changes"])
+            return buffer.getvalue()
+
+        self.assertIn("a thing happened", run())
+        # Nothing changed but the clock. It must stay silent.
+        self.assertEqual(run().strip(), "")

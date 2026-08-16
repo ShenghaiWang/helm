@@ -390,6 +390,17 @@ Prefix anything about a project with its glyph and name (`🟦 media — …`), 
 several projects report into one session and a line without its project is
 ambiguous the moment more than one is running.
 
+**Stamp it with when it happened and how long it has waited**, in the same
+shape `helm pending` uses: `08-17 09:39   5m 🟦 media — …`. Local clock time
+first, then the age. They answer different questions and the reader needs both
+— the age decides whether to act now, and the clock time is what they correlate
+against a deploy, a log, or their own memory of the moment it landed. Relaying
+a report as though it just arrived is its own small lie: a result from four
+days ago and one from this minute read identically without it, so everything
+looks equally urgent and an attention list becomes a neglect list nobody can
+see the shape of. This applies to what the coordinator writes, not only to what
+Helm prints.
+
 The reporting chain has three hops and the coordinator owns the last one: a
 foreman pushes anything needing a human, Helm records it, and **the coordinator
 relays it — unprompted**. Check what is pending at the start of a turn and lead

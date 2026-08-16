@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as _dt
 import json
 import re
 import os
@@ -676,6 +677,59 @@ def _liveness_probe(coordinator):
             return None
 
     return probe
+
+def _when_label(stamp: str | None = None, seconds: float | None = None) -> str:
+    """When it arrived, in local time, beside how long it has been waiting.
+
+    Two different questions, and a reader needs both. The age answers "how long
+    have I left this" -- the one that decides whether to act now. The clock time
+    answers "when did this reach me", which is what a reader correlates against
+    a deploy, a log, or their own memory of what they were doing, and what an
+    age alone cannot give back.
+
+    Local time on purpose: the reader is deciding about their own day, not
+    reconciling zones. Date included because a bare HH:MM on a nine-day-old
+    item reads as this morning.
+    """
+    moment = None
+    if stamp:
+        with contextlib.suppress(ValueError):
+            moment = _dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    if moment is None and seconds is not None and seconds >= 0:
+        moment = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds)
+    if moment is None:
+        return f"{'':>11} {_age_label(stamp, seconds)}"
+    local = moment.astimezone()
+    return f"{local:%m-%d %H:%M} {_age_label(stamp, seconds)}"
+
+
+def _age_label(stamp: str | None = None, seconds: float | None = None) -> str:
+    """How long this has been waiting, compactly, for the front of a line.
+
+    Relative rather than absolute on purpose: the question a reader is asking
+    is "has this been ignored, or did it just happen", and "6d" answers it
+    where "2026-08-11 04:12" makes them do arithmetic first. Without it every
+    item reads as equally urgent -- a blocker from six days ago and one from
+    this minute look identical -- which is the same failure as an attention
+    list full of healthy workers, wearing different clothes.
+
+    It goes in the DISPLAY string only, never in the identity `--changes`
+    compares on. An age ticks on every poll, so keying on it would make every
+    unchanged line look new forever.
+    """
+    if seconds is None and stamp:
+        with contextlib.suppress(ValueError):
+            moment = _dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            seconds = _dt.datetime.now(_dt.timezone.utc).timestamp() - moment.timestamp()
+    if seconds is None or seconds < 0:
+        return "   ?"
+    if seconds < 90:
+        return f"{int(seconds):>3}s"
+    if seconds < 5400:
+        return f"{int(seconds // 60):>3}m"
+    if seconds < 172800:
+        return f"{int(seconds // 3600):>3}h"
+    return f"{int(seconds // 86400):>3}d"
 
 def _glyph_for(coordinator: Coordinator, project_id: str) -> str:
     """A project's colour glyph, so any report says which project it is about.
@@ -2863,17 +2917,19 @@ def main(argv: list[str] | None = None) -> int:
                 first = next(
                     (line.strip() for line in item["text"].splitlines() if line.strip()), ""
                 )
+                stamp = str(item.get("at") or item.get("created_at") or "")
                 entries.append((
-                    str(item.get("at") or item.get("created_at") or ""),
-                    f"{glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
+                    stamp,
+                    f"{_when_label(stamp)} {glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
                     f"{glyph} {item['kind']} {item['worker_id']}: {first}",
                 ))
             for item in coordinator.open_action_items(None):
                 if item.get("kind") not in BLOCKING_GATE_KINDS:
                     continue
+                stamp = str(item.get("at") or "")
                 entries.append((
-                    str(item.get("at") or ""),
-                    f"{item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}",
+                    stamp,
+                    f"{_when_label(stamp)} {item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}",
                     f"{item['glyph']} {item['project_id']} GATE waiting: {item['text']}",
                 ))
             # Owed but unrelayed outcomes. `mark_seen=False` matters: this runs
@@ -2893,9 +2949,10 @@ def main(argv: list[str] | None = None) -> int:
                 # usually at the END of the line -- a video id, a URL, a commit
                 # -- so a 100-character cut removes exactly the part worth
                 # reading and leaves something that looks like nothing was said.
+                stamp = str(update.get("at") or "")
                 entries.append((
-                    str(update.get("at") or ""),
-                    f"{update['glyph']} {update['project_id']}: {update['text'][:220]}",
+                    stamp,
+                    f"{_when_label(stamp)} {update['glyph']} {update['project_id']}: {update['text'][:220]}",
                     f"{update['glyph']} {update['project_id']}: {update['text']}",
                 ))
             for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
@@ -2904,10 +2961,22 @@ def main(argv: list[str] | None = None) -> int:
                 }:
                     continue
                 glyph = _glyph_for(coordinator, entry["project_id"])
+                idle = max(
+                    entry.get("output_idle_seconds") or 0.0,
+                    entry.get("reported_idle_seconds") or 0.0,
+                )
+                # A health verdict carries no timestamp, but it does carry its
+                # own idleness -- so date it from that and it sorts among the
+                # timestamped items correctly instead of falling to the bottom
+                # as a block. Without this the list only claimed to be
+                # newest-first.
+                dated = (
+                    _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=idle)
+                ).isoformat().replace("+00:00", "Z")
                 entries.append((
-                    "",  # health has no timestamp; a stalled worker is by definition old
-                    f"{glyph} {entry['project_id']} {entry['worker_id']} "
-                    f"[{entry['verdict']}]: {entry['detail'][:80]}",
+                    dated,
+                    f"{_when_label(seconds=idle)} {glyph} {entry['project_id']} "
+                    f"{entry['worker_id']} [{entry['verdict']}]: {entry['detail'][:80]}",
                     f"{glyph} {entry['project_id']} {entry['worker_id']} "
                     f"[{entry['verdict']}]: {entry['detail']}",
                 ))
