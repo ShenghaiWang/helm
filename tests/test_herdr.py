@@ -824,3 +824,72 @@ class PrecomputedReviewDiffTests(HelmTestCase):
         adapter = HerdrAdapter(self.coordinator, client=FakeHerdr())
         base = _git(Path(task["workspace"]), "rev-parse", task["base_branch"]).strip()
         self.assertEqual(adapter._precomputed_diff(task, base), ("", ""))
+
+
+class AnswerDeliveryIsConfirmedTests(HelmTestCase):
+    """Delivery must be observed, not assumed.
+
+    `send_text` fills an input buffer and `Enter` submits it, and neither
+    raising was taken as proof. But an agent that was mid-execution treats the
+    arriving text as an interruption and parks at its own "what should I do
+    instead?" prompt, where the Enter lands on the interrupt dialog rather than
+    on the message. The message then sits in the buffer while every record says
+    delivered -- which is exactly how a foreman sat stalled with Helm's message
+    visible on screen and nothing in Helm noticing. The commander noticed.
+    """
+
+    def _worker_in_a_pane(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the thing")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        adapter.QUIET_WAIT_SECONDS = 0.1
+        adapter.ANSWER_SETTLE_SECONDS = 0.0
+        adapter.SUBMIT_CONFIRM_SECONDS = 0.4
+        # This suite is about the terminal-driving path, so the fake stands in
+        # for a client that types into a real pane.
+        herdr.drives_a_terminal = True
+        return adapter, herdr, worker
+
+    def _log(self, worker_id: str) -> Path:
+        return self.coordinator.store.directory / "workers" / worker_id / "output.log"
+
+    def test_an_agent_that_acts_on_the_message_counts_as_delivered(self) -> None:
+        adapter, herdr, worker = self._worker_in_a_pane("acts")
+        log = self._log(worker["id"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("idle\n", encoding="utf-8")
+
+        original = herdr.pane_send_keys
+
+        def acting(pane_id: str, keys: str):
+            result = original(pane_id, keys)
+            if keys == "Enter":
+                # Taking the message means doing something, and doing something
+                # writes to the pane. That growth is the evidence.
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("reading the file now\n")
+            return result
+
+        herdr.pane_send_keys = acting
+        self.assertTrue(adapter.answer_worker(worker["id"], "go on then"))
+
+    def test_a_pane_that_never_moves_is_reported_as_not_delivered(self) -> None:
+        """The parked-at-a-prompt case. Silence must not read as success."""
+        adapter, herdr, worker = self._worker_in_a_pane("parked")
+        log = self._log(worker["id"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("interrupted, waiting for a human\n", encoding="utf-8")
+
+        self.assertFalse(
+            adapter.answer_worker(worker["id"], "go on then"),
+            "an unmoving pane must not be reported as delivered",
+        )
+        # And it must have tried more than once: an interrupt prompt swallows
+        # the first Enter as its own answer.
+        enters = [k for _pane, k in getattr(herdr, "sent_keys", []) if k == "Enter"]
+        self.assertGreaterEqual(len(enters), 2, "one Enter is not a delivery attempt")

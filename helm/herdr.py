@@ -184,6 +184,12 @@ class SubprocessHerdrClient:
         # flag, so a stray one would be swallowed as part of the command.
         return self._call(["pane", "run", pane_id, command])
 
+    #: This client types into a real terminal, so whether a message was
+    #: actually submitted is observable in the pane's own output. An in-memory
+    #: client drives no terminal: nothing there can submit, so nothing there
+    #: can be reported as unsubmitted either.
+    drives_a_terminal = True
+
     def pane_send_text(self, pane_id: str, text: str) -> dict[str, Any]:
         return self._call(["pane", "send-text", pane_id, text])
 
@@ -2123,6 +2129,49 @@ class HerdrAdapter:
                 return
             time.sleep(0.2)
 
+    #: How long to watch for the agent to ACT after Enter, and how many times to
+    #: press it again before admitting the message never went in.
+    SUBMIT_CONFIRM_SECONDS = 6.0
+    SUBMIT_ATTEMPTS = 3
+
+    def _submitted(self, worker_id: str, log_size: int) -> bool:
+        """Did the agent actually take the message, or is it sitting in a box?
+
+        `send_text` fills an input buffer and `Enter` submits it -- but an agent
+        that was mid-execution treats the arriving text as an interruption and
+        parks at its own "what should I do instead?" prompt, where the Enter can
+        land on the interrupt dialog rather than on the message. The message
+        then sits in the buffer, unsubmitted, while every signal Helm had said
+        delivered: the sends did not raise, so `answer_worker` returned True.
+
+        A worker that reads its message ACTS, and acting writes to the pane. So
+        the evidence is the output log growing. Absence of growth is not proof
+        of failure -- an agent can be briefly slow -- which is why this retries
+        the Enter rather than failing at the first quiet moment, and why a
+        caller treats False as "could not confirm", not as "certainly lost".
+        """
+        # Only a client that drives a real terminal can be observed at all. With
+        # an in-memory one there is nothing to submit into, so "it did not
+        # move" is not evidence of anything and must not be reported as a
+        # failed delivery.
+        if not getattr(self.client, "drives_a_terminal", False):
+            return True
+        log = self.coordinator.store.directory / "workers" / worker_id / "output.log"
+        # Silence is only evidence from something that writes. A worker with no
+        # output stream at all -- no log, or one still empty -- has told us
+        # nothing by staying quiet.
+        if log_size <= 0:
+            return True
+        deadline = time.monotonic() + self.SUBMIT_CONFIRM_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if log.stat().st_size > log_size:
+                    return True
+            except OSError:
+                return True
+            time.sleep(0.2)
+        return False
+
     def answer_worker(self, worker_id: str, text: str) -> bool:
         """Deliver a coordinator answer into the worker's own session.
 
@@ -2183,8 +2232,27 @@ class HerdrAdapter:
         # And a pause before Enter. Sent immediately, the newline races the
         # text and submits a fragment of it.
         time.sleep(self.ANSWER_SETTLE_SECONDS)
-        send_keys(pane, "Enter")
-        return True
+        # Press Enter, then CHECK. Reporting delivery because the send did not
+        # raise is what let a foreman sit parked at an interrupt prompt with
+        # Helm's message visible in its input box and every record saying it
+        # had been delivered -- the commander spotted the stall, not Helm.
+        for attempt in range(self.SUBMIT_ATTEMPTS):
+            try:
+                before = (
+                    self.coordinator.store.directory / "workers" / worker_id / "output.log"
+                ).stat().st_size
+            except OSError:
+                before = 0
+            with contextlib.suppress(HerdrUnavailable):
+                send_keys(pane, "Enter")
+            if self._submitted(worker_id, before):
+                return True
+            if attempt == 0:
+                # An interrupt prompt swallows the first Enter as its own
+                # answer; the message is still in the buffer and the next
+                # Enter is the one that submits it.
+                continue
+        return False
 
     def session_reachable(self, worker_id: str) -> bool:
         """Whether something can actually be said to this worker's session now.
