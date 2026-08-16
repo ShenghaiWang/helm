@@ -1,0 +1,29 @@
+{
+  "//": "Tracked, so a fresh clone gets this with nothing to install. Both hooks call helm's own CLI by module name and use no absolute paths, so they work in any checkout on any machine.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "//": "Arms the in-session watch. A Monitor dies with its session and nothing re-arms it, so a restarted root goes blind until somebody notices -- the exact failure this mechanism exists to prevent. Printing the instruction into the session's context makes re-arming automatic rather than remembered.",
+            "command": "printf '%s\\n' 'HELM: arm the attention watch for this session before anything else. Use the Monitor tool with persistent:true, running this command, so a gate, approval request, worker question, blocker or terminal report wakes you within 20s instead of waiting to be asked --- prev=\"\"; while true; do out=$(python3 -m helm pending 2>/dev/null || true); if [ -n \"$out\" ]; then cur=$(printf %s \"$out\" | tr -d 0-9 | shasum | cut -d\" \" -f1); if [ \"$cur\" != \"$prev\" ]; then prev=\"$cur\"; printf \"%s\\\\n\" \"$out\" | sed -n 1,7p; fi; fi; sleep 20; done --- It emits only when the set of waiting items CHANGES, so a quiet root stays quiet.'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "//": "Prints nothing when nothing needs a human, so a quiet root stays quiet.",
+            "command": "python3 -m helm pending 2>/dev/null || true",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

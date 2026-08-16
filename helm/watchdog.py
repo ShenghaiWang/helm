@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 
 LABEL = "com.helm.watchdog"
-DEFAULT_INTERVAL = 900
+DEFAULT_INTERVAL = 20
 
 
 def _fingerprint(text: str) -> str:
@@ -93,7 +93,15 @@ def pending_text(root: Path | None) -> str:
 
 
 def run(root: Path | None, interval: int, once: bool = False) -> int:
-    """Check now, then every `interval` seconds until stopped."""
+    """Check now, then every `interval` seconds until stopped.
+
+    The interval is a POLL, not a report cadence: it decides how quickly
+    something reaches the human, and a human waiting fifteen minutes to learn a
+    publish failed is not being told promptly. Cheap by construction -- the
+    check reads state already on disk and prints nothing unless the set of
+    waiting items changed -- so a short interval costs almost nothing and buys
+    the difference between "surfaced" and "surfaced in time".
+    """
     state = Path(os.environ.get("TMPDIR", "/tmp")) / "helm-watchdog.last"
     while True:
         try:
@@ -117,7 +125,7 @@ def run(root: Path | None, interval: int, once: bool = False) -> int:
                 print(text, flush=True)
         if once:
             return 0
-        time.sleep(max(60, interval))
+        time.sleep(max(5, interval))
 
 
 def _launchd_plist(root: Path, interval: int, log: Path) -> str:
@@ -133,11 +141,11 @@ def _launchd_plist(root: Path, interval: int, log: Path) -> str:
     <string>-m</string><string>helm</string>
     <string>--root</string><string>{root}</string>
     <string>watchdog</string><string>run</string>
-    <string>--once</string>
+    <string>--interval</string><string>{interval}</string>
   </array>
   <key>WorkingDirectory</key><string>{root}</string>
-  <key>StartInterval</key><integer>{interval}</integer>
-  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict>
@@ -151,9 +159,10 @@ def _systemd_units(root: Path, interval: int) -> tuple[str, str]:
 Description=Helm watchdog: surface what needs a human
 
 [Service]
-Type=oneshot
+Type=simple
 WorkingDirectory={root}
-ExecStart={executable} -m helm --root {root} watchdog run --once
+ExecStart={executable} -m helm --root {root} watchdog run --interval {interval}
+Restart=always
 """
     timer = f"""[Unit]
 Description=Helm watchdog timer
@@ -182,8 +191,8 @@ def install(root: Path, interval: int) -> int:
             ["launchctl", "load", str(target)], check=False, timeout=20
         )
         print(f"Installed the Helm watchdog: {target}")
-        print(f"  Runs every {interval}s against {root}, and stays silent unless")
-        print("  something needs a human AND the list has changed.")
+        print(f"  Polls every {interval}s against {root} and notifies within that,")
+        print("  staying silent unless something needs a human AND the list changed.")
         if result.returncode != 0:
             print("  launchctl load reported a problem; run it by hand to see why.")
             return 1
@@ -191,17 +200,18 @@ def install(root: Path, interval: int) -> int:
     if system == "Linux":
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
-        service, timer = _systemd_units(root, interval)
+        service, _timer = _systemd_units(root, interval)
+        # A continuously-polling service needs no timer: a timer would restart
+        # it on a cadence, which is the very latency this is removing.
         (unit_dir / "helm-watchdog.service").write_text(service, encoding="utf-8")
-        (unit_dir / "helm-watchdog.timer").write_text(timer, encoding="utf-8")
         with _quiet():
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, timeout=20)
             subprocess.run(
-                ["systemctl", "--user", "enable", "--now", "helm-watchdog.timer"],
+                ["systemctl", "--user", "enable", "--now", "helm-watchdog.service"],
                 check=False,
                 timeout=20,
             )
-        print(f"Installed the Helm watchdog: {unit_dir}/helm-watchdog.timer")
+        print(f"Installed the Helm watchdog: {unit_dir}/helm-watchdog.service")
         print(f"  Runs every {interval}s against {root}.")
         return 0
     # Windows, BSD, a container without an init -- say so rather than pretending.
@@ -227,7 +237,7 @@ def uninstall(root: Path) -> int:
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         with _quiet():
             subprocess.run(
-                ["systemctl", "--user", "disable", "--now", "helm-watchdog.timer"],
+                ["systemctl", "--user", "disable", "--now", "helm-watchdog.service"],
                 check=False,
                 timeout=20,
             )
