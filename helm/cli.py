@@ -2843,9 +2843,13 @@ def main(argv: list[str] | None = None) -> int:
             for update in coordinator.project_updates_for_watch(None, mark_seen=False):
                 if update.get("kind") != "situation":
                     continue
+                # Wider than the rest on purpose. A terminal report's payload is
+                # usually at the END of the line -- a video id, a URL, a commit
+                # -- so a 100-character cut removes exactly the part worth
+                # reading and leaves something that looks like nothing was said.
                 entries.append((
                     str(update.get("at") or ""),
-                    f"{update['glyph']} {update['project_id']}: {update['text'][:100]}",
+                    f"{update['glyph']} {update['project_id']}: {update['text'][:220]}",
                 ))
             for entry in coordinator.worker_health():
                 if entry["verdict"] in {
