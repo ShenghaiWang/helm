@@ -1445,3 +1445,47 @@ class EscalationReconciliationTests(ApprovalTests):
         self.assertEqual(
             sum(1 for line in printed.splitlines() if worker["id"] in line), 1
         )
+
+    def test_an_authorized_action_that_failed_can_be_asked_about(self) -> None:
+        """A worker whose authorized action did not complete must be able to say so.
+
+        An in-flight hold used to close only on a `result` or receipts. So a
+        worker whose action FAILED had no honest move: claiming a result would
+        be a lie, and anything else left the hold in-flight forever -- which
+        then refuses every future approval-needed on that task. A publish that
+        exited before its first API call got stuck exactly there, unable to ask
+        for the retry that would have been safe.
+        """
+        project, task, worker = self._paused_on_approval("failed-action")
+        self.coordinator.release_task_hold(
+            task["id"], action="publish", confirm=True
+        )
+        self.coordinator.start_authorized_action(worker["id"])
+
+        # The action ran and failed. The worker asks rather than retrying.
+        self.coordinator.record_worker_message(
+            worker["id"], "question",
+            "the upload exited before any API call; nothing reached the service",
+        )
+
+        held = self.coordinator.inspect_task(task["id"])["task"]
+        open_holds = [
+            h for h in held.get("holds", [])
+            if h.get("status") not in {"closed", "abandoned"}
+        ]
+        self.assertEqual(
+            open_holds, [], "a failed authorized action left its hold dangling"
+        )
+
+        # And a fresh request is now possible -- which is the whole point.
+        self.coordinator.record_worker_message(
+            worker["id"], self.coordinator.HOLD_MESSAGE_KIND,
+            "PREFLIGHT, retry: same snapshot, cause fixed",
+            payload={"action": "publish"},
+        )
+        reopened = self.coordinator.inspect_task(task["id"])["task"]
+        self.assertTrue(
+            any(h.get("status") == "waiting" for h in reopened.get("holds", [])),
+            "the retry could not ask for a fresh authorization",
+        )
+        self.assertEqual(reopened.get("status"), "approval-needed")

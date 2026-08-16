@@ -6154,6 +6154,32 @@ class Coordinator:
                 data, project, task, f"task ended {task['status']} with the hold open"
             )
             return "abandon"
+        if hold["status"] == "in-flight" and kind == "question":
+            # THE ACTION WAS ATTEMPTED AND DID NOT COMPLETE, and the worker is
+            # asking what to do about it. Before this, an in-flight hold closed
+            # only on a `result` or receipts -- so a worker whose authorized
+            # action FAILED had no way to say so: claiming a result would be a
+            # lie, and anything else left the hold in-flight forever, which
+            # then refuses every future approval-needed on that task. A publish
+            # that exited before its first API call got stuck exactly there,
+            # unable to ask for the retry that would have been safe.
+            #
+            # Closing it here spends nothing and hides nothing: the
+            # authorization was already spent at action-start, the question
+            # carries the account of what happened, and a retry needs a FRESH
+            # authorization bound to a fresh snapshot -- which is precisely the
+            # protection that was unreachable while the hold dangled.
+            self._move_hold(
+                data, project, task, hold, "outcome",
+                detail=(
+                    f"Authorized {hold['action']} did not complete; the worker "
+                    "asked rather than retrying. A fresh authorization is needed."
+                ),
+                payload={"receipts": hold["outcome"].get("receipts", [])},
+                worker=worker,
+                message_kind="approval-outcome",
+            )
+            return "outcome"
         if hold["status"] == "in-flight" and (kind == "result" or receipts):
             # The authorized action ran and this is its outcome. Receipts are
             # recorded as outcome data; they are never a precondition.
