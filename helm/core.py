@@ -10891,7 +10891,7 @@ class Coordinator:
                     {"source": "cleanup"},
                 )
             if (
-                task["status"] not in {"completed", "failed", "merged", "pr-merged"}
+task["status"] not in {"completed", "failed", "merged", "pr-merged"}
                 # The status gate protects a checkout: work not yet reviewed,
                 # or waiting on approval, must not have the directory holding
                 # it removed underneath. A role with no worktree has no such

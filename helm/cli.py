@@ -2815,38 +2815,52 @@ def main(argv: list[str] | None = None) -> int:
                     with contextlib.suppress(HelmError, OSError):
                         coordinator.poll_worker(entry["id"])
 
-            lines: list[str] = []
+            # (recency, text): a gate raised two minutes ago must not sit
+            # under a blocker from yesterday. The list is read top-down and the
+            # top is the only part reliably read, so ordering by age is the
+            # difference between surfacing something and burying it. Items with
+            # no timestamp sort oldest -- they are the long-standing ones.
+            entries: list[tuple[str, str]] = []
             for item in coordinator.open_escalations(None):
                 glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
                 first = next(
                     (line.strip() for line in item["text"].splitlines() if line.strip()), ""
                 )
-                lines.append(f"{glyph} {item['kind']} {item['worker_id']}: {first[:100]}")
+                entries.append((
+                    str(item.get("at") or item.get("created_at") or ""),
+                    f"{glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
+                ))
             for item in coordinator.open_action_items(None):
                 if item.get("kind") not in BLOCKING_GATE_KINDS:
                     continue
-                lines.append(
-                    f"{item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}"
-                )
+                entries.append((
+                    str(item.get("at") or ""),
+                    f"{item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}",
+                ))
             # Owed but unrelayed outcomes. `mark_seen=False` matters: this runs
             # unattended, and a check that consumed what it reported would be
             # the exact hole this command exists to close.
             for update in coordinator.project_updates_for_watch(None, mark_seen=False):
                 if update.get("kind") != "situation":
                     continue
-                lines.append(f"{update['glyph']} {update['project_id']}: {update['text'][:100]}")
+                entries.append((
+                    str(update.get("at") or ""),
+                    f"{update['glyph']} {update['project_id']}: {update['text'][:100]}",
+                ))
             for entry in coordinator.worker_health():
                 if entry["verdict"] in {
                     "healthy", "settled", "reported", "starting", "driving",
                 }:
                     continue
                 glyph = _glyph_for(coordinator, entry["project_id"])
-                lines.append(
+                entries.append((
+                    "",  # health has no timestamp; a stalled worker is by definition old
                     f"{glyph} {entry['project_id']} {entry['worker_id']} "
-                    f"[{entry['verdict']}]: {entry['detail'][:80]}"
-                )
-            if not lines:
+                    f"[{entry['verdict']}]: {entry['detail'][:80]}",
+                ))
+            if not entries:
                 return 0
+            lines = [text for _at, text in sorted(entries, key=lambda e: e[0], reverse=True)]
             print(f"HELM NEEDS A HUMAN ({len(lines)}):")
             for line in lines:
                 print(f"  {line}")
