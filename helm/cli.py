@@ -2843,6 +2843,13 @@ def main(argv: list[str] | None = None) -> int:
             for update in coordinator.project_updates_for_watch(None, mark_seen=False):
                 if update.get("kind") != "situation":
                     continue
+                # OWED reports only. This command is read unattended and its
+                # whole value is that it changes when something needs a human;
+                # a routine progress line has nothing that ever clears it, so
+                # including one makes the list permanently non-empty and every
+                # future change look like the same old news.
+                if not update.get("owed"):
+                    continue
                 # Wider than the rest on purpose. A terminal report's payload is
                 # usually at the END of the line -- a video id, a URL, a commit
                 # -- so a 100-character cut removes exactly the part worth

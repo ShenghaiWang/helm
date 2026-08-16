@@ -8732,6 +8732,13 @@ class Coordinator:
                         "at": entry.get("at"),
                         "text": entry.get("text", ""),
                         "kind": "situation",
+                        # Whether this is a report the commander is OWED, or an
+                        # ordinary progress line. A caller that must not nag --
+                        # an unattended watch, say -- needs to tell them apart:
+                        # an owed report clears when it is acknowledged, while a
+                        # routine line has nothing to clear it and would repeat
+                        # for the life of the root.
+                        "owed": bool(entry.get("surface")),
                     })
                 if mark_seen:
                     for entry in action_items:
