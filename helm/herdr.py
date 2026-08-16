@@ -955,6 +955,7 @@ class HerdrAdapter:
                 review_data = self.coordinator.store.load()
                 artifact_handoff = self._artifact_handoff(review_data, task_id)
                 full_suite_evidence = self._full_suite_evidence(review_data, task_id)
+                diff_handoff, _diff_path = self._precomputed_diff(task, review_base)
                 # Terminal protocol results settle workers even when their
                 # interactive pane remains open. Do not reopen a completed
                 # worker for another review round; launch a fresh reviewer task.
@@ -1004,6 +1005,11 @@ class HerdrAdapter:
                         "whose FIRST WORD is APPROVED or CHANGES-REQUESTED -- Helm reads "
                         "that word to decide whether the loop continues -- followed by "
                         "your findings."
+                        # Before the author's text and before the evidence
+                        # block: this is the instruction that keeps the
+                        # reviewer alive, so nothing may crowd it off the end
+                        # of a brief truncated at 20,000 characters.
+                        f"{diff_handoff}"
                         # Mandatory and Helm's own, so it precedes the author's
                         # untrusted text below for the same reason the rest of
                         # this brief does: nothing the author writes may crowd
@@ -1735,6 +1741,62 @@ class HerdrAdapter:
         if len(fragment) > 2:
             return f"{entry} {fragment}{marker}"
         return f"{entry} {cls._ARTIFACT_DESCRIPTION_OMITTED}"
+
+    def _precomputed_diff(self, task: dict[str, Any], review_base: str) -> tuple[str, str]:
+        """Write the diff to a file so the reviewer never has to run `git diff`.
+
+        Five consecutive reviewers on one project died the same way: read the
+        diff, then re-run `git diff` while composing the verdict, and once it
+        repeats it repeats forever -- one burned 3.9 hours and 47MB emitting
+        the same command. Every brief warned against it more sternly than the
+        last, which is the tell that prose was the wrong instrument: Helm's own
+        brief tells the reviewer to run git commands in the author's checkout,
+        so Helm was steering it into the failure mode and then asking it not to
+        go there.
+
+        A reviewer that never runs `git diff` cannot loop on `git diff`. So
+        Helm runs it once, writes it down, and hands over the path. That also
+        removes the honest reason to re-run it -- an incremental reader that
+        lost its place had nothing else to go back to.
+
+        Returns (brief_fragment, path). On any failure the fragment is empty and
+        the reviewer falls back to reading the repository itself: a diff Helm
+        could not compute must not become a review that cannot happen.
+        """
+        workspace = task.get("workspace")
+        branch = task.get("branch")
+        if not workspace or not branch:
+            return "", ""
+        directory = self.coordinator.store.directory / "reviews" / task["id"]
+        target = directory / "diff.patch"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            patch = _git(
+                Path(workspace), "diff", f"{review_base}...{branch}", check=False
+            )
+            stat = _git(
+                Path(workspace), "diff", "--stat", f"{review_base}...{branch}", check=False
+            )
+            if not patch.strip():
+                return "", ""
+            target.write_text(patch, encoding="utf-8")
+        except (OSError, HelmError):
+            return "", ""
+        return (
+            "\n\nTHE COMPLETE DIFF HAS ALREADY BEEN COMPUTED FOR YOU:\n"
+            f"  {target}\n"
+            "READ THAT FILE. It is the whole change, produced by Helm with the "
+            "exact three-dot range against the base commit named above, so it "
+            "cannot disagree with what you were asked to review.\n"
+            "DO NOT RUN `git diff`. Five reviewers before you died re-running "
+            "it while writing their verdict -- once that repeats it repeats "
+            "forever, and the review is lost along with everything they had "
+            "already worked out. If you lose your place, re-read the FILE. You "
+            "may still run the type checker, the linter and focused tests, and "
+            "you may read individual files for context.\n"
+            f"Summary of what changed:\n{stat.strip()}\n\n",
+            str(target),
+        )
 
     @classmethod
     def _artifact_handoff(cls, data: dict[str, Any], task_id: str) -> str:

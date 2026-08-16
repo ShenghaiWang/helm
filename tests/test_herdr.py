@@ -15,6 +15,7 @@ from helm import cli
 from helm.core import (
     project_glyph,
     SafetyError,
+    _git,
 )
 from helm.herdr import HerdrAdapter, HerdrNotFound, SubprocessHerdrClient
 
@@ -749,3 +750,77 @@ class HerdrTests(HelmTestCase):
         self.assertFalse(
             HerdrAdapter._superseded_reviewer(alone, alone["tasks"]["t-dead"])
         )
+
+
+class PrecomputedReviewDiffTests(HelmTestCase):
+    """A reviewer that never runs `git diff` cannot loop on `git diff`.
+
+    Five consecutive reviewers on one project died the same way: read the diff,
+    then re-run it while composing the verdict, and once that repeats it
+    repeats forever. Every brief warned against it more sternly than the last,
+    which is the tell that prose was the wrong instrument -- Helm's own brief
+    told the reviewer to run git commands in the author's checkout, so Helm was
+    steering it into the failure mode and then asking it not to go there.
+    """
+
+    def _task_with_change(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "make a change")
+        # The worktree is materialised when a worker is prepared, not at task
+        # creation -- and a review needs a branch that actually holds a commit.
+        self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+        self.commit_on_task_branch(task, "a line the reviewer must see")
+        return project, task
+
+    def test_the_diff_is_written_down_and_the_reviewer_is_told_where(self) -> None:
+        _project, task = self._task_with_change("precomputed")
+        adapter = HerdrAdapter(self.coordinator, client=FakeHerdr())
+        base = _git(Path(task["workspace"]), "rev-parse", task["base_branch"]).strip()
+
+        fragment, path = adapter._precomputed_diff(task, base)
+
+        self.assertTrue(path, "the reviewer needs a path, not an empty string")
+        written = Path(path).read_text(encoding="utf-8")
+        self.assertIn("a line the reviewer must see", written)
+        self.assertIn(path, fragment)
+        # The instruction is the point; a path alone still leaves `git diff`
+        # as the obvious move.
+        self.assertIn("DO NOT RUN `git diff`", fragment)
+        self.assertIn("re-read the FILE", fragment)
+        # It must not forbid the verification a review actually needs.
+        self.assertIn("focused tests", fragment)
+
+    def test_a_diff_helm_cannot_compute_does_not_block_the_review(self) -> None:
+        """A missing diff must degrade to the old behaviour, not to no review.
+
+        Failing closed here would turn one unreadable repository into a project
+        that can never be reviewed again -- strictly worse than a reviewer that
+        has to run git itself.
+        """
+        _project, task = self._task_with_change("degrade")
+        adapter = HerdrAdapter(self.coordinator, client=FakeHerdr())
+
+        fragment, path = adapter._precomputed_diff(task, "not-a-real-commit")
+        self.assertEqual((fragment, path), ("", ""))
+
+        missing = dict(task, workspace=None)
+        self.assertEqual(adapter._precomputed_diff(missing, "HEAD"), ("", ""))
+
+    def test_an_empty_diff_hands_over_nothing_rather_than_an_empty_file(self) -> None:
+        """An empty patch would read as 'nothing changed', which is a lie."""
+        root = self.repo("nochange")
+        project = self.coordinator.register_project(
+            "Nochange", str(root), project_id="nochange"
+        )
+        task = self.coordinator.create_task(project["id"], "change nothing")
+        self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+        adapter = HerdrAdapter(self.coordinator, client=FakeHerdr())
+        base = _git(Path(task["workspace"]), "rev-parse", task["base_branch"]).strip()
+        self.assertEqual(adapter._precomputed_diff(task, base), ("", ""))
