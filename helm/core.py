@@ -23,7 +23,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from . import models
 from . import preferences as prefs
@@ -7018,12 +7018,33 @@ class Coordinator:
         """When the worker itself last pushed, ignoring Helm's own messages."""
         return worker.get("last_reported_at")
 
-    def worker_health(self, *, silence_seconds: float | None = None) -> list[dict[str, Any]]:
+    LIVE_SILENCE_GRACE = 3.0
+
+    def worker_health(
+        self,
+        *,
+        silence_seconds: float | None = None,
+        liveness: Callable[[dict[str, Any]], bool | None] | None = None,
+    ) -> list[dict[str, Any]]:
         """Report every running worker's liveness without opening its UI.
 
         This is the check a human would otherwise perform by looking at each
         agent's pane. Helm owns it instead: the point of delegation is that
         nobody has to watch the workers.
+
+        An idle log file is evidence, not a verdict. A worker Helm launched as
+        a process is checked against its own pid, but a worker in a Herdr pane
+        has no pid here and was judged on output alone -- so an agent thinking
+        for six minutes was reported as stalled, which is how a healthy
+        reviewer gets killed. `liveness` lets the caller that CAN ask the
+        provider answer the question; core stays out of Herdr.
+
+        It is deliberately not a blanket excuse for silence. A reviewer that
+        ran for hours re-issuing one command was alive the whole time and was
+        still broken, so being alive only buys a worker a short grace --
+        `LIVE_SILENCE_GRACE` times the threshold -- after which it is reported
+        however alive it is. Alive and silent for minutes is a long model
+        call; alive and silent for an hour is a fault.
         """
         threshold = self.SILENCE_SECONDS if silence_seconds is None else silence_seconds
         data = self.store.load()
@@ -7056,6 +7077,14 @@ class Coordinator:
                 and worker.get("execution") == "process"
                 and not self._process_alive(worker.get("pid"))
             )
+            # None means "could not tell", which must not read as either
+            # alive or dead: an unavailable provider is not evidence.
+            alive: bool | None = None
+            if liveness is not None and not finished and worker.get("execution") != "process":
+                with contextlib.suppress(Exception):
+                    alive = liveness(worker)
+            if alive is False and not finished:
+                vanished = True
             # An agent CLI keeps its session open after it finishes, so a
             # worker that has already delivered a terminal message is idle, not
             # stalled.  Calling that "attention" every time would train the
@@ -7150,10 +7179,25 @@ class Coordinator:
                     "delivered a terminal message; session still open",
                 )
             elif stale_output and stale_reports:
-                verdict, detail = (
-                    "stalled",
-                    f"no protocol message and no terminal output for {int(output_idle)}s",
+                within_grace = (
+                    output_idle is not None
+                    and output_idle <= threshold * self.LIVE_SILENCE_GRACE
                 )
+                if alive is True and within_grace:
+                    verdict, detail = (
+                        "working",
+                        f"alive but silent for {int(output_idle)}s; the provider "
+                        "confirms the session, so this is a long model call",
+                    )
+                else:
+                    detail = (
+                        f"no protocol message and no terminal output for {int(output_idle)}s"
+                    )
+                    if alive is True:
+                        # Worth saying: it removes "maybe it died" from the
+                        # diagnosis and points at a wedged or looping agent.
+                        detail += "; the session is still alive, so it is stuck rather than gone"
+                    verdict = "stalled"
             elif reported_idle is not None and reported_idle <= threshold:
                 verdict, detail = "healthy", "reporting"
             elif last_message is None:

@@ -1089,3 +1089,76 @@ class WorkerProtocolTests(HelmTestCase):
             self.assertEqual(
                 self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
             )
+
+
+class LiveButSilentWorkerTests(HelmTestCase):
+    """A silent worker is not a dead one, and a live one is not a healthy one."""
+
+    def _paneless(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "think for a while")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        # A Herdr worker has no pid here, which is precisely why output was the
+        # only signal and a long model call read as a stall.
+        data = self.coordinator.store.load()
+        data["workers"][worker["id"]]["execution"] = "herdr"
+        self.coordinator.store.save(data)
+        return worker
+
+    def _age(self, worker, seconds: float) -> None:
+        stamp = time.time() - seconds
+        os.utime(worker["log_file"], (stamp, stamp))
+
+    def test_a_live_worker_silent_for_minutes_is_working_not_stalled(self) -> None:
+        worker = self._paneless("thinking")
+        self._age(worker, 320)  # just past the 300s threshold
+
+        blind = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(blind[worker["id"]]["verdict"], "stalled")
+
+        health = {
+            e["worker_id"]: e
+            for e in self.coordinator.worker_health(liveness=lambda w: True)
+        }
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "working")
+        self.assertIn("long model call", entry["detail"])
+
+    def test_being_alive_only_buys_a_grace_period_not_silence_forever(self) -> None:
+        """The reviewer that looped for hours was alive the whole time."""
+        worker = self._paneless("runaway")
+        self._age(worker, 4_000)
+
+        health = {
+            e["worker_id"]: e
+            for e in self.coordinator.worker_health(liveness=lambda w: True)
+        }
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "stalled")
+        self.assertIn("stuck rather than gone", entry["detail"])
+
+    def test_a_provider_that_says_the_session_is_gone_settles_it_as_died(self) -> None:
+        worker = self._paneless("gone")
+        self._age(worker, 320)
+        health = {
+            e["worker_id"]: e
+            for e in self.coordinator.worker_health(liveness=lambda w: False)
+        }
+        self.assertEqual(health[worker["id"]]["verdict"], "died")
+
+    def test_an_unavailable_provider_is_not_evidence_either_way(self) -> None:
+        worker = self._paneless("unknown")
+        self._age(worker, 320)
+        for probe in (lambda w: None, lambda w: (_ for _ in ()).throw(RuntimeError("herdr down"))):
+            health = {
+                e["worker_id"]: e
+                for e in self.coordinator.worker_health(liveness=probe)
+            }
+            entry = health[worker["id"]]
+            self.assertEqual(entry["verdict"], "stalled")
+            self.assertNotIn("still alive", entry["detail"])

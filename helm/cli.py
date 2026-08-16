@@ -654,6 +654,28 @@ def _print_delivery(delivered: list[dict[str, Any]]) -> None:
             print(f"  MISSING {entry['path']} (recorded but not in the worktree)")
 
 
+def _liveness_probe(coordinator):
+    """A Herdr-aware liveness answer, or None when nothing can tell.
+
+    `worker_health` judges a paneless worker on an idle log file alone, which
+    reads a six-minute model call as a stall. Only the Herdr layer can ask the
+    provider whether the session is still there, so the caller supplies it and
+    core stays provider-neutral. Any failure answers "unknown" rather than
+    "dead": an unavailable provider must never look like evidence.
+    """
+    adapter = None
+
+    def probe(worker):
+        nonlocal adapter
+        try:
+            if adapter is None:
+                adapter = HerdrAdapter(coordinator)
+            return adapter._provider_worker_alive(worker)
+        except Exception:
+            return None
+
+    return probe
+
 def _glyph_for(coordinator: Coordinator, project_id: str) -> str:
     """A project's colour glyph, so any report says which project it is about.
 
@@ -876,12 +898,12 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
     # default view has to say when a worker has gone quiet.
     needs_attention = [
         entry
-        for entry in coordinator.worker_health()
+        for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator))
         # Same healthy set as `watch`, `driving` included for the same reason:
         # a foreman waiting on a worker it launched is working, and listing it
         # as needing attention is how a real stall stops standing out.
         if entry["verdict"] not in {
-            "healthy", "settled", "reported", "starting", "driving",
+            "healthy", "settled", "reported", "starting", "driving", "working",
         }
         and (project_id is None or entry["project_id"] == project_id)
     ]
@@ -2867,9 +2889,9 @@ def main(argv: list[str] | None = None) -> int:
                     str(update.get("at") or ""),
                     f"{update['glyph']} {update['project_id']}: {update['text'][:220]}",
                 ))
-            for entry in coordinator.worker_health():
+            for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
                 if entry["verdict"] in {
-                    "healthy", "settled", "reported", "starting", "driving",
+                    "healthy", "settled", "reported", "starting", "driving", "working",
                 }:
                     continue
                 glyph = _glyph_for(coordinator, entry["project_id"])
@@ -2958,7 +2980,7 @@ def main(argv: list[str] | None = None) -> int:
                 # exactly like the two that were genuinely down, and the whole
                 # signal stopped being worth reading.
                 healthy = entry["verdict"] in {
-                    "healthy", "settled", "reported", "starting", "driving",
+                    "healthy", "settled", "reported", "starting", "driving", "working",
                 }
                 if healthy:
                     mark = ""
@@ -3140,7 +3162,7 @@ def main(argv: list[str] | None = None) -> int:
                 # and without a way out that project could never be given
                 # another driver. So say how to replace it.
                 health = {
-                    entry["worker_id"]: entry for entry in coordinator.worker_health()
+                    entry["worker_id"]: entry for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator))
                 }.get(existing["id"], {})
                 verdict = health.get("verdict", "unknown")
                 print(
