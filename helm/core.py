@@ -7194,9 +7194,11 @@ class Coordinator:
                         f"no protocol message and no terminal output for {int(output_idle)}s"
                     )
                     if alive is True:
-                        # Worth saying: it removes "maybe it died" from the
-                        # diagnosis and points at a wedged or looping agent.
-                        detail += "; the session is still alive, so it is stuck rather than gone"
+                        # Say what is known and stop there. Liveness rules out
+                        # "it died"; it does NOT distinguish a wedged agent from
+                        # one waiting on a slow model, and asserting "stuck"
+                        # sends a reader to kill work that was merely thinking.
+                        detail += "; the session is alive, so it is slow, wedged or looping, not gone"
                     verdict = "stalled"
             elif reported_idle is not None and reported_idle <= threshold:
                 verdict, detail = "healthy", "reporting"

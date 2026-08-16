@@ -2888,6 +2888,7 @@ def main(argv: list[str] | None = None) -> int:
                 entries.append((
                     str(update.get("at") or ""),
                     f"{update['glyph']} {update['project_id']}: {update['text'][:220]}",
+                    f"{update['glyph']} {update['project_id']}: {update['text']}",
                 ))
             for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
                 if entry["verdict"] in {
@@ -2899,8 +2900,11 @@ def main(argv: list[str] | None = None) -> int:
                     "",  # health has no timestamp; a stalled worker is by definition old
                     f"{glyph} {entry['project_id']} {entry['worker_id']} "
                     f"[{entry['verdict']}]: {entry['detail'][:80]}",
+                    f"{glyph} {entry['project_id']} {entry['worker_id']} "
+                    f"[{entry['verdict']}]: {entry['detail']}",
                 ))
-            lines = [text for _at, text in sorted(entries, key=lambda e: e[0], reverse=True)]
+            ordered = sorted(entries, key=lambda e: e[0], reverse=True)
+            lines = [text for _at, text, _identity in ordered]
             if args.changes:
                 # Only what is NEW since the last --changes call. An unattended
                 # watch that re-prints the whole list every poll buries the one
@@ -2910,15 +2914,26 @@ def main(argv: list[str] | None = None) -> int:
                 # Compared with digits stripped, because a line carries elapsed
                 # time ("quiet for 7481s") that differs on every poll: without
                 # that, every health line reads as new, forever.
-                def _key(line: str) -> str:
-                    return "".join(c for c in line if not c.isdigit())
+                #
+                # The identity is built from the FULL text, never the truncated
+                # display line. Truncating first reintroduces the bug by the
+                # back door: when a counter grows from 994s to 1016s the line
+                # gets one character longer, the cut lands one character
+                # earlier, and the stripped tails differ -- so an unchanged
+                # item announces itself again purely because a number got wider.
+                def _key(text: str) -> str:
+                    return "".join(c for c in text if not c.isdigit())
 
                 seen_file = coordinator.store.directory / "pending-seen.json"
                 previous: set[str] = set()
                 with contextlib.suppress(OSError, ValueError):
                     previous = set(json.loads(seen_file.read_text()))
-                current = {_key(line) for line in lines}
-                fresh = [line for line in lines if _key(line) not in previous]
+                current = {_key(identity) for _at, _text, identity in ordered}
+                fresh = [
+                    text
+                    for _at, text, identity in ordered
+                    if _key(identity) not in previous
+                ]
                 with contextlib.suppress(OSError):
                     seen_file.write_text(json.dumps(sorted(current)))
                 for line in fresh:

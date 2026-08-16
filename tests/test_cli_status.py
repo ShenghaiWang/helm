@@ -804,3 +804,51 @@ class CliStatusTests(HelmTestCase):
         printed = third.getvalue()
         self.assertIn("the second thing", printed)
         self.assertNotIn("the first thing", printed)
+
+
+    def test_a_growing_counter_does_not_reannounce_an_unchanged_item(self) -> None:
+        """994s -> 1016s is one character longer, and that used to leak through.
+
+        The identity was built from the DISPLAY line, which is truncated. One
+        more digit pushed the cut one character earlier, the tails differed,
+        and an item nobody had touched announced itself again -- on every poll
+        that crossed a digit boundary. Comparing the full text fixes it.
+        """
+        helm_root = self._helm_root("counter-root")
+        destination = helm_root / "projects" / "counter"
+        shutil.move(str(self.repo("counter")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "counter")
+
+        # The REAL detail, and its length is the point: at 117 characters the
+        # 80-character display cut lands inside it, so one more digit shifts
+        # the tail from "so it" to "so i". A shorter string never truncates
+        # and the test would pass without exercising anything.
+        detail = (
+            "no protocol message and no terminal output for {}s; the session "
+            "is alive, so it is slow, wedged or looping, not gone"
+        )
+        health = [{
+            "worker_id": "w-slow", "task_id": "t-1", "role": "worker",
+            "project_id": project["id"], "agent_id": None, "execution": "herdr",
+            "verdict": "stalled", "detail": detail.format(994),
+            "output_idle_seconds": 994.0, "reported_idle_seconds": 994.0,
+            "nudged_at": None,
+        }]
+
+        def run() -> str:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                cli.main(["--root", str(helm_root), "pending", "--changes"])
+            return buffer.getvalue()
+
+        with mock.patch.object(Coordinator, "worker_health", return_value=health):
+            first = run()
+        self.assertIn("w-slow", first)
+
+        health[0]["detail"] = detail.format(1016)  # one digit wider
+        health[0]["output_idle_seconds"] = 1016.0
+        with mock.patch.object(Coordinator, "worker_health", return_value=health):
+            second = run()
+        self.assertEqual(second.strip(), "", "a wider counter is not news")
+        self.assertGreater(len(detail.format(994)), 80, "must exceed the display cut")

@@ -1130,7 +1130,12 @@ class LiveButSilentWorkerTests(HelmTestCase):
         self.assertIn("long model call", entry["detail"])
 
     def test_being_alive_only_buys_a_grace_period_not_silence_forever(self) -> None:
-        """The reviewer that looped for hours was alive the whole time."""
+        """The reviewer that looped for hours was alive the whole time.
+
+        The verdict must not claim more than liveness proves: a silent live
+        worker may be wedged OR waiting on a slow model, and calling it stuck
+        is how a reader is talked into killing work that was only thinking.
+        """
         worker = self._paneless("runaway")
         self._age(worker, 4_000)
 
@@ -1140,7 +1145,7 @@ class LiveButSilentWorkerTests(HelmTestCase):
         }
         entry = health[worker["id"]]
         self.assertEqual(entry["verdict"], "stalled")
-        self.assertIn("stuck rather than gone", entry["detail"])
+        self.assertIn("slow, wedged or looping, not gone", entry["detail"])
 
     def test_a_provider_that_says_the_session_is_gone_settles_it_as_died(self) -> None:
         worker = self._paneless("gone")
