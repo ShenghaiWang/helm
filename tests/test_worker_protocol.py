@@ -1254,3 +1254,45 @@ class FailureScanReadsTextNotEscapesTests(HelmTestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0], "API Error: overloaded, retrying")
         self.assertNotIn("\x1b", failures[0], "the reported reason must be readable")
+
+    def test_prose_about_a_killed_process_is_not_a_killed_process(self) -> None:
+        """An agent whose job is writing about failures writes the word often.
+
+        `Killed` as a bare substring matched a foreman DESCRIBING its own fix
+        -- "a staleness horizon so a writer killed mid-append cannot wedge the
+        day" -- and reported it as a worker that had died. The signature has to
+        say WHERE the word must appear, not only what it says.
+        """
+        root = self.repo("prose")
+        project = self.coordinator.register_project(
+            "Prose", str(root), project_id="prose"
+        )
+        task = self.coordinator.create_task(project["id"], "write about failures")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        log = Path(worker["log_file"])
+        log.write_text(
+            "a staleness horizon so a writer killed mid-append cannot wedge the day\n"
+            "the process was killed by the OOM killer, so the lock must expire\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.coordinator.worker_failures(worker["id"]), [])
+
+    def test_the_shell_kill_report_is_still_a_failure(self) -> None:
+        """Narrowing must not blind the check to the thing it exists for."""
+        root = self.repo("oomed")
+        project = self.coordinator.register_project(
+            "Oomed", str(root), project_id="oomed"
+        )
+        task = self.coordinator.create_task(project["id"], "get killed")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        for report in ("Killed", "Killed: 9", "zsh: killed  node dist/main.js",
+                       "Killed process 4821 (node)"):
+            Path(worker["log_file"]).write_text(report + "\n", encoding="utf-8")
+            self.assertEqual(
+                self.coordinator.worker_failures(worker["id"]), [report],
+                f"{report!r} is the report this check exists for",
+            )

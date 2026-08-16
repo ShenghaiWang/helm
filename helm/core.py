@@ -6970,16 +6970,28 @@ class Coordinator:
     # printed -- so the evidence of a failure is already on disk, and was simply
     # never read. Deliberately narrow: a phrase that also appears in ordinary
     # work would make the check noise, and noise is how a warning stops working.
+    #: Matched as regexes against the READABLE text of a line, so a signature
+    #: can say where it must appear rather than only what it says. Most are
+    #: distinctive enough as plain phrases; the exception is the shell's
+    #: kill report, which as a bare substring matches the ordinary English
+    #: word and flagged a foreman that was DESCRIBING a fix -- "a staleness
+    #: horizon so a writer killed mid-append cannot wedge the day" -- as a
+    #: worker that had died. An agent whose job is writing about failures
+    #: will write the word constantly.
     _FAILURE_SIGNATURES = (
-        "API Error",
-        "Connection closed mid-response",
-        "rate limit",
-        "context left",
-        "Traceback (most recent call last)",
-        "command not found",
-        "Killed",
-        "session ended",
-        "credit balance is too low",
+        r"API Error",
+        r"Connection closed mid-response",
+        r"rate limit",
+        r"context left",
+        r"Traceback \(most recent call last\)",
+        r"command not found",
+        # With a shell prefix ("zsh: killed  node ...") the word is
+        # unambiguously the kill report, whatever follows it.
+        r"^\s*[\w./-]+:\s*[Kk]illed\b",
+        # Without one it must stand alone, name a process, or carry a signal.
+        r"^\s*[Kk]illed\b(?:\s+process\b|\s*:?\s*\d*\s*$)",
+        r"session ended",
+        r"credit balance is too low",
     )
 
     # A prompt is not a failure, but it is just as fatal in a pane nobody is
@@ -7043,7 +7055,7 @@ class Coordinator:
                 if not line:
                     continue
                 for signature in self._FAILURE_SIGNATURES:
-                    if signature.lower() in line.lower() and line not in found:
+                    if re.search(signature, line, re.IGNORECASE) and line not in found:
                         found.append(line[:160])
                         break
         return found
