@@ -882,3 +882,43 @@ class CliStatusTests(HelmTestCase):
                 exit_code = cli.main(["--root", str(helm_root), *argv])
             self.assertEqual(exit_code, 0, f"{argv} must not crash")
             self.assertIn("cannot reach the tracker", buffer.getvalue())
+
+
+    def test_two_workers_do_not_share_one_identity(self) -> None:
+        """Stripping every digit dissolved the worker id and swallowed news.
+
+        w-1a2b3c4d5e6f and w-12ab3c4d5e6f both reduced to "w-edab", so once one
+        had been reported the other never was. A repeat is noise; a swallowed
+        item is the silence this command exists to prevent, so this error runs
+        the dangerous way and gets its own test.
+        """
+        helm_root = self._helm_root("collide-root")
+        destination = helm_root / "projects" / "collide"
+        shutil.move(str(self.repo("collide")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "collide")
+
+        def entry(worker_id: str, idle: int) -> dict:
+            return {
+                "worker_id": worker_id, "task_id": "t-1", "role": "worker",
+                "project_id": project["id"], "agent_id": None, "execution": "herdr",
+                "verdict": "stalled",
+                "detail": f"no protocol message and no terminal output for {idle}s",
+                "output_idle_seconds": float(idle),
+                "reported_idle_seconds": float(idle), "nudged_at": None,
+            }
+
+        def run(health: list) -> str:
+            buffer = io.StringIO()
+            with mock.patch.object(Coordinator, "worker_health", return_value=health):
+                with contextlib.redirect_stdout(buffer):
+                    cli.main(["--root", str(helm_root), "pending", "--changes"])
+            return buffer.getvalue()
+
+        first = run([entry("w-1a2b3c4d5e6f", 400)])
+        self.assertIn("w-1a2b3c4d5e6f", first)
+
+        # A DIFFERENT worker, whose id collides once every digit is stripped.
+        second = run([entry("w-1a2b3c4d5e6f", 460), entry("w-12ab3c4d5e6f", 400)])
+        self.assertIn("w-12ab3c4d5e6f", second, "the second worker must not be swallowed")
+        self.assertNotIn("w-1a2b3c4d5e6f", second, "the first is unchanged; only its clock moved")

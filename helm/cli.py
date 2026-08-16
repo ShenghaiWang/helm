@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import re
 import os
 import secrets
 import shutil
@@ -2928,8 +2929,17 @@ def main(argv: list[str] | None = None) -> int:
                 # gets one character longer, the cut lands one character
                 # earlier, and the stripped tails differ -- so an unchanged
                 # item announces itself again purely because a number got wider.
+                #
+                # Only ELAPSED TIMES are normalised, not every digit. Stripping
+                # all of them also dissolved the worker id, whose digits are
+                # most of what distinguishes one from another: two ids differing
+                # only in where their digits sit reduced to the SAME key, so the
+                # second worker's news was SUPPRESSED once the first had been
+                # reported. That error runs the dangerous way -- a repeat is
+                # noise, but a swallowed item is the silence this command exists
+                # to prevent.
                 def _key(text: str) -> str:
-                    return "".join(c for c in text if not c.isdigit())
+                    return re.sub(r"\d+s\b", "Ns", text)
 
                 seen_file = coordinator.store.directory / "pending-seen.json"
                 previous: set[str] = set()
