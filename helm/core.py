@@ -7208,10 +7208,23 @@ class Coordinator:
                 # every new worker would make the attention list noise.
                 verdict, detail = "starting", "running; no protocol message yet"
             elif output_idle is not None:
-                verdict, detail = (
-                    "quiet",
-                    f"producing output but no protocol message for {int(reported_idle)}s",
-                )
+                # Its log IS moving, so it is alive and working; the only thing
+                # missing is a protocol push. That is worth saying eventually --
+                # a worker that never reports is indistinguishable from a dead
+                # one -- but not at five minutes, when an agent is simply
+                # mid-edit. Reusing the liveness grace keeps one rule for
+                # "silent but demonstrably alive" instead of two.
+                if reported_idle is not None and reported_idle <= threshold * self.LIVE_SILENCE_GRACE:
+                    verdict, detail = (
+                        "working",
+                        f"producing output; no protocol message for "
+                        f"{int(reported_idle)}s, still within the reporting grace",
+                    )
+                else:
+                    verdict, detail = (
+                        "quiet",
+                        f"producing output but no protocol message for {int(reported_idle)}s",
+                    )
             else:
                 verdict, detail = "unknown", "no output log to read"
             role = (data.get("tasks", {}).get(worker["task_id"]) or {}).get("role", "worker")

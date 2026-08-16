@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import io
 import os
 import json
@@ -1091,6 +1092,11 @@ class WorkerProtocolTests(HelmTestCase):
             )
 
 
+def _stamp_ago(seconds: float) -> str:
+    moment = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
 class LiveButSilentWorkerTests(HelmTestCase):
     """A silent worker is not a dead one, and a live one is not a healthy one."""
 
@@ -1167,3 +1173,35 @@ class LiveButSilentWorkerTests(HelmTestCase):
             entry = health[worker["id"]]
             self.assertEqual(entry["verdict"], "stalled")
             self.assertNotIn("still alive", entry["detail"])
+
+    def test_a_worker_still_producing_output_is_not_a_fault_at_five_minutes(self) -> None:
+        """Its log is moving, so it is working; only the protocol push is late.
+
+        This landed in the "needs a human" list at just over five minutes,
+        which is an agent mid-edit. An attention list full of healthy workers
+        trains its reader to skip it -- the same failure as reporting nothing.
+        """
+        worker = self._paneless("mid-edit")
+        # Output fresh (the log was just written), but nothing reported yet.
+        self.coordinator.record_worker_message(worker["id"], "status", "starting")
+        data = self.coordinator.store.load()
+        # `last_reported_at` is the worker's OWN push, which is what the
+        # health check reads -- not the message log.
+        data["workers"][worker["id"]]["last_reported_at"] = _stamp_ago(320)
+        self.coordinator.store.save(data)
+
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "working")
+        self.assertIn("within the reporting grace", entry["detail"])
+
+    def test_a_worker_that_never_reports_is_still_surfaced_eventually(self) -> None:
+        """A worker that reports nothing is indistinguishable from a dead one."""
+        worker = self._paneless("silent")
+        self.coordinator.record_worker_message(worker["id"], "status", "starting")
+        data = self.coordinator.store.load()
+        data["workers"][worker["id"]]["last_reported_at"] = _stamp_ago(4_000)
+        self.coordinator.store.save(data)
+
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(health[worker["id"]]["verdict"], "quiet")
