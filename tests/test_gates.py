@@ -762,3 +762,97 @@ class GateTests(HelmTestCase):
         with self._as_foreman(worker["id"]):
             with self.assertRaisesRegex(HelmError, "already authorized task"):
                 self.coordinator.create_task(project["id"], "do A again after a bad launch")
+
+
+class GatesSurviveAForemanRestartTests(HelmTestCase):
+    """A confirmed decision belongs to the WORK, not to whoever is driving it.
+
+    Gates were recorded on one foreman task row and read from the project's
+    live foreman, so replacing the foreman discarded the commander's decision.
+    The successor came up with empty gates and could not reach the solution
+    gate for want of a decided requirement. The cost is not the second
+    keystroke -- it is that the loss is invisible, because a fresh foreman with
+    empty gates looks exactly like one that has not proposed yet.
+    """
+
+    def _project_with_live_foreman(self, name: str) -> tuple[dict, dict, dict]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        worker = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        return project, foreman_task, worker
+
+    def _as_foreman(self, worker_id: str):
+        return mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker_id})
+
+    def _retire_foreman(self, foreman_task: dict) -> None:
+        data = self.coordinator.store.load()
+        data["tasks"][foreman_task["id"]]["status"] = "completed"
+        for worker in data["workers"].values():
+            if worker["task_id"] == foreman_task["id"]:
+                worker["status"] = "completed"
+        self.coordinator.store.save(data)
+
+    def test_a_decided_requirement_survives_the_foreman_that_carried_it(self) -> None:
+        project, foreman_task, worker = self._project_with_live_foreman("carried")
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(
+                foreman_task["id"], "requirement", "goal: ship it; scope: X only"
+            )
+        self.coordinator.decide_gate(
+            foreman_task["id"], "requirement", confirm=True, skip=False
+        )
+        self._retire_foreman(foreman_task)
+
+        successor = self.coordinator.create_foreman_task(project["id"])
+        carried = successor["gates"]["requirement"]
+        self.assertIsNotNone(carried, "the commander's decision must not die with a driver")
+        self.assertIsNotNone(carried["confirmed_at"])
+        self.assertEqual(successor["gates"]["bound_task_id"], None)
+
+        # And the successor can now reach the solution gate, which is the thing
+        # that was actually blocked.
+        replacement = self.coordinator.prepare_external_worker(
+            successor["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        with self._as_foreman(replacement["id"]):
+            self.coordinator.propose_gate(
+                successor["id"], "solution", "approach: do X; verification: tests"
+            )
+
+    def test_a_SPENT_pair_is_not_carried_to_a_new_foreman(self) -> None:
+        """Otherwise one confirmation buys two state-changing tasks."""
+        project, foreman_task, worker = self._project_with_live_foreman("spent")
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "requirement", "goal: X")
+        self.coordinator.decide_gate(
+            foreman_task["id"], "requirement", confirm=True, skip=False
+        )
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "solution", "approach: X")
+        self.coordinator.decide_gate(
+            foreman_task["id"], "solution", confirm=True, skip=False
+        )
+        with self._as_foreman(worker["id"]):
+            spent_on = self.coordinator.create_task(project["id"], "the one authorized task")
+        self.assertTrue(spent_on["id"])
+        self._retire_foreman(foreman_task)
+
+        successor = self.coordinator.create_foreman_task(project["id"])
+        self.assertIsNone(
+            successor["gates"]["requirement"],
+            "a spent authorization must not be reissued by replacing the foreman",
+        )
+        self.assertIsNone(successor["gates"]["solution"])
+
+    def test_an_undecided_proposal_is_not_carried(self) -> None:
+        """Only a COMMANDER DECISION is worth preserving; a draft is not."""
+        project, foreman_task, worker = self._project_with_live_foreman("undecided")
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "requirement", "goal: X")
+        self._retire_foreman(foreman_task)
+
+        successor = self.coordinator.create_foreman_task(project["id"])
+        self.assertIsNone(successor["gates"]["requirement"])

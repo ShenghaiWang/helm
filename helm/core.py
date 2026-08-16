@@ -7,6 +7,7 @@ moves a task through the small set of non-approval states defined here.
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as _dt
 import fcntl
 import hashlib
@@ -3254,7 +3255,11 @@ class Coordinator:
                         # `propose_gate`/`decide_gate`. Only meaningful on a
                         # foreman task -- a worker/reviewer task never gates
                         # itself.
-                        "gates": {gate_type: None for gate_type in GATE_TYPES},
+                        "gates": (
+                            self._inherited_gates(data, project["id"])
+                            if role == "foreman"
+                            else {gate_type: None for gate_type in GATE_TYPES}
+                        ),
                         "delivery": {
                             "policy": policy,
                             "state": "worktree",
@@ -8132,6 +8137,58 @@ class Coordinator:
     TERMINAL_REPORT_KINDS = frozenset(
         {"result", "blocker", "failure", "approval-needed"}
     )
+
+    @staticmethod
+    def _decided(gate: Any) -> bool:
+        """A gate the commander has actually ruled on, either way."""
+        return bool(gate) and (gate.get("confirmed_at") is not None or gate.get("skipped"))
+
+    def _inherited_gates(self, data: dict[str, Any], project_id: str) -> dict[str, Any]:
+        """Carry an UNSPENT gate decision onto a project's next foreman task.
+
+        Gates were recorded on one foreman task row and read from the project's
+        *live* foreman, so replacing the foreman -- it failed, was stopped, or
+        stood down having finished -- silently discarded the commander's
+        decision. The successor came up with empty gates, `gate propose --type
+        solution` refused for want of a decided requirement, and the pair had to
+        be confirmed again.
+
+        The cost is not the second keystroke, it is that the loss is INVISIBLE:
+        a fresh foreman with empty gates is indistinguishable from one that has
+        simply not proposed yet, so a decision that WAS made reads as a decision
+        still pending. A confirmed pair is a statement about the work -- this
+        project may do this next thing -- not about whoever happens to be
+        driving it, and a driver dying must not revoke it.
+
+        A SPENT pair is deliberately not carried. Once `bound_task_id` names the
+        task that consumed it, the authorization is used, and copying it onto a
+        new foreman would hand out a second state-changing task on one
+        confirmation -- exactly the accounting the binding exists to enforce.
+        """
+        newest: dict[str, Any] | None = None
+        for task in data.get("tasks", {}).values():
+            if task.get("project_id") != project_id or task.get("role") != "foreman":
+                continue
+            gates = task.get("gates") or {}
+            if gates.get("bound_task_id") is not None:
+                continue
+            if not any(self._decided(gates.get(gate_type)) for gate_type in GATE_TYPES):
+                continue
+            if newest is None or str(task.get("created_at") or "") > str(
+                newest.get("created_at") or ""
+            ):
+                newest = task
+        if newest is None:
+            return {gate_type: None for gate_type in GATE_TYPES}
+        carried = {
+            gate_type: copy.deepcopy(newest["gates"].get(gate_type))
+            for gate_type in GATE_TYPES
+        }
+        # Never carried: an unspent pair becomes spendable again on the new
+        # task, and it must be the NEW task's binding that records that.
+        carried["bound_task_id"] = None
+        carried["bound_at"] = None
+        return carried
 
     @staticmethod
     def _live_foreman_task_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
