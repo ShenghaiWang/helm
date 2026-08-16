@@ -2851,7 +2851,12 @@ def main(argv: list[str] | None = None) -> int:
             # top is the only part reliably read, so ordering by age is the
             # difference between surfacing something and burying it. Items with
             # no timestamp sort oldest -- they are the long-standing ones.
-            entries: list[tuple[str, str]] = []
+            # (recency, display, identity). The identity is the UNtruncated
+            # text: --changes compares on it, and comparing truncated lines
+            # lets a widening number look like a new item. Every append must
+            # carry all three -- a 2-tuple here crashes the whole command,
+            # which is the one command that must never fail silently.
+            entries: list[tuple[str, str, str]] = []
             for item in coordinator.open_escalations(None):
                 glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
                 first = next(
@@ -2860,6 +2865,7 @@ def main(argv: list[str] | None = None) -> int:
                 entries.append((
                     str(item.get("at") or item.get("created_at") or ""),
                     f"{glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
+                    f"{glyph} {item['kind']} {item['worker_id']}: {first}",
                 ))
             for item in coordinator.open_action_items(None):
                 if item.get("kind") not in BLOCKING_GATE_KINDS:
@@ -2867,6 +2873,7 @@ def main(argv: list[str] | None = None) -> int:
                 entries.append((
                     str(item.get("at") or ""),
                     f"{item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}",
+                    f"{item['glyph']} {item['project_id']} GATE waiting: {item['text']}",
                 ))
             # Owed but unrelayed outcomes. `mark_seen=False` matters: this runs
             # unattended, and a check that consumed what it reported would be

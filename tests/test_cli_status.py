@@ -852,3 +852,33 @@ class CliStatusTests(HelmTestCase):
             second = run()
         self.assertEqual(second.strip(), "", "a wider counter is not news")
         self.assertGreater(len(detail.format(994)), 80, "must exceed the display cut")
+
+
+    def test_pending_survives_every_kind_of_item_it_can_list(self) -> None:
+        """The one command that must never fail silently.
+
+        `pending` builds its list from four separate append sites -- an
+        escalation, a blocking gate, an owed report and a health verdict. They
+        were changed to carry a third element (the untruncated identity that
+        --changes compares on) and two were missed, so the command crashed on
+        unpack for anyone whose root had an escalation or an open gate. It
+        reported nothing at all for as long as that was true, which is the
+        worst possible failure for a notifier: silence that looks like calm.
+        """
+        helm_root = self._helm_root("every-kind-root")
+        destination = helm_root / "projects" / "everykind"
+        shutil.move(str(self.repo("everykind")), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "everykind")
+        task = coordinator.create_task(project["id"], "do a thing")
+        worker = coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        coordinator.record_worker_message(worker["id"], "blocker", "cannot reach the tracker")
+        coordinator.record_situation(project["id"], "Worker result: it finished", surface=True)
+
+        for argv in (["pending"], ["pending", "--changes"]):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = cli.main(["--root", str(helm_root), *argv])
+            self.assertEqual(exit_code, 0, f"{argv} must not crash")
+            self.assertIn("cannot reach the tracker", buffer.getvalue())
