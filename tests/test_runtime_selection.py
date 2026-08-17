@@ -112,6 +112,41 @@ class RuntimeSelectionTests(HelmTestCase):
             ["pi", "--model", "pi/model", "--approve", "--print", prompt],
         )
 
+    def test_cursor_runtime_forces_approval_and_keeps_the_prompt_last(self) -> None:
+        """The executable is `cursor-agent`, and `--force` is what makes it usable.
+
+        Cursor publishes both `--add-dir` and `--sandbox`, the pair that
+        usually means writes are confined and Helm's state is out of reach --
+        the failure that silenced every codex worker. It is not confined under
+        `--force`, which was established by running it and watching a write to
+        an absolute path outside the working directory land. Without `--force`
+        a worker stops on an approval prompt nobody is watching.
+        """
+        runtime = runtimes.builtin_runtime("cursor")
+        assert runtime is not None
+        self.assertEqual(runtime.name, "Cursor CLI")
+
+        # The binary is cursor-agent; `cursor` is the editor and is not it.
+        self.assertEqual(
+            runtime.command(interactive=True),
+            ["cursor-agent", "--force", runtimes.PROMPT_PLACEHOLDER],
+        )
+        self.assertEqual(
+            runtime.command(interactive=False),
+            ["cursor-agent", "--force", "--print", runtimes.PROMPT_PLACEHOLDER],
+        )
+        prompt = "assignment prompt"
+        self.assertEqual(
+            runtimes.apply_prompt(
+                runtime.with_model("gpt-5", interactive=False), prompt
+            ),
+            ["cursor-agent", "--model", "gpt-5", "--force", "--print", prompt],
+        )
+        # A credential is forwarded for roots that authenticate by environment;
+        # a model name never is, because model choice belongs to the task.
+        self.assertIn("CURSOR_API_KEY", runtime.env_passthrough)
+        self.assertNotIn("CURSOR_MODEL", runtime.env_passthrough)
+
     def test_opencode_runtime_auto_approves_and_keeps_the_prompt_last(self) -> None:
         """A reviewer that cannot report is worse than no reviewer.
 

@@ -217,6 +217,40 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
         detect_env=("OPENCODE", "OPENCODE_PID"),
     ),
     AgentRuntime(
+        id="cursor",
+        name="Cursor CLI",
+        # Same reason as every runtime above: nobody is watching this pane, so
+        # an approval prompt is a deadlock rather than a gate. `--force` is
+        # cursor's form of that (`--yolo` is documented as its alias).
+        #
+        # The executable is `cursor-agent`, not `cursor`. Herdr recognises this
+        # agent, which is why it appeared under "integrations not in Helm's
+        # built-ins" -- but Herdr recognising a running agent is not a launch
+        # recipe, so it was unusable for Helm work until this entry existed.
+        #
+        # It publishes BOTH `--add-dir` and `--sandbox`, the pair that usually
+        # means writes are confined and Helm's state would be out of reach --
+        # the failure that silenced every codex worker. It is not confined:
+        # under `--force` it writes to an absolute path outside its working
+        # directory, checked by running it rather than inferred from the flags
+        # existing. So `helm worker message` lands and no extra grant is needed.
+        #
+        # Interactive takes the prompt positionally; `--print` is the
+        # non-interactive form and is documented as retaining every tool,
+        # including write and shell. `--model` sits before the prompt, which is
+        # what `with_model` needs.
+        interactive=("cursor-agent", "--force", PROMPT_PLACEHOLDER),
+        noninteractive=("cursor-agent", "--force", "--print", PROMPT_PLACEHOLDER),
+        # Auth is a login under HOME, which survives the worker scrub.
+        # CURSOR_API_KEY is forwarded for roots that authenticate by
+        # environment instead; CURSOR_API_ENDPOINT for a proxied install.
+        env_passthrough=(
+            "CURSOR_API_KEY",
+            "CURSOR_API_ENDPOINT",
+        ),
+        detect_env=("CURSOR_AGENT", "CURSOR_TRACE_ID"),
+    ),
+    AgentRuntime(
         id="omp",
         name="Oh My Pi",
         # Same reason as every runtime above: nobody is watching this pane, so
