@@ -759,7 +759,9 @@ class RuntimeSelectionTests(HelmTestCase):
         env = {"PATH": str(bin_dir), "CLAUDECODE": "1"}
         with mock.patch.dict(os.environ, env):
             report = {entry["id"]: entry for entry in coordinator.agent_availability()}
-        self.assertEqual(set(report), {"claude", "codex", "pi", "opencode", "omp"})
+        self.assertEqual(
+            set(report), {"claude", "codex", "pi", "opencode", "omp", "cursor"}
+        )
         self.assertTrue(report["claude"]["available"])
         self.assertTrue(report["claude"]["detected"])
         self.assertFalse(report["codex"]["available"])

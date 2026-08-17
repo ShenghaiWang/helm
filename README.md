@@ -194,7 +194,8 @@ stopped and clarified rather than merged.
 
 A worker is an agent CLI, and Helm knows how to start several without any
 configuration. The built-in runtimes are `claude` (Claude Code), `codex`
-(Codex CLI), `pi`, `opencode`, and `omp` (Oh My Pi); each contributes only an executable, the
+(Codex CLI), `pi`, `opencode`, `cursor` (Cursor CLI, whose executable is
+`cursor-agent`), and `omp` (Oh My Pi); each contributes only an executable, the
 argv that hands it one prompt, and the credential variables that runtime reads.
 A runtime is available when its executable is actually on `PATH` — a name alone
 never makes one available.

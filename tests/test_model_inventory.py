@@ -635,6 +635,8 @@ class SelectionContextTests(HelmTestCase):
             mock.patch("helm.core.Coordinator._check_command", return_value=(True, "ok")):
             evidence = coordinator.model_selection_evidence()
         self.assertEqual(
-            launchable_requested[-1], {"claude", "codex", "omp"}, "exclusions prune first"
+            launchable_requested[-1],
+            {"claude", "codex", "omp", "cursor"},
+            "exclusions prune first",
         )
         self.assertEqual(evidence["free_evidence"], [])
