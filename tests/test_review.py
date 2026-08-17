@@ -355,6 +355,31 @@ class ReviewTests(HelmTestCase):
         self.assertIn(json.dumps("pytest -q: 547 passed, 0 failed, exit 0"), brief)
         self.assertNotIn("MISSING", brief)
 
+    def test_an_oversized_full_suite_report_keeps_its_tail_for_the_reviewer(self) -> None:
+        """An over-long report is elided in the middle, never cut off at the end.
+
+        A report states its exit status first and its justification last --
+        which test failed, why a project waives it, which packages had to run
+        separately. Dropping only the tail removes exactly the part a reviewer
+        needs to judge a non-zero status, and the reviewer then reports the
+        absence it was shown rather than the evidence that existed.
+        """
+        task, worker = self._artifact_task("suitetail")
+        head = "exit_status: 1 " + ("h" * 4000)
+        tail = " sole_failure: the waived createSession race"
+        self.coordinator.record_worker_message(
+            worker["id"],
+            "status",
+            "ready for review",
+            payload={"summary": True, "full_suite": head + tail},
+        )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("exit_status: 1", brief)
+        self.assertIn("sole_failure: the waived createSession race", brief)
+        self.assertIn("elided from the middle", brief)
+
     def test_the_reviewer_brief_reports_a_real_timestamp_for_the_full_suite_evidence(self) -> None:
         """The reported time must come from the message's own record, not read blank.
 
