@@ -1351,3 +1351,42 @@ class DeliveryTests(HelmTestCase):
         # open alongside; what must survive is the note Helm cannot judge.
         self.assertNotIn(DELIVERY_DECISION_KIND, [item["kind"] for item in remaining])
         self.assertIn(FOLLOW_UP_ACTION_KIND, [item["kind"] for item in remaining])
+
+
+class ApprovalAfterAFailedRoundTests(HelmTestCase):
+    """A task reviewed over many rounds must stay approvable when an early
+    round's worker died and a later one finished the work."""
+
+    def test_a_failed_earlier_round_does_not_block_approving_the_latest(self) -> None:
+        root, project, task = self._completed_task_awaiting_approval("manyrounds")
+        data = self.coordinator.store.load()
+        workers = [w for w in data["workers"].values() if w.get("task_id") == task["id"]]
+        self.assertEqual(len(workers), 1)
+        finished = workers[0]
+        # An EARLIER round that died, recorded before the one that succeeded.
+        data["workers"]["w-deadround"] = {
+            **finished,
+            "id": "w-deadround",
+            "status": "failed",
+            "started_at": "2000-01-01T00:00:00Z",
+        }
+        self.coordinator.store.save(data)
+
+        approved = self.coordinator.approve_task(task["id"], "reviewed")
+
+        self.assertEqual(approved["status"], "approved")
+
+    def test_a_failed_latest_round_still_refuses(self) -> None:
+        root, project, task = self._completed_task_awaiting_approval("lastroundfailed")
+        data = self.coordinator.store.load()
+        workers = [w for w in data["workers"].values() if w.get("task_id") == task["id"]]
+        data["workers"]["w-lastround"] = {
+            **workers[0],
+            "id": "w-lastround",
+            "status": "failed",
+            "started_at": "2099-01-01T00:00:00Z",
+        }
+        self.coordinator.store.save(data)
+
+        with self.assertRaisesRegex(SafetyError, "w-lastround"):
+            self.coordinator.approve_task(task["id"], "reviewed")

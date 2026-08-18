@@ -6952,8 +6952,24 @@ class Coordinator:
         live = [worker for worker in workers if worker.get("status") == "running"]
         if live:
             raise SafetyError(f"{operation} refused while worker {live[0]['id']} is still running")
-        if require_completed and any(worker.get("status") != "completed" for worker in workers):
-            raise SafetyError(f"{operation} requires a successfully completed worker")
+        if require_completed:
+            # The question is whether the work STANDS, and only the last round
+            # answers it. Asking every worker the task ever had makes one
+            # failed round permanently unapprovable -- a branch reviewed over
+            # forty rounds could never be merged because round four's worker
+            # died, even though every later round completed and the reviewer
+            # signed off on the tip. A round that failed and was replaced is
+            # history, not an open defect; a task whose LATEST round failed is
+            # the case this guard is actually for.
+            latest = max(
+                workers,
+                key=lambda worker: (worker.get("started_at") or "", worker.get("id") or ""),
+            )
+            if latest.get("status") != "completed":
+                raise SafetyError(
+                    f"{operation} requires a successfully completed worker; the "
+                    f"latest is {latest['id']} [{latest.get('status')}]"
+                )
         return workers[0]
 
     # ---------- worker health ----------

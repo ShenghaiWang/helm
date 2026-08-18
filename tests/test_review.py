@@ -355,6 +355,50 @@ class ReviewTests(HelmTestCase):
         self.assertIn(json.dumps("pytest -q: 547 passed, 0 failed, exit 0"), brief)
         self.assertNotIn("MISSING", brief)
 
+    def test_evidence_followed_by_later_results_warns_the_reviewer_of_misfiling(self) -> None:
+        """A report that predates later author activity must say so.
+
+        A long-lived task served a round-38 suite report to a round-42
+        reviewer because the later rounds reported their runs in message text
+        rather than under the `full_suite` payload key. Three review rounds
+        bounced on staleness nobody could locate. The brief must carry what
+        Helm actually knows: author results came after the newest filed
+        report.
+        """
+        task, worker = self._artifact_task("misfiled")
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "round 38 done",
+            payload={"full_suite": "pnpm -r test at oldtip: exit 0"},
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "status",
+            "round 40: suite green at newtip, reported here in prose only",
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "round 42 done, tree clean",
+        )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("2 author message(s)", brief)
+        self.assertIn("misfiled", brief)
+
+    def test_fresh_evidence_carries_no_misfiling_warning(self) -> None:
+        task, worker = self._artifact_task("freshfiling")
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "old round",
+            payload={"full_suite": "old run: exit 0"},
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "final round",
+            payload={"full_suite": "fresh run at tip: exit 0"},
+        )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn(json.dumps("fresh run at tip: exit 0"), brief)
+        self.assertNotIn("misfiled", brief)
+
     def test_an_oversized_full_suite_report_keeps_its_tail_for_the_reviewer(self) -> None:
         """An over-long report is elided in the middle, never cut off at the end.
 

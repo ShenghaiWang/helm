@@ -1915,9 +1915,21 @@ class HerdrAdapter:
         being invisible.
         """
         latest: tuple[str, str] | None = None
+        # Counted so a report that predates later author activity can say so.
+        # A long-lived task once served a round-38 suite report to a round-42
+        # reviewer: the later rounds HAD run the suite but reported it in
+        # message text rather than under this payload key, so Helm kept
+        # quoting the old report as "the author's evidence" and three review
+        # rounds bounced on staleness nobody could locate. The reviewer can
+        # judge freshness only if Helm says what it actually knows: this is
+        # the newest report *filed where reports go*, and N author messages
+        # came after it.
+        results_after_latest = 0
         for message in data.get("messages", []):
             if message.get("task_id") != task_id:
                 continue
+            if latest is not None and message.get("kind") in ("status", "result"):
+                results_after_latest += 1
             payload = message.get("payload")
             if not isinstance(payload, dict):
                 continue
@@ -1925,6 +1937,7 @@ class HerdrAdapter:
             if not report:
                 continue
             latest = (message.get("created_at", ""), _safe_text(str(report)).strip())
+            results_after_latest = 0
         if latest is None:
             return (
                 "\n\nAUTHOR'S FULL-SUITE EVIDENCE: MISSING -- no message on this task "
@@ -1933,6 +1946,15 @@ class HerdrAdapter:
                 "a finding.\n"
             )
         at, text = latest
+        staleness = ""
+        if results_after_latest:
+            staleness = (
+                f"\nNOTE: {results_after_latest} author message(s) on this task "
+                "came AFTER this report, and none carried a newer `full_suite` payload. "
+                "If a later message claims a fresh run in its text, the author misfiled "
+                "the evidence -- report that as the finding, naming the payload key, "
+                "rather than only calling the evidence stale.\n"
+            )
         if len(text) > cls._FULL_SUITE_EVIDENCE_LIMIT:
             tail = cls._FULL_SUITE_EVIDENCE_TAIL
             head = cls._FULL_SUITE_EVIDENCE_LIMIT - tail
@@ -1950,6 +1972,7 @@ class HerdrAdapter:
             "unmasked (an exit status is visible, not piped through something that "
             "could swallow one). If it looks stale, masked, or shows a failure, report "
             "that as a finding instead of rerunning the suite yourself.\n"
+            f"{staleness}"
         )
 
     def _review_target(self, project: dict[str, Any], task: dict[str, Any]) -> str:
