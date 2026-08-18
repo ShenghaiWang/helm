@@ -3508,6 +3508,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 delivered = False
+                live = None
                 with contextlib.suppress(HelmError, OSError):
                     live = next(
                         (
@@ -3525,11 +3526,39 @@ def main(argv: list[str] | None = None) -> int:
                             HerdrAdapter(coordinator).answer_worker(live["id"], notice)
                         )
                 if not delivered:
-                    print(
-                        "  Not delivered into a live session. The decision is "
-                        "recorded; the foreman will see it in helm project status, "
-                        "or route it a message to move it along."
-                    )
+                    # Two very different failures were being reported in one
+                    # soft sentence. A live agent that merely could not be
+                    # reached will find the decision by polling; a session that
+                    # has ENDED never will, and the gate is bound to that
+                    # task's row -- so a replacement foreman re-proposes and
+                    # the decision just made is spent on nothing. That case
+                    # needs a different next command, and it needs to be hard
+                    # to miss: an agent waiting on a gate that answers into a
+                    # dead session stalls the project until a human notices.
+                    if live is not None:
+                        print(
+                            "  Not delivered into a live session. The decision is "
+                            "recorded; the foreman will see it in helm project "
+                            "status, or route it a message to move it along."
+                        )
+                    else:
+                        project_id = task.get("project_id") or "<project>"
+                        print(
+                            "  NOT DELIVERED -- no live session holds this task, so "
+                            "nothing is waiting on the decision you just made."
+                        )
+                        print(
+                            "  The decision is recorded on the task and stays "
+                            "recorded. But the gate is bound to THIS task, so a "
+                            "replacement foreman starts a new task and proposes "
+                            "its gates again; do not read this decision as "
+                            "already spent on the work."
+                        )
+                        print(
+                            f"  Revive the driver: helm foreman {project_id} "
+                            "(replace a stale one first with helm worker stop "
+                            "<worker-id> --reason \"...\")."
+                        )
             return 0
         if args.command == "authority":
             if args.authority_command == "init":

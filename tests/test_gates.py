@@ -856,3 +856,51 @@ class GatesSurviveAForemanRestartTests(HelmTestCase):
 
         successor = self.coordinator.create_foreman_task(project["id"])
         self.assertIsNone(successor["gates"]["requirement"])
+
+
+class GateDecisionDeliveryTests(HelmTestCase):
+    """A decision nobody is left to receive must not read like one that
+    merely could not be pasted into a pane."""
+
+    def _foreman_task(self, name: str) -> tuple[dict, dict]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        worker = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        return foreman_task, worker
+
+    def _decide(self, task_id: str) -> str:
+        argv = ["--state-dir", str(self.state.directory)]
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(
+                cli.main([*argv, "gate", "decide", task_id,
+                          "--type", "requirement", "--confirm"]),
+                0,
+            )
+        return buffer.getvalue()
+
+    def test_a_decision_with_no_session_left_to_receive_it_says_so(self) -> None:
+        foreman_task, worker = self._foreman_task("deadforeman")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.main(["--state-dir", str(self.state.directory), "gate", "propose",
+                          foreman_task["id"], "--type", "requirement", "--text", "goal: x"])
+        # The session ends -- exactly what happens when a foreman reports and exits.
+        data = self.coordinator.store.load()
+        data["workers"][worker["id"]]["status"] = "failed"
+        self.coordinator.store.save(data)
+
+        output = self._decide(foreman_task["id"])
+
+        self.assertIn("NOT DELIVERED", output)
+        # It must name the recovery command, and warn that the gate binding
+        # does not survive the driver it was bound to.
+        self.assertIn("helm foreman deadforeman", output)
+        self.assertIn("proposes", output.lower() + output)
+        self.assertNotIn(
+            "route it a message to move it along", output,
+            msg="that advice is for a live session; there is none",
+        )
