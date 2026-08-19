@@ -21,11 +21,15 @@ and reaches the same conclusion. It confirms the assumption rather than
 re-examining it. So the reviewer must not be the author, measured by what
 actually differs:
 
-1. **A different agent runtime** — different model, tooling, defaults, habits.
-   The strong form. Prefer it whenever two runtimes are available.
-2. **A different model on the same runtime** — the fallback when only one
-   runtime exists. It still breaks the shared prior that makes self-review
-   worthless. Record which model reviewed.
+1. **A different model.** This is the load-bearing half: the shared prior
+   that makes self-review worthless lives in the model, not the harness. A
+   reviewer on the author's runtime with an explicitly different model is a
+   full independent review, not a fallback. Record which model reviewed.
+2. **A different runtime as well** — adds different tooling, defaults, and
+   habits on top. Worth taking when it is convenient (a gateway runtime
+   reaches other vendors' models easily), but it is an addition, not the
+   requirement — do not route through a slower runtime solely to change the
+   harness when a different model is available on the one already running.
 3. **A fresh session of the same model** — the weakest form, not sufficient
    alone. It clears the conversation and keeps every prior. Label such a review
    as unindependent rather than implying a check that did not happen.
