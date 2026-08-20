@@ -660,6 +660,25 @@ class HerdrTests(HelmTestCase):
             "foreman",
         )
 
+    def test_a_ticketed_task_tab_leads_with_the_ticket(self) -> None:
+        """The ticket is what a human scans the tab list for, so it goes first;
+        a task without one keeps the plain slug label."""
+        from helm.herdr import HerdrAdapter
+
+        worker = {"id": "w-abcd1234"}
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"brief": "implement nextest adoption", "ticket": "DSK-770"}, worker
+            ),
+            "DSK-770 implement-ne-abcd",
+        )
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"brief": "implement nextest adoption"}, worker
+            ),
+            "implement-ne-abcd",
+        )
+
     def test_a_long_message_is_handed_over_as_a_file_not_typed_into_the_pane(self) -> None:
         """Pasting a long brief into a live TUI destroys the pane as evidence.
 

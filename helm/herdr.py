@@ -323,7 +323,10 @@ class HerdrAdapter:
             return "foreman"
         slug = cls._brief_slug(task.get("brief", "") if task else "")
         suffix = str(worker["id"]).replace("w-", "")[:4]
-        return f"{slug}-{suffix}" if slug else f"w{suffix}"
+        label = f"{slug}-{suffix}" if slug else f"w{suffix}"
+        # The ticket is what a human scans the tab list for; it goes first.
+        ticket = str((task or {}).get("ticket") or "").strip()
+        return f"{ticket} {label}" if ticket else label
 
     def _herdr_state(self, data: dict[str, Any]) -> dict[str, Any]:
         integrations = data.setdefault("integrations", {})
