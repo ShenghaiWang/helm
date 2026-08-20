@@ -3172,6 +3172,8 @@ class Coordinator:
                         self._require_gates_confirmed(
                             data, project_id, consume_for_task_id=task_id
                         )
+                    elif role == "worker" and not read_only and self.caller_role() == "root":
+                        self._consume_gates_if_settled(data, project_id, task_id)
                     if role in WORKTREELESS_ROLES:
                         # These roles drive or read; they never edit. Handing
                         # one a checkout and a task branch invites it to do
@@ -8345,9 +8347,55 @@ class Coordinator:
                 "and have the commander reconfirm it to authorize another"
             )
         if consume_for_task_id is not None and bound_task_id != consume_for_task_id:
+            # A confirmed pair is spendable only by the side that proposed it.
+            # Without this, the coordinator and the foreman each read "both
+            # gates confirmed" as their green light and spawn duplicate
+            # workers for the same change -- observed three times in one day.
+            pair_owner = gates.get("pair_owner")
+            if pair_owner is not None:
+                identity = self.caller_identity()
+                if identity["role"] != "root" and identity.get("worker_id") != pair_owner:
+                    owner_label = (
+                        "the root coordinator" if pair_owner == "root"
+                        else f"foreman worker {pair_owner}"
+                    )
+                    raise HelmError(
+                        f"the confirmed gate pair on {foreman_task['id']} was "
+                        f"proposed by {owner_label}, so this foreman may not spend "
+                        "it on a new task -- let the proposer create the task, "
+                        "or re-propose the gates yourself and have them "
+                        "reconfirmed"
+                    )
             gates["bound_task_id"] = consume_for_task_id
             gates["bound_at"] = now()
             foreman_task["gates"] = gates
+
+    def _consume_gates_if_settled(
+        self, data: dict[str, Any], project_id: str, task_id: str
+    ) -> None:
+        """Spend a live confirmed pair on root's own task, when one exists.
+
+        Root is never gated, but a confirmed pair left unspent after root's
+        launch is a second green light: the foreman reads it and spawns a
+        duplicate worker for the same change. Binding it to root's task makes
+        the foreman's later create refuse instead. No foreman or no settled
+        pair means nothing to spend, and nothing is required.
+        """
+        foreman_task = self._live_foreman_task_in(data, project_id)
+        if foreman_task is None:
+            return
+        gates = dict(foreman_task.get("gates") or {})
+        if gates.get("bound_task_id") is not None:
+            return
+        for gate_type in GATE_TYPES:
+            gate = gates.get(gate_type)
+            if gate is None:
+                return
+            if gate.get("confirmed_at") is None and not gate.get("skipped"):
+                return
+        gates["bound_task_id"] = task_id
+        gates["bound_at"] = now()
+        foreman_task["gates"] = gates
 
     def propose_gate(self, task_id: str, gate_type: str, text: str) -> dict[str, Any]:
         """Record a foreman's requirement or solution proposal for the commander.
@@ -8405,6 +8453,12 @@ class Coordinator:
             # `_require_gates_confirmed`.
             gates["bound_task_id"] = None
             gates["bound_at"] = None
+            # The proposing side owns the pair: only it may later spend the
+            # confirmation on a new task, so root and foreman can never both
+            # treat one confirmation as their own green light.
+            gates["pair_owner"] = (
+                "root" if identity["role"] == "root" else identity.get("worker_id")
+            )
             if gate_type == "requirement":
                 gates["requirement"] = proposal
                 gates["solution"] = None

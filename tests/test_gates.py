@@ -904,3 +904,56 @@ class GateDecisionDeliveryTests(HelmTestCase):
             "route it a message to move it along", output,
             msg="that advice is for a live session; there is none",
         )
+
+
+class GatePairOwnershipTests(GateTests):
+    def test_roots_task_spends_the_pair_so_the_foreman_cannot_respawn_it(self) -> None:
+        """The duplicate-driver race: gates confirmed, then root AND the
+        foreman each create a worker for the same change. Root's create must
+        spend the pair so the foreman's create refuses."""
+        project, foreman_task, worker = self._project_with_live_foreman("spentbyroot")
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "requirement", "goal")
+        self.coordinator.decide_gate(foreman_task["id"], "requirement", confirm=True, skip=False)
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "solution", "approach")
+        self.coordinator.decide_gate(foreman_task["id"], "solution", confirm=True, skip=False)
+
+        root_task = self.coordinator.create_task(project["id"], "root ships it")
+
+        gates = self.coordinator.store.load()["tasks"][foreman_task["id"]]["gates"]
+        self.assertEqual(gates["bound_task_id"], root_task["id"])
+        with self._as_foreman(worker["id"]):
+            with self.assertRaisesRegex(HelmError, "already authorized task"):
+                self.coordinator.create_task(project["id"], "foreman ships it too")
+
+    def test_a_foreman_cannot_spend_a_pair_another_side_proposed(self) -> None:
+        """A pair is owned by its proposer: a foreman may spend only a pair it
+        proposed itself, so it can never race the coordinator to a
+        confirmation that was not addressed to it."""
+        project, foreman_task, worker = self._project_with_live_foreman("ownedpair")
+        # Root proposes and the commander confirms both gates.
+        self.coordinator.propose_gate(foreman_task["id"], "requirement", "goal")
+        self.coordinator.decide_gate(foreman_task["id"], "requirement", confirm=True, skip=False)
+        self.coordinator.propose_gate(foreman_task["id"], "solution", "approach")
+        self.coordinator.decide_gate(foreman_task["id"], "solution", confirm=True, skip=False)
+
+        with self._as_foreman(worker["id"]):
+            with self.assertRaisesRegex(HelmError, "proposed by the root coordinator"):
+                self.coordinator.create_task(project["id"], "foreman grabs it")
+
+        # Root spends its own pair fine.
+        task = self.coordinator.create_task(project["id"], "root ships it")
+        self.assertEqual(task["role"], "worker")
+
+    def test_a_foreman_spends_its_own_pair_as_before(self) -> None:
+        project, foreman_task, worker = self._project_with_live_foreman("ownpairok")
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "requirement", "goal")
+        self.coordinator.decide_gate(foreman_task["id"], "requirement", confirm=True, skip=False)
+        with self._as_foreman(worker["id"]):
+            self.coordinator.propose_gate(foreman_task["id"], "solution", "approach")
+        self.coordinator.decide_gate(foreman_task["id"], "solution", confirm=True, skip=False)
+        with self._as_foreman(worker["id"]):
+            task = self.coordinator.create_task(project["id"], "foreman ships it")
+        self.assertEqual(task["role"], "worker")
