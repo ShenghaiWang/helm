@@ -668,9 +668,9 @@ class HerdrTests(HelmTestCase):
         worker = {"id": "w-abcd1234"}
         self.assertEqual(
             HerdrAdapter._worker_tab_label(
-                {"brief": "implement nextest adoption", "ticket": "DSK-770"}, worker
+                {"brief": "implement nextest adoption", "ticket": "TCK-123"}, worker
             ),
-            "DSK-770 implement-ne-abcd",
+            "TCK-123 implement-ne-abcd",
         )
         self.assertEqual(
             HerdrAdapter._worker_tab_label(
