@@ -1044,6 +1044,10 @@ class HerdrAdapter:
                     # project, thirty-five clones with submodules, every review
                     # branch deleted as empty when the tasks were cleaned up.
                     role="reviewer",
+                    # The reviewer serves the same ticket as the change it
+                    # reviews, and the ticket is what a human scans the tab
+                    # list for.
+                    ticket=task.get("ticket"),
                 )
                 reviewer_worker = self.launch_task(
                     review_task["id"], choice["command"], wait=False

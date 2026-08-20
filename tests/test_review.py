@@ -1213,3 +1213,47 @@ class ReviewTests(HelmTestCase):
             ),
             "changes-requested",
         )
+
+
+class ReviewerTicketTests(HelmTestCase):
+    def test_a_reviewer_task_inherits_the_reviewed_tickets_ticket(self) -> None:
+        """The reviewer serves the same ticket as the change it reviews, so its
+        tab label can lead with that ticket like the author's does."""
+        import sys
+        from unittest import mock
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        root = self.repo("ticketreview")
+        project = self.coordinator.register_project(
+            "Ticketed", str(root), project_id="ticketreview"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "write the code", ticket="TCK-77"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.commit_on_task_branch(task)
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        original_launch = adapter.launch_task
+
+        def fake_launch(review_task_id, command, wait=False):
+            worker = original_launch(review_task_id, command, wait=wait)
+            self.coordinator.record_worker_message(worker["id"], "result", "APPROVED fine")
+            return worker
+
+        with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
+             mock.patch.object(self.coordinator, "pick_reviewer_agent", return_value={
+                 "agent": "codex",
+                 "command": [sys.executable, "-c", ""],
+                 "independence": "different-runtime",
+                 "reason": "test",
+             }):
+            adapter.run_review_cycle(task["id"], rounds=1, timeout=1.0)
+
+        reviewer_tasks = [
+            row
+            for row in self.coordinator.store.load()["tasks"].values()
+            if row.get("role") == "reviewer" and row.get("reviews") == task["id"]
+        ]
+        self.assertEqual(len(reviewer_tasks), 1)
+        self.assertEqual(reviewer_tasks[0].get("ticket"), "TCK-77")
