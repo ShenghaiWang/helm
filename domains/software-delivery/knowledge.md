@@ -85,3 +85,6 @@ whatever the project actually uses.
 ## Approved learning: suggested remedies
 - Fact: Treat a reporter suggested remedy as evidence of intent, not as the requirement. Build to the observed symptom; if the suggested mechanism would not produce the desired result, say so and record why.
 - Rationale: A user may describe the mechanism they expect rather than the invariant they need. Verify the mechanism against the actual code before implementing it literally.
+## Approved learning: comment restraint
+- Fact: Keep code comments sparse. Write one only for what the code cannot say itself — a non-obvious constraint, an external contract, a deliberate deviation. Do not narrate what a line does, restate the diff, argue the change is correct, or leave review-round commentary in the source; match the file's existing comment density rather than raising it.
+- Rationale: Commander direction (2026-08-20) after generated changes carried excessive comments. Comments addressed to a reviewer are noise the moment the change merges, and every stale comment is a future contradiction the next reader must resolve against the code.
