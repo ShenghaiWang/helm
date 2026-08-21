@@ -788,6 +788,46 @@ class WorkerRoundTests(HelmTestCase):
             )
         self.coordinator.stop_worker(worker["id"], reason="test cleanup")
 
+    def test_a_failed_delivery_still_launches_a_fresh_worker(self) -> None:
+        """When the resident session does not accept the round, stopping it
+        must not strand the round: the task stays continuable and a fresh
+        worker is launched instead of a silent no-op."""
+        import contextlib as _ctx
+        import io
+        from unittest import mock
+        from helm import cli
+        _project, task, worker, adapter = self._task_with_resident("deadresident")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+        output = io.StringIO()
+        with _ctx.redirect_stdout(output), mock.patch.object(
+            cli, "HerdrAdapter", return_value=adapter
+        ), mock.patch.object(adapter, "answer_worker", return_value=False), \
+                mock.patch.object(
+                    adapter, "launch_task",
+                    side_effect=lambda tid, _cmd, **kw: type(adapter).launch_task(
+                        adapter, tid, [sys.executable, "-c", ""], **kw
+                    ),
+                ):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "worker", "round", task["id"],
+                "--state-changing", "--brief", "round two",
+            ])
+        self.assertEqual(code, 0)
+        text = output.getvalue()
+        self.assertIn("did not accept the round", text)
+        self.assertIn("fresh worker", text)
+        data = self.coordinator.store.load()
+        self.assertNotEqual(data["tasks"][task["id"]]["status"], "failed")
+        fresh = [
+            w for w in data["workers"].values()
+            if w["task_id"] == task["id"] and w["id"] != worker["id"]
+        ]
+        self.assertTrue(fresh)
+        for w in fresh:
+            self.coordinator.stop_worker(w["id"], reason="test cleanup")
+
     def test_the_worker_context_tells_the_author_to_stay_resident(self) -> None:
         root = self.repo("residencycontract")
         project = self.coordinator.register_project(

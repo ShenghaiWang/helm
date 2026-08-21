@@ -2667,6 +2667,14 @@ def main(argv: list[str] | None = None) -> int:
                         resident["id"],
                         reason="round delivery failed; replacing the resident session",
                     )
+                    # Stopping a still-"running" resident fails its task, but
+                    # this round was just opened on it: the failure belongs to
+                    # the dead session, not the round. Restore the round's own
+                    # state so the fresh launch below is not refused.
+                    with coordinator.store.locked() as data:
+                        stopped_task = data["tasks"][args.task_id]
+                        if stopped_task.get("status") == "failed":
+                            stopped_task["status"] = "allocated"
                     print(
                         f"Live session {resident['id']} did not accept the round; "
                         "stopped it and launching a fresh worker"
