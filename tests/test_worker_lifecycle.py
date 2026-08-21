@@ -744,3 +744,63 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
             core._pretrust_workspace("claude", workspace)
         finally:
             core._TRUST_CONFIGS = original
+
+
+class WorkerRoundTests(HelmTestCase):
+    def _task_with_resident(self, name: str):
+        import sys
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "first round")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(60)"], wait=False
+        )
+        return project, task, worker, adapter
+
+    def test_a_round_reuses_the_named_resident_worker(self) -> None:
+        """A live worker blocks a plain round but not one that names it as the
+        resident the round is being delivered into."""
+        _project, task, worker, _adapter = self._task_with_resident("residentround")
+        from helm.core import SafetyError
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+        with self.assertRaisesRegex(SafetyError, "still running"):
+            self.coordinator.continue_task(task["id"], "round two")
+        reopened = self.coordinator.continue_task(
+            task["id"], "round two", reuse_worker=worker["id"]
+        )
+        self.assertEqual(reopened["status"], "allocated")
+        self.assertEqual(reopened["brief"], "round two")
+        self.coordinator.stop_worker(worker["id"], reason="test cleanup")
+
+    def test_a_round_still_refuses_a_live_worker_it_did_not_name(self) -> None:
+        _project, task, worker, _adapter = self._task_with_resident("wrongresident")
+        from helm.core import SafetyError
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+        with self.assertRaisesRegex(SafetyError, "still running"):
+            self.coordinator.continue_task(
+                task["id"], "round two", reuse_worker="w-notthisone"
+            )
+        self.coordinator.stop_worker(worker["id"], reason="test cleanup")
+
+    def test_the_worker_context_tells_the_author_to_stay_resident(self) -> None:
+        root = self.repo("residencycontract")
+        project = self.coordinator.register_project(
+            "Residency", str(root), project_id="residencycontract"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        import sys, json
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        context_path = (
+            self.coordinator.store.directory / "workers" / worker["id"] / "context.json"
+        )
+        text = context_path.read_text(encoding="utf-8")
+        self.assertIn("STAY in this session", text)
+        self.assertIn("stand down", text)

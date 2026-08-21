@@ -1327,6 +1327,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-herdr", dest="herdr", action="store_false", default=True,
         help="start it as a bare process instead of a tab in the project's space",
     )
+    round_cmd = worker_commands.add_parser(
+        "round",
+        help="send the next round to a task: into its live author session when "
+        "one exists, or by relaunching when it does not",
+    )
+    round_cmd.add_argument("task_id")
+    round_cmd.add_argument("--brief", required=True, help="what this round is for")
+    round_kind = round_cmd.add_mutually_exclusive_group(required=True)
+    round_kind.add_argument(
+        "--read-only", dest="read_only", action="store_true",
+        help="this round changes nothing; the worktree is locked",
+    )
+    round_kind.add_argument(
+        "--state-changing", dest="read_only", action="store_false",
+        help="this round may edit and commit",
+    )
+    round_cmd.add_argument(
+        "--fresh", action="store_true",
+        help="force a new worker even if the author session is still live "
+        "(use on a scope change, where accumulated context misleads)",
+    )
     for name in ("poll", "wait"):
         worker_commands.add_parser(name).add_argument("worker_id")
     report = worker_commands.add_parser("message", aliases=["report"])
@@ -1888,6 +1909,24 @@ def _worker_runner(config_path: str) -> int:
         except (OSError, KeyError) as exc:
             return _runner_failure(config_path, f"foreman workspace verification failed: {exc}")
     else:
+        # One retry on a short delay: the worktree is created moments before
+        # the runner starts, and a still-settling filesystem fails this probe
+        # transiently. A round lost to that is pure waste; a real mismatch
+        # fails identically twice.
+        for verify_attempt in (1, 2):
+            try:
+                subprocess.run(
+                    ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                    check=True, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                break
+            except (OSError, subprocess.SubprocessError):
+                if verify_attempt == 2:
+                    return _runner_failure(
+                        config_path, "worker workspace verification failed"
+                    )
+                time.sleep(2)
         try:
             actual_root = subprocess.run(
                 ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
@@ -2246,6 +2285,7 @@ _FOREMAN_ONLY_COMMANDS = frozenset({
     # task carried -- both of those are the foreman's, not a worker's.
     ("task", "continue"),
     ("worker", "launch"),
+    ("worker", "round"),
     ("worker", "answer"),
     ("herdr", "launch"),
     ("review", None),
@@ -2572,6 +2612,72 @@ def main(argv: list[str] | None = None) -> int:
                     f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
                     f"pid={worker.get('pid')} agent={worker.get('agent_id', 'default')} "
                     f"reason={worker.get('agent_reason', '')}"
+                )
+            elif args.worker_command == "round":
+                adapter = HerdrAdapter(coordinator)
+                data = coordinator.store.load()
+                # The resident is the task's most recent worker whose pane
+                # still exists. Its RECORD is usually settled -- a terminal
+                # result settles the worker while the interactive session
+                # stays open -- so liveness here means the pane, not the
+                # status field.
+                candidates = sorted(
+                    (
+                        w for w in data.get("workers", {}).values()
+                        if w.get("task_id") == args.task_id
+                    ),
+                    key=lambda w: (w.get("started_at") or "", w.get("id") or ""),
+                )
+                resident = None
+                if candidates and not args.fresh:
+                    latest = candidates[-1]
+                    layout = (
+                        data.get("integrations", {}).get("herdr", {})
+                        .get("workers", {}).get(latest["id"])
+                    )
+                    if layout is not None:
+                        resident = latest
+                if resident is not None:
+                    task = coordinator.continue_task(
+                        args.task_id, args.brief,
+                        read_only=args.read_only,
+                        reuse_worker=(
+                            resident["id"]
+                            if resident.get("status") == "running" else None
+                        ),
+                    )
+                    round_no = len(task.get("rounds", [])) + 1
+                    delivered = adapter.answer_worker(
+                        resident["id"],
+                        f"ROUND {round_no} for your task {args.task_id} "
+                        f"({'read-only' if args.read_only else 'state-changing'}). "
+                        "Same worktree, same branch, same reporting protocol; finish "
+                        f"with one result. BRIEF: {args.brief}",
+                    )
+                    if delivered:
+                        print(
+                            f"Round {round_no} delivered into live worker "
+                            f"{resident['id']} on {args.task_id}"
+                        )
+                        return 0
+                    # The session looked alive but the round never landed in it.
+                    # A resident nobody can reach is a dead driver: stand it
+                    # down and fall through to a fresh launch, saying so.
+                    coordinator.stop_worker(
+                        resident["id"],
+                        reason="round delivery failed; replacing the resident session",
+                    )
+                    print(
+                        f"Live session {resident['id']} did not accept the round; "
+                        "stopped it and launching a fresh worker"
+                    )
+                else:
+                    coordinator.continue_task(
+                        args.task_id, args.brief, read_only=args.read_only
+                    )
+                worker = adapter.launch_task(args.task_id, None, wait=False)
+                print(
+                    f"Round launched with fresh worker {worker['id']} on {args.task_id}"
                 )
             elif args.worker_command == "poll":
                 worker = coordinator.poll_worker(args.worker_id)
