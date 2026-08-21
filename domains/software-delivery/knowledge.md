@@ -76,6 +76,7 @@ whatever the project actually uses.
 ## Approved learning: branch ticket metadata
 - Fact: Put the tracker ticket ID in the BRANCH NAME, not in code comments. A branch name is routing metadata a human reads once; a code comment is a permanent artifact whose reader may have no access to that tracker. Write comments so they stand alone - name the file, symbol or atom involved rather than a ticket number.
 - Rationale: Tracker IDs in source comments age poorly and often require access to a private system. A branch can carry the ticket for routing while comments carry the enduring code-level reason.
+- Verification, not memory: before requesting a push, run `git diff $(git merge-base HEAD origin/main)..HEAD | grep -nE '^\+.*[A-Z]{2,6}-[0-9]+'` and rewrite any comment or doc line it surfaces. Three branches shipped ticket ids in one day on memory alone; the grep is the rule's enforcement.
 ## Approved learning: real UI verification
 - Fact: Verify a UI fix in the real running app, not in a harness that mocks the surrounding surface. A harness that renders the changed element over a mocked version of its neighbour encodes the assumption under test and will confirm any fix.
 - Rationale: Mocking the surface adjacent to the changed component can bake the desired result into the test and hide the real integration defect.
