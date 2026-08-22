@@ -141,7 +141,13 @@ class HelmTestCase(unittest.TestCase):
         self.repos: list[Path] = []
 
     def tearDown(self) -> None:
-        self.temp.cleanup()
+        # A worker process still exiting can write into the temp tree while
+        # rmtree walks it, and losing that race failed the whole test in
+        # teardown. The directory is disposable; removing it is best-effort.
+        try:
+            self.temp.cleanup()
+        except OSError:
+            shutil.rmtree(self.temp.name, ignore_errors=True)
 
     def write_preferences(self, helm_root: Path | None = None, **document: Any) -> Path:
         """Give a root the operator preferences a test needs, and only those.
