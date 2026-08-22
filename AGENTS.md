@@ -409,6 +409,19 @@ reason a dead reviewer or a waiting gate goes unmentioned; they cannot ask about
 something they have not been told exists. `helm pending` is the whole list and
 is silent when nothing needs a human, so this costs nothing on a quiet root.
 
+**Arm the attention watch at session start, with whatever your harness has.**
+The check-at-turn-start above is the floor every runtime can meet: run
+`python3 -m helm pending` when a turn begins and lead with what it prints.
+If your harness can also deliver events mid-session — a persistent background
+monitor, a subscription, anything that wakes you without a commander turn —
+arm it on `python3 -m helm pending --changes` in a 20-second loop instead:
+`--changes` prints only what is new since its last call, so a quiet root
+generates no events and the first gate, approval request, blocker or terminal
+report wakes you within seconds. Claude Code arms this automatically through
+this repository's session-start hook; a runtime without such a facility is not
+failing by falling back to the turn-start floor, but it must then say the gap
+out loud rather than describe the watch as armed.
+
 Be honest about the one hop this does not fix. The coordinator only exists
 inside a turn, so nothing reaches the commander while they are away, however
 diligently the foreman reports. That gap needs a scheduled check delivering
