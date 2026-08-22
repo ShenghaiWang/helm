@@ -789,6 +789,14 @@ class WorkerProtocolTests(HelmTestCase):
         Path(worker["log_file"]).write_text(
             "doing the work\nAPI Error: Connection closed mid-response\n", encoding="utf-8"
         )
+        # While the session keeps writing past the failure text it has
+        # recovered: the signature in scrollback is history, not the state.
+        fresh = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        if worker["id"] in fresh:
+            self.assertNotEqual(fresh[worker["id"]]["verdict"], "erroring")
+        # Once the output has also gone quiet, the failure is the last word.
+        stale = time.time() - self.coordinator.SILENCE_SECONDS - 60
+        os.utime(worker["log_file"], (stale, stale))
         # Helm cannot see inside the session, but the evidence was already on
         # disk and simply never read.
         health = {e["worker_id"]: e for e in self.coordinator.worker_health()}

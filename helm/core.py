@@ -7244,10 +7244,13 @@ class Coordinator:
                     "waiting-on-a-prompt",
                     "its own session is asking for confirmation and nobody is watching it",
                 )
-            elif broke and not delivered:
+            elif broke and not delivered and stale_output:
                 # Its own output says it failed, and it never reported. Left
                 # unread this looks like healthy work for as long as the
-                # session sits there.
+                # session sits there. Only when the output has also gone
+                # quiet, though: a session still writing past the failure
+                # text has recovered from it, and the signature sitting in
+                # scrollback re-flagged a healthy worker on every scan.
                 verdict, detail = (
                     "erroring",
                     f"its output reports failure and it has not reported: {broke[-1]}",
