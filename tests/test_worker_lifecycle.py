@@ -828,6 +828,66 @@ class WorkerRoundTests(HelmTestCase):
         for w in fresh:
             self.coordinator.stop_worker(w["id"], reason="test cleanup")
 
+    def test_a_vanished_pane_mid_delivery_still_launches_a_fresh_worker(self) -> None:
+        """A pane error raised during delivery is a refused round, not a raw
+        provider error stranding the task."""
+        import contextlib as _ctx
+        import io
+        from unittest import mock
+        from helm import cli
+        from helm.herdr import HerdrUnavailable
+        _project, task, worker, adapter = self._task_with_resident("vanishedpane")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+        output = io.StringIO()
+        with _ctx.redirect_stdout(output), mock.patch.object(
+            cli, "HerdrAdapter", return_value=adapter
+        ), mock.patch.object(
+            adapter, "answer_worker", side_effect=HerdrUnavailable("pane gone")
+        ), mock.patch.object(
+            adapter, "launch_task",
+            side_effect=lambda tid, _cmd, **kw: type(adapter).launch_task(
+                adapter, tid, [sys.executable, "-c", ""], **kw
+            ),
+        ):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "worker", "round", task["id"],
+                "--state-changing", "--brief", "round two",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("fresh worker", output.getvalue())
+        data = self.coordinator.store.load()
+        for w in data["workers"].values():
+            if w["task_id"] == task["id"] and w.get("status") == "running":
+                self.coordinator.stop_worker(w["id"], reason="test cleanup")
+
+    def test_a_failed_launch_restores_the_round_to_continuable(self) -> None:
+        """When the fresh launch itself dies, the task must not be stranded
+        in `allocated` where no later round can continue it."""
+        import contextlib as _ctx
+        import io
+        from unittest import mock
+        from helm import cli
+        from helm.herdr import HerdrUnavailable
+        _project, task, worker, adapter = self._task_with_resident("launchdies")
+        self.coordinator.stop_worker(worker["id"], reason="clear resident")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+        with _ctx.redirect_stdout(io.StringIO()), _ctx.redirect_stderr(io.StringIO()), \
+                mock.patch.object(cli, "HerdrAdapter", return_value=adapter), \
+                mock.patch.object(
+                    adapter, "launch_task", side_effect=HerdrUnavailable("no pane")
+                ):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "worker", "round", task["id"],
+                "--state-changing", "--fresh", "--brief", "round two",
+            ])
+        self.assertNotEqual(code, 0)
+        data = self.coordinator.store.load()
+        self.assertEqual(data["tasks"][task["id"]]["status"], "completed")
+
     def test_the_worker_context_tells_the_author_to_stay_resident(self) -> None:
         root = self.repo("residencycontract")
         project = self.coordinator.register_project(

@@ -3251,6 +3251,10 @@ class Coordinator:
                         # below) is never indistinguishable from one that just
                         # happens not to have changed anything yet.
                         "read_only": bool(read_only),
+                        # Sticky: once any round is state-changing the task is
+                        # a delivery candidate for good, however its last
+                        # round was classified.
+                        "was_state_changing": not read_only,
                         # The two commander confirmation gates a foreman task
                         # drives before it may launch a state-changing worker.
                         # None until the foreman proposes one; see
@@ -5350,6 +5354,8 @@ class Coordinator:
             task["brief"] = brief
             task["status"] = "allocated"
             task["read_only"] = bool(read_only)
+            if not read_only:
+                task["was_state_changing"] = True
             if task.get("approval") is not None:
                 task["approval"] = None
                 self._message(
@@ -6980,8 +6986,21 @@ class Coordinator:
             # signed off on the tip. A round that failed and was replaced is
             # history, not an open defect; a task whose LATEST round failed is
             # the case this guard is actually for.
+            # A launch that died before its runner ever wrote a byte is not a
+            # round: it produced nothing to judge, and letting it shadow the
+            # real latest round made genuinely delivered work unapprovable
+            # until someone hand-edited state.
+            def _ran(worker: dict[str, Any]) -> bool:
+                if worker.get("status") != "failed":
+                    return True
+                log_file = worker.get("log_file")
+                try:
+                    return bool(log_file) and Path(log_file).stat().st_size > 0
+                except OSError:
+                    return False
+            ran = [worker for worker in workers if _ran(worker)] or workers
             latest = max(
-                workers,
+                ran,
                 key=lambda worker: (worker.get("started_at") or "", worker.get("id") or ""),
             )
             if latest.get("status") != "completed":
@@ -10170,7 +10189,10 @@ class Coordinator:
         those entry points refuses it here regardless of how a commit landed
         on its branch.
         """
-        if task.get("read_only"):
+        if task.get("read_only") and not task.get("was_state_changing"):
+            # `read_only` reflects the LATEST round; a delivery task that
+            # closed with a read-only verification round is still a delivery
+            # task. Only work that was never state-changing is refused here.
             raise SafetyError(
                 f"task {task['id']} is read-only and was never a candidate for "
                 f"delivery; a --read-only task cannot be {verb}"

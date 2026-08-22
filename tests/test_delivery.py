@@ -1025,6 +1025,37 @@ class DeliveryTests(HelmTestCase):
         self.assertEqual(stood_down["id"], foreman["id"])
         self.assertEqual([i["task_id"] for i in self._decisions(project["id"])], [task["id"]])
 
+    def test_a_stillborn_launch_does_not_shadow_delivered_work(self) -> None:
+        """A failed worker that never wrote a byte is not the task's latest
+        round; the delivered round before it still approves and merges."""
+        root, project, task = self._completed_task_awaiting_approval("stillborn")
+        dead_log = Path(self.temp.name) / "stillborn.log"
+        dead_log.write_text("", encoding="utf-8")
+        with self.coordinator.store.locked() as data:
+            data["workers"]["w-stillborn"] = {
+                "id": "w-stillborn",
+                "task_id": task["id"],
+                "project_id": project["id"],
+                "status": "failed",
+                "started_at": "9999-01-01T00:00:00Z",
+                "log_file": str(dead_log),
+            }
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+        merged = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(merged["status"], "merged")
+
+    def test_a_read_only_verification_round_keeps_the_task_deliverable(self) -> None:
+        """`read_only` reflects the latest round; a delivery task closed by a
+        read-only verification round is still a delivery candidate."""
+        root, project, task = self._completed_task_awaiting_approval("verifyround")
+        self.coordinator.continue_task(task["id"], "verify the tip", read_only=True)
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""])
+        self.coordinator.approve_task(task["id"], "reviewed")
+        self.coordinator.merge_task(task["id"])
+        merged = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(merged["status"], "merged")
+
     def test_a_delivery_decision_resolves_when_the_work_is_merged(self) -> None:
         root, project, task = self._completed_task_awaiting_approval("mergegate")
         self.coordinator.record_delivery_decision(

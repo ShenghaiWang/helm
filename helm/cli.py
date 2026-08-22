@@ -36,7 +36,7 @@ from . import doctor as doctor_module
 from . import models
 from . import preferences
 from . import runtimes
-from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter
+from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter, HerdrUnavailable
 
 
 def _json(value: Any) -> str:
@@ -2647,13 +2647,20 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                     )
                     round_no = len(task.get("rounds", [])) + 1
-                    delivered = adapter.answer_worker(
+                    try:
+                        delivered = adapter.answer_worker(
                         resident["id"],
                         f"ROUND {round_no} for your task {args.task_id} "
                         f"({'read-only' if args.read_only else 'state-changing'}). "
                         "Same worktree, same branch, same reporting protocol; finish "
                         f"with one result. BRIEF: {args.brief}",
-                    )
+                        )
+                    except HerdrUnavailable:
+                        # A vanished pane mid-delivery is the same fact as a
+                        # refused delivery: the resident cannot take the
+                        # round. Raw provider errors used to escape here and
+                        # strand the task in its just-continued state.
+                        delivered = False
                     if delivered:
                         print(
                             f"Round {round_no} delivered into live worker "
@@ -2683,7 +2690,18 @@ def main(argv: list[str] | None = None) -> int:
                     coordinator.continue_task(
                         args.task_id, args.brief, read_only=args.read_only
                     )
-                worker = adapter.launch_task(args.task_id, None, wait=False)
+                try:
+                    worker = adapter.launch_task(args.task_id, None, wait=False)
+                except BaseException:
+                    # The round was opened but its worker never launched.
+                    # Left as-is the task sits in "allocated", which no later
+                    # round may continue from -- so put back the settled
+                    # status the round found it in.
+                    with coordinator.store.locked() as failed_data:
+                        stranded = failed_data["tasks"][args.task_id]
+                        if stranded.get("status") == "allocated":
+                            stranded["status"] = "completed"
+                    raise
                 print(
                     f"Round launched with fresh worker {worker['id']} on {args.task_id}"
                 )
