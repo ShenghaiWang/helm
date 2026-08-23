@@ -1331,3 +1331,53 @@ class FailureScanReadsTextNotEscapesTests(HelmTestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("command not found: docker", failures[0])
         self.assertLess(len(failures[0]), 400, "an excerpt, not the whole pane")
+
+
+class OneDriverPerWorkerTests(HelmTestCase):
+    """Two answers to one worker inside two minutes is two drivers racing.
+
+    A root and a project's foreman both answered the same question within a
+    minute. The second `send-text` arrived while the agent was already acting
+    on the first, interleaved with its own redraw, and the session read the
+    arriving keystrokes as an interrupt. They happened to agree that time, so
+    the only casualty was an unreadable pane -- two answers that DISAGREED
+    would have raced, and the later one would have won silently.
+    """
+
+    def _running_worker(self, name: str) -> dict:
+        """A worker that is still alive, so an answer can be recorded against it."""
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "ask something")
+        return self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+    def test_a_second_answer_inside_the_window_is_seen_as_a_race(self) -> None:
+        worker = self._running_worker("race")
+        self.coordinator.record_worker_message(worker["id"], "answer", "first answer")
+        racing = self.coordinator.recent_answer(worker["id"])
+        self.assertIsNotNone(racing)
+        self.assertEqual(racing["text"], "first answer")
+
+    def test_an_older_answer_is_not_a_race_so_a_later_push_still_works(self) -> None:
+        # Answering is not the only thing this path carries: a driver also
+        # pushes fresh instructions to a worker that asked nothing. Refusing
+        # those to prevent the rare double-answer would break the common case.
+        worker = self._running_worker("older")
+        self.coordinator.record_worker_message(worker["id"], "answer", "long ago")
+        with self.coordinator.store.locked() as data:
+            for message in data["messages"]:
+                if message.get("worker_id") == worker["id"] and message.get("kind") == "answer":
+                    message["created_at"] = "2020-01-01T00:00:00Z"
+        self.assertIsNone(self.coordinator.recent_answer(worker["id"]))
+
+    def test_a_worker_never_answered_is_never_a_race(self) -> None:
+        worker = self._running_worker("fresh")
+        self.assertIsNone(self.coordinator.recent_answer(worker["id"]))
+
+    def test_the_cli_exposes_a_force_escape_hatch(self) -> None:
+        parser = cli._build_parser()
+        parsed = parser.parse_args(["worker", "answer", "w-1", "--text", "x", "--force"])
+        self.assertTrue(parsed.force)
+        self.assertFalse(parser.parse_args(["worker", "answer", "w-1", "--text", "x"]).force)

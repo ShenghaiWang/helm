@@ -2162,8 +2162,15 @@ class HerdrAdapter:
     QUIET_WAIT_SECONDS = 8.0
     QUIET_STILL_SECONDS = 1.2
 
-    def _wait_for_quiet(self, worker_id: str) -> None:
-        """Give the agent a gap to be spoken into, if one comes along soon."""
+    def _wait_for_quiet(self, worker_id: str) -> bool:
+        """Give the agent a gap to be spoken into, and say whether one came.
+
+        Returns True when the output actually went still, False when the wait
+        ran out with the agent still writing.  The caller needs the difference:
+        this used to return nothing, so a deadline that expired against a busy
+        agent was indistinguishable from a clean gap, and the send went in
+        regardless with no record that it had been forced.
+        """
         log = self.coordinator.store.directory / "workers" / worker_id / "output.log"
         deadline = time.monotonic() + self.QUIET_WAIT_SECONDS
         last_size = -1
@@ -2172,13 +2179,15 @@ class HerdrAdapter:
             try:
                 size = log.stat().st_size
             except OSError:
-                return
+                # Nothing to observe. Not evidence the agent is busy.
+                return True
             if size != last_size:
                 last_size = size
                 still_since = time.monotonic()
             elif time.monotonic() - still_since >= self.QUIET_STILL_SECONDS:
-                return
+                return True
             time.sleep(0.2)
+        return False
 
     #: How long to watch for the agent to ACT after Enter, and how many times to
     #: press it again before admitting the message never went in.
@@ -2249,7 +2258,7 @@ class HerdrAdapter:
         # delivered and the worker waits forever.
         # Wait for a gap first, so this lands between the agent's own output
         # rather than through the middle of it.
-        self._wait_for_quiet(worker_id)
+        quiet = self._wait_for_quiet(worker_id)
         with contextlib.suppress(HerdrUnavailable):
             send_keys(pane, "Escape")
             time.sleep(self.ANSWER_SETTLE_SECONDS)
@@ -2262,8 +2271,14 @@ class HerdrAdapter:
         #
         # Writing it down first also makes the brief durable and re-readable,
         # which a paste into a scrollback never was.
+        # Hand over as a file when the message is long -- OR when the agent
+        # never stopped writing. Length was the only trigger, which read the
+        # damage backwards: what garbles a pane is two streams writing to it at
+        # once, and a short message pasted into an agent mid-redraw interleaves
+        # exactly as badly as a long one. When there was no gap to speak into,
+        # the least we can put through the pane is a single pointer line.
         delivered_text = text
-        if len(text) > self.INLINE_MESSAGE_LIMIT:
+        if len(text) > self.INLINE_MESSAGE_LIMIT or not quiet:
             with contextlib.suppress(OSError):
                 inbox = (
                     self.coordinator.store.directory / "workers" / worker_id / "inbox"

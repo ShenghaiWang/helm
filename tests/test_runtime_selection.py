@@ -7,6 +7,7 @@ import io
 import os
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -1232,3 +1233,81 @@ class AgentHelpNamesEveryRuntimeTests(HelmTestCase):
                     help_text,
                     f"{' '.join(path)} --agent help omits the built-in runtime {runtime.id}",
                 )
+
+
+class ForemanEffortTests(HelmTestCase):
+    """A foreman is an agent Helm starts, so effort must resolve for it too.
+
+    It did not: `--model` and `--agent` were both there and `--effort` was not,
+    so the only way to run a driver at a chosen level was an environment
+    variable -- which is a session-wide setting standing in for a per-appointment
+    one.
+    """
+
+    def test_foreman_appointment_accepts_and_records_an_effort(self) -> None:
+        parser = cli._build_parser()
+        parsed = parser.parse_args(["foreman", "media", "--effort", "high"])
+        self.assertEqual(parsed.effort, "high")
+
+    def test_a_foreman_task_carries_the_effort_it_was_appointed_with(self) -> None:
+        root = self.repo("driver")
+        project = self.coordinator.register_project("Driver", str(root), project_id="driver")
+        task = self.coordinator.create_foreman_task(project["id"], effort="high")
+        self.assertEqual(task["effort"], "high")
+
+    def test_an_unappointed_effort_stays_unset_rather_than_invented(self) -> None:
+        root = self.repo("driver2")
+        project = self.coordinator.register_project("Driver2", str(root), project_id="driver2")
+        task = self.coordinator.create_foreman_task(project["id"])
+        self.assertIsNone(task.get("effort"))
+
+
+class RuntimeProbeTests(HelmTestCase):
+    """A probe reports what happened; it never downgrades availability.
+
+    The whole reason this exists is that a runtime whose executable is present
+    can still die the moment it starts. The reason it must not flip
+    ``available`` is that the non-interactive form it probes can fail while the
+    interactive form Helm actually launches works perfectly -- both were
+    observed on the same runtime within an hour.
+    """
+
+    def test_an_unknown_runtime_is_an_error_not_a_verdict(self) -> None:
+        with self.assertRaises(HelmError):
+            self.coordinator.probe_runtime("not-a-runtime")
+
+    def test_a_missing_executable_reports_absent_without_running_anything(self) -> None:
+        with mock.patch("helm.core.shutil.which", return_value=None):
+            verdict = self.coordinator.probe_runtime("claude")
+        self.assertEqual(verdict["verdict"], "absent")
+
+    def test_a_rejected_credential_is_named_as_auth_not_as_a_generic_failure(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["claude"], returncode=1, stdout="", stderr="Your stored authentication is invalid.",
+        )
+        with mock.patch("helm.core.shutil.which", return_value="/usr/bin/claude"), \
+                mock.patch("helm.core.subprocess.run", return_value=completed):
+            verdict = self.coordinator.probe_runtime("claude")
+        self.assertEqual(verdict["verdict"], "auth")
+
+    def test_a_probe_failure_leaves_the_runtime_listed_as_available(self) -> None:
+        # cursor failed --print with a transport error while running fine in a
+        # pane. A probe that marked it unavailable would have hidden a usable
+        # runtime, which is the worse direction for this check.
+        completed = subprocess.CompletedProcess(
+            args=["cursor-agent"], returncode=1, stdout="",
+            stderr="RetriableError: WritableIterable is closed",
+        )
+        with mock.patch("helm.core.shutil.which", return_value="/usr/bin/cursor-agent"), \
+                mock.patch("helm.core.subprocess.run", return_value=completed):
+            verdict = self.coordinator.probe_runtime("cursor")
+        self.assertEqual(verdict["verdict"], "failed")
+        rows = {row["id"]: row for row in self.coordinator.builtin_runtime_availability()}
+        self.assertNotIn("probe", rows["cursor"], "a probe verdict must not leak into availability")
+
+    def test_a_timeout_is_its_own_verdict(self) -> None:
+        with mock.patch("helm.core.shutil.which", return_value="/usr/bin/claude"), \
+                mock.patch("helm.core.subprocess.run",
+                           side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
+            verdict = self.coordinator.probe_runtime("claude")
+        self.assertEqual(verdict["verdict"], "timeout")

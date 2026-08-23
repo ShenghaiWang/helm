@@ -972,3 +972,76 @@ class RootTabNameTests(HelmTestCase):
 def cli_root_tab_name() -> str:
     from helm import cli
     return cli.ROOT_TAB_NAME
+
+
+class BusyAgentGetsAPointerNotAPasteTests(HelmTestCase):
+    """What garbles a pane is two streams writing to it at once.
+
+    Length was the only trigger for the file handoff, which reads the damage
+    backwards: a short message pasted into an agent mid-redraw interleaves
+    character-by-character exactly as badly as a long one, and the session
+    reads the arriving keystrokes as an interrupt. Observed on a real round --
+    the agent's own "Now I'll write the tests first" came out shredded through
+    Helm's message, and the turn was cut.
+    """
+
+    def _worker_in_a_pane(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the thing")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        adapter.QUIET_WAIT_SECONDS = 0.3
+        adapter.QUIET_STILL_SECONDS = 0.1
+        adapter.ANSWER_SETTLE_SECONDS = 0.0
+        adapter.SUBMIT_CONFIRM_SECONDS = 0.2
+        herdr.drives_a_terminal = True
+        return adapter, herdr, worker
+
+    def _log(self, worker_id: str) -> Path:
+        return self.coordinator.store.directory / "workers" / worker_id / "output.log"
+
+    def _sent_text(self, herdr) -> str:
+        return "\n".join(text for _pane, text in getattr(herdr, "sent_text", []))
+
+    def test_a_quiet_agent_still_gets_a_short_message_typed_in(self) -> None:
+        adapter, herdr, worker = self._worker_in_a_pane("quiet")
+        log = self._log(worker["id"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("idle\n", encoding="utf-8")
+        adapter.answer_worker(worker["id"], "carry on")
+        self.assertIn("carry on", self._sent_text(herdr))
+
+    def test_an_agent_that_never_stops_writing_gets_a_pointer_instead(self) -> None:
+        adapter, herdr, worker = self._worker_in_a_pane("busy")
+        log = self._log(worker["id"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("working\n", encoding="utf-8")
+        original_stat = Path.stat
+        grew = {"n": 0}
+
+        def never_still(self_path, *args, **kwargs):
+            result = original_stat(self_path, *args, **kwargs)
+            if str(self_path) == str(log):
+                # Keep the observed size moving so the wait never finds a gap.
+                grew["n"] += 1
+                return type(
+                    "Grown", (), {"st_size": result.st_size + grew["n"], "st_mtime": result.st_mtime}
+                )()
+            return result
+
+        with mock.patch.object(Path, "stat", never_still):
+            adapter.answer_worker(worker["id"], "carry on")
+        sent = self._sent_text(herdr)
+        self.assertNotIn("carry on", sent, "a busy agent must not be pasted into")
+        self.assertIn("Helm has a message for you", sent)
+
+    def test_the_quiet_wait_says_whether_it_actually_found_a_gap(self) -> None:
+        adapter, _herdr, worker = self._worker_in_a_pane("gap")
+        log = self._log(worker["id"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("idle\n", encoding="utf-8")
+        self.assertTrue(adapter._wait_for_quiet(worker["id"]))

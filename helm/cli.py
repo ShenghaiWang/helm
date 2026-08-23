@@ -110,6 +110,26 @@ def _print_projects(projects: list[dict[str, Any]]) -> None:
         )
 
 
+def _print_probe(coordinator: Coordinator) -> None:
+    """Say which runtimes can actually answer, without calling any unavailable.
+
+    Kept separate from the availability list on purpose. A probe verdict is
+    additional evidence, never a downgrade: a runtime that fails its
+    non-interactive probe can still be perfectly usable in the interactive form
+    Helm launches into a pane, and saying otherwise hides a working option.
+    """
+    print("")
+    print("Probe (one real call per runtime; a failure here does NOT mean unavailable):")
+    for runtime in runtimes.BUILTIN_RUNTIMES:
+        verdict = coordinator.probe_runtime(runtime.id)
+        detail = f" -- {verdict['detail']}" if verdict.get("detail") else ""
+        print(f"  {verdict['verdict']:<12} {runtime.id}{detail}")
+        if verdict["verdict"] == "auth":
+            print(f"               its credential is rejected; repair it with the tool's own login")
+        elif verdict["verdict"] in {"failed", "timeout"}:
+            print(f"               non-interactive form only; the pane form may still work")
+
+
 def _print_agents(coordinator: Coordinator, *, check: bool = False) -> None:
     profiles = coordinator.agent_availability() if check else coordinator.list_agent_profiles()
 
@@ -1450,11 +1470,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     answer.add_argument("worker_id")
     answer.add_argument("--text", required=True, help="the answer, in the worker's own terms")
+    answer.add_argument(
+        "--force", action="store_true",
+        help="send even though this worker was answered moments ago (two drivers racing)",
+    )
 
     agent = commands.add_parser("agent", help="list and check configured worker profiles")
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     agent_commands.add_parser("list", help="list configured profiles without launching anything")
-    agent_commands.add_parser("check", help="check profile commands and live availability checks")
+    agent_check = agent_commands.add_parser(
+        "check", help="check profile commands and live availability checks"
+    )
+    agent_check.add_argument(
+        "--probe", action="store_true",
+        help="ask each built-in runtime to actually answer; costs one real call each",
+    )
     agent_models = agent_commands.add_parser(
         "models",
         help="query live model catalogues and classify explicitly-free models (read-only)",
@@ -1645,6 +1675,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"agent runtime or configured profile for the foreman (built in: {_BUILTIN_AGENT_NAMES})")
     foreman.add_argument("--model",
         help="model the foreman runs on; overrides the project pin and HELM_MODEL")
+    foreman.add_argument("--effort", choices=EFFORT_LEVELS,
+        help="reasoning effort for the foreman; overrides the project pin and HELM_EFFORT")
     foreman.add_argument("--command", dest="worker_command_text",
         help="foreman command, parsed without a shell")
     foreman.add_argument(
@@ -2099,10 +2131,11 @@ def _start_foreman(
     command: str | None = None,
     agent: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
     request: str | None = None,
 ) -> dict[str, Any]:
     task = coordinator.create_foreman_task(
-        project_id, agent=agent, model=model, request=request
+        project_id, agent=agent, model=model, effort=effort, request=request
     )
     if herdr:
         worker = HerdrAdapter(coordinator).launch_task(task["id"], command, wait=False)
@@ -2965,6 +2998,27 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(HelmError, OSError):
                     HerdrAdapter(coordinator).route_worker_messages(args.worker_id)
             elif args.worker_command == "answer":
+                # One worker, one driver. Two answers inside two minutes is a
+                # root and a foreman both replying to the same question, and the
+                # second lands while the agent is already acting on the first --
+                # interleaving with its own redraw and reading as an interrupt.
+                # Refuse rather than deliver, because two answers that disagree
+                # race and the later one wins silently.
+                racing = None if args.force else coordinator.recent_answer(args.worker_id)
+                if racing is not None:
+                    print(
+                        f"Refusing: worker {args.worker_id} was already answered at "
+                        f"{racing.get('created_at')}, which is inside Helm's "
+                        f"{int(Coordinator.ANSWER_RACE_SECONDS)}s window."
+                    )
+                    print(
+                        "  That is what two drivers answering one worker looks like. "
+                        "Decide who is driving this task and let them answer; ask the "
+                        "other for status instead."
+                    )
+                    print(f"  Deliberate follow-up? Resend with --force.")
+                    print(f"  Already sent: {(racing.get('text') or '')[:160]}")
+                    return 1
                 # Record first: the answer is part of the task's audit trail
                 # whether or not a presentation surface can deliver it.
                 task = coordinator.record_worker_message(args.worker_id, "answer", args.text)
@@ -3030,6 +3084,8 @@ def main(argv: list[str] | None = None) -> int:
                 _print_agent_models(coordinator, as_json=args.agent_models_json)
             else:
                 _print_agents(coordinator, check=args.agent_command == "check")
+                if args.agent_command == "check" and getattr(args, "probe", False):
+                    _print_probe(coordinator)
             return 0
 
         if args.command == "prefs":
@@ -3547,7 +3603,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 return 0
             task = coordinator.create_foreman_task(
-                args.project_id, agent=args.agent, model=args.model
+                args.project_id, agent=args.agent, model=args.model, effort=args.effort
             )
             if args.herdr:
                 worker = HerdrAdapter(coordinator).launch_task(

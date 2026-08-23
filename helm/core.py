@@ -3821,6 +3821,82 @@ class Coordinator:
         """Return configured profiles without treating configuration as availability."""
         return self._load_agent_profiles()
 
+    #: How long a runtime probe may take before Helm stops waiting. A probe is
+    #: a real round-trip to the vendor, so this is generous rather than tight.
+    PROBE_TIMEOUT_SECONDS = 60.0
+
+    #: What an authentication failure looks like coming back from an agent CLI.
+    #: Each vendor words it differently and none of them exit with a
+    #: distinguishable code, so the text is all there is.
+    _PROBE_AUTH_SIGNATURES = (
+        "authentication",
+        "auth error",
+        "not logged in",
+        "please log in",
+        "log in again",
+        "unauthorized",
+        "invalid api key",
+        "no credentials",
+    )
+
+    def probe_runtime(self, runtime_id: str) -> dict[str, Any]:
+        """Ask a runtime to actually answer something, and report what happened.
+
+        Executable-on-PATH is not availability.  On 2026-08-23 a foreman
+        launched on a runtime whose binary was present, took its brief, and
+        died on `Your stored authentication is invalid` -- while that CLI's own
+        `status` command reported a successful login.  Helm had already
+        recorded a live worker for it.  A PATH test cannot catch that and
+        neither can the tool's own status command, so this runs the thing.
+
+        THE VERDICT NEVER MARKS A RUNTIME UNAVAILABLE, and that is deliberate.
+        The probe uses the non-interactive form, and a runtime can fail there
+        while working perfectly in the interactive form Helm actually launches
+        into a pane -- cursor did exactly that within an hour of the auth
+        failure above, dying on `RetriableError: WritableIterable is closed`
+        under `--print` while running fine interactively.  A probe that
+        downgraded availability would have hidden a usable runtime, which is
+        the worse error: an unavailable runtime you can still start costs a
+        try, and an available one you were told not to costs the whole option.
+        """
+        runtime = runtimes.builtin_runtime(runtime_id)
+        if runtime is None:
+            raise HelmError(f"unknown runtime: {runtime_id}")
+        command = list(runtime.command(interactive=False))
+        if not command:
+            return {"id": runtime_id, "verdict": "unprobeable",
+                    "detail": "no non-interactive form to probe"}
+        if not shutil.which(command[0]):
+            return {"id": runtime_id, "verdict": "absent",
+                    "detail": f"{command[0]} is not on PATH"}
+        command = [
+            "helm probe: reply with the single word OK and nothing else"
+            if part == runtimes.PROMPT_PLACEHOLDER else part
+            for part in command
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"id": runtime_id, "verdict": "timeout",
+                    "detail": f"no answer within {int(self.PROBE_TIMEOUT_SECONDS)}s"}
+        except OSError as error:
+            return {"id": runtime_id, "verdict": "failed", "detail": str(error)}
+        output = f"{result.stdout}\n{result.stderr}".strip()
+        lowered = output.lower()
+        if any(signature in lowered for signature in self._PROBE_AUTH_SIGNATURES):
+            return {"id": runtime_id, "verdict": "auth",
+                    "detail": output.splitlines()[-1][:200] if output else "authentication rejected"}
+        if result.returncode != 0:
+            return {"id": runtime_id, "verdict": "failed",
+                    "detail": (output.splitlines()[-1][:200] if output else f"exit {result.returncode}")}
+        return {"id": runtime_id, "verdict": "ok", "detail": ""}
+
     def builtin_runtime_availability(self) -> list[dict[str, Any]]:
         """Report which built-in agent runtimes this machine can actually start.
 
@@ -6725,6 +6801,44 @@ class Coordinator:
             )
         return report
 
+    #: How close together two answers to one worker have to be before Helm
+    #: reads them as two drivers racing rather than as a deliberate follow-up.
+    #: Wide enough to catch the real case -- a root and a foreman both replying
+    #: to the same question within a minute -- and narrow enough that pushing a
+    #: new instruction to a worker minutes later is still ordinary work.
+    ANSWER_RACE_SECONDS = 120.0
+
+    def recent_answer(self, worker_id: str) -> dict[str, Any] | None:
+        """The answer this worker was sent moments ago, if it was sent one.
+
+        One worker must have one driver.  Prose said so and nothing enforced
+        it, so a root and a project's foreman both answered the same question
+        inside a minute: the second `send-text` arrived while the agent was
+        already acting on the first, interleaved with its own redraw, and
+        Claude Code read the arriving keystrokes as an interrupt.  They agreed
+        that time, so the only casualty was a pane nobody could read
+        afterwards; two answers that DISAGREED would have raced, and whichever
+        landed second would have silently won.
+
+        Deliberately recency-scoped rather than "has this question been
+        answered".  Answering is not the only thing this path carries -- a
+        driver also pushes fresh instructions to a worker that asked nothing --
+        and refusing those would break the ordinary case to prevent the rare
+        one.  What is never ordinary is two answers inside two minutes.
+        """
+        cutoff = _dt.datetime.now(_dt.timezone.utc).timestamp() - self.ANSWER_RACE_SECONDS
+        data = self.store.load()
+        for message in reversed(data.get("messages", [])):
+            if message.get("worker_id") != worker_id or message.get("kind") != "answer":
+                continue
+            stamp = message.get("created_at")
+            try:
+                when = _dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return message if when.timestamp() >= cutoff else None
+        return None
+
     def record_worker_message(
         self,
         worker_id: str,
@@ -9383,6 +9497,7 @@ class Coordinator:
         *,
         agent: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
         request: str | None = None,
     ) -> dict[str, Any]:
         """Create the task a project's foreman runs as.
@@ -9400,6 +9515,7 @@ class Coordinator:
             brief,
             agent=agent,
             model=model,
+            effort=effort,
             domain=FOREMAN_DOMAIN,
             role="foreman",
         )
