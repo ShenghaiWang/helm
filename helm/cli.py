@@ -1052,6 +1052,23 @@ def _print_inspect(report: dict[str, Any]) -> None:
     print(f"  policy: {task['delivery_policy']}")
     print(f"  branch: {task['branch']}")
     print(f"  workspace: {task['workspace']}")
+    # What this task will actually be RUN as. Absent from inspect until a
+    # foreman was asked to verify an effort it had passed and found the
+    # command's own record unreadable -- a setting nobody can inspect is a
+    # setting nobody can check was honoured.
+    chosen = [
+        (label, task.get(key))
+        for label, key in (
+            ("agent", "agent_override"),
+            ("model", "model"),
+            ("effort", "effort"),
+        )
+        if task.get(key)
+    ]
+    if chosen:
+        print("  " + "  ".join(f"{label}: {value}" for label, value in chosen))
+    if task.get("effort_reason"):
+        print(f"  effort chosen because: {task['effort_reason']}")
     if task.get("domain"):
         print(f"  domain: {task['domain']} ({task.get('domain_selection', 'selected')})")
     if task.get("agent_id"):
@@ -1377,6 +1394,11 @@ def _build_parser() -> argparse.ArgumentParser:
     round_kind.add_argument(
         "--state-changing", dest="read_only", action="store_false",
         help="this round may edit and commit",
+    )
+    round_cmd.add_argument(
+        "--effort", choices=EFFORT_LEVELS,
+        help="reasoning effort for THIS round; a rebase or evidence run "
+        "rarely wants what the authoring round wanted",
     )
     round_cmd.add_argument(
         "--fresh", action="store_true",
@@ -2571,6 +2593,7 @@ def main(argv: list[str] | None = None) -> int:
                     domain=args.domain,
                     agent=args.agent,
                     model=args.model,
+                    effort=args.effort,
                     ticket=args.ticket,
                     no_domain=args.no_domain,
                     read_only=args.read_only,
@@ -2747,6 +2770,7 @@ def main(argv: list[str] | None = None) -> int:
                     task = coordinator.continue_task(
                         args.task_id, args.brief,
                         read_only=args.read_only,
+                        effort=args.effort,
                         reuse_worker=(
                             resident["id"]
                             if resident.get("status") == "running" else None
@@ -2794,7 +2818,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 else:
                     coordinator.continue_task(
-                        args.task_id, args.brief, read_only=args.read_only
+                        args.task_id, args.brief, read_only=args.read_only,
+                        effort=args.effort,
                     )
                 try:
                     worker = adapter.launch_task(args.task_id, None, wait=False)

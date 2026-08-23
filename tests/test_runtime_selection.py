@@ -1149,3 +1149,57 @@ class EffortByModelSwapTests(HelmTestCase):
         message = str(caught.exception)
         self.assertIn("pi-large", message)
         self.assertIn("pi-small", message)
+
+
+class EffortReachesTheRecordTests(HelmTestCase):
+    """Both halves of "did the effort take" — the CLI path that stores it, and
+    the command that shows it.
+
+    Found in use, not in test: a foreman asked to verify an effort it had
+    passed discovered `task create` dropped the flag silently and `task
+    inspect` could not have shown it either way. A setting nobody can inspect
+    is a setting nobody can check was honoured.
+    """
+
+    def _project(self, name: str):
+        root = self.repo(name)
+        return self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+
+    def test_task_create_stores_the_effort_it_was_given(self) -> None:
+        import contextlib as _ctx
+        import io
+        from helm import cli
+
+        project = self._project("effortcreate")
+        out = io.StringIO()
+        with _ctx.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "task", "create", "--project", project["id"],
+                "--brief", "careful work", "--effort", "high",
+            ])
+        self.assertEqual(code, 0)
+        task_id = out.getvalue().split()[2]
+        stored = self.coordinator.store.load()["tasks"][task_id]
+        self.assertEqual(stored["effort"], "high")
+
+    def test_inspect_shows_what_the_task_will_run_as(self) -> None:
+        import contextlib as _ctx
+        import io
+        from helm import cli
+
+        project = self._project("effortinspect")
+        task = self.coordinator.create_task(
+            project["id"], "careful work", agent="pi", effort="high"
+        )
+        out = io.StringIO()
+        with _ctx.redirect_stdout(out):
+            cli.main([
+                "--state-dir", str(self.state.directory),
+                "task", "inspect", task["id"],
+            ])
+        shown = out.getvalue()
+        self.assertIn("effort: high", shown)
+        self.assertIn("agent: pi", shown)

@@ -929,3 +929,48 @@ class WorkerRoundTests(HelmTestCase):
         text = context_path.read_text(encoding="utf-8")
         self.assertIn("STAY in this session", text)
         self.assertIn("stand down", text)
+
+
+class RoundEffortTests(HelmTestCase):
+    """A round states its own level.
+
+    A rebase or an evidence run rarely wants what the authoring round wanted,
+    and inheriting the author's level silently is how a mechanical replay ends
+    up billed at the level chosen for correctness-critical work.
+    """
+
+    def test_a_round_can_lower_the_effort_the_task_carried(self) -> None:
+        root = self.repo("roundeffort")
+        project = self.coordinator.register_project(
+            "RoundEffort", str(root), project_id="roundeffort"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "author the change", effort="high"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=True)
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+
+        self.coordinator.continue_task(
+            task["id"], "rebase only", read_only=False, effort="low"
+        )
+        self.assertEqual(
+            self.coordinator.store.load()["tasks"][task["id"]]["effort"], "low"
+        )
+
+    def test_a_round_that_says_nothing_keeps_what_the_task_had(self) -> None:
+        root = self.repo("roundeffortkeep")
+        project = self.coordinator.register_project(
+            "Keep", str(root), project_id="roundeffortkeep"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "author the change", effort="high"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=True)
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+
+        self.coordinator.continue_task(task["id"], "another round", read_only=False)
+        self.assertEqual(
+            self.coordinator.store.load()["tasks"][task["id"]]["effort"], "high"
+        )

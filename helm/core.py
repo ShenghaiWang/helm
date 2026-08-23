@@ -5454,6 +5454,7 @@ class Coordinator:
         *,
         read_only: bool = False,
         reuse_worker: str | None = None,
+        effort: str | None = None,
     ) -> dict[str, Any]:
         """Reopen a finished task for another round in the same worktree.
 
@@ -5536,6 +5537,11 @@ class Coordinator:
             task["brief"] = brief
             task["status"] = "allocated"
             task["read_only"] = bool(read_only)
+            # Stated per round, because a rebase or an evidence run rarely
+            # wants the level the authoring round wanted. Silence keeps
+            # whatever the task already carried.
+            if effort:
+                task["effort"] = _validate_effort(effort, "round")
             if not read_only:
                 task["was_state_changing"] = True
             if task.get("approval") is not None:
