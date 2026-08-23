@@ -1034,6 +1034,12 @@ class HerdrAdapter:
                     ),
                     domain="code-review",
                     agent=choice["agent"],
+                    # The reviewer's own model, not the project's. A project
+                    # pin describes what its AUTHORS run; inherited by the
+                    # reviewer it makes every review the author's own model,
+                    # which is what independence forbids -- and where the pin
+                    # is a restricted family, it deadlocks the review outright.
+                    model=reviewer_model,
                     # What this reviewer reviews, so a second driver can see it
                     # exists before starting another.
                     reviews=task_id,
