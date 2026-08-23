@@ -1193,7 +1193,7 @@ class EffortReachesTheRecordTests(HelmTestCase):
 
         project = self._project("effortinspect")
         task = self.coordinator.create_task(
-            project["id"], "careful work", agent="pi", effort="high"
+            project["id"], "careful work", agent="claude", effort="high"
         )
         out = io.StringIO()
         with _ctx.redirect_stdout(out):
@@ -1203,7 +1203,7 @@ class EffortReachesTheRecordTests(HelmTestCase):
             ])
         shown = out.getvalue()
         self.assertIn("effort: high", shown)
-        self.assertIn("agent: pi", shown)
+        self.assertIn("agent: claude", shown)
 
 
 class AgentHelpNamesEveryRuntimeTests(HelmTestCase):
@@ -1311,3 +1311,52 @@ class RuntimeProbeTests(HelmTestCase):
                            side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
             verdict = self.coordinator.probe_runtime("claude")
         self.assertEqual(verdict["verdict"], "timeout")
+
+
+class ImpossibleEffortIsRefusedWhereItCanStillBeFixedTests(HelmTestCase):
+    """An effort the named runtime cannot express must fail at CREATION.
+
+    It used to fail only at launch. `--agent cursor --effort low` was
+    accepted and recorded, and every launch then refused it -- with no
+    command to clear an effort off an existing task, so the task was
+    unlaunchable from the instant it existed. A foreman spent three launch
+    attempts on one and correctly reported it rather than working around it.
+    The launch check stays for runtimes only resolved there; this one catches
+    the pairing while the caller can still act on it.
+    """
+
+    def _project(self, name: str):
+        root = self.repo(name)
+        return self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+
+    def test_a_runtime_with_no_effort_setting_is_refused_at_creation(self) -> None:
+        project = self._project("impossible")
+        with self.assertRaisesRegex(HelmError, r"cannot be told a reasoning effort"):
+            self.coordinator.create_task(
+                project["id"], "mechanical apply", agent="cursor", effort="low"
+            )
+
+    def test_a_level_the_runtime_does_not_offer_is_refused_at_creation(self) -> None:
+        project = self._project("badlevel")
+        # codex takes minimal/low/medium/high and has no xhigh.
+        with self.assertRaisesRegex(HelmError, r"does not accept effort"):
+            self.coordinator.create_task(
+                project["id"], "careful work", agent="codex", effort="xhigh"
+            )
+
+    def test_an_effort_the_runtime_accepts_still_creates(self) -> None:
+        project = self._project("fine")
+        task = self.coordinator.create_task(
+            project["id"], "careful work", agent="claude", effort="xhigh"
+        )
+        self.assertEqual(task["effort"], "xhigh")
+
+    def test_an_effort_with_no_agent_named_is_left_to_launch(self) -> None:
+        # The runtime is not knowable yet -- a project pin or the session
+        # default may well accept it -- so refusing here would reject work
+        # that is perfectly launchable.
+        project = self._project("later")
+        task = self.coordinator.create_task(project["id"], "careful work", effort="high")
+        self.assertEqual(task["effort"], "high")

@@ -3193,6 +3193,16 @@ class Coordinator:
         model = _validate_model_id(model, "task") if model else None
         if agent is not None:
             _validate_agent_id(agent, "--agent")
+        if agent is not None and effort:
+            # Both named here, so the pairing is knowable NOW. It used to be
+            # checked only at launch, which created a task that could never
+            # start: --agent cursor --effort low was accepted, recorded, and
+            # then refused every time, with no command to clear an effort off
+            # an existing task. A foreman burned three launch attempts on one.
+            # Refusing at creation is the same rule enforced where the caller
+            # can still act on it -- the launch check stays, for the runtimes
+            # that are only resolved there.
+            self._require_effort_supported(effort, agent, "task")
 
         worktree_backed = role not in WORKTREELESS_ROLES
         # Bounded retry, not a loop that can spin forever: a fetch runs
