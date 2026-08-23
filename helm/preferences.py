@@ -33,6 +33,8 @@ understood.
 
 from __future__ import annotations
 
+import re
+
 import json
 import os
 import tempfile
@@ -76,6 +78,8 @@ KEY_AGENT_EXCLUDE = "agent.exclude"
 KEY_MODEL_DEFAULT = "model.default"
 KEY_MODEL_RUNTIMES = "model.runtimes"
 KEY_MODEL_FREE = "model.free"
+KEY_EFFORT_DEFAULT = "effort.default"
+KEY_EFFORT_RUNTIMES = "effort.runtimes"
 
 #: The whole vocabulary `model.free` understands. Deliberately enumerated:
 #: a narrow preference cannot be stretched into a standing order to downgrade
@@ -96,6 +100,16 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
     KEY_MODEL_DEFAULT: (
         False,
         "root default model, below a task choice and a project pin",
+    ),
+    KEY_EFFORT_DEFAULT: (
+        False,
+        "root default reasoning effort, below a task choice and a project pin "
+        "(runtimes that cannot express one refuse rather than drop it)",
+    ),
+    f"{KEY_EFFORT_RUNTIMES}.<runtime>": (
+        True,
+        "teach this root how a runtime takes effort: flag:<name>:<levels> or "
+        "config:<key>:<levels>, for an agent or level Helm does not ship yet",
     ),
     f"{KEY_MODEL_RUNTIMES}.<family>": (
         True,
@@ -163,6 +177,14 @@ class Preferences:
     present: bool = False
     default_agent: str | None = None
     default_model: str | None = None
+    default_effort: str | None = None
+    #: runtime id -> (mechanism, argument, levels). A shipped capability is a
+    #: default, not a limit: CLIs add flags and models add levels between Helm
+    #: releases, and a root that cannot say so locally would have to wait for
+    #: one.
+    effort_runtimes: Mapping[str, tuple[str, str, frozenset[str]]] = field(
+        default_factory=dict
+    )
     excluded_agents: frozenset[str] = frozenset()
     model_runtimes: Mapping[str, frozenset[str]] = field(default_factory=dict)
     #: `prefer` asks the dispatcher to prefer an explicitly-free model it has
@@ -206,6 +228,8 @@ class Preferences:
             model["free"] = self.free_model
         if model:
             document["model"] = model
+        if self.default_effort:
+            document["effort"] = {"default": self.default_effort}
         return document
 
     def entries(self) -> list[tuple[str, str]]:
@@ -284,7 +308,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
             f"unsupported preferences version {version!r}{where}; this build "
             f"understands {', '.join(str(item) for item in SUPPORTED_VERSIONS)}"
         )
-    _reject_unknown(document, {"version", "agent", "model"}, "", where)
+    _reject_unknown(document, {"version", "agent", "model", "effort"}, "", where)
 
     agent = _object(document.get("agent"), "agent", where)
     _reject_unknown(agent, {"default", "exclude"}, "agent", where)
@@ -296,6 +320,17 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
     excluded = frozenset(
         _agent_id(item, "agent.exclude", where)
         for item in _list(agent.get("exclude"), "agent.exclude", where)
+    )
+
+    effort = _object(document.get("effort"), "effort", where)
+    _reject_unknown(effort, {"default", "runtimes"}, "effort", where)
+    effort_runtimes = _effort_runtimes(
+        _object(effort.get("runtimes"), "effort.runtimes", where), where
+    )
+    default_effort = (
+        _effort_level(effort["default"], "effort.default", where)
+        if effort.get("default") is not None
+        else None
     )
 
     model = _object(document.get("model"), "model", where)
@@ -338,6 +373,8 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         excluded_agents=excluded,
         model_runtimes=runtimes_by_family,
         free_model=free_model,
+        default_effort=default_effort,
+        effort_runtimes=effort_runtimes,
     )
 
 
@@ -384,6 +421,67 @@ def _agent_id(value: Any, name: str, where: str) -> str:
         return runtimes.validate_agent_id(value)
     except ValueError as exc:
         raise PreferencesError(f"{name}{where}: {exc}") from exc
+
+
+#: Same list as core's EFFORT_LEVELS. Kept here too because preferences must
+#: refuse an unusable value at load, before anything tries to launch with it.
+_SAFE_ARGUMENT = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _effort_runtimes(
+    section: Mapping[str, Any], where: str
+) -> dict[str, tuple[str, str, frozenset[str]]]:
+    """Parse locally-taught effort capabilities.
+
+    Spelled `<mechanism>:<argument>:<level>,<level>...` so the whole
+    declaration is one narrow string with no free-text field: mechanism is one
+    of two words, argument is a flag or config key, and levels are validated
+    against the same vocabulary as everywhere else. A root can teach this
+    installation a new agent's flag without waiting for a Helm release, and
+    still cannot smuggle a command into a launch.
+    """
+    parsed: dict[str, tuple[str, str, frozenset[str]]] = {}
+    for runtime_id, value in section.items():
+        spec = str(value or "").strip()
+        parts = spec.split(":")
+        if len(parts) != 3:
+            raise PreferencesError(
+                f"{where}: effort.runtimes.{runtime_id} must be "
+                "'flag:<name>:<levels>' or 'config:<key>:<levels>'"
+            )
+        mechanism, argument, levels = (part.strip() for part in parts)
+        if mechanism not in ("flag", "config"):
+            raise PreferencesError(
+                f"{where}: effort.runtimes.{runtime_id} mechanism must be "
+                f"'flag' or 'config', not {mechanism!r}"
+            )
+        if not _SAFE_ARGUMENT.fullmatch(argument):
+            raise PreferencesError(
+                f"{where}: effort.runtimes.{runtime_id} argument {argument!r} "
+                "is not a plain flag or config key"
+            )
+        named = tuple(
+            _effort_level(level, f"effort.runtimes.{runtime_id}", where)
+            for level in levels.split(",")
+            if level.strip()
+        )
+        if not named:
+            raise PreferencesError(
+                f"{where}: effort.runtimes.{runtime_id} names no levels"
+            )
+        parsed[runtime_id] = (mechanism, argument, frozenset(named))
+    return parsed
+
+
+def _effort_level(value: Any, key: str, where: str) -> str:
+    level = str(value or "").strip().lower()
+    if level not in EFFORT_LEVELS:
+        raise PreferencesError(
+            f"{where}: {key} must be one of {', '.join(EFFORT_LEVELS)}, not {value!r}"
+        )
+    return level
 
 
 def _model_id(value: Any, name: str, where: str) -> str:

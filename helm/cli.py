@@ -17,6 +17,7 @@ from typing import Any
 from . import watchdog as watchdog_module
 from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .core import (
+    EFFORT_LEVELS,
     AUTHORITY_ENV,
     DELIVERY_DECISION_KIND,
     BLOCKING_GATE_KINDS,
@@ -1189,6 +1190,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="agent runtime or configured profile for this task (built in: claude, codex, pi, opencode)")
     run.add_argument("--model",
         help="model this task runs on; overrides the project pin and HELM_MODEL")
+    run.add_argument("--effort", choices=EFFORT_LEVELS,
+        help="reasoning effort for this task; overrides the project pin and "
+        "HELM_EFFORT")
     run.add_argument("--ticket",
         help="tracker id for this work; goes in the branch name so a human can find it")
     run.add_argument(
@@ -1241,6 +1245,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="agent runtime or configured profile for this task (built in: claude, codex, pi, opencode)")
     create.add_argument("--model",
         help="model this task runs on; overrides the project pin and HELM_MODEL")
+    create.add_argument("--effort", choices=EFFORT_LEVELS,
+        help="reasoning effort for this task; overrides the project pin and "
+        "HELM_EFFORT. A runtime that cannot express it refuses rather than "
+        "dropping it")
     create.add_argument("--ticket",
         help="tracker id for this work; goes in the branch name so a human can find it")
     create.add_argument(
@@ -1450,6 +1458,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     doctor_cmd.add_argument(
         "--project", dest="doctor_project", help="also run checks for one managed project"
+    )
+    doctor_cmd.add_argument(
+        "--probe-runtimes", action="store_true",
+        help="also run each installed agent's --help to catch an effort flag "
+        "Helm records but the CLI no longer publishes (starts processes, so "
+        "it is opt-in)"
     )
     doctor_cmd.add_argument(
         "--json", dest="doctor_json", action="store_true", help="emit the machine-readable report"
@@ -2147,7 +2161,15 @@ def _doctor_command(
             raise HelmError(
                 f"unknown project {project_id}; expected a Git project at {candidate}"
             )
-    return _emit_doctor(args, doctor_module.run(coordinator, helm_root, project_id))
+    return _emit_doctor(
+        args,
+        doctor_module.run(
+            coordinator,
+            helm_root,
+            project_id,
+            probe_runtimes=getattr(args, "probe_runtimes", False),
+        ),
+    )
 
 
 def _emit_doctor(args: argparse.Namespace, report: doctor_module.Report) -> int:
@@ -2459,7 +2481,8 @@ def main(argv: list[str] | None = None) -> int:
             project = coordinator.discover_project(helm_root, args.project_id)
             task = coordinator.create_task(
                 project["id"], brief, delivery_policy=args.delivery, domain=args.domain,
-                agent=args.agent, model=args.model, ticket=args.ticket,
+                agent=args.agent, model=args.model, effort=args.effort,
+                ticket=args.ticket,
                 no_domain=args.no_domain,
             )
             if args.herdr:

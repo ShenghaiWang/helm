@@ -901,3 +901,166 @@ class RuntimeSelectionTests(HelmTestCase):
             # workspace-write is the narrower of the two modes that allow it;
             # danger-full-access would drop the sandbox entirely.
             self.assertEqual(mode, "workspace-write")
+
+
+class EffortCapabilityTests(HelmTestCase):
+    """Effort is a property of the runtime, expressed four different ways.
+
+    Encoding it as "every CLI has --effort" would have been wrong for three of
+    the five runtimes Helm ships, and wrong silently: the level would vanish
+    and the commander would pay for a quality difference nobody could see.
+    """
+
+    def test_each_runtime_declares_how_it_takes_effort(self) -> None:
+        from helm import runtimes
+        claude = runtimes.builtin_runtime("claude")
+        self.assertEqual(claude.effort_mechanism, runtimes.EFFORT_FLAG)
+        self.assertIn("high", claude.effort_levels)
+        codex = runtimes.builtin_runtime("codex")
+        self.assertEqual(codex.effort_mechanism, runtimes.EFFORT_CONFIG)
+        # OpenAI's vocabulary, not Claude Code's.
+        self.assertIn("minimal", codex.effort_levels)
+        self.assertNotIn("xhigh", codex.effort_levels)
+        for runtime_id in ("pi", "opencode", "omp", "cursor"):
+            runtime = runtimes.builtin_runtime(runtime_id)
+            self.assertEqual(
+                runtime.effort_mechanism, runtimes.EFFORT_UNSUPPORTED, runtime_id
+            )
+            self.assertFalse(runtime.accepts_effort("high"), runtime_id)
+
+    def test_a_flag_runtime_carries_effort_beside_the_model(self) -> None:
+        from helm import runtimes
+        runtime = runtimes.builtin_runtime("claude")
+        command = runtime.with_effort(
+            runtime.with_model("claude-opus-5", interactive=True), "high"
+        )
+        self.assertEqual(command[1:5], ["--effort", "high", "--model", "claude-opus-5"])
+
+    def test_a_config_runtime_carries_effort_as_an_override(self) -> None:
+        from helm import runtimes
+        runtime = runtimes.builtin_runtime("codex")
+        command = runtime.with_effort(runtime.command(interactive=True), "high")
+        self.assertEqual(command[1:3], ["-c", "model_reasoning_effort=high"])
+
+    def test_effort_is_never_added_twice(self) -> None:
+        from helm import runtimes
+        runtime = runtimes.builtin_runtime("claude")
+        once = runtime.with_effort(runtime.command(interactive=True), "high")
+        self.assertEqual(runtime.with_effort(once, "high"), once)
+
+
+class EffortResolutionTests(HelmTestCase):
+    def _project_task(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the work")
+        return project, task
+
+    def test_the_task_outranks_the_project_pin(self) -> None:
+        project, _ = self._project_task("effortladder")
+        with self.coordinator.store.locked() as data:
+            data["projects"][project["id"]]["effort"] = "low"
+        task = self.coordinator.create_task(
+            project["id"], "careful work", effort="high"
+        )
+        loaded = self.coordinator.store.load()
+        effort, reason = self.coordinator._resolve_effort(
+            loaded["projects"][project["id"]], loaded["tasks"][task["id"]]
+        )
+        self.assertEqual(effort, "high")
+        self.assertIn("task", reason)
+
+    def test_the_project_pin_applies_when_the_task_is_silent(self) -> None:
+        project, task = self._project_task("effortpin")
+        with self.coordinator.store.locked() as data:
+            data["projects"][project["id"]]["effort"] = "medium"
+        loaded = self.coordinator.store.load()
+        effort, reason = self.coordinator._resolve_effort(
+            loaded["projects"][project["id"]], loaded["tasks"][task["id"]]
+        )
+        self.assertEqual(effort, "medium")
+        self.assertIn(project["id"], reason)
+
+    def test_nothing_chosen_means_the_runtimes_own_default(self) -> None:
+        """Helm never invents a level: unset stays unset, so the runtime keeps
+        whatever the machine is configured for."""
+        project, task = self._project_task("effortunset")
+        loaded = self.coordinator.store.load()
+        effort, reason = self.coordinator._resolve_effort(
+            loaded["projects"][project["id"]], loaded["tasks"][task["id"]]
+        )
+        self.assertIsNone(effort)
+        self.assertEqual(reason, "")
+
+    def test_an_unknown_level_is_refused_at_the_edge(self) -> None:
+        from helm.core import HelmError
+        project, _ = self._project_task("effortbogus")
+        with self.assertRaises(HelmError):
+            self.coordinator.create_task(project["id"], "work", effort="turbo")
+
+
+class EffortRefusalTests(HelmTestCase):
+    """A level the runtime cannot express is refused, never dropped.
+
+    Dropping it would spend the commander's money at a level they did not
+    choose and leave nothing in the record to show the difference.
+    """
+
+    def test_a_runtime_without_effort_refuses_rather_than_dropping_it(self) -> None:
+        from helm.core import HelmError
+        with self.assertRaises(HelmError) as caught:
+            self.coordinator._require_effort_supported(
+                "high", "opencode", "project x pins high effort"
+            )
+        self.assertIn("opencode", str(caught.exception))
+        self.assertIn("high", str(caught.exception))
+
+    def test_a_level_outside_the_runtimes_vocabulary_is_refused(self) -> None:
+        from helm.core import HelmError
+        with self.assertRaises(HelmError) as caught:
+            self.coordinator._require_effort_supported(
+                "xhigh", "codex", "task asks for xhigh effort"
+            )
+        # Names what it does take, so the fix is obvious from the message.
+        self.assertIn("minimal", str(caught.exception))
+
+    def test_a_supported_level_passes_silently(self) -> None:
+        self.coordinator._require_effort_supported("high", "claude", "task")
+        self.coordinator._require_effort_supported(None, "opencode", "task")
+
+
+class EffortAtLaunchTests(HelmTestCase):
+    def test_the_launch_records_the_effort_it_applied(self) -> None:
+        """The trustworthy record is Helm's, not the agent's self-report: an
+        agent knows what it was told, not what it is running."""
+        import sys
+        root = self.repo("effortlaunch")
+        project = self.coordinator.register_project(
+            "Launch", str(root), project_id="effortlaunch"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "careful work", effort="high"
+        )
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        recorded = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(recorded["effort"], "high")
+        self.assertIn("high", recorded["effort_reason"])
+        self.coordinator.stop_worker(worker["id"], reason="test cleanup")
+
+    def test_a_launch_refuses_an_effort_the_runtime_cannot_express(self) -> None:
+        """The refusal has to bite where the launch happens, not only in the
+        helper: this is the path a real task takes."""
+        from helm.core import HelmError
+        root = self.repo("effortrefuse")
+        project = self.coordinator.register_project(
+            "Refuse", str(root), project_id="effortrefuse"
+        )
+        task = self.coordinator.create_task(project["id"], "work", effort="high")
+        with self.assertRaises(HelmError):
+            self.coordinator.launch_worker(
+                task["id"], ["opencode", "--auto", "{prompt}"], wait=False
+            )

@@ -41,6 +41,14 @@ WORKER_DIR_PLACEHOLDER = "{worker_dir}"
 STATE_DIR_PLACEHOLDER = "{state_dir}"
 
 
+#: How a runtime accepts an effort level. Not every one does, and the three
+#: that do disagree on the mechanism, so Helm names the mechanism rather than
+#: assuming every CLI grew the same flag.
+EFFORT_UNSUPPORTED = "unsupported"
+EFFORT_FLAG = "flag"
+EFFORT_CONFIG = "config"
+
+
 @dataclass(frozen=True)
 class AgentRuntime:
     """One agent CLI Helm knows how to start as a worker."""
@@ -62,6 +70,24 @@ class AgentRuntime:
     # Flag that selects a model. Needed when only one runtime is installed and
     # a review still has to be run by something other than the author.
     model_flag: str = "--model"
+    #: How this runtime accepts a reasoning-effort level, if at all. Effort is
+    #: not a property runtimes share: Claude Code takes a session flag, Codex
+    #: takes a config override, pi expresses "think harder" by swapping in a
+    #: different model, and opencode carries it inside the model id. Helm
+    #: records the mechanism rather than assuming a flag, because a silently
+    #: dropped effort is a cost and a quality difference nobody can see
+    #: afterwards.
+    effort_mechanism: str = EFFORT_UNSUPPORTED
+    #: The argument that carries it, read according to `effort_mechanism`: a
+    #: flag name for `flag`, a config key for `config`.
+    effort_argument: str = ""
+    #: The levels this runtime accepts, lowest first. Empty means unknown, and
+    #: Helm then refuses rather than passing a level the CLI may reject.
+    effort_levels: tuple[str, ...] = ()
+    #: The in-session command that changes effort on a running agent, for the
+    #: runtimes that have one. Helm can send it into a live pane; a launch
+    #: flag cannot help a session that is already going.
+    effort_command: str = ""
 
     def with_model(self, model: str | None, *, interactive: bool) -> list[str]:
         command = self.command(interactive=interactive)
@@ -69,6 +95,34 @@ class AgentRuntime:
             return command
         # Insert before the prompt so a variadic option cannot swallow it.
         return [command[0], self.model_flag, model, *command[1:]]
+
+    def accepts_effort(self, level: str) -> bool:
+        """Whether this runtime can express `level` at launch."""
+        if self.effort_mechanism == EFFORT_UNSUPPORTED:
+            return False
+        return bool(self.effort_levels) and level in self.effort_levels
+
+    def with_effort(self, command: Sequence[str], effort: str | None) -> list[str]:
+        """Add the effort selection to an already-built command.
+
+        Silently returns the command unchanged only when there is nothing to
+        add. A level this runtime cannot express is the caller's error to
+        refuse -- see `Coordinator._require_effort_supported` -- because
+        dropping it here would spend the commander's money at a level they did
+        not choose and leave no trace of the difference.
+        """
+        actual = list(command)
+        if not effort or self.effort_mechanism == EFFORT_UNSUPPORTED:
+            return actual
+        if self.effort_argument in actual:
+            return actual
+        if self.effort_mechanism == EFFORT_FLAG:
+            return [actual[0], self.effort_argument, effort, *actual[1:]]
+        if self.effort_mechanism == EFFORT_CONFIG:
+            # A config override, not a flag: the key and value travel together
+            # as one argument to the runtime's own -c option.
+            return [actual[0], "-c", f"{self.effort_argument}={effort}", *actual[1:]]
+        return actual
 
     def command(self, *, interactive: bool) -> list[str]:
         return list(self.interactive if interactive else self.noninteractive)
@@ -82,6 +136,11 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
     AgentRuntime(
         id="claude",
         name="Claude Code",
+        # Claude Code publishes a session flag and an in-session command.
+        effort_mechanism=EFFORT_FLAG,
+        effort_argument="--effort",
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        effort_command="/effort",
         # A Helm worker runs in a pane nobody is watching, so an interactive
         # permission prompt is not a safety gate -- it is a deadlock. The
         # boundary that actually holds is the one Helm enforces: an isolated
@@ -121,6 +180,11 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
     AgentRuntime(
         id="codex",
         name="Codex CLI",
+        # No flag; reasoning effort is a config override, and the vocabulary
+        # is OpenAI's rather than Claude Code's.
+        effort_mechanism=EFFORT_CONFIG,
+        effort_argument="model_reasoning_effort",
+        effort_levels=("minimal", "low", "medium", "high"),
         # Same reason as Claude Code's permission mode: a Helm worker runs in
         # a pane nobody is watching, so an approval prompt is a deadlock, not a
         # gate.

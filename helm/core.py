@@ -1437,6 +1437,25 @@ def _validate_agent_id(agent_id: Any, source: str = "") -> str:
         raise HelmError(f"{exc}{f': {source}' if source else ''}") from exc
 
 
+#: Every level any supported runtime accepts. Helm validates the shape here
+#: and leaves "does THIS runtime take it" to the runtime's own capability
+#: record, because the vocabularies differ: Claude Code has xhigh and max,
+#: Codex has minimal.
+EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _validate_effort(effort: Any, source: str = "") -> str:
+    """Accept an effort level without letting it become a command."""
+    level = str(effort or "").strip().lower()
+    where = f" ({source})" if source else ""
+    if level not in EFFORT_LEVELS:
+        raise HelmError(
+            f"unknown effort level {effort!r}{where}: "
+            f"expected one of {', '.join(EFFORT_LEVELS)}"
+        )
+    return level
+
+
 def _validate_model_id(model_id: Any, source: str = "") -> str:
     """Accept a model name without letting it become a command.
 
@@ -2674,6 +2693,93 @@ class Coordinator:
             return preferred, f"root preferences set model {preferred}"
         return None, ""
 
+    def _resolve_effort(
+        self, project: dict[str, Any], task: dict[str, Any]
+    ) -> tuple[str | None, str]:
+        """Choose the reasoning effort a task runs at, most-specific-first.
+
+        The same ladder as the model, and unset means the runtime's own
+        default rather than a level Helm invented. Effort is a cost the
+        commander pays and a quality difference they cannot see afterwards, so
+        it is stated or it is left alone.
+        """
+        chosen = task.get("effort")
+        if chosen:
+            return _validate_effort(chosen, "task record"), f"task asks for {chosen} effort"
+        pinned = project.get("effort")
+        if pinned:
+            return (
+                _validate_effort(str(pinned), f"project {project['id']}"),
+                f"project {project['id']} pins {pinned} effort",
+            )
+        configured = os.environ.get("HELM_EFFORT", "").strip()
+        if configured:
+            return (
+                _validate_effort(configured, "HELM_EFFORT"),
+                f"HELM_EFFORT sets {configured} effort",
+            )
+        preferred = self.preferences().default_effort
+        if preferred:
+            return preferred, f"root preferences set {preferred} effort"
+        return None, ""
+
+    def _effort_capability(self, runtime_id: str | None):
+        """This root's effort capability for a runtime, override first.
+
+        A shipped capability is a default, not a limit. CLIs grow flags and
+        models grow levels between Helm releases, so a root can teach its own
+        installation with `effort.runtimes.<runtime>` and have it apply
+        everywhere the shipped table would have.
+        """
+        if not runtime_id:
+            return None
+        taught = self.preferences().effort_runtimes.get(runtime_id)
+        if taught is not None:
+            mechanism, argument, levels = taught
+            return runtimes.AgentRuntime(
+                id=runtime_id,
+                name=runtime_id,
+                interactive=(),
+                noninteractive=(),
+                env_passthrough=(),
+                detect_env=(),
+                effort_mechanism=(
+                    runtimes.EFFORT_FLAG if mechanism == "flag"
+                    else runtimes.EFFORT_CONFIG
+                ),
+                effort_argument=argument,
+                effort_levels=tuple(sorted(levels)),
+            )
+        return runtimes.builtin_runtime(runtime_id)
+
+    def _require_effort_supported(
+        self, effort: str | None, runtime_id: str | None, reason: str
+    ) -> None:
+        """Refuse an effort the resolved runtime cannot express.
+
+        Dropping it instead would spend the commander's money at a level they
+        did not choose, and leave nothing in the record to show the
+        difference. Refusing names the runtime, the level, and where the level
+        came from, so the fix is obvious from the message alone.
+        """
+        if not effort:
+            return
+        runtime = self._effort_capability(runtime_id)
+        if runtime is None:
+            return
+        if runtime.accepts_effort(effort):
+            return
+        if runtime.effort_mechanism == runtimes.EFFORT_UNSUPPORTED:
+            raise HelmError(
+                f"runtime {runtime.id} cannot be told a reasoning effort, but "
+                f"{reason} asks for {effort}. Drop the effort, or choose a "
+                "runtime that accepts one (claude, codex)."
+            )
+        raise HelmError(
+            f"runtime {runtime.id} does not accept effort {effort} ({reason}); "
+            f"it takes {', '.join(runtime.effort_levels)}."
+        )
+
     @staticmethod
     def _launch_runtime_id(profile: dict[str, Any], command: Sequence[str]) -> str | None:
         """Name the runtime a command will actually start, when it is knowable.
@@ -3054,6 +3160,7 @@ class Coordinator:
         domain: str | None = None,
         agent: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
         no_domain: bool = False,
         role: str = "worker",
         reviews: str | None = None,
@@ -3257,6 +3364,10 @@ class Coordinator:
                         # below) is never indistinguishable from one that just
                         # happens not to have changed anything yet.
                         "read_only": bool(read_only),
+                        #: The level this task's agent should reason at, when
+                        #: one was chosen. Absent means the ladder decides at
+                        #: launch; see `_resolve_effort`.
+                        "effort": _validate_effort(effort, "task") if effort else None,
                         # Sticky: once any round is state-changing the task is
                         # a delivery candidate for good, however its last
                         # round was classified.
@@ -5049,6 +5160,21 @@ class Coordinator:
             interactive=execution == "herdr",
         )
         command_args = list(selected_agent["command"])
+        # One place for effort, whichever path built the command and whichever
+        # source chose the level: resolved here, refused here when the runtime
+        # cannot express it, and recorded on the task so a report can be
+        # checked against what was actually launched.
+        effort, effort_reason = self._resolve_effort(project, task)
+        if effort:
+            runtime_id = Coordinator._launch_runtime_id(
+                {"id": selected_agent["id"]}, command_args
+            ) or selected_agent["id"]
+            self._require_effort_supported(effort, runtime_id, effort_reason)
+            runtime = self._effort_capability(runtime_id)
+            if runtime is not None:
+                command_args = runtime.with_effort(command_args, effort)
+            task["effort"] = effort
+            task["effort_reason"] = effort_reason
         task["agent_id"] = selected_agent["id"]
         task["agent"] = selected_agent["id"]
         task["agent_reason"] = selected_agent["reason"]

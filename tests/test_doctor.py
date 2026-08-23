@@ -1787,3 +1787,46 @@ class ThirdReviewRegressionTests(DoctorTestCase):
             finding = self.finding(self.report(helm_root), "root.runtimes")
         self.assertEqual(finding.severity, doctor.ERROR)
         self.assertIn("excluded", finding.message)
+
+
+class EffortDriftTests(HelmTestCase):
+    """The capability table is a shipped default and CLIs rename flags.
+
+    A stale entry fails quietly — the flag is passed, the runtime ignores or
+    rejects it, and the work runs at a level nobody chose — so the runtime's
+    own --help is checked rather than trusted.
+    """
+
+    def test_a_vanished_flag_is_reported(self) -> None:
+        from unittest import mock
+        from helm import doctor as doctor_module
+
+        helm_root = self._helm_root("effortdrift")
+        checker = doctor_module._Doctor(self.coordinator, helm_root)
+
+        class Result:
+            stdout = "usage: claude [options]\n  --model <name>\n"
+            stderr = ""
+
+        with mock.patch.object(doctor_module.shutil, "which", return_value="/bin/claude"), \
+             mock.patch.object(doctor_module.subprocess, "run", return_value=Result()):
+            problems = checker._effort_drift_problems()
+        self.assertTrue(any("claude" in p and "--effort" in p for p in problems))
+
+    def test_a_config_key_is_not_expected_in_help(self) -> None:
+        """Only the option that carries a config key appears in --help; looking
+        for the key itself would condemn every config-mechanism runtime."""
+        from unittest import mock
+        from helm import doctor as doctor_module
+
+        helm_root = self._helm_root("effortconfig")
+        checker = doctor_module._Doctor(self.coordinator, helm_root)
+
+        class Result:
+            stdout = "usage: codex\n  -c, --config <key=value>\n  --effort x\n"
+            stderr = ""
+
+        with mock.patch.object(doctor_module.shutil, "which", return_value="/bin/x"), \
+             mock.patch.object(doctor_module.subprocess, "run", return_value=Result()):
+            problems = checker._effort_drift_problems()
+        self.assertEqual([p for p in problems if "codex" in p], [])

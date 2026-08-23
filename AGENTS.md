@@ -513,6 +513,31 @@ can inform runtime fit and diagnosis, but it becomes selectable for Helm work
 only through a built-in entry in `helm/runtimes.py` or a configured agent
 profile with a concrete command and credential passthrough.
 
+**And the effort is a third choice, owed the same way.** Reasoning effort is a
+cost the commander pays and a quality difference nobody can see afterwards, so
+Helm states it or leaves it alone — it never invents one. It resolves
+most-specific-first like the model: `--effort` on the task, the project's
+`"effort"` pin, `HELM_EFFORT`, then the root's `effort.default` preference;
+unset means the runtime's own default.
+
+Effort is *not* a property runtimes share, which is why Helm records a
+mechanism per runtime rather than assuming a flag: Claude Code takes
+`--effort` (low, medium, high, xhigh, max) and also has an in-session
+`/effort`; Codex takes a `-c model_reasoning_effort=` override with OpenAI's
+own vocabulary; pi expresses "think harder" by swapping models; opencode
+carries it inside the model id. A runtime that cannot express a level Helm was
+asked for **refuses the launch** rather than dropping it silently. A root can
+teach its own installation a runtime or level Helm does not ship with
+`effort.runtimes.<runtime>` in `preferences.json`, and `helm doctor
+--probe-runtimes` runs each installed agent's `--help` to catch a flag that has
+been renamed upstream.
+
+Match the level to the work: high for authoring or reviewing correctness-
+critical code — auth, tokens, money, anything security-shaped — medium for
+ordinary feature work, low for mechanical rounds like rebases, evidence runs
+and doc edits. Say which level you chose and why when you relay, for the same
+reason you say which model.
+
 **Naming the runtime is not naming the model, and the coordinator owes the
 worker both.** A runtime resolves to *something that can run*; the model decides
 whether it is any good at this task and what it costs. Resolve it the same way,

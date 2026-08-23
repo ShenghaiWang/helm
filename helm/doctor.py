@@ -389,6 +389,9 @@ class _Doctor:
         *,
         state_error: str = "",
     ) -> None:
+        #: Opt-in: run each installed agent's --help to catch a renamed
+        #: effort flag. Off by default because doctor starts nothing.
+        self.probe_runtimes = False
         self.coordinator = coordinator
         self.root = canonical(helm_root) if helm_root is not None else None
         self.findings: list[Finding] = []
@@ -1026,6 +1029,48 @@ class _Doctor:
             models.append((ambient, "HELM_MODEL", False))
         return models
 
+    def _effort_drift_problems(self) -> list[str]:
+        """Effort flags Helm records that the installed CLI no longer publishes.
+
+        The capability table is a shipped default, and CLIs rename flags. A
+        stale entry does not fail loudly: the flag is passed, the runtime
+        rejects or ignores it, and the work runs at a level nobody chose. So
+        the runtime's own --help is the authority, checked here rather than
+        trusted at launch. Only a warning: --help output is not a contract,
+        and doctor must not fail a healthy root over a formatting change.
+        """
+        problems: list[str] = []
+        for runtime in runtimes.BUILTIN_RUNTIMES:
+            if runtime.effort_mechanism == runtimes.EFFORT_UNSUPPORTED:
+                continue
+            if not shutil.which(runtime.command(interactive=True)[0]):
+                continue
+            try:
+                result = subprocess.run(
+                    [runtime.command(interactive=True)[0], "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            published = f"{result.stdout}\n{result.stderr}"
+            # A flag appears in --help by name. A config KEY does not -- only
+            # the option that carries it does -- so checking the key would
+            # report every config-mechanism runtime as broken forever.
+            expected = (
+                runtime.effort_argument
+                if runtime.effort_mechanism == runtimes.EFFORT_FLAG
+                else "--config"
+            )
+            if expected and expected not in published:
+                problems.append(
+                    f"{runtime.id} no longer publishes {expected}; Helm's "
+                    "recorded effort mechanism may be stale"
+                )
+        return problems
+
     def _pairing_problems(self, named: dict[str, list[str]]) -> list[str]:
         """Model families this root restricted, paired with a runtime it forbids.
 
@@ -1291,6 +1336,10 @@ class _Doctor:
             )
             if not available:
                 broken.append(f"{shown} named by {sources}: {reason}")
+        for drifted in (
+            self._effort_drift_problems() if self.probe_runtimes else []
+        ):
+            self.warn("root.runtimes", drifted, "check the runtime's own --help")
         broken.extend(self._pairing_problems(named))
         broken.extend(self._effective_launch_problems())
         if broken:
@@ -1878,10 +1927,21 @@ class _Doctor:
 
 
 def run(
-    coordinator: Coordinator, helm_root: Path | None, project_id: str | None = None
+    coordinator: Coordinator,
+    helm_root: Path | None,
+    project_id: str | None = None,
+    *,
+    probe_runtimes: bool = False,
 ) -> Report:
-    """Inspect a root, and optionally one project, changing nothing."""
+    """Inspect a root, and optionally one project, changing nothing.
+
+    `probe_runtimes` additionally runs each installed agent's `--help` to see
+    whether Helm's recorded effort mechanism still exists. Opt-in because
+    doctor's whole contract is that it is cheap and starts nothing; spawning
+    five CLIs is neither, and a preflight nobody dares run is worthless.
+    """
     doctor = _Doctor(coordinator, helm_root)
+    doctor.probe_runtimes = probe_runtimes
     if project_id is not None:
         doctor.preload_project(project_id)
     ran = doctor.run_root()

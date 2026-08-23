@@ -170,6 +170,8 @@ class PreferenceSchemaTests(HelmTestCase):
                 "model.default",
                 "model.free",
                 "model.runtimes.<family>",
+                "effort.default",
+                "effort.runtimes.<runtime>",
             },
         )
         for family in runtimes.model_family_ids():
@@ -571,3 +573,54 @@ if __name__ == "__main__":  # pragma: no cover
     import unittest
 
     unittest.main()
+
+
+class EffortPreferenceTests(HelmTestCase):
+    """A shipped capability is a default, not a limit: agents grow flags and
+    models grow levels between Helm releases."""
+
+    _roots = 0
+
+    def _load(self, document: dict):
+        import json
+        from helm import preferences
+        EffortPreferenceTests._roots += 1
+        root = self._helm_root(f"effortprefs{EffortPreferenceTests._roots}")
+        path = root / preferences.PREFERENCES_FILENAME
+        path.write_text(
+            json.dumps({"version": preferences.PREFERENCES_VERSION, **document}),
+            encoding="utf-8",
+        )
+        return preferences.load(path)
+
+    def test_a_default_effort_is_read(self) -> None:
+        loaded = self._load({"effort": {"default": "high"}})
+        self.assertEqual(loaded.default_effort, "high")
+
+    def test_an_unknown_level_is_refused_at_load(self) -> None:
+        from helm import preferences
+        with self.assertRaises(preferences.PreferencesError):
+            self._load({"effort": {"default": "turbo"}})
+
+    def test_a_root_can_teach_a_runtime_helm_does_not_ship(self) -> None:
+        loaded = self._load(
+            {"effort": {"runtimes": {"newagent": "flag:--thinking:low,high"}}}
+        )
+        mechanism, argument, levels = loaded.effort_runtimes["newagent"]
+        self.assertEqual((mechanism, argument), ("flag", "--thinking"))
+        self.assertEqual(levels, frozenset({"low", "high"}))
+
+    def test_a_taught_capability_cannot_smuggle_a_command(self) -> None:
+        """The declaration is three narrow fields, not free text: an argument
+        that is not a plain flag or key is refused rather than launched."""
+        from helm import preferences
+        with self.assertRaises(preferences.PreferencesError):
+            self._load(
+                {"effort": {"runtimes": {"x": "flag:--m; rm -rf /:low"}}}
+            )
+
+    def test_a_malformed_declaration_is_refused(self) -> None:
+        from helm import preferences
+        for spec in ("flag:--x", "sideways:--x:low", "flag:--x:"):
+            with self.assertRaises(preferences.PreferencesError, msg=spec):
+                self._load({"effort": {"runtimes": {"x": spec}}})
