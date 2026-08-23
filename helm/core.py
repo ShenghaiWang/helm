@@ -5533,6 +5533,66 @@ class Coordinator:
     #: already landed.
     _CONTINUABLE_TASK_STATES = frozenset({"completed", "approved"})
 
+    _REOPENABLE_TASK_STATES = frozenset({"failed", "blocked"})
+
+    def reopen_task(self, task_id: str, note: str = "") -> dict[str, Any]:
+        """Record that a human read a stopped task, and make it continuable again.
+
+        `continue_task` refuses a failed or blocked task with "a person needs to
+        read it first". That refusal is right and it stays. What was missing is
+        the other half: there was no way for a person to SAY they had read it,
+        so a task that stopped could never be restarted at all.
+
+        A foreman found the dead end the hard way. Its worker died on a provider
+        outage; it stopped the stale worker, which is correct and which Helm
+        asks for; stopping moved the task to `failed`; and from there `continue`
+        refused, `--agent` was refused because a round had already opened, and
+        the task's effort pinned it to runtimes that could express one. Four
+        correct guards with no exit between them. Nothing was wrong with the
+        branch -- it sat clean and committed while the task could not move.
+
+        Root only, like every other command that decides something. The whole
+        value is that a person looked, so an agent reopening its own failure
+        would be the one thing this must not allow.
+        """
+        authority = self.authority("reopening a stopped task")
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            if task["status"] in self._CONTINUABLE_TASK_STATES:
+                raise HelmError(
+                    f"task {task_id} is already {task['status']} and can take "
+                    "another round; reopening it would change nothing"
+                )
+            if task["status"] not in self._REOPENABLE_TASK_STATES:
+                raise HelmError(
+                    f"task {task_id} is {task['status']}, and only "
+                    f"{sorted(self._REOPENABLE_TASK_STATES)} can be reopened. "
+                    "A merged or cleaned-up task is finished; start a new one."
+                )
+            live = [
+                worker
+                for worker in data.get("workers", {}).values()
+                if worker.get("task_id") == task_id and worker.get("status") == "running"
+            ]
+            if live:
+                raise SafetyError(
+                    f"worker {live[0]['id']} is still running on {task_id}; "
+                    "reopening now would put a second round over a live one"
+                )
+            was = task["status"]
+            task["status"] = "completed"
+            task["reopened_at"] = now()
+            task["reopened_from"] = was
+            task["reopened_note"] = _safe_text(note).strip()
+            project = self._project(data, task["project_id"])
+            self._message(
+                data, project, task, None, "status",
+                f"Commander reopened this task from {was}; it can take another round"
+                + (f": {task['reopened_note']}" if task["reopened_note"] else ""),
+                {"reopened_from": was, "authority": authority.mode},
+            )
+            return dict(task)
+
     def continue_task(
         self,
         task_id: str,
@@ -8860,6 +8920,27 @@ class Coordinator:
                 "note": "",
             }
             gates = dict(task.get("gates") or {})
+            # A CONFIRMED PAIR THAT NOTHING HAS SPENT IS A LIVE COMMANDER
+            # DECISION, AND OVERWRITING IT USED TO BE SILENT. On 2026-08-23 a
+            # confirmed requirement for one round vanished when the next round
+            # proposed on the same foreman task; only the foreman noticing kept
+            # that round from running ungated.
+            #
+            # REFUSING IT WOULD BE WRONG, and that was tried first: a foreman
+            # re-proposing its own gate before anything spends it is legitimate
+            # self-correction, and one did exactly that the same evening --
+            # withdrawing a proposal it had thought better of. Blocking that
+            # breaks the mechanism in the name of protecting it.
+            #
+            # So the fix is the silence, not the overwrite. Say what is being
+            # discarded, on the record, where the commander reads it.
+            at_risk = ("requirement", "solution") if gate_type == "requirement" else ("solution",)
+            discarded = [
+                name
+                for name in at_risk
+                if (gates.get(name) or {}).get("confirmed_at")
+                and not gates.get("bound_task_id")
+            ]
             # Any new proposal is a material change in what is being
             # confirmed, so a binding this pair already spent on an earlier
             # task no longer describes what the commander is about to decide.
@@ -8890,10 +8971,20 @@ class Coordinator:
                 gates["solution"] = proposal
             task["gates"] = gates
             project = self._project(data, task["project_id"])
+            # Name what this proposal threw away, in the message the commander
+            # actually reads. An unspent confirmation is a decision they made
+            # and have not yet seen used; it must not disappear quietly.
+            announcement = f"Foreman proposed the {gate_type} gate; waiting on the commander"
+            if discarded:
+                announcement += (
+                    f" -- THIS DISCARDED A CONFIRMED, UNSPENT DECISION: "
+                    f"{' and '.join(discarded)}. No task had consumed it, so if that "
+                    "decision still stood, it has to be made again."
+                )
             self._message(
                 data, project, task, None, "status",
-                f"Foreman proposed the {gate_type} gate; waiting on the commander",
-                {"gate": gate_type, "text": text},
+                announcement,
+                {"gate": gate_type, "text": text, "discarded_confirmed": discarded},
             )
             project_id = task["project_id"]
             result = dict(task)
@@ -9618,6 +9709,40 @@ class Coordinator:
                         "evidence": "ancestry",
                     }
         return {"role": "root", "worker_id": "", "evidence": "unmarked"}
+
+    def require_same_project(self, worker_id: str, action: str) -> None:
+        """Refuse an agent addressing a worker outside its own project.
+
+        Isolation was enforced where work HAPPENS -- worktrees, branches,
+        composed context -- and nowhere on the path where agents TALK. So a
+        foreman could hand a message to any worker id in the root, and on
+        2026-08-23 one did: a review brief naming another project's runbook,
+        its tracker rows and a commander decision was delivered into a second
+        project's foreman session by a mistyped id. Nothing refused it.
+
+        Isolation is about what an agent is allowed to KNOW, not only what it
+        may write, so a message is a leak in its own right -- the receiving
+        foreman could not unread it, and correctly stood down rather than
+        continue with another project's material in its context.
+
+        The root addresses anything: it coordinates every project by design.
+        An agent is confined to its own.
+        """
+        identity = self.caller_identity()
+        if identity["role"] == "root":
+            return
+        data = self.store.load()
+        caller = data.get("workers", {}).get(identity["worker_id"]) or {}
+        target = data.get("workers", {}).get(worker_id) or {}
+        mine, theirs = caller.get("project_id"), target.get("project_id")
+        if not mine or not theirs or mine == theirs:
+            return
+        raise HelmError(
+            f"{action} refused: worker {worker_id} belongs to project {theirs}, "
+            f"and you are {identity['worker_id']} on {mine}. One worker serves one "
+            "project, and a message is context -- an agent cannot unread another "
+            "project's material. Check the worker id; ask the root to route it."
+        )
 
     def caller_role(self) -> str:
         """The calling agent's role: the root, a foreman, or a worker."""

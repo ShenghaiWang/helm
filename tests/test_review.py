@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
+import io
 import itertools
 import json
 import re
@@ -469,14 +471,26 @@ class ReviewTests(HelmTestCase):
         self.assertIn(json.dumps("pytest -q: 547 passed, 0 failed, exit 0"), brief)
         self.assertNotIn(json.dumps("pytest -q: 3 failed, exit 1"), brief)
 
-    def test_the_reviewer_brief_marks_full_suite_evidence_explicitly_missing(self) -> None:
-        """Absence must read as a stated fact, not as silence the reviewer has to notice."""
+    def test_the_reviewer_brief_states_the_payload_is_absent_not_the_evidence(self) -> None:
+        """A stated fact, but the RIGHT one.
+
+        This used to say the evidence was MISSING, which is a claim about the
+        world made from a claim about a payload key. An author wrote a
+        complete, correct evidence report -- tip, clean tree, every package
+        with counts, unmasked exit -- in prose, and this line told the reviewer
+        it did not exist. The reviewer obeyed and blocked a clean branch.
+        """
         task, worker = self._artifact_task("suitemissing")
 
         brief = self._captured_reviewer_brief(task)
 
-        self.assertIn("AUTHOR'S FULL-SUITE EVIDENCE: MISSING", brief)
-        self.assertIn("report the absence as a finding", brief)
+        self.assertIn("NO MACHINE-READABLE PAYLOAD", brief)
+        self.assertNotIn("EVIDENCE: MISSING", brief)
+        # It must send the reviewer to look before concluding, and it must
+        # keep the two outcomes distinct: prose is a misfiling, nothing at
+        # all is the blocking finding.
+        self.assertIn("before calling it absent", brief)
+        self.assertIn("MISFILING", brief)
 
     def test_the_reviewer_brief_stays_quiet_when_no_artifact_was_reported(self) -> None:
         """No artifacts means no paragraph, not an empty list to read past."""
@@ -1389,3 +1403,93 @@ class ReviewerTicketTests(HelmTestCase):
         )
         self.assertEqual(again, command)
         self.assertEqual(again.count("--model"), 1)
+
+
+class EvidenceAbsenceIsNotEvidenceOfAbsenceTests(HelmTestCase):
+    """"No payload" and "no suite ran" are different, and Helm said the second.
+
+    An author wrote a complete, correct evidence report in prose -- tip, clean
+    tree, every package with counts, unmasked exit -- and the reviewer brief
+    told the reviewer the evidence was MISSING and to report the absence as a
+    finding. It obeyed exactly, and a clean branch took a blocking finding.
+    The brief must distinguish a misfiling from an absence.
+    """
+
+    def test_the_brief_does_not_call_an_unpayloaded_task_evidence_free(self) -> None:
+        root = self.repo("brief")
+        project = self.coordinator.register_project("Brief", str(root), project_id="brief")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        note = HerdrAdapter._full_suite_evidence(
+            self.coordinator.store.load(), task["id"]
+        )
+        self.assertNotIn("EVIDENCE: MISSING", note)
+        self.assertIn("NO MACHINE-READABLE PAYLOAD", note)
+        # And it must send the reviewer to look before concluding.
+        self.assertIn("before calling it absent", note)
+
+
+class EvidenceDetailRejectionExplainsItselfTests(HelmTestCase):
+    """A bad --detail said "Expecting value: line 1 column 1" and nothing else.
+
+    That names neither the flag nor what it wanted, and the most likely
+    mistake is prose -- because everything around it is prose.
+    """
+
+    def test_prose_detail_is_refused_with_the_shape_it_wanted(self) -> None:
+        root = self.repo("detail")
+        project = self.coordinator.register_project("Detail", str(root), project_id="detail")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        from helm import cli
+
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out), contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "task", "evidence", task["id"],
+                "--tip", "abc1234", "--command", "pnpm -r test", "--exit", "0",
+                "--detail", "everything passed",
+            ])
+        self.assertNotEqual(code, 0)
+        printed = out.getvalue()
+        self.assertIn("--detail", printed)
+        self.assertIn("JSON object", printed)
+
+
+class ReviewerGetsAnEffortTests(HelmTestCase):
+    """The reviewer was created with an agent and a model and no effort.
+
+    So it ran at whatever the runtime defaulted to -- `low` on an install
+    where that is the default. The reviewer does the hardest reasoning in the
+    round: it is asked to construct the attack the author did not think of.
+    Giving it the least effort of anyone is backwards, and it showed -- a
+    reviewer on `low` found a real hole in a runbook and then truncated its
+    own report mid-finding.
+    """
+
+    def test_the_cli_accepts_a_reviewer_effort(self) -> None:
+        from helm import cli
+
+        parser = cli._build_parser()
+        parsed = parser.parse_args(["review", "t-1", "--reviewer-effort", "high"])
+        self.assertEqual(parsed.reviewer_effort, "high")
+
+    def test_reviewer_effort_is_unset_by_default_not_invented(self) -> None:
+        # Unset must stay unset: Helm states an effort or leaves it alone, and
+        # a default invented here would spend at a level nobody chose.
+        from helm import cli
+
+        parser = cli._build_parser()
+        self.assertIsNone(parser.parse_args(["review", "t-1"]).reviewer_effort)
+
+    def test_run_review_cycle_takes_the_reviewer_effort(self) -> None:
+        import inspect
+
+        signature = inspect.signature(HerdrAdapter.run_review_cycle)
+        self.assertIn("reviewer_effort", signature.parameters)
+        self.assertIsNone(signature.parameters["reviewer_effort"].default)
+
+    def test_the_reviewer_task_is_created_with_that_effort(self) -> None:
+        # The value has to reach create_task, not merely be accepted by the
+        # CLI -- that gap is the whole defect.
+        source = inspect.getsource(HerdrAdapter.run_review_cycle)
+        self.assertIn("effort=reviewer_effort", source)

@@ -1384,6 +1384,13 @@ def _build_parser() -> argparse.ArgumentParser:
     deliver.add_argument(
         "--force", action="store_true", help="replace an existing differing file"
     )
+    reopen = task_commands.add_parser(
+        "reopen",
+        help="record that you have read a failed or blocked task, so it can take another round",
+    )
+    reopen.add_argument("task_id")
+    reopen.add_argument("--note", default="", help="what you found when you read it")
+
     approve = task_commands.choices["approve"]
     approve.add_argument("--note", default="")
     approve.add_argument(
@@ -1890,6 +1897,8 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("task_id")
     review.add_argument("--reviewer-agent", help="force a reviewer runtime")
     review.add_argument("--reviewer-model", help="review on a different model of the same runtime")
+    review.add_argument("--reviewer-effort", choices=EFFORT_LEVELS,
+        help="reasoning effort for the reviewer; unset leaves the runtime's own default")
     review.add_argument("--rounds", type=int, default=2, help="bounded disagreement rounds (default 2)")
     review.add_argument("--timeout", type=float, default=1800.0)
 
@@ -2646,7 +2655,19 @@ def main(argv: list[str] | None = None) -> int:
             elif args.task_command == "evidence":
                 detail = {}
                 if args.detail:
-                    parsed = json.loads(args.detail)
+                    # A bad --detail used to surface as a raw json.loads
+                    # message ("Expecting value: line 1 column 1"), which
+                    # names neither the flag nor what it wanted. The most
+                    # likely mistake is prose, because the surrounding report
+                    # is prose.
+                    try:
+                        parsed = json.loads(args.detail)
+                    except json.JSONDecodeError as error:
+                        raise HelmError(
+                            f"--detail must be a JSON object of per-package counts, "
+                            f'e.g. \'{{"packages/foo": "12/12"}}\' -- could not parse '
+                            f"it ({error.msg} at position {error.pos})"
+                        ) from error
                     if not isinstance(parsed, dict):
                         raise HelmError("--detail must be a JSON object")
                     detail = parsed
@@ -2660,6 +2681,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"Recorded full-suite evidence for {args.task_id} at "
                     f"{recorded['tip']} (exit {recorded['exit']})"
+                )
+            elif args.task_command == "reopen":
+                task = coordinator.reopen_task(args.task_id, args.note)
+                print(
+                    f"Reopened task {task['id']} from {task['reopened_from']}; "
+                    f"it is now {task['status']} and can take another round"
+                )
+                print(
+                    "  Continue it with helm task continue "
+                    f"{task['id']} --brief \"...\" --read-only|--state-changing"
                 )
             elif args.task_command == "approve":
                 task = coordinator.approve_task(
@@ -3004,6 +3035,11 @@ def main(argv: list[str] | None = None) -> int:
                 # interleaving with its own redraw and reading as an interrupt.
                 # Refuse rather than deliver, because two answers that disagree
                 # race and the later one wins silently.
+                # One project, one worker. An agent addressing a worker in
+                # another project is a context leak the receiver cannot undo,
+                # and --force must not buy past it -- it exists for a
+                # deliberate follow-up to your OWN worker, not for a boundary.
+                coordinator.require_same_project(args.worker_id, "worker answer")
                 racing = None if args.force else coordinator.recent_answer(args.worker_id)
                 if racing is not None:
                     print(
@@ -3919,6 +3955,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.task_id,
                 reviewer_agent=args.reviewer_agent,
                 reviewer_model=args.reviewer_model,
+                reviewer_effort=args.reviewer_effort,
                 rounds=args.rounds,
                 timeout=args.timeout,
             )

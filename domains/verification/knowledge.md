@@ -44,3 +44,41 @@ wrong branch produces a false pass or false fail — worse than no result.
    wall rather than continuing indefinitely.
 
 ---
+
+## Filing suite evidence so it counts
+
+A reviewer is shown the author's full-suite result through **one machine-read
+channel**: the `full_suite` payload on a task message. Reporting the same facts
+in prose puts nothing in that channel, so Helm tells the reviewer no evidence
+exists — and the reviewer, doing as it was told, returns a blocking finding
+against a branch whose suite ran clean. That has now cost review rounds on two
+separate projects, each time to an author who had written the evidence out in
+full.
+
+**So file it with the command, not with a sentence:**
+
+```
+helm task evidence <task-id> --tip <sha> --command "<the suite command>" --exit 0 \
+  --detail '{"packages/foo": "252/252", "packages/bar": "87 pass, 1 skipped"}'
+```
+
+`--detail` is a JSON object, not prose. File one call per suite when a project
+has more than one runner — a workspace suite and a separate mobile suite are two
+calls, because a package outside the workspace is not covered by the recursive
+run and a reviewer cannot tell that from a single total.
+
+What the evidence has to be able to survive:
+
+- **Fresh.** Run it *after* the commit it claims to test, and name that tip. A
+  run that predates the code proves nothing about the code.
+- **Unmasked.** Read the exit status directly (`$?`), never through a pipe that
+  can swallow it. Write the log to a file rather than piping it away.
+- **Complete in scope.** Name every package with its counts, including any that
+  sits outside the workspace and is therefore missed by a recursive run. "All
+  tests pass" is not scope; a list is.
+- **Clean-tree.** State that the working tree was clean at the tip, so the run
+  and the diff describe the same code.
+
+Report the same facts in your own prose too — a human reads that — but the
+payload is what a reviewer is shown. Prose alone is a misfiling, and it looks
+identical to never having run the suite at all.

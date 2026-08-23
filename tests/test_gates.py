@@ -957,3 +957,95 @@ class GatePairOwnershipTests(GateTests):
         with self._as_foreman(worker["id"]):
             task = self.coordinator.create_task(project["id"], "foreman ships it")
         self.assertEqual(task["role"], "worker")
+
+
+class AConfirmedGateIsNotOverwrittenSilentlyTests(HelmTestCase):
+    """A confirmed pair nobody has spent is a live commander decision.
+
+    One slot per gate type, overwritten in place, meant a new proposal
+    destroyed it with no warning and no record of what went. On 2026-08-23 a
+    confirmed requirement for one round vanished when the next round proposed
+    on the same foreman task; only the foreman noticing kept that round from
+    running ungated. The commander decides what to discard -- only they know
+    whether the decision they made still stands.
+    """
+
+    def _foreman_task(self, name: str) -> dict:
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        return self.coordinator.create_foreman_task(project["id"])
+
+    def test_discarding_an_unspent_confirmation_is_announced_not_silent(self) -> None:
+        task = self._foreman_task("unspent")
+        self.coordinator.propose_gate(task["id"], "requirement", "the first round")
+        self.coordinator.decide_gate(task["id"], "requirement", confirm=True, skip=False)
+        self.coordinator.propose_gate(task["id"], "requirement", "a second round")
+        messages = [
+            m for m in self.coordinator.store.load()["messages"]
+            if m.get("task_id") == task["id"] and m.get("kind") == "status"
+        ]
+        latest = messages[-1]
+        self.assertIn("DISCARDED A CONFIRMED, UNSPENT DECISION", latest["text"])
+        self.assertEqual(latest["payload"]["discarded_confirmed"], ["requirement"])
+
+    def test_overwriting_is_allowed_because_self_correction_is_legitimate(self) -> None:
+        # A foreman that thinks better of its own proposal before anything
+        # spends it must be able to withdraw it. One did exactly that the
+        # evening this guard was written; refusing would have broken the
+        # mechanism in the name of protecting it.
+        task = self._foreman_task("selfcorrect")
+        self.coordinator.propose_gate(task["id"], "requirement", "the first round")
+        self.coordinator.decide_gate(task["id"], "requirement", confirm=True, skip=False)
+        updated = self.coordinator.propose_gate(task["id"], "requirement", "on reflection")
+        self.assertEqual(updated["gates"]["requirement"]["text"], "on reflection")
+        self.assertIsNone(updated["gates"]["requirement"]["confirmed_at"])
+
+    def test_nothing_is_announced_when_no_confirmation_was_lost(self) -> None:
+        # Re-proposing an undecided gate destroys nothing, so the warning must
+        # not cry wolf -- a notice that fires on the ordinary case is one
+        # nobody reads on the dangerous one.
+        task = self._foreman_task("nowarn")
+        self.coordinator.propose_gate(task["id"], "requirement", "first draft")
+        self.coordinator.propose_gate(task["id"], "requirement", "second draft")
+        messages = [
+            m for m in self.coordinator.store.load()["messages"]
+            if m.get("task_id") == task["id"] and m.get("kind") == "status"
+        ]
+        self.assertNotIn("DISCARDED", messages[-1]["text"])
+        self.assertEqual(messages[-1]["payload"]["discarded_confirmed"], [])
+
+    def test_an_unconfirmed_proposal_may_still_be_replaced(self) -> None:
+        # Re-proposing before the commander has decided costs nothing: there
+        # is no decision to destroy.
+        task = self._foreman_task("redraft")
+        self.coordinator.propose_gate(task["id"], "requirement", "first draft")
+        updated = self.coordinator.propose_gate(task["id"], "requirement", "second draft")
+        self.assertEqual(updated["gates"]["requirement"]["text"], "second draft")
+
+    def test_a_spent_pair_may_be_replaced_freely(self) -> None:
+        # Once a task has consumed the pair the decision is finished, and
+        # proposing again is the ordinary way to authorize the next round.
+        # Binding is set here directly: this test is about the overwrite
+        # guard, not about the consumption path that sets it.
+        task = self._foreman_task("spent")
+        self.coordinator.propose_gate(task["id"], "requirement", "round one")
+        self.coordinator.decide_gate(task["id"], "requirement", confirm=True, skip=False)
+        self.coordinator.propose_gate(task["id"], "solution", "how")
+        self.coordinator.decide_gate(task["id"], "solution", confirm=True, skip=False)
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["gates"]["bound_task_id"] = "t-alreadyspent"
+        again = self.coordinator.propose_gate(task["id"], "requirement", "round two")
+        self.assertEqual(again["gates"]["requirement"]["text"], "round two")
+
+    def test_a_solution_may_be_proposed_against_a_confirmed_requirement(self) -> None:
+        # The ordinary flow, and the one a careless guard breaks: proposing a
+        # requirement resets BOTH gates, but proposing a solution resets only
+        # the solution, so a confirmed requirement is not at risk from it.
+        task = self._foreman_task("normalflow")
+        self.coordinator.propose_gate(task["id"], "requirement", "what")
+        self.coordinator.decide_gate(task["id"], "requirement", confirm=True, skip=False)
+        updated = self.coordinator.propose_gate(task["id"], "solution", "how")
+        self.assertEqual(updated["gates"]["solution"]["text"], "how")
+        self.assertIsNotNone(updated["gates"]["requirement"]["confirmed_at"])

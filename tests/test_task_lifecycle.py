@@ -1492,3 +1492,88 @@ class TaskLifecycleTests(HelmTestCase):
         report = output / "findings.md"
         report.write_text("what the round found\n", encoding="utf-8")
         self.assertEqual(report.read_text(encoding="utf-8"), "what the round found\n")
+
+
+class AStoppedTaskCanBeReadAndReopenedTests(HelmTestCase):
+    """`continue` said a person must read it first and gave them no way to say so.
+
+    A foreman's worker died on a provider outage. It stopped the stale worker
+    -- correct, and what Helm asks for -- which moved the task to `failed`.
+    From there `continue` refused pending a human, `--agent` was refused
+    because a round had already opened, and the task's effort pinned it to
+    runtimes that could express one. Four correct guards and no exit between
+    them, holding a clean, fully committed branch immovable.
+    """
+
+    def _failed_task(self, name: str) -> dict:
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the work")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "failed"
+        return task
+
+    def test_a_failed_task_becomes_continuable_again(self) -> None:
+        task = self._failed_task("stopped")
+        reopened = self.coordinator.reopen_task(task["id"], "read it; the branch is clean")
+        self.assertEqual(reopened["status"], "completed")
+        self.assertEqual(reopened["reopened_from"], "failed")
+
+    def test_the_note_is_kept_because_the_point_is_that_someone_looked(self) -> None:
+        task = self._failed_task("noted")
+        reopened = self.coordinator.reopen_task(task["id"], "provider outage, work intact")
+        self.assertEqual(reopened["reopened_note"], "provider outage, work intact")
+        messages = [
+            m for m in self.coordinator.store.load()["messages"]
+            if m.get("task_id") == task["id"] and m.get("kind") == "status"
+        ]
+        self.assertIn("provider outage, work intact", messages[-1]["text"])
+
+    def test_reopening_a_task_that_is_already_continuable_is_refused(self) -> None:
+        root = self.repo("fine")
+        project = self.coordinator.register_project("Fine", str(root), project_id="fine")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+        with self.assertRaisesRegex(HelmError, r"would change nothing"):
+            self.coordinator.reopen_task(task["id"])
+
+    def test_a_merged_task_is_finished_and_cannot_be_reopened(self) -> None:
+        root = self.repo("done")
+        project = self.coordinator.register_project("Done", str(root), project_id="done")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "merged"
+        with self.assertRaisesRegex(HelmError, r"only \['blocked', 'failed'\]"):
+            self.coordinator.reopen_task(task["id"])
+
+    def test_reopening_over_a_live_worker_is_refused(self) -> None:
+        # Reopening while something still runs would put a second round on top
+        # of a live one -- the same hazard `continue` already refuses.
+        root = self.repo("live")
+        project = self.coordinator.register_project("Live", str(root), project_id="live")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "failed"
+        with self.assertRaisesRegex(SafetyError, r"still running"):
+            self.coordinator.reopen_task(task["id"])
+
+    def test_an_agent_cannot_reopen_its_own_failure(self) -> None:
+        # The whole value is that a PERSON looked. An agent clearing its own
+        # failed task would make the guard decorative.
+        root = self.repo("agent")
+        project = self.coordinator.register_project("Agent", str(root), project_id="agent")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=True
+        )
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "failed"
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+            with self.assertRaises((SafetyError, HelmError)):
+                self.coordinator.reopen_task(task["id"], "let me out")

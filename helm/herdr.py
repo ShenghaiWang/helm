@@ -888,6 +888,7 @@ class HerdrAdapter:
         *,
         reviewer_agent: str | None = None,
         reviewer_model: str | None = None,
+        reviewer_effort: str | None = None,
         rounds: int = 2,
         timeout: float = 1800.0,
     ) -> dict[str, Any]:
@@ -1040,6 +1041,16 @@ class HerdrAdapter:
                     # which is what independence forbids -- and where the pin
                     # is a restricted family, it deadlocks the review outright.
                     model=reviewer_model,
+                    # And its own effort. A reviewer used to be created with an
+                    # agent and a model and NO effort, so it ran at whatever the
+                    # runtime defaulted to -- `low`, on an install where that is
+                    # the default. The reviewer does the hardest reasoning in
+                    # the round: it is asked to construct the attack the author
+                    # did not think of. Giving it the least effort of anyone is
+                    # exactly backwards, and it showed -- a reviewer on `low`
+                    # found a real hole and then truncated its own report
+                    # mid-sentence, so the finding had to be recovered by hand.
+                    effort=reviewer_effort,
                     # What this reviewer reviews, so a second driver can see it
                     # exists before starting another.
                     reviews=task_id,
@@ -1953,10 +1964,16 @@ class HerdrAdapter:
             results_after_latest = 0
         if latest is None:
             return (
-                "\n\nAUTHOR'S FULL-SUITE EVIDENCE: MISSING -- no message on this task "
-                "reported one (payload key `full_suite`). Per the code-review domain, "
-                "do not run the full suite yourself to find out; report the absence as "
-                "a finding.\n"
+                "\n\nAUTHOR'S FULL-SUITE EVIDENCE: NO MACHINE-READABLE PAYLOAD -- no "
+                "message on this task carries the `full_suite` payload key. That is NOT "
+                "the same as no suite having run, and the difference has already cost a "
+                "review round: an author wrote a complete, correct evidence report in "
+                "PROSE -- tip, clean tree, every package with counts, unmasked exit -- and "
+                "this line called it missing.\n"
+                "SO: look for the evidence in the author's own messages before calling it "
+                "absent, and say which you found. Evidence in prose is a MISFILING and is "
+                "reported as one, naming the payload key; evidence nowhere at all is the "
+                "blocking finding. Do not run the full suite yourself to settle it.\n"
             )
         at, text = latest
         staleness = ""

@@ -1381,3 +1381,67 @@ class OneDriverPerWorkerTests(HelmTestCase):
         parsed = parser.parse_args(["worker", "answer", "w-1", "--text", "x", "--force"])
         self.assertTrue(parsed.force)
         self.assertFalse(parser.parse_args(["worker", "answer", "w-1", "--text", "x"]).force)
+
+
+class OneProjectPerMessageTests(HelmTestCase):
+    """An agent may not hand a message to a worker in another project.
+
+    Isolation was enforced where work HAPPENS -- worktrees, branches, composed
+    context -- and nowhere on the path where agents TALK. On 2026-08-23 a
+    foreman's review brief, naming another project's runbook, its tracker rows
+    and a commander decision, was delivered into a second project's foreman by
+    a mistyped worker id. Nothing refused it. The receiving foreman read
+    enough to identify the misroute, refused to act, and stood down -- which
+    was correct, and is also the cost: a message is context, and it cannot be
+    unread.
+    """
+
+    def _worker_in(self, name: str) -> dict:
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the work")
+        return self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+    def test_an_agent_cannot_address_another_projects_worker(self) -> None:
+        mine = self._worker_in("alpha")
+        theirs = self._worker_in("beta")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": mine["id"]}):
+            with self.assertRaisesRegex(HelmError, r"belongs to project beta"):
+                self.coordinator.require_same_project(theirs["id"], "worker answer")
+
+    def test_an_agent_may_address_its_own_projects_worker(self) -> None:
+        mine = self._worker_in("gamma")
+        sibling = self._worker_in("gamma2")
+        # Same project, different worker: allowed. A foreman answers the
+        # workers it drives.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": mine["id"]}):
+            self.coordinator.require_same_project(mine["id"], "worker answer")
+        self.assertIsNotNone(sibling["id"])
+
+    def test_the_root_addresses_any_project(self) -> None:
+        # The root coordinates every project by design; confining it would
+        # break the only thing that can route between them.
+        theirs = self._worker_in("delta")
+        env = {k: v for k, v in os.environ.items() if k != "HELM_WORKER_ID"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.coordinator.require_same_project(theirs["id"], "worker answer")
+
+    def test_the_refusal_names_both_projects_and_the_worker(self) -> None:
+        mine = self._worker_in("epsilon")
+        theirs = self._worker_in("zeta")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": mine["id"]}):
+            try:
+                self.coordinator.require_same_project(theirs["id"], "worker answer")
+            except HelmError as error:
+                message = str(error)
+            else:
+                self.fail("expected a refusal")
+        # A refusal that does not say which project is which leaves the caller
+        # guessing at exactly the moment they mistyped an opaque hex id.
+        self.assertIn("zeta", message)
+        self.assertIn("epsilon", message)
+        self.assertIn(theirs["id"], message)
