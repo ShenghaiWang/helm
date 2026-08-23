@@ -2736,6 +2736,20 @@ class Coordinator:
         taught = self.preferences().effort_runtimes.get(runtime_id)
         if taught is not None:
             mechanism, argument, levels = taught
+            if mechanism == "model":
+                # levels holds (level, model-id) pairs for a swap runtime.
+                mapping = dict(levels)
+                return runtimes.AgentRuntime(
+                    id=runtime_id,
+                    name=runtime_id,
+                    interactive=(),
+                    noninteractive=(),
+                    env_passthrough=(),
+                    detect_env=(),
+                    effort_mechanism=runtimes.EFFORT_MODEL,
+                    effort_models=mapping,
+                    effort_levels=tuple(sorted(mapping)),
+                )
             return runtimes.AgentRuntime(
                 id=runtime_id,
                 name=runtime_id,
@@ -5171,7 +5185,23 @@ class Coordinator:
             ) or selected_agent["id"]
             self._require_effort_supported(effort, runtime_id, effort_reason)
             runtime = self._effort_capability(runtime_id)
-            if runtime is not None:
+            swapped = runtime.effort_model(effort) if runtime is not None else None
+            if swapped:
+                # This runtime has no effort setting and expresses depth by
+                # model. Refused rather than resolved when a model was also
+                # chosen: overriding an explicit model to satisfy an effort is
+                # the kind of silent substitution that leaves the commander
+                # believing they ran something they did not.
+                model, model_reason = self._resolve_model(project, task)
+                if model and model != swapped:
+                    raise HelmError(
+                        f"runtime {runtime_id} expresses effort by model, so "
+                        f"{effort_reason} would run {swapped}, but {model_reason}. "
+                        "Choose one: drop the effort, or drop the model."
+                    )
+                command_args = runtimes.replace_model(command_args, swapped)
+                task["model"] = swapped
+            elif runtime is not None:
                 command_args = runtime.with_effort(command_args, effort)
             task["effort"] = effort
             task["effort_reason"] = effort_reason

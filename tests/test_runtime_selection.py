@@ -1064,3 +1064,88 @@ class EffortAtLaunchTests(HelmTestCase):
             self.coordinator.launch_worker(
                 task["id"], ["opencode", "--auto", "{prompt}"], wait=False
             )
+
+
+class EffortByModelSwapTests(HelmTestCase):
+    """Some runtimes have no effort setting and express depth by model.
+
+    Refusing those outright was the wrong answer: the commander's intent is
+    reachable through the mechanism the runtime actually has, and only the
+    map from level to model needs teaching — which is a root's job, because
+    model names change constantly.
+    """
+
+    def _taught(self, spec: str):
+        import json
+        from helm import preferences
+        root = self._helm_root(f"swap{abs(hash(spec)) % 10000}")
+        path = root / preferences.PREFERENCES_FILENAME
+        path.write_text(
+            json.dumps({
+                "version": preferences.PREFERENCES_VERSION,
+                "effort": {"runtimes": {"pi": spec}},
+            }),
+            encoding="utf-8",
+        )
+        return preferences.load(path)
+
+    def test_a_taught_map_makes_a_swap_runtime_accept_effort(self) -> None:
+        from helm import runtimes
+        loaded = self._taught("model::high=pi-large,low=pi-small")
+        mechanism, _argument, pairs = loaded.effort_runtimes["pi"]
+        self.assertEqual(mechanism, "model")
+        self.assertEqual(dict(pairs), {"high": "pi-large", "low": "pi-small"})
+        runtime = runtimes.AgentRuntime(
+            id="pi", name="pi", interactive=(), noninteractive=(),
+            env_passthrough=(), detect_env=(),
+            effort_mechanism=runtimes.EFFORT_MODEL, effort_models=dict(pairs),
+        )
+        self.assertTrue(runtime.accepts_effort("high"))
+        self.assertEqual(runtime.effort_model("high"), "pi-large")
+        # A level nobody taught stays unreachable rather than guessed at.
+        self.assertFalse(runtime.accepts_effort("max"))
+
+    def test_a_mapping_without_a_model_is_refused(self) -> None:
+        from helm import preferences
+        with self.assertRaises(preferences.PreferencesError):
+            self._taught("model::high=")
+
+    def test_replacing_a_model_never_names_it_twice(self) -> None:
+        from helm import runtimes
+        replaced = runtimes.replace_model(["pi", "--model", "small", "--prompt", "x"], "big")
+        self.assertEqual(replaced.count("--model"), 1)
+        self.assertIn("big", replaced)
+        self.assertNotIn("small", replaced)
+
+    def test_a_pinned_model_and_a_swap_effort_refuse_rather_than_override(self) -> None:
+        """Satisfying the effort would mean running a model the commander did
+        not choose. Both were stated; Helm surfaces the conflict instead of
+        silently preferring one."""
+        import json
+        import sys
+        from helm import preferences
+        from helm.core import Coordinator, HelmError, StateStore
+
+        root = self._helm_root("swapconflict")
+        (root / preferences.PREFERENCES_FILENAME).write_text(
+            json.dumps({
+                "version": preferences.PREFERENCES_VERSION,
+                "effort": {"runtimes": {"pi": "model::high=pi-large"}},
+            }),
+            encoding="utf-8",
+        )
+        coordinator = Coordinator(StateStore(root / "state", helm_root=root))
+        repo = self.repo("swapconflictrepo")
+        project = coordinator.register_project(
+            "Swap", str(repo), project_id="swapconflictrepo"
+        )
+        task = coordinator.create_task(
+            project["id"], "write", model="pi-small", effort="high"
+        )
+        with self.assertRaises(HelmError) as caught:
+            coordinator.launch_worker(
+                task["id"], ["pi", "--model", "pi-small", "{prompt}"], wait=False
+            )
+        message = str(caught.exception)
+        self.assertIn("pi-large", message)
+        self.assertIn("pi-small", message)

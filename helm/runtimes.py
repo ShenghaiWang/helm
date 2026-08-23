@@ -21,7 +21,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Sequence
 
 # A launch command may carry this token once; Helm replaces it with the
@@ -47,6 +47,11 @@ STATE_DIR_PLACEHOLDER = "{state_dir}"
 EFFORT_UNSUPPORTED = "unsupported"
 EFFORT_FLAG = "flag"
 EFFORT_CONFIG = "config"
+#: The runtime has no effort setting, but expresses "think harder" by running
+#: a different model. pi is the shipped example. The level -> model map is
+#: taught per root rather than shipped, because model names change constantly
+#: and a stale map is worse than none.
+EFFORT_MODEL = "model"
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,8 @@ class AgentRuntime:
     #: The argument that carries it, read according to `effort_mechanism`: a
     #: flag name for `flag`, a config key for `config`.
     effort_argument: str = ""
+    #: For EFFORT_MODEL: level -> model id. Empty when nothing was taught.
+    effort_models: Mapping[str, str] = field(default_factory=dict)
     #: The levels this runtime accepts, lowest first. Empty means unknown, and
     #: Helm then refuses rather than passing a level the CLI may reject.
     effort_levels: tuple[str, ...] = ()
@@ -100,7 +107,15 @@ class AgentRuntime:
         """Whether this runtime can express `level` at launch."""
         if self.effort_mechanism == EFFORT_UNSUPPORTED:
             return False
+        if self.effort_mechanism == EFFORT_MODEL:
+            return level in self.effort_models
         return bool(self.effort_levels) and level in self.effort_levels
+
+    def effort_model(self, level: str | None) -> str | None:
+        """The model that realises `level`, for a model-swap runtime."""
+        if not level or self.effort_mechanism != EFFORT_MODEL:
+            return None
+        return self.effort_models.get(level)
 
     def with_effort(self, command: Sequence[str], effort: str | None) -> list[str]:
         """Add the effort selection to an already-built command.
@@ -467,6 +482,23 @@ def model_families(model: str | None) -> tuple[str, ...]:
 # form here, so none is guessed -- an invented ``-m`` would refuse launches for
 # a flag that may mean something else entirely to the command being run.
 _MODEL_FLAGS = frozenset({runtime.model_flag for runtime in BUILTIN_RUNTIMES})
+
+
+def replace_model(command: Sequence[str], model: str) -> list[str]:
+    """Put `model` into a command, replacing any model already named.
+
+    Used where effort is realised as a model swap: the command may already
+    carry the runtime's default choice, and appending a second flag is how a
+    runtime ends up parsing a list instead of a name.
+    """
+    actual = list(command)
+    for index, token in enumerate(actual):
+        if token in _MODEL_FLAGS and index + 1 < len(actual):
+            actual[index + 1] = model
+            return actual
+    if not actual:
+        return actual
+    return [actual[0], "--model", model, *actual[1:]]
 
 
 def model_in_command(command: Sequence[str]) -> str | None:

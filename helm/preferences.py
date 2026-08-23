@@ -108,8 +108,9 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
     ),
     f"{KEY_EFFORT_RUNTIMES}.<runtime>": (
         True,
-        "teach this root how a runtime takes effort: flag:<name>:<levels> or "
-        "config:<key>:<levels>, for an agent or level Helm does not ship yet",
+        "teach this root how a runtime takes effort: flag:<name>:<levels>, "
+        "config:<key>:<levels>, or model::<level>=<id>,... for a runtime that "
+        "expresses depth by swapping models",
     ),
     f"{KEY_MODEL_RUNTIMES}.<family>": (
         True,
@@ -151,11 +152,28 @@ def split_model_runtimes_key(key: str) -> str | None:
     return family
 
 
+def split_effort_runtimes_key(key: str) -> str | None:
+    """Return the runtime an `effort.runtimes.<runtime>` key names, or None.
+
+    Deliberately not checked against the built-in list: the whole point of
+    this key is teaching a root a runtime Helm does not ship.
+    """
+    prefix = f"{KEY_EFFORT_RUNTIMES}."
+    if not key.startswith(prefix):
+        return None
+    runtime_id = key[len(prefix):]
+    if not runtime_id or not _SAFE_ARGUMENT.fullmatch(runtime_id):
+        raise PreferencesError(f"not a usable runtime id: {runtime_id!r}")
+    return runtime_id
+
+
 def takes_list(key: str) -> bool:
     if key in SUPPORTED_KEYS:
         return SUPPORTED_KEYS[key][0]
     if split_model_runtimes_key(key) is not None:
         return True
+    if split_effort_runtimes_key(key) is not None:
+        return False
     raise _unknown_key(key)
 
 
@@ -228,8 +246,17 @@ class Preferences:
             model["free"] = self.free_model
         if model:
             document["model"] = model
+        effort: dict[str, Any] = {}
         if self.default_effort:
-            document["effort"] = {"default": self.default_effort}
+            effort["default"] = self.default_effort
+        if self.effort_runtimes:
+            effort["runtimes"] = {
+                runtime_id: _effort_spec(mechanism, argument, levels)
+                for runtime_id, (mechanism, argument, levels)
+                in sorted(self.effort_runtimes.items())
+            }
+        if effort:
+            document["effort"] = effort
         return document
 
     def entries(self) -> list[tuple[str, str]]:
@@ -249,6 +276,15 @@ class Preferences:
             rows.append((f"{KEY_MODEL_RUNTIMES}.{family}", ", ".join(sorted(allowed))))
         if self.free_model:
             rows.append((KEY_MODEL_FREE, self.free_model))
+        if self.default_effort:
+            rows.append((KEY_EFFORT_DEFAULT, self.default_effort))
+        for runtime_id, (mechanism, argument, levels) in sorted(
+            self.effort_runtimes.items()
+        ):
+            rows.append((
+                f"{KEY_EFFORT_RUNTIMES}.{runtime_id}",
+                _effort_spec(mechanism, argument, levels),
+            ))
         return rows
 
 
@@ -430,6 +466,19 @@ _SAFE_ARGUMENT = re.compile(r"[A-Za-z0-9._-]{1,64}")
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
+def _effort_spec(mechanism: str, argument: str, levels) -> str:
+    """Render a taught capability back into the string a root wrote.
+
+    Round-tripping matters: `prefs set` reloads the whole document through
+    the same validator, so a field this cannot spell would be silently
+    dropped on the next write of any other key.
+    """
+    if mechanism == "model":
+        pairs = ",".join(f"{level}={model}" for level, model in sorted(levels))
+        return f"model::{pairs}"
+    return f"{mechanism}:{argument}:{','.join(sorted(levels))}"
+
+
 def _effort_runtimes(
     section: Mapping[str, Any], where: str
 ) -> dict[str, tuple[str, str, frozenset[str]]]:
@@ -452,6 +501,29 @@ def _effort_runtimes(
                 "'flag:<name>:<levels>' or 'config:<key>:<levels>'"
             )
         mechanism, argument, levels = (part.strip() for part in parts)
+        if mechanism == "model":
+            # A runtime with no effort setting that expresses depth by running
+            # a different model. Spelled model::<level>=<id>,<level>=<id> --
+            # the middle field is empty because there is no flag to name.
+            mapping: dict[str, str] = {}
+            for pair in levels.split(","):
+                if not pair.strip():
+                    continue
+                level, _, model_id = pair.partition("=")
+                if not model_id.strip():
+                    raise PreferencesError(
+                        f"{where}: effort.runtimes.{runtime_id} model mapping "
+                        f"{pair!r} must be <level>=<model-id>"
+                    )
+                mapping[_effort_level(level, f"effort.runtimes.{runtime_id}", where)] = (
+                    _model_id(model_id.strip(), f"effort.runtimes.{runtime_id}", where)
+                )
+            if not mapping:
+                raise PreferencesError(
+                    f"{where}: effort.runtimes.{runtime_id} names no level mappings"
+                )
+            parsed[runtime_id] = ("model", "", frozenset(mapping.items()))
+            continue
         if mechanism not in ("flag", "config"):
             raise PreferencesError(
                 f"{where}: effort.runtimes.{runtime_id} mechanism must be "
@@ -551,6 +623,19 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
     model = dict(document.get("model", {}))
     families = dict(model.get("runtimes", {}))
 
+    effort_section = dict(document.get("effort", {}))
+    effort_runtimes = dict(effort_section.get("runtimes", {}))
+    taught_runtime = split_effort_runtimes_key(key)
+    if taught_runtime is not None:
+        if listed is None:
+            effort_runtimes.pop(taught_runtime, None)
+        else:
+            effort_runtimes[taught_runtime] = listed[0]
+        if effort_runtimes:
+            effort_section["runtimes"] = effort_runtimes
+        else:
+            effort_section.pop("runtimes", None)
+
     family = split_model_runtimes_key(key)
     if family is not None:
         if listed is None:
@@ -581,15 +666,23 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
             model.pop("free", None)
         else:
             model["free"] = listed[0]
-    else:
+    elif key == KEY_EFFORT_DEFAULT:
+        if listed is None:
+            effort_section.pop("default", None)
+        else:
+            effort_section["default"] = listed[0]
+    elif taught_runtime is None:
         raise _unknown_key(key)
 
     document["agent"] = agent
     document["model"] = model
+    document["effort"] = effort_section
     if not agent:
         document.pop("agent")
     if not model:
         document.pop("model")
+    if not effort_section:
+        document.pop("effort")
     # Re-validate the whole document: the same path a hand-edited file takes,
     # so the CLI can never write something loading would then refuse.
     return _from_document(document, current.path)

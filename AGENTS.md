@@ -525,8 +525,15 @@ mechanism per runtime rather than assuming a flag: Claude Code takes
 `--effort` (low, medium, high, xhigh, max) and also has an in-session
 `/effort`; Codex takes a `-c model_reasoning_effort=` override with OpenAI's
 own vocabulary; pi expresses "think harder" by swapping models; opencode
-carries it inside the model id. A runtime that cannot express a level Helm was
-asked for **refuses the launch** rather than dropping it silently. A root can
+carries it inside the model id. A runtime with no effort setting of its own can still
+be taught to realise one **by model**: `effort.runtimes.pi =
+model::high=<id>,low=<id>` says "high effort on pi means this model", which is
+how a runtime that expresses depth by swapping models honours the intent
+instead of refusing it. Where a task states both a model and an effort that
+would swap models, Helm refuses — overriding a stated model to satisfy an
+effort is exactly the silent substitution this whole mechanism exists to
+prevent. A runtime that cannot express a level at all, and has no map,
+**refuses the launch** rather than dropping it silently. A root can
 teach its own installation a runtime or level Helm does not ship with
 `effort.runtimes.<runtime>` in `preferences.json`, and `helm doctor
 --probe-runtimes` runs each installed agent's `--help` to catch a flag that has
