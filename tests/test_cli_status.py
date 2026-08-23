@@ -334,6 +334,45 @@ class CliStatusTests(HelmTestCase):
             len(self.coordinator.open_action_items()), len(items)
         )
 
+    def test_a_replaced_foremans_blocker_stops_being_owed(self) -> None:
+        """Appointing a replacement IS the answer to a foreman's escalation.
+
+        The blocked record stays as evidence, but presenting it as still
+        needing a human turns the attention list into a list of things
+        already dealt with — and a reader who skims a stale list misses the
+        entries that are real.
+        """
+        import sys
+        root = self.repo("supersededforeman")
+        project = self.coordinator.register_project(
+            "Superseded", str(root), project_id="supersededforeman"
+        )
+        first = self.coordinator.create_task(
+            project["id"], "drive the project", role="foreman"
+        )
+        worker = self.coordinator.launch_worker(
+            first["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "cannot proceed without a decision"
+        )
+        owed = [
+            u for u in self.coordinator.project_updates_for_watch()
+            if "cannot proceed" in u["text"]
+        ]
+        self.assertTrue(owed, "a foreman blocker should be owed while it stands")
+
+        # The replacement is the answer.
+        self.coordinator.create_task(
+            project["id"], "drive the project", role="foreman"
+        )
+
+        still_owed = [
+            u for u in self.coordinator.project_updates_for_watch()
+            if "cannot proceed" in u["text"]
+        ]
+        self.assertEqual(still_owed, [])
+
     def test_an_owed_report_survives_a_read_that_relayed_nothing(self) -> None:
         """Surfaced meant "something read it", which is the wrong property.
 

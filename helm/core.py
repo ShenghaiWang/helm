@@ -4884,6 +4884,7 @@ class Coordinator:
         """Reject obvious command/profile failures before allocating a worktree."""
         data = self.store.load()
         task = self._task(data, task_id)
+        self._reconcile_workspace_lock(task)
         project = self._project(data, task["project_id"])
         profiles = self._load_agent_profiles()
         intended = task.get("agent_override")
@@ -4993,6 +4994,25 @@ class Coordinator:
             _git(root, "worktree", "remove", str(workspace), check=False)
         _git(root, "branch", "-D", task["branch"], check=False)
         task["allocated_at"] = None
+
+    def _reconcile_workspace_lock(self, task: dict[str, Any]) -> None:
+        """Make the worktree's permissions match what the task now says.
+
+        The lock is applied on one transition and lifted on another, so the
+        flag and the filesystem can drift: a crash between the two, or a
+        record repaired by hand, leaves a state-changing round in a worktree
+        it cannot write. That failure surfaces as EACCES inside the test
+        suite, which reads as a broken change rather than a broken
+        permission. Converging here means every launch starts from the state
+        the task actually declares, whatever happened before it.
+        """
+        workspace = task.get("workspace")
+        if not workspace or task.get("workspace_removed"):
+            return
+        with contextlib.suppress(OSError):
+            self._set_workspace_writable(
+                canonical(workspace), writable=not task.get("read_only")
+            )
 
     def _prepare_worker_locked(
         self,
@@ -6069,6 +6089,7 @@ class Coordinator:
             "kind": kind,
             "task_id": task["id"],
             "project_id": task["project_id"],
+            "task_id": task["id"],
             "worker_id": worker["id"],
             "role": task.get("role", "worker"),
             "task_status": task.get("status"),
@@ -6411,6 +6432,7 @@ class Coordinator:
                     project_id,
                     event["situation"],
                     surface=event.get("situation_surface", False),
+                    task_id=event.get("task_id", ""),
                 )
         if event["action_item"]:
             with contextlib.suppress(HelmError, OSError):
@@ -6483,6 +6505,63 @@ class Coordinator:
         if kind == self.HOLD_MESSAGE_KIND:
             return "noop" if worker.get("late_hold_recorded") else "accept"
         return "refuse"
+
+    def record_task_evidence(
+        self,
+        task_id: str,
+        *,
+        tip: str,
+        command: str,
+        exit_code: int,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a suite result as the evidence a reviewer actually reads.
+
+        The review pipeline reads one structured field. Reporting the same
+        facts as prose produces no evidence at all, and the failure is silent
+        both ways: the author believes it reported, the reviewer sees nothing
+        newer than the last payload and rejects the change for stale
+        evidence. Two consecutive reviews were spent that way on a suite that
+        had in fact run green. So the shape stops being something a worker has
+        to remember and becomes something Helm builds.
+        """
+        tip = _safe_text(tip).strip()
+        command = _safe_text(command).strip()
+        if not tip:
+            raise HelmError("evidence needs the tip its suite ran against")
+        if not command:
+            raise HelmError("evidence needs the command that produced it")
+        report = {
+            "tip": tip,
+            "command": command,
+            "exit": int(exit_code),
+            "recorded_at": now(),
+        }
+        if detail:
+            report.update(detail)
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            workers = sorted(
+                self._task_workers(data, task_id),
+                key=lambda w: (w.get("started_at") or "", w.get("id") or ""),
+            )
+            if not workers:
+                raise HelmError(
+                    f"task {task_id} has no worker to attribute this evidence to"
+                )
+            worker_id = workers[-1]["id"]
+            data.setdefault("messages", []).append(
+                {
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "project_id": task["project_id"],
+                    "kind": "status",
+                    "text": f"full suite at {tip}: {command} exited {int(exit_code)}",
+                    "payload": {"full_suite": report},
+                    "at": now(),
+                }
+            )
+        return report
 
     def record_worker_message(
         self,
@@ -7622,6 +7701,7 @@ class Coordinator:
         *,
         supersedes: str = "",
         surface: bool = False,
+        task_id: str = "",
     ) -> dict[str, Any]:
         """Append one line of context Helm cannot derive.
 
@@ -7657,6 +7737,11 @@ class Coordinator:
                 if supersedes and entry.get("id") == supersedes:
                     entry["superseded_by"] = now()
             entry = {"id": new_id("s"), "at": now(), "text": text}
+            if task_id:
+                # Which task raised the line. Without it a report can only be
+                # matched back by parsing its own prose, so nothing downstream
+                # can tell a live escalation from one already answered.
+                entry["task_id"] = task_id
             if surface:
                 entry["surface"] = True
             status["situation"].append(entry)
@@ -8730,6 +8815,39 @@ class Coordinator:
             status["evidence"][worker_id] = entry
         return entry
 
+    @staticmethod
+    def _superseded_foreman_report(
+        data: dict[str, Any], entry: dict[str, Any]
+    ) -> bool:
+        """True when this report came from a foreman that has been replaced.
+
+        A foreman that escalates ends `blocked`, and that record is permanent
+        evidence of what happened -- rightly. But appointing its replacement
+        IS the answer to the escalation, so continuing to present it as
+        needing a human turns the attention list into a list of things
+        already dealt with. Seven such entries on one project trained the
+        reader to skim past the two that were real.
+        """
+        task_id = entry.get("task_id")
+        if not task_id:
+            return False
+        task = data.get("tasks", {}).get(task_id)
+        if not task or task.get("role") != "foreman":
+            return False
+        if task.get("status") not in {"blocked", "failed"}:
+            return False
+        # A LIVE replacement, not merely a later record: what answers the
+        # escalation is somebody driving the project now. Comparing timestamps
+        # cannot decide this -- two foremen appointed in the same second are
+        # indistinguishable by `created_at`.
+        return any(
+            other.get("role") == "foreman"
+            and other.get("project_id") == task.get("project_id")
+            and other.get("id") != task_id
+            and other.get("status") in {"created", "allocated", "running"}
+            for other in data.get("tasks", {}).values()
+        )
+
     def pending_foreman_requests(
         self, project_id: str, *, data: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
@@ -8961,6 +9079,10 @@ class Coordinator:
                     entry
                     for entry in status.get("situation", [])
                     if not entry.get("superseded_by")
+                    # A foreman that escalated and has since been replaced is
+                    # answered by the replacement; keep the record, drop the
+                    # summons.
+                    and not self._superseded_foreman_report(data, entry)
                     and (
                         not entry.get("acknowledged_at")
                         if entry.get("surface")
@@ -9025,7 +9147,8 @@ class Coordinator:
                         # an owed report clears when it is acknowledged, while a
                         # routine line has nothing to clear it and would repeat
                         # for the life of the root.
-                        "owed": bool(entry.get("surface")),
+                        "owed": bool(entry.get("surface"))
+                        and not self._superseded_foreman_report(data, entry),
                     })
                 if mark_seen:
                     for entry in action_items:

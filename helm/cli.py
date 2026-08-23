@@ -1245,6 +1245,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     for name in ("allocate", "inspect", "approve", "merge"):
         task_commands.add_parser(name).add_argument("task_id")
+    evidence_cmd = task_commands.add_parser(
+        "evidence",
+        help="record the full test-suite result for a task's current tip, as "
+        "the structured evidence a reviewer reads",
+    )
+    evidence_cmd.add_argument("task_id")
+    evidence_cmd.add_argument(
+        "--tip", required=True, help="the commit the suite ran against"
+    )
+    evidence_cmd.add_argument(
+        "--command", required=True, help="the command that ran, verbatim"
+    )
+    evidence_cmd.add_argument(
+        "--exit", dest="exit_code", type=int, required=True,
+        help="its exact, unmasked exit status",
+    )
+    evidence_cmd.add_argument(
+        "--detail", help="JSON object of per-package or per-runner counts"
+    )
     continue_cmd = task_commands.add_parser(
         "continue",
         help="run another round on a finished task, reusing its worktree and branch",
@@ -2493,6 +2512,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Allocated {task['id']} workspace={task['workspace']} branch={task['branch']}")
             elif args.task_command == "inspect":
                 _print_inspect(coordinator.inspect_task(args.task_id))
+            elif args.task_command == "evidence":
+                detail = {}
+                if args.detail:
+                    parsed = json.loads(args.detail)
+                    if not isinstance(parsed, dict):
+                        raise HelmError("--detail must be a JSON object")
+                    detail = parsed
+                recorded = coordinator.record_task_evidence(
+                    args.task_id,
+                    tip=args.tip,
+                    command=args.command,
+                    exit_code=args.exit_code,
+                    detail=detail,
+                )
+                print(
+                    f"Recorded full-suite evidence for {args.task_id} at "
+                    f"{recorded['tip']} (exit {recorded['exit']})"
+                )
             elif args.task_command == "approve":
                 task = coordinator.approve_task(
                     args.task_id, args.note, grant_id=args.grant_id

@@ -888,6 +888,31 @@ class WorkerRoundTests(HelmTestCase):
         data = self.coordinator.store.load()
         self.assertEqual(data["tasks"][task["id"]]["status"], "completed")
 
+    def test_a_launch_reconciles_a_worktree_left_locked(self) -> None:
+        """The read-only lock and the task flag can drift — a crash between
+        them, or a record repaired by hand. A state-changing launch must not
+        start in a worktree it cannot write, because that surfaces as EACCES
+        inside the suite and reads as a broken change."""
+        import os
+        root = self.repo("lockdrift")
+        project = self.coordinator.register_project(
+            "Drift", str(root), project_id="lockdrift"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        workspace = Path(
+            self.coordinator.store.load()["tasks"][task["id"]]["workspace"]
+        )
+        # The drift: locked on disk, state-changing in the record.
+        self.coordinator._set_workspace_writable(workspace, writable=False)
+        self.assertFalse(os.access(workspace, os.W_OK))
+
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+
+        self.assertTrue(os.access(workspace, os.W_OK))
+        self.coordinator.stop_worker(worker["id"], reason="test cleanup")
+
     def test_the_worker_context_tells_the_author_to_stay_resident(self) -> None:
         root = self.repo("residencycontract")
         project = self.coordinator.register_project(

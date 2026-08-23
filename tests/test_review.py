@@ -1307,6 +1307,51 @@ class ReviewerTicketTests(HelmTestCase):
         self.assertEqual(len(reviewer_tasks), 1)
         self.assertEqual(reviewer_tasks[0].get("model"), "openai/gpt-5.5")
 
+    def test_task_evidence_is_read_as_the_reviewers_full_suite_report(self) -> None:
+        """The review pipeline reads one structured field, and prose produces
+        no evidence at all. `helm task evidence` builds the shape so a worker
+        cannot lose a green suite to a forgotten key."""
+        import sys
+        from helm.herdr import HerdrAdapter
+
+        root = self.repo("evidencecmd")
+        project = self.coordinator.register_project(
+            "Evidence", str(root), project_id="evidencecmd"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        self.coordinator.record_task_evidence(
+            task["id"],
+            tip="abc1234",
+            command="pnpm -r test",
+            exit_code=0,
+            detail={"packages": {"core": {"pass": 12, "fail": 0}}},
+        )
+
+        rendered = HerdrAdapter._full_suite_evidence(
+            self.coordinator.store.load(), task["id"]
+        )
+        self.assertIn("abc1234", rendered)
+        self.assertIn("pnpm -r test", rendered)
+
+    def test_evidence_refuses_without_the_tip_it_ran_against(self) -> None:
+        """Evidence that does not name its tip is what a reviewer cannot
+        judge, so it is refused at the edge rather than recorded useless."""
+        import sys
+        from helm.core import HelmError
+
+        root = self.repo("evidencetip")
+        project = self.coordinator.register_project(
+            "EvidenceTip", str(root), project_id="evidencetip"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        with self.assertRaises(HelmError):
+            self.coordinator.record_task_evidence(
+                task["id"], tip="  ", command="pnpm -r test", exit_code=0
+            )
+
     def test_a_model_already_in_the_command_is_not_passed_twice(self) -> None:
         """A duplicated --model makes some runtimes parse the value as a list
         and die on it, taking the pane with them."""
