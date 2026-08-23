@@ -1335,6 +1335,32 @@ class ReviewerTicketTests(HelmTestCase):
         self.assertIn("abc1234", rendered)
         self.assertIn("pnpm -r test", rendered)
 
+    def test_the_evidence_command_is_dispatchable(self) -> None:
+        """`--command` must not claim the dest the top-level subparser uses,
+        or the parse succeeds and then dispatches nowhere — which is how the
+        command shipped and stopped the first worker that tried it."""
+        import contextlib as _ctx
+        import io
+        import sys
+        from helm import cli
+
+        root = self.repo("evidencedispatch")
+        project = self.coordinator.register_project(
+            "Dispatch", str(root), project_id="evidencedispatch"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        out = io.StringIO()
+        with _ctx.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "task", "evidence", task["id"],
+                "--tip", "abc1234", "--command", "pnpm -r test", "--exit", "0",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("abc1234", out.getvalue())
+
     def test_evidence_refuses_without_the_tip_it_ran_against(self) -> None:
         """Evidence that does not name its tip is what a reviewer cannot
         judge, so it is refused at the edge rather than recorded useless."""

@@ -36,7 +36,12 @@ from . import doctor as doctor_module
 from . import models
 from . import preferences
 from . import runtimes
-from .herdr import DEFAULT_WAIT_TIMEOUT, HerdrAdapter, HerdrUnavailable
+from .herdr import (
+    DEFAULT_WAIT_TIMEOUT,
+    HerdrAdapter,
+    HerdrUnavailable,
+    SubprocessHerdrClient,
+)
 
 
 def _json(value: Any) -> str:
@@ -1255,7 +1260,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--tip", required=True, help="the commit the suite ran against"
     )
     evidence_cmd.add_argument(
-        "--command", required=True, help="the command that ran, verbatim"
+        # Not dest="command": that is the top-level subparser's own attribute,
+        # and taking it leaves the parse undispatchable.
+        "--command", dest="suite_command", required=True,
+        help="the command that ran, verbatim",
     )
     evidence_cmd.add_argument(
         "--exit", dest="exit_code", type=int, required=True,
@@ -2347,6 +2355,43 @@ def _authority_refusal(coordinator: Coordinator, args: argparse.Namespace) -> st
     return None
 
 
+
+#: What the root's own Herdr tab is called. Project spaces say
+#: "Helm Reports · <project>"; the root says this, so anyone opening a Helm
+#: root in Herdr sees the same name rather than a bare tab number.
+ROOT_TAB_NAME = "Helm"
+
+
+def _name_root_tab(coordinator: Coordinator) -> None:
+    """Name the tab the ROOT's own session occupies, once.
+
+    Helm never retitles a space it did not create, and this does not: it
+    names only the tab whose id Herdr exported into this very process, and
+    only when the caller is the root. A worker runs `helm` commands inside
+    its OWN pane, so without that guard the first report a worker sent would
+    rename its ticket-labelled tab and lose the label a human scans for.
+    """
+    tab_id = os.environ.get("HERDR_TAB_ID")
+    if os.environ.get("HERDR_ENV") != "1" or not tab_id:
+        return
+    if os.environ.get("HELM_WORKER_ID"):
+        return
+    with contextlib.suppress(Exception):
+        if coordinator.caller_role() != "root":
+            return
+        data = coordinator.store.load()
+        named = data.get("integrations", {}).get("herdr", {}).get("root_tab")
+        if named == tab_id:
+            return
+        client = SubprocessHerdrClient()
+        rename = getattr(client, "tab_rename", None)
+        if rename is None or not client.available():
+            return
+        rename(tab_id, ROOT_TAB_NAME)
+        with coordinator.store.locked() as locked:
+            integrations = locked.setdefault("integrations", {})
+            integrations.setdefault("herdr", {})["root_tab"] = tab_id
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     # The runner is an internal child process. Keep it out of the public
@@ -2361,6 +2406,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         store, helm_root = _store_for_args(args)
         coordinator = Coordinator(store)
+        _name_root_tab(coordinator)
     except (
         HelmError,
         OSError,
@@ -2522,7 +2568,7 @@ def main(argv: list[str] | None = None) -> int:
                 recorded = coordinator.record_task_evidence(
                     args.task_id,
                     tip=args.tip,
-                    command=args.command,
+                    command=args.suite_command,
                     exit_code=args.exit_code,
                     detail=detail,
                 )

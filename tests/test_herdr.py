@@ -912,3 +912,63 @@ class AnswerDeliveryIsConfirmedTests(HelmTestCase):
         # the first Enter as its own answer.
         enters = [k for _pane, k in getattr(herdr, "sent_keys", []) if k == "Enter"]
         self.assertGreaterEqual(len(enters), 2, "one Enter is not a delivery attempt")
+
+
+class RootTabNameTests(HelmTestCase):
+    """The root's own tab carries the product's name, so anyone opening a Helm
+    root in Herdr sees the same thing instead of a bare number."""
+
+    def _run(self, env: dict) -> list:
+        import os
+        from unittest import mock
+        from helm import cli
+
+        renamed: list = []
+
+        class FakeClient:
+            def available(self) -> bool:
+                return True
+
+            def tab_rename(self, tab_id: str, label: str) -> dict:
+                renamed.append((tab_id, label))
+                return {}
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(cli, "SubprocessHerdrClient", FakeClient):
+            cli.main(["--state-dir", str(self.state.directory), "status"])
+        return renamed
+
+    def test_the_root_names_the_tab_it_is_running_in(self) -> None:
+        import os
+        renamed = self._run({
+            "HERDR_ENV": "1",
+            "HERDR_TAB_ID": "w1:t1",
+            **({"HELM_WORKER_ID": ""} if os.environ.get("HELM_WORKER_ID") else {}),
+        })
+        self.assertEqual(renamed, [("w1:t1", cli_root_tab_name())])
+
+    def test_a_worker_never_renames_its_own_tab(self) -> None:
+        """A worker runs `helm` commands inside its own pane. Without this
+        guard the first report it sent would replace the ticket-prefixed label
+        a human scans the tab list for."""
+        renamed = self._run({
+            "HERDR_ENV": "1",
+            "HERDR_TAB_ID": "w1:t9",
+            "HELM_WORKER_ID": "w-someworker",
+        })
+        self.assertEqual(renamed, [])
+
+    def test_naming_happens_once_per_tab(self) -> None:
+        import os
+        env = {
+            "HERDR_ENV": "1",
+            "HERDR_TAB_ID": "w1:t1",
+            **({"HELM_WORKER_ID": ""} if os.environ.get("HELM_WORKER_ID") else {}),
+        }
+        self._run(env)
+        self.assertEqual(self._run(env), [])
+
+
+def cli_root_tab_name() -> str:
+    from helm import cli
+    return cli.ROOT_TAB_NAME
