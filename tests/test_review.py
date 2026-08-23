@@ -16,6 +16,7 @@ from helm.core import (
     HelmError,
     inside,
 )
+from helm import runtimes
 from helm.herdr import HerdrAdapter
 
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS
@@ -1305,3 +1306,15 @@ class ReviewerTicketTests(HelmTestCase):
         ]
         self.assertEqual(len(reviewer_tasks), 1)
         self.assertEqual(reviewer_tasks[0].get("model"), "openai/gpt-5.5")
+
+    def test_a_model_already_in_the_command_is_not_passed_twice(self) -> None:
+        """A duplicated --model makes some runtimes parse the value as a list
+        and die on it, taking the pane with them."""
+        runtime = runtimes.builtin_runtime("opencode")
+        command = runtime.with_model("stealth/ox-alpha", interactive=True)
+        profile = {"id": "opencode", "builtin": True}
+        again = self.coordinator._with_model(
+            profile, command, "stealth/ox-alpha", "test"
+        )
+        self.assertEqual(again, command)
+        self.assertEqual(again.count("--model"), 1)

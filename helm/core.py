@@ -2785,6 +2785,12 @@ class Coordinator:
             )
         if not model:
             return actual
+        if baked is not None:
+            # The command already selects a model, so adding the flag again
+            # would pass it twice. Some runtimes then parse the value as a
+            # list and die on it, taking the pane with them -- and the flag
+            # Helm would add is the one already there.
+            return actual
         # A restricted family is bound to its runtimes whatever chose the model
         # -- the CLI, the task, the project pin, or HELM_MODEL. Checked before
         # the flag question below, because for a profile that inherits a
