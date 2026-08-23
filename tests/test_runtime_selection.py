@@ -1203,3 +1203,32 @@ class EffortReachesTheRecordTests(HelmTestCase):
         shown = out.getvalue()
         self.assertIn("effort: high", shown)
         self.assertIn("agent: pi", shown)
+
+
+class AgentHelpNamesEveryRuntimeTests(HelmTestCase):
+    """The `--agent` help is the only place most operators learn what they may name.
+
+    It was hand-written, so it went stale the moment a runtime was added: it
+    still said four when six shipped, which reads as "cursor is not supported"
+    to anyone who trusts it.
+    """
+
+    def _agent_help(self, parser, path):
+        action = parser
+        for name in path:
+            action = action._subparsers._group_actions[0].choices[name]  # type: ignore[union-attr]
+        for candidate in action._actions:
+            if "--agent" in candidate.option_strings:
+                return candidate.help or ""
+        self.fail(f"no --agent option on {' '.join(path)}")
+
+    def test_every_built_in_runtime_is_named_in_the_agent_help(self) -> None:
+        parser = cli._build_parser()
+        for path in (("run",), ("task", "create"), ("worker", "launch"), ("foreman",)):
+            help_text = self._agent_help(parser, path)
+            for runtime in runtimes.BUILTIN_RUNTIMES:
+                self.assertIn(
+                    runtime.id,
+                    help_text,
+                    f"{' '.join(path)} --agent help omits the built-in runtime {runtime.id}",
+                )

@@ -1176,6 +1176,12 @@ def _task_brief(brief: str | None) -> str:
         return ""
 
 
+#: Named from the registry rather than retyped: a hand-written list goes stale
+#: the first time a runtime is added, and this one had -- it still said four
+#: when six shipped.
+_BUILTIN_AGENT_NAMES = ", ".join(runtime.id for runtime in runtimes.BUILTIN_RUNTIMES)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="helm",
@@ -1204,7 +1210,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-domain", action="store_true", help="state that no domain applies to this task"
     )
     run.add_argument("--agent",
-        help="agent runtime or configured profile for this task (built in: claude, codex, pi, opencode)")
+        help=f"agent runtime or configured profile for this task (built in: {_BUILTIN_AGENT_NAMES})")
     run.add_argument("--model",
         help="model this task runs on; overrides the project pin and HELM_MODEL")
     run.add_argument("--effort", choices=EFFORT_LEVELS,
@@ -1259,7 +1265,7 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--domain", help="explicit domain override for ambiguous tasks")
     create.add_argument("--no-domain", action="store_true")
     create.add_argument("--agent",
-        help="agent runtime or configured profile for this task (built in: claude, codex, pi, opencode)")
+        help=f"agent runtime or configured profile for this task (built in: {_BUILTIN_AGENT_NAMES})")
     create.add_argument("--model",
         help="model this task runs on; overrides the project pin and HELM_MODEL")
     create.add_argument("--effort", choices=EFFORT_LEVELS,
@@ -1373,7 +1379,7 @@ def _build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--command", dest="worker_command_text", help="worker command, parsed without a shell")
     launch.add_argument("--domain", help="explicit domain override before launch")
     launch.add_argument("--agent",
-        help="agent runtime or configured profile for this task (built in: claude, codex, pi, opencode)")
+        help=f"agent runtime or configured profile for this task (built in: {_BUILTIN_AGENT_NAMES})")
     launch.add_argument("--async", dest="asynchronous", action="store_true", help="return while worker runs")
     launch.add_argument(
         "--no-herdr", dest="herdr", action="store_false", default=True,
@@ -1520,7 +1526,7 @@ def _build_parser() -> argparse.ArgumentParser:
     herdr_launch.add_argument("--command", dest="worker_command_text", help="worker command, parsed without a shell")
     herdr_launch.add_argument("--domain", help="explicit domain override before launch")
     herdr_launch.add_argument("--agent",
-        help="agent runtime or configured profile for this task (built in: claude, codex, pi, opencode)")
+        help=f"agent runtime or configured profile for this task (built in: {_BUILTIN_AGENT_NAMES})")
     herdr_launch.add_argument(
         "--async", dest="asynchronous", action="store_true", default=True
     )
@@ -1636,7 +1642,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     foreman.add_argument("project_id")
     foreman.add_argument("--agent",
-        help="agent runtime or configured profile for the foreman (built in: claude, codex, pi, opencode)")
+        help=f"agent runtime or configured profile for the foreman (built in: {_BUILTIN_AGENT_NAMES})")
     foreman.add_argument("--model",
         help="model the foreman runs on; overrides the project pin and HELM_MODEL")
     foreman.add_argument("--command", dest="worker_command_text",
