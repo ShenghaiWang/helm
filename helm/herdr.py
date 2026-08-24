@@ -1167,12 +1167,27 @@ class HerdrAdapter:
                     review_retried = True
                     rounds_budget += 1
                     previous = (reviewer_worker or {}).get("agent_id")
+                    # An EXPLICIT reviewer is the caller's decision, and the
+                    # retry must not quietly overrule it. Substituting one is
+                    # how a named runtime became a different one nobody asked
+                    # for -- and because the substitution also drops the root's
+                    # review.agent preference, the fallback landed somewhere
+                    # neither the caller nor the root had chosen. So: keep an
+                    # explicit choice and retry it once, on the chance the
+                    # death was transient; if it dies again the loop reports
+                    # review-unavailable, which is a fact the human can act on
+                    # rather than a silent swap they cannot see.
                     with contextlib.suppress(HelmError, OSError):
                         self.coordinator.record_task_progress_summary(
                             task_id,
                             f"review round {round_number} died on infrastructure "
                             f"({previous or 'reviewer'} did not survive to judge "
-                            "anything); retrying once on a different runtime",
+                            "anything); retrying once on "
+                            + (
+                                f"the requested runtime ({reviewer_agent})"
+                                if reviewer_agent
+                                else "a different runtime"
+                            ),
                             source="Review loop",
                         )
                     with contextlib.suppress(HelmError, OSError):
@@ -1180,9 +1195,13 @@ class HerdrAdapter:
                     with contextlib.suppress(HelmError):
                         choice = self.coordinator.pick_reviewer_agent(
                             author.get("agent_id"),
-                            explicit=None,
+                            explicit=reviewer_agent,
                             model=reviewer_model,
-                            exclude=[previous] if previous else None,
+                            exclude=(
+                                None
+                                if reviewer_agent
+                                else ([previous] if previous else None)
+                            ),
                         )
                     reviewer_worker = None
                     continue

@@ -1616,3 +1616,82 @@ class TheRootCanNameItsReviewerTests(HelmTestCase):
         choice = self._rooted().pick_reviewer_agent("claude", explicit="opencode")
 
         self.assertEqual(choice["agent"], "opencode")
+
+
+class ExplicitReviewerSurvivesTheRetryTests(ReviewTests):
+    """A reviewer the caller NAMED is not swapped out when the first one dies.
+
+    The retry after an infrastructure death moves to a different runtime, on
+    the sound reasoning that one runtime being killed says nothing about
+    another. It did that by passing `explicit=None` -- so a caller who asked
+    for a specific reviewer silently got a different one, and because dropping
+    `explicit` also drops the root's `review.agent` preference, the fallback
+    landed on a runtime neither the caller nor the root had chosen. Ten reviews
+    failed across two projects before the cause was found; each looked like an
+    unrelated flake, which is what a silent substitution looks like from
+    outside.
+
+    Substituting Helm's OWN pick is still right. Substituting the caller's is
+    not: a named runtime that dies twice is a fact a human can act on, and a
+    swap they cannot see is not.
+    """
+
+    def test_an_explicitly_named_reviewer_is_retried_not_replaced(self) -> None:
+        root = self.repo("explicitreviewer")
+        project = self.coordinator.register_project(
+            "Explicit", str(root), project_id="explicitreviewer"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.commit_on_task_branch(task)
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+
+        picks: list[dict[str, object]] = []
+        deaths = [True]  # the first reviewer dies on infrastructure, then not
+
+        def recording_pick(author_agent_id, **kwargs):
+            picks.append(dict(kwargs))
+            return {
+                "agent": kwargs.get("explicit") or "some-other-runtime",
+                "command": None,
+                "independence": "different-runtime",
+                "reason": "test",
+            }
+
+        def fake_launch(review_task_id, command, wait=False):
+            worker = self.coordinator.launch_worker(
+                review_task_id, [sys.executable, "-c", ""], wait=False
+            )
+            if deaths:
+                deaths.pop()
+                # The observed shape of an OOM-killed reviewer: it reports a
+                # failure rather than a verdict, which the loop reads as
+                # review-unavailable and retries once.
+                self.coordinator.record_worker_message(
+                    worker["id"], "failure", "Worker exited with code 1"
+                )
+            else:
+                self.coordinator.record_worker_message(worker["id"], "result", "APPROVE")
+            return worker
+
+        with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
+             mock.patch.object(adapter, "answer_worker", return_value=True), \
+             mock.patch.object(
+                 self.coordinator, "pick_reviewer_agent", side_effect=recording_pick
+             ):
+            adapter.run_review_cycle(
+                task["id"], reviewer_agent="cursor", rounds=1, timeout=0.05
+            )
+
+        self.assertGreaterEqual(
+            len(picks), 2, "the loop should have retried after the reviewer died"
+        )
+        retry = picks[1]
+        # THE REGRESSION THIS PINS: the retry used to pass explicit=None.
+        self.assertEqual(
+            retry["explicit"], "cursor",
+            "the retry must keep the reviewer the caller named, not substitute one",
+        )
+        # And it must not situationally exclude that same runtime, or the
+        # named reviewer would be ruled out of its own retry.
+        self.assertIsNone(retry.get("exclude"))
