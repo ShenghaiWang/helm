@@ -1445,3 +1445,143 @@ class OneProjectPerMessageTests(HelmTestCase):
         self.assertIn("zeta", message)
         self.assertIn("epsilon", message)
         self.assertIn(theirs["id"], message)
+
+
+class AnArtifactMayLiveInTheWorkerDirectoryTests(HelmTestCase):
+    """Two shipped rules contradicted each other and a compliant worker lost.
+
+    Helm's reporting document tells every worker to report each file it
+    produces with `--type artifact --path`. The verification guidance tells it
+    to write reports and logs into its OWN directory and never into the
+    worktree, because an untracked file there either pollutes the branch or
+    blocks approval. The validator then accepted only worktree paths. Obey
+    both instructions and you produce exactly what the third rejects: one
+    worker failed five artifact calls in four seconds doing as it was told.
+    """
+
+    def _worker_and_task(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "produce a report")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        return task, worker
+
+    def _artifacts(self, task_id: str) -> list:
+        """ACCEPTED artifacts, not the worker's report of them.
+
+        The `artifact` message is recorded either way -- it is what the worker
+        said. Acceptance is the separate record Helm builds after the path
+        check, so that is what these tests read.
+        """
+        return [
+            a for a in self.coordinator.store.load().get("artifacts", [])
+            if a.get("task_id") == task_id
+        ]
+
+    def _rejections(self, task_id: str) -> list:
+        return [
+            m for m in self.coordinator.store.load().get("messages", [])
+            if m.get("task_id") == task_id and m.get("kind") == "artifact-rejected"
+        ]
+
+    def test_a_report_in_the_workers_own_directory_is_accepted(self) -> None:
+        task, worker = self._worker_and_task("ownerdir")
+        report = self.coordinator.store.directory / "workers" / worker["id"] / "FINDINGS.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("what I found\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "the round's findings", payload={"path": str(report)}
+        )
+        self.assertEqual(self._rejections(task["id"]), [])
+        self.assertEqual(len(self._artifacts(task["id"])), 1)
+
+    def test_a_file_in_the_worktree_is_still_accepted(self) -> None:
+        # The ordinary case must not regress: a real build output lives in the
+        # worktree and that is where a reviewer expects to find it.
+        task, worker = self._worker_and_task("worktreedir")
+        produced = Path(task["workspace"]) / "built.txt"
+        produced.write_text("output\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "a build output", payload={"path": str(produced)}
+        )
+        self.assertEqual(self._rejections(task["id"]), [])
+        self.assertEqual(len(self._artifacts(task["id"])), 1)
+
+    def test_a_path_in_neither_place_is_still_refused(self) -> None:
+        # The boundary that matters. Widening to the worker directory must not
+        # widen to anywhere at all.
+        task, worker = self._worker_and_task("elsewhere")
+        stray = Path(self.temp.name) / "not-mine.txt"
+        stray.write_text("someone else's\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "a stray file", payload={"path": str(stray)}
+        )
+        self.assertEqual(len(self._rejections(task["id"])), 1)
+        self.assertEqual(self._artifacts(task["id"]), [])
+
+    def test_another_workers_directory_is_refused(self) -> None:
+        # "The worker's own directory" means its OWN. Isolation still forbids
+        # reaching into a sibling's state.
+        task, worker = self._worker_and_task("mine")
+        _other_task, other = self._worker_and_task("theirs")
+        theirs = self.coordinator.store.directory / "workers" / other["id"] / "THEIRS.md"
+        theirs.parent.mkdir(parents=True, exist_ok=True)
+        theirs.write_text("not yours\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "a neighbour's report", payload={"path": str(theirs)}
+        )
+        self.assertEqual(len(self._rejections(task["id"])), 1)
+
+
+class ATruncatedReportSaysSoTests(HelmTestCase):
+    """A cut that nobody can see is worse than a cut.
+
+    A worker's design report arrived at exactly the limit and lost its last two
+    verdicts mid-heading. The reader saw a section title with nothing under it,
+    and a truncated report and an author who simply stopped writing look
+    identical -- but one needs the missing part requested and the other needs
+    the finding chased. The marker is what tells them apart.
+    """
+
+    def test_an_oversized_message_carries_its_own_truncation_notice(self) -> None:
+        from helm.core import SAFE_TEXT_LIMIT, _safe_text
+
+        rendered = _safe_text("x" * (SAFE_TEXT_LIMIT + 5_000))
+
+        self.assertLessEqual(len(rendered), SAFE_TEXT_LIMIT)
+        self.assertIn("truncated by Helm", rendered)
+        # The reader needs the size of the hole, not just its existence: it is
+        # the difference between a lost sentence and a lost half.
+        self.assertIn("5000 more were dropped", rendered)
+
+    def test_text_within_the_limit_is_returned_untouched(self) -> None:
+        from helm.core import _safe_text
+
+        self.assertEqual(_safe_text("a result that fits"), "a result that fits")
+
+    def test_a_truncated_worker_report_reaches_the_reader_marked(self) -> None:
+        """End to end: the marker must survive the protocol, not just the helper."""
+        from helm.core import SAFE_TEXT_LIMIT
+
+        root = self.repo("truncreport")
+        project = self.coordinator.register_project(
+            "Truncreport", str(root), project_id="truncreport"
+        )
+        task = self.coordinator.create_task(project["id"], "produce a report")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "B1 verdict... " + "y" * (SAFE_TEXT_LIMIT + 400)
+        )
+
+        stored = [
+            m for m in self.coordinator.store.load()["messages"]
+            if m.get("worker_id") == worker["id"] and m.get("kind") == "result"
+        ][-1]
+
+        self.assertIn("truncated by Helm", stored["text"])

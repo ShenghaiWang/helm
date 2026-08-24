@@ -36,3 +36,34 @@ or a **plan gap**, in which case fix the plan first and re-issue it. Never let
 implementation silently deviate from a plan that turned out wrong; correct the
 plan so the record stays true. Treat a CI failure with the same priority as a
 failed verification.
+
+## Where a long report goes
+
+A report too long for a protocol message goes in a **file** — a message that
+gets truncated mid-finding is worse than no message, and it has happened: a
+reviewer's report dissolved into its own terminal spinner frames partway
+through the finding that mattered.
+
+**Write it to your own worker directory, not to the task worktree.** Helm gives
+you `state/workers/<your-worker-id>/`, and that is the place:
+
+```
+state/workers/<your-worker-id>/ROUND_3_FINDINGS.md
+```
+
+Not the worktree. A file left in the worktree is either committed — putting a
+working note into the project's history, where it does not belong — or left
+untracked, and an untracked file makes the task **unapprovable**: Helm refuses
+approval on an unclean workspace, which is the right rule, because it cannot
+tell your report from work you forgot to commit. Three rounds in one evening
+stalled that way, each needing the file moved out by hand before the merge
+could proceed.
+
+The worker directory has neither problem. It survives the session, it is not in
+the repository, and it does not dirty the tree. Name the file in your protocol
+message with its full path so a reader can find it:
+
+> Full report: `state/workers/<your-worker-id>/ROUND_3_FINDINGS.md`
+
+Keep the message itself to the verdict and the headline — enough that a reader
+who never opens the file still knows what happened and whether it needs them.

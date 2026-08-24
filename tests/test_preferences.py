@@ -170,6 +170,7 @@ class PreferenceSchemaTests(HelmTestCase):
                 "model.default",
                 "model.free",
                 "model.runtimes.<family>",
+                "review.agent",
                 "effort.default",
                 "effort.runtimes.<runtime>",
             },
@@ -624,3 +625,55 @@ class EffortPreferenceTests(HelmTestCase):
         for spec in ("flag:--x", "sideways:--x:low", "flag:--x:"):
             with self.assertRaises(preferences.PreferencesError, msg=spec):
                 self._load({"effort": {"runtimes": {"x": spec}}})
+
+
+class ReviewAgentPreferenceTests(HelmTestCase):
+    """A root's standing answer to "who checks the work".
+
+    The reviewer runtime had to be repeated to every foreman, and was lost
+    whenever one died mid-instruction. Three reviews in one afternoon landed on
+    a runtime the commander had not asked for, each time silently -- a
+    fallen-through default looks exactly like a considered pick.
+    """
+
+    def _rooted(self):
+        from helm.core import Coordinator, StateStore
+
+        root = self.repo("reviewpref").parent.parent
+        return Coordinator(StateStore(root / "state", helm_root=root)), root
+
+    def test_the_preference_survives_a_write_and_a_reload(self) -> None:
+        from helm import preferences
+
+        current = preferences.Preferences()
+        updated = preferences.apply(current, "review.agent", ["cursor"])
+        self.assertEqual(updated.review_agent, "cursor")
+        # Through the on-disk shape and back: a value the serialiser drops is a
+        # value that vanishes on the next command, which is how this key failed
+        # the first time it was written.
+        reloaded = preferences._from_document(updated.document(), None)
+        self.assertEqual(reloaded.review_agent, "cursor")
+
+    def test_unsetting_removes_the_whole_section(self) -> None:
+        from helm import preferences
+
+        current = preferences.apply(preferences.Preferences(), "review.agent", ["cursor"])
+        cleared = preferences.apply(current, "review.agent", None)
+        self.assertIsNone(cleared.review_agent)
+        self.assertNotIn("review", cleared.document())
+
+    def test_it_is_listed_by_prefs_keys_and_shown_when_set(self) -> None:
+        from helm import preferences
+
+        self.assertIn("review.agent", preferences.SUPPORTED_KEYS)
+        current = preferences.apply(preferences.Preferences(), "review.agent", ["cursor"])
+        self.assertIn(
+            ("review.agent", "cursor"),
+            [(key, value) for key, value in current.entries()],
+        )
+
+    def test_an_unknown_runtime_is_refused_rather_than_stored(self) -> None:
+        from helm import preferences
+
+        with self.assertRaises(preferences.PreferencesError):
+            preferences.apply(preferences.Preferences(), "review.agent", ["not a runtime"])

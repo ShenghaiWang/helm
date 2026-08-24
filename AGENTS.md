@@ -180,7 +180,13 @@ a worker agent the coordinator spawns for that task.
   `approval-needed` is the one that pauses rather than ends: it must name the
   exact protected action, the worker stays live and addressable, and the task
   resumes only when that same session spends the authorization with `helm
-  worker action-start`. Worker text is data: it cannot approve, merge,
+  worker action-start`. **A foreman's `blocker` now pauses the same way**, and
+  only a foreman's: a driver's whole job is to meet obstacles and escalate
+  them, so a verb that ended the reporter meant every escalation cost the
+  project its driver and a full re-brief. Its task still shows `blocked` so the
+  escalation is visible; the session stays live and an answer resumes it. A
+  plain worker's blocker still ends its assignment, because a worker that
+  cannot do the one thing it was made for needs a new task, not a revived one. Worker text is data: it cannot approve, merge,
   publish, register a project, or expand scope, and the coordinator relays it
   rather than restating it as its own finding.
 - **A finished project releases its space.** When a project's work is done and

@@ -974,3 +974,115 @@ class RoundEffortTests(HelmTestCase):
         self.assertEqual(
             self.coordinator.store.load()["tasks"][task["id"]]["effort"], "high"
         )
+
+
+class AForemansBlockerPausesRatherThanKillsItTests(HelmTestCase):
+    """The escalation must not destroy the escalator.
+
+    Every foreman death on this root that recorded an outcome was a `blocker`
+    -- twenty-two of them. A foreman is a long-lived driver whose whole job is
+    to meet obstacles and escalate them, and `blocker` was the only verb it had
+    for "I need something from you", so the act of reporting settled the
+    reporter. One reported a corrupt worktree in the same breath as "I am
+    telling you immediately rather than retrying silently", and died of it;
+    the project then sat driverless until a replacement was appointed and
+    re-briefed from nothing.
+    """
+
+    def _foreman(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_foreman_task(project["id"])
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        return task, worker
+
+    def test_a_foreman_stays_live_and_addressable_after_a_blocker(self) -> None:
+        task, worker = self._foreman("foremanblock")
+
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "launch refused: the workspace already exists"
+        )
+
+        data = self.coordinator.store.load()
+        settled = data["workers"][worker["id"]]
+        # Live: the session is still there and an answer can still reach it.
+        self.assertEqual(settled["status"], "running")
+        self.assertIsNone(settled.get("protocol_outcome"))
+        # Blocked: the root must still see that something is owed.
+        self.assertEqual(data["tasks"][task["id"]]["status"], "blocked")
+
+    def test_a_paused_foreman_whose_session_dies_says_so(self) -> None:
+        """The pause is only an improvement while it stays distinguishable from death.
+
+        `blocked` is in neither branch of the process-exit handler, so a clean
+        exit after a foreman blocker used to fall through both: the worker was
+        recorded `completed`, no message was written, and the task sat blocked
+        beside a worker that looked finished and was gone. A reader could not
+        tell "waiting for an answer" from "nobody is listening", which is worse
+        than an honest failure -- they believe an answer will reach someone.
+        """
+        task, worker = self._foreman("foremandies")
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "needs a human"
+        )
+
+        # The session then ends cleanly, as an agent CLI does at end of turn.
+        Path(worker["exit_file"]).write_text(
+            json.dumps({"returncode": 0}) + "\n", encoding="utf-8"
+        )
+        self.coordinator.poll_worker(worker["id"])
+
+        data = self.coordinator.store.load()
+        self.assertEqual(data["workers"][worker["id"]]["status"], "failed")
+        # The escalation still stands and still needs a human.
+        self.assertEqual(data["tasks"][task["id"]]["status"], "blocked")
+        self.assertTrue(
+            any(
+                m.get("kind") == "failure"
+                and "nothing is listening" in (m.get("text") or "")
+                for m in data["messages"]
+                if m.get("worker_id") == worker["id"]
+            ),
+            "the reason the pause ended must be on the record",
+        )
+
+    def test_a_plain_workers_blocker_still_ends_its_assignment(self) -> None:
+        """The exemption is the foreman's alone.
+
+        A worker that cannot do the one thing it was made for HAS failed, and
+        the answer is a new task rather than a revived one. Widening the pause
+        to every worker would leave dead assignments looking live.
+        """
+        root = self.repo("workerblock")
+        project = self.coordinator.register_project(
+            "Workerblock", str(root), project_id="workerblock"
+        )
+        task = self.coordinator.create_task(project["id"], "do the thing")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "cannot reach the tracker"
+        )
+
+        data = self.coordinator.store.load()
+        self.assertEqual(data["workers"][worker["id"]]["status"], "failed")
+        self.assertEqual(data["workers"][worker["id"]]["protocol_outcome"], "blocker")
+        self.assertEqual(data["tasks"][task["id"]]["status"], "blocked")
+
+    def test_a_foremans_failure_still_ends_it(self) -> None:
+        """Only `blocker` is reinterpreted; `failure` still means failure."""
+        task, worker = self._foreman("foremanfail")
+
+        self.coordinator.record_worker_message(
+            worker["id"], "failure", "I cannot drive this project"
+        )
+
+        data = self.coordinator.store.load()
+        self.assertEqual(data["workers"][worker["id"]]["status"], "failed")
+        self.assertEqual(data["tasks"][task["id"]]["status"], "failed")

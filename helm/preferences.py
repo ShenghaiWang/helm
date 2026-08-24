@@ -80,6 +80,7 @@ KEY_MODEL_RUNTIMES = "model.runtimes"
 KEY_MODEL_FREE = "model.free"
 KEY_EFFORT_DEFAULT = "effort.default"
 KEY_EFFORT_RUNTIMES = "effort.runtimes"
+KEY_REVIEW_AGENT = "review.agent"
 
 #: The whole vocabulary `model.free` understands. Deliberately enumerated:
 #: a narrow preference cannot be stretched into a standing order to downgrade
@@ -116,6 +117,12 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         True,
         "restrict a model family to named runtimes; families: "
         + ", ".join(runtimes.model_family_ids()),
+    ),
+    KEY_REVIEW_AGENT: (
+        False,
+        "runtime this root reviews on, below an explicit --reviewer-agent and "
+        "above automatic selection (independence is still enforced: a reviewer "
+        "that would match the author is refused, not silently accepted)",
     ),
     KEY_MODEL_FREE: (
         False,
@@ -204,6 +211,14 @@ class Preferences:
         default_factory=dict
     )
     excluded_agents: frozenset[str] = frozenset()
+    #: The runtime this root reviews on. A standing answer to "who checks the
+    #: work", which otherwise had to be repeated to every foreman and was
+    #: silently lost whenever one died mid-instruction -- twice in one morning,
+    #: both times landing a review on a runtime the commander had not chosen.
+    #: It never overrides an explicit `--reviewer-agent`, and it never buys a
+    #: reviewer past the independence rule: naming the author's own runtime
+    #: here still yields a same-agent review, labelled as the weak check it is.
+    review_agent: str | None = None
     model_runtimes: Mapping[str, frozenset[str]] = field(default_factory=dict)
     #: `prefer` asks the dispatcher to prefer an explicitly-free model it has
     #: judged competent; `off` records the opposite, explicitly; None is the
@@ -246,6 +261,8 @@ class Preferences:
             model["free"] = self.free_model
         if model:
             document["model"] = model
+        if self.review_agent:
+            document["review"] = {"agent": self.review_agent}
         effort: dict[str, Any] = {}
         if self.default_effort:
             effort["default"] = self.default_effort
@@ -276,6 +293,8 @@ class Preferences:
             rows.append((f"{KEY_MODEL_RUNTIMES}.{family}", ", ".join(sorted(allowed))))
         if self.free_model:
             rows.append((KEY_MODEL_FREE, self.free_model))
+        if self.review_agent:
+            rows.append((KEY_REVIEW_AGENT, self.review_agent))
         if self.default_effort:
             rows.append((KEY_EFFORT_DEFAULT, self.default_effort))
         for runtime_id, (mechanism, argument, levels) in sorted(
@@ -344,7 +363,9 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
             f"unsupported preferences version {version!r}{where}; this build "
             f"understands {', '.join(str(item) for item in SUPPORTED_VERSIONS)}"
         )
-    _reject_unknown(document, {"version", "agent", "model", "effort"}, "", where)
+    _reject_unknown(
+        document, {"version", "agent", "model", "effort", "review"}, "", where
+    )
 
     agent = _object(document.get("agent"), "agent", where)
     _reject_unknown(agent, {"default", "exclude"}, "agent", where)
@@ -366,6 +387,14 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
     default_effort = (
         _effort_level(effort["default"], "effort.default", where)
         if effort.get("default") is not None
+        else None
+    )
+
+    review = _object(document.get("review"), "review", where)
+    _reject_unknown(review, {"agent"}, "review", where)
+    review_agent = (
+        _agent_id(review["agent"], "review.agent", where)
+        if review.get("agent") is not None
         else None
     )
 
@@ -407,6 +436,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         default_agent=default_agent,
         default_model=default_model,
         excluded_agents=excluded,
+        review_agent=review_agent,
         model_runtimes=runtimes_by_family,
         free_model=free_model,
         default_effort=default_effort,
@@ -624,6 +654,7 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
     families = dict(model.get("runtimes", {}))
 
     effort_section = dict(document.get("effort", {}))
+    review_section = dict(document.get("review", {}))
     effort_runtimes = dict(effort_section.get("runtimes", {}))
     taught_runtime = split_effort_runtimes_key(key)
     if taught_runtime is not None:
@@ -666,6 +697,11 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
             model.pop("free", None)
         else:
             model["free"] = listed[0]
+    elif key == KEY_REVIEW_AGENT:
+        if listed is None:
+            review_section.pop("agent", None)
+        else:
+            review_section["agent"] = listed[0]
     elif key == KEY_EFFORT_DEFAULT:
         if listed is None:
             effort_section.pop("default", None)
@@ -677,12 +713,15 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
     document["agent"] = agent
     document["model"] = model
     document["effort"] = effort_section
+    document["review"] = review_section
     if not agent:
         document.pop("agent")
     if not model:
         document.pop("model")
     if not effort_section:
         document.pop("effort")
+    if not review_section:
+        document.pop("review")
     # Re-validate the whole document: the same path a hand-edited file takes,
     # so the CLI can never write something loading would then refuse.
     return _from_document(document, current.path)

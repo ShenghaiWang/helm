@@ -178,13 +178,22 @@ class DeliveryTests(HelmTestCase):
 
         self.assertFalse(worker_dir.exists())
 
-    def test_an_escalated_foreman_can_still_be_cleaned_up(self) -> None:
-        """Escalating is how a foreman ends, and it ends blocked.
+    def test_a_stood_down_escalated_foreman_can_still_be_cleaned_up(self) -> None:
+        """Escalating no longer ends a foreman, so standing it down comes first.
 
         The status gate protects a checkout holding unreviewed work. A foreman
         has neither -- its workspace is empty and its evidence is the worker
         log, which cleanup never touches -- so the gate only left one empty
         directory per escalation that nothing could shed.
+
+        What changed underneath this test: a foreman's `blocker` used to settle
+        it, so an escalated foreman was already terminal and cleanup just
+        worked. Now the blocker PAUSES it and the session stays live and
+        addressable, which is the whole point -- the escalation must not
+        destroy the escalator. The consequence is that cleanup must be
+        preceded by a deliberate stand-down, and that is correct rather than
+        awkward: shedding the workspace of an agent somebody may still be
+        answering should be a decision, not a side effect.
         """
         root = self.repo("escalated")
         project = self.coordinator.register_project(
@@ -200,11 +209,16 @@ class DeliveryTests(HelmTestCase):
         workspace = Path(task["workspace"])
         self.assertTrue(workspace.is_dir())
         log = Path(worker["log_file"])
+        # The pause keeps it live on purpose, so cleanup refuses until someone
+        # decides it is done. That refusal is the new behaviour working.
+        with self.assertRaises(SafetyError):
+            self.coordinator.cleanup_task(task["id"])
         # Its session is over; the separate session gate is not what this test
         # is about.
         Path(worker["exit_file"]).write_text(
             json.dumps({"returncode": 0}) + "\n", encoding="utf-8"
         )
+        self.coordinator.stop_worker(worker["id"], "stood down before cleanup")
 
         self.coordinator.cleanup_task(task["id"])
 
@@ -214,7 +228,11 @@ class DeliveryTests(HelmTestCase):
         # blocker message in state.
         self.assertFalse(log.exists())
         inspected = self.coordinator.inspect_task(task["id"])
-        self.assertEqual(inspected["task"]["status"], "blocked")
+        # `failed`, not `blocked`: the stand-down is what ended this foreman,
+        # and the blocker only paused it. The status names how it ended; the
+        # REASON it stopped is the blocker message below, which is what has to
+        # survive cleanup and does.
+        self.assertEqual(inspected["task"]["status"], "failed")
         self.assertTrue(
             any(
                 m["kind"] == "blocker" and "needs a human" in (m.get("text") or "")

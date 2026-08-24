@@ -660,9 +660,15 @@ class HerdrTests(HelmTestCase):
             "foreman",
         )
 
-    def test_a_ticketed_task_tab_leads_with_the_ticket(self) -> None:
-        """The ticket is what a human scans the tab list for, so it goes first;
-        a task without one keeps the plain slug label."""
+    def test_a_ticketed_task_tab_leads_with_the_ticket_then_its_purpose(self) -> None:
+        """Ticket first, then what the agent is FOR.
+
+        The body used to be a slug of the brief, which produced tabs named
+        after whatever words the brief happened to open with -- and the ticket
+        was already in front of it, so the slug mostly repeated it. What a tab
+        list has to answer is which agent is which: who is writing code, who
+        is checking it, who is only reading. The task records that already.
+        """
         from helm.herdr import HerdrAdapter
 
         worker = {"id": "w-abcd1234"}
@@ -670,13 +676,35 @@ class HerdrTests(HelmTestCase):
             HerdrAdapter._worker_tab_label(
                 {"brief": "implement nextest adoption", "ticket": "TCK-123"}, worker
             ),
-            "TCK-123 implement-ne-abcd",
+            "TCK-123 coder abcd",
         )
         self.assertEqual(
             HerdrAdapter._worker_tab_label(
                 {"brief": "implement nextest adoption"}, worker
             ),
-            "implement-ne-abcd",
+            "coder abcd",
+        )
+
+    def test_a_tab_says_whether_it_reviews_writes_or_only_reads(self) -> None:
+        """reviewer/coder is the distinction that matters most -- they run on
+        different models by design, and confusing them is how a review gets
+        read as authorship. A read-only round is a `scout`: it can be left
+        running without wondering whether it is mid-edit."""
+        from helm.herdr import HerdrAdapter
+
+        worker = {"id": "w-abcd1234"}
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"role": "reviewer", "ticket": "TCK-123", "brief": "review it"}, worker
+            ),
+            "TCK-123 reviewer abcd",
+        )
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"role": "worker", "read_only": True, "ticket": "TCK-123", "brief": "look"},
+                worker,
+            ),
+            "TCK-123 scout abcd",
         )
 
     def test_a_long_message_is_handed_over_as_a_file_not_typed_into_the_pane(self) -> None:

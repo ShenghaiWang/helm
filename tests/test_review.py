@@ -402,6 +402,83 @@ class ReviewTests(HelmTestCase):
         self.assertIn(json.dumps("fresh run at tip: exit 0"), brief)
         self.assertNotIn("misfiled", brief)
 
+    def test_every_command_filed_at_the_newest_tip_reaches_the_reviewer(self) -> None:
+        """A round's evidence is several commands, and the reviewer needs all of them.
+
+        Helm used to keep whichever `full_suite` payload it saw last. A project
+        with a package deliberately outside the workspace root files the
+        recursive run alongside that package's own runner, and the recursive
+        run is naturally filed last -- so the reviewer was handed the one
+        report that structurally cannot cover the changed package, reasoned
+        correctly from it, and blocked the change for evidence that had been
+        filed seconds earlier. It happened twice on one task, to two different
+        reviewers, before anyone looked at the payloads directly.
+        """
+        task, worker = self._artifact_task("everycommand")
+        for command, detail in (
+            ("npx expo export --platform ios", "1 ios bundle, exit 0"),
+            ("npx jest (cwd apps/mobile)", "24/24 suites, 173/173 tests"),
+            ("npx tsc --noEmit (cwd apps/mobile)", "0 diagnostics"),
+            ("pnpm -r run test (repo root)", "5 workspace projects; apps/mobile NOT covered"),
+        ):
+            self.coordinator.record_worker_message(
+                worker["id"], "status", "evidence",
+                payload={"full_suite": {"tip": "0dffee4", "command": command, "detail": detail}},
+            )
+
+        brief = self._captured_reviewer_brief(task)
+
+        for command in (
+            "npx expo export --platform ios",
+            "npx jest (cwd apps/mobile)",
+            "npx tsc --noEmit (cwd apps/mobile)",
+            "pnpm -r run test (repo root)",
+        ):
+            self.assertIn(command, brief)
+        self.assertIn("4 report(s)", brief)
+        # The mirror-image failure: reading four reports as competing accounts
+        # of one run instead of as one round's coverage.
+        self.assertIn("SEPARATE COMMANDS", brief)
+
+    def test_a_rerun_of_one_command_supersedes_its_earlier_result(self) -> None:
+        """Showing every command must not resurrect a failure already fixed."""
+        task, worker = self._artifact_task("rerunsupersede")
+        for detail in ("3 failed, exit 1", "547 passed, exit 0"):
+            self.coordinator.record_worker_message(
+                worker["id"], "status", "evidence",
+                payload={"full_suite": {"tip": "abc1234", "command": "pytest -q", "detail": detail}},
+            )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("547 passed, exit 0", brief)
+        self.assertNotIn("3 failed, exit 1", brief)
+        self.assertIn("1 report(s)", brief)
+
+    def test_an_abbreviated_tip_does_not_split_one_set_of_evidence(self) -> None:
+        """Authors abbreviate shas, and not consistently within one round.
+
+        Grouping on string equality would drop a report whose only sin is
+        naming the same commit at full length -- reintroducing on a
+        technicality exactly the amputation the grouping prevents.
+        """
+        task, worker = self._artifact_task("abbrevtip")
+        full = "199169062ae5fc761a3cd746be1c7235ed02aebb"
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "evidence",
+            payload={"full_suite": {"tip": full, "command": "npx tsc --noEmit", "detail": "clean"}},
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "evidence",
+            payload={"full_suite": {"tip": full[:7], "command": "npx jest", "detail": "173/173"}},
+        )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("npx tsc --noEmit", brief)
+        self.assertIn("npx jest", brief)
+        self.assertIn("2 report(s)", brief)
+
     def test_an_oversized_full_suite_report_keeps_its_tail_for_the_reviewer(self) -> None:
         """An over-long report is elided in the middle, never cut off at the end.
 
@@ -1493,3 +1570,49 @@ class ReviewerGetsAnEffortTests(HelmTestCase):
         # CLI -- that gap is the whole defect.
         source = inspect.getsource(HerdrAdapter.run_review_cycle)
         self.assertIn("effort=reviewer_effort", source)
+
+
+class TheRootCanNameItsReviewerTests(HelmTestCase):
+    """`review.agent` is a preference, not an override.
+
+    It sits below an explicit `--reviewer-agent` and above the automatic
+    search, so a root stops having to repeat its reviewer choice to every
+    foreman. What it must never do is buy a reviewer past the independence
+    rule: naming the author's own runtime is a convenience colliding with the
+    whole purpose of a review, and the search wins.
+    """
+
+    def _rooted(self):
+        from pathlib import Path
+        from helm.core import Coordinator, StateStore
+
+        root = Path(self.temp.name)
+        return Coordinator(StateStore(root / "state", helm_root=root))
+
+    def _prefer(self, runtime: str) -> None:
+        self.write_preferences(review={"agent": runtime})
+
+    def test_the_preferred_runtime_is_chosen_over_the_automatic_search(self) -> None:
+        self._prefer("cursor")
+
+        choice = self._rooted().pick_reviewer_agent("claude")
+
+        self.assertEqual(choice["agent"], "cursor")
+        self.assertIn("review.agent", choice["reason"])
+        self.assertEqual(choice["independence"], "different-runtime")
+
+    def test_it_never_makes_the_author_review_itself(self) -> None:
+        """The one case a convenience must lose."""
+        self._prefer("cursor")
+
+        choice = self._rooted().pick_reviewer_agent("cursor")
+
+        self.assertNotEqual(choice["agent"], "cursor")
+        self.assertNotIn("review.agent", choice["reason"])
+
+    def test_an_explicit_reviewer_still_wins(self) -> None:
+        self._prefer("cursor")
+
+        choice = self._rooted().pick_reviewer_agent("claude", explicit="opencode")
+
+        self.assertEqual(choice["agent"], "opencode")

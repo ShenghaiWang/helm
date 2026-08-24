@@ -1412,9 +1412,37 @@ def _color_for(project_id: str, taken: Sequence[str] = ()) -> str:
     return _COLOR_PALETTE[start]
 
 
+#: Beyond this a single field is no longer a report, it is a denial of service
+#: on whoever has to read it. But see `_safe_text` for why the cut is announced.
+SAFE_TEXT_LIMIT = 20_000
+
+#: Room for the marker, so the cut text plus its notice still fit the limit.
+_SAFE_TEXT_NOTICE = "\n\n[...truncated by Helm at {limit} characters; {dropped} more were dropped. Ask the author to re-report the missing part in a shorter message.]"
+
+
 def _safe_text(value: Any, default: str = "") -> str:
+    """Bound one field, and say so when the bound bites.
+
+    The cut used to be silent. A worker's design report came in at exactly the
+    limit and lost its last two verdicts mid-heading; the reader saw a section
+    title with nothing under it and had no way to tell a truncated report from
+    an author who stopped writing. Both look like a document that ends. The
+    first needs the missing part requested, the second needs the finding
+    chased, and guessing wrong wastes a round either way.
+
+    So the marker is the whole point. It names the limit, says how much went,
+    and tells the reader what to do -- because the reader is usually an agent
+    that will otherwise reason confidently from a document it does not know is
+    incomplete, which is the same failure as a reviewer judging a change on one
+    of four evidence payloads.
+    """
     text = str(value if value is not None else default)
-    return text[:20_000]
+    if len(text) <= SAFE_TEXT_LIMIT:
+        return text
+    notice = _SAFE_TEXT_NOTICE.format(
+        limit=SAFE_TEXT_LIMIT, dropped=len(text) - SAFE_TEXT_LIMIT
+    )
+    return text[: SAFE_TEXT_LIMIT - len(notice)] + notice
 
 
 def _validate_protected_action(action: Any) -> str:
@@ -4375,6 +4403,46 @@ class Coordinator:
                 "reason": f"explicit reviewer {explicit}"
                 + (f" on model {model}" if model else ""),
             }
+        # THE ROOT'S STANDING ANSWER TO "WHO CHECKS THE WORK", below an
+        # explicit --reviewer-agent and above the automatic search. Without it
+        # the choice had to be repeated to every foreman, and was lost whenever
+        # one died mid-instruction: three reviews in one afternoon landed on a
+        # runtime the commander had not asked for, each time silently, because
+        # a fallen-through default looks identical to a considered pick.
+        #
+        # It is a preference, not an override. A preferred runtime that is
+        # excluded, unavailable, situationally ruled out, or would be the
+        # author's own is skipped and the ordinary search runs -- independence
+        # is the point of the whole function and a convenience must not buy
+        # past it.
+        preferred = self.preferences().review_agent
+        if (
+            preferred
+            and preferred != author_agent_id
+            and preferred not in excluded
+            and preferred not in situational
+            and any(
+                entry["id"] == preferred and entry["available"]
+                for entry in self.builtin_runtime_availability()
+            )
+        ):
+            try:
+                self._require_model_runtime(model, preferred, f"reviewer {preferred}")
+            except HelmError:
+                pass  # A restricted model cannot run here; fall through.
+            else:
+                runtime = runtimes.builtin_runtime(preferred)
+                return {
+                    "agent": preferred,
+                    "command": (
+                        runtime.with_model(model, interactive=interactive)
+                        if runtime
+                        else None
+                    ),
+                    "independence": "different-runtime",
+                    "reason": f"root review.agent preference ({preferred})"
+                    + (f" on model {model}" if model else ""),
+                }
         available = [
             entry["id"]
             for entry in self.builtin_runtime_availability()
@@ -6172,19 +6240,40 @@ class Coordinator:
             self._message(data, project, task, worker, "artifact-rejected", "Artifact has no path", {})
             return
         workspace = self._verify_workspace_record(data, project, task)
+        # THE WORKER'S OWN DIRECTORY COUNTS TOO, and leaving it out made two
+        # shipped rules contradict each other. Helm's reporting document tells
+        # every worker to report each file it produces with --type artifact
+        # --path; the verification guidance tells it to write reports and logs
+        # into its OWN directory and never into the worktree, because an
+        # untracked file there either pollutes the branch or blocks approval.
+        # Obey both and you produce exactly what this check rejected: one
+        # worker failed five artifact calls in four seconds doing as it was
+        # told.
+        #
+        # This is not a hole in isolation. The worker directory is Helm's own
+        # state, created by Helm for that one worker, and already handed to the
+        # runtime as an added directory -- it is the place Helm told the worker
+        # to write. What isolation forbids is reaching into ANOTHER task's
+        # worktree or another project, and neither root permits that.
+        roots = [workspace]
+        worker_dir = self.store.directory / "workers" / str(worker.get("id") or "")
+        with contextlib.suppress(OSError):
+            roots.append(canonical(worker_dir))
         candidate = canonical(raw_path) if os.path.isabs(str(raw_path)) else canonical(workspace / str(raw_path))
-        if not inside(candidate, workspace) or not candidate.is_file():
+        home = next((root for root in roots if inside(candidate, root)), None)
+        if home is None or not candidate.is_file():
             self._message(
                 data,
                 project,
                 task,
                 worker,
                 "artifact-rejected",
-                "Artifact path is outside the assigned workspace or does not exist",
+                "Artifact path is outside the assigned workspace and this worker's "
+                "own directory, or does not exist",
                 {"path": _safe_text(raw_path)},
             )
             return
-        relative = candidate.relative_to(workspace).as_posix()
+        relative = candidate.relative_to(home).as_posix()
         artifact = {
             "id": new_id("a"),
             "project_id": project["id"],
@@ -6480,7 +6569,7 @@ class Coordinator:
                 hold_event = self._resolve_hold_on_event(
                     data, project, task, worker, hold, kind, receipts
                 )
-        if kind in self._TERMINAL_MESSAGE_TASK_STATE:
+        if self._ends_the_assignment(task, kind):
             # The message is terminal even when the provider process or pane
             # stays open. Mark only the worker/task lifecycle here; approval,
             # merge, publish, and other protected actions remain separate
@@ -6858,15 +6947,28 @@ class Coordinator:
                     f"task {task_id} has no worker to attribute this evidence to"
                 )
             worker_id = workers[-1]["id"]
+            # A COMPLETE MESSAGE, built the same way every other one is.
+            # This used to append a hand-rolled dict with NO `id` and an `at`
+            # where the rest of the store writes `created_at`, and two separate
+            # consumers have now broken on it: a reader that keyed on
+            # `created_at` saw an undated record, and the pane router did
+            # `message["id"]` and took the whole launcher down with a KeyError
+            # mid-round -- traceback to stdout, exit code that read as success.
+            #
+            # Hand-building a record next to a builder that exists is how a
+            # field gets forgotten. Every consumer is entitled to assume the
+            # shape, so the shape is not optional.
             data.setdefault("messages", []).append(
                 {
+                    "id": new_id("m"),
                     "worker_id": worker_id,
                     "task_id": task_id,
                     "project_id": task["project_id"],
                     "kind": "status",
                     "text": f"full suite at {tip}: {command} exited {int(exit_code)}",
                     "payload": {"full_suite": report},
-                    "at": now(),
+                    "created_at": now(),
+                    "status": None,
                 }
             )
         return report
@@ -7225,6 +7327,32 @@ class Coordinator:
             )
             self._abandon_open_hold(
                 data, project, task, f"its session exited with code {exit_code}"
+            )
+        elif task["status"] == "blocked" and not self.terminal_protocol_outcome(worker):
+            # A PAUSED FOREMAN WHOSE SESSION THEN ENDED. `blocked` is in
+            # neither branch above, so a clean exit here used to fall through
+            # both: the worker was recorded `completed`, no message was
+            # written, and the task sat blocked forever beside a worker that
+            # looked finished and was in fact gone.
+            #
+            # That is precisely the ambiguity the foreman pause was introduced
+            # to remove. Pausing on a blocker is only an improvement if
+            # "waiting for an answer" stays distinguishable from "dead" -- a
+            # pause nobody is listening to is worse than an honest failure,
+            # because the reader believes an answer will reach someone.
+            #
+            # The task stays blocked: the escalation still stands and still
+            # needs a human. What changes is that the worker reads failed and
+            # the reason is on the record, so the next reader knows a new
+            # driver has to take it.
+            worker["status"] = "failed"
+            worker["exit_code"] = 1
+            self._message(
+                data, project, task, worker, "failure",
+                "Its session ended while the task was blocked, so the pause is "
+                "over and nothing is listening for an answer. The blocker still "
+                "stands: a new driver has to pick it up.",
+                {"exit_code": exit_code, "source": "process-fallback"},
             )
         elif task["status"] in {"created", "allocated", "running"}:
             task["status"] = "completed"
@@ -7848,6 +7976,35 @@ class Coordinator:
         "blocker": "blocked",
         "failure": "failed",
     }
+
+    @classmethod
+    def _ends_the_assignment(cls, task: dict[str, Any], kind: str) -> bool:
+        """Whether a terminal-looking message actually ends this worker.
+
+        A `blocker` ends a WORKER's assignment, and should: it could not do the
+        one thing it was made for, so the answer is a new task rather than a
+        revived one.
+
+        It must not end a FOREMAN's. A foreman is a long-lived driver whose
+        entire job is to meet obstacles and escalate them, and `blocker` is the
+        only verb it has for "I need something from you" -- so reporting one
+        killed the reporter. Every foreman death on this root that recorded an
+        outcome was a blocker, twenty-two of them: the driver did exactly what
+        the protocol asks of it, told the root immediately instead of retrying
+        silently, and was settled for the telling. The project was then left
+        with no driver until someone noticed, appointed a replacement and
+        re-briefed it from nothing, which repeatedly cost more than the
+        obstacle had. One reported a corrupt worktree in the same breath as
+        "I am telling you immediately rather than retrying silently", and died
+        of it.
+
+        So a foreman's blocker PAUSES, exactly as `approval-needed` already
+        does: the task shows blocked so `open_escalations` still surfaces it,
+        the session stays live and addressable, and an answer resumes it.
+        """
+        if kind not in cls._TERMINAL_MESSAGE_TASK_STATE:
+            return False
+        return not (kind == "blocker" and task.get("role") == "foreman")
 
     def settle_reported_worker(self, worker_id: str) -> dict[str, Any]:
         """End a task on the worker's own terminal message.
@@ -9213,17 +9370,46 @@ class Coordinator:
             return False
         if task.get("status") not in {"blocked", "failed"}:
             return False
-        # A LIVE replacement, not merely a later record: what answers the
-        # escalation is somebody driving the project now. Comparing timestamps
-        # cannot decide this -- two foremen appointed in the same second are
-        # indistinguishable by `created_at`.
-        return any(
-            other.get("role") == "foreman"
-            and other.get("project_id") == task.get("project_id")
-            and other.get("id") != task_id
-            and other.get("status") in {"created", "allocated", "running"}
-            for other in data.get("tasks", {}).values()
-        )
+        # WHAT ANSWERS THE ESCALATION IS THAT A REPLACEMENT WAS APPOINTED --
+        # not that it is still running. The first version of this required a
+        # LIVE successor, which held only while one happened to be driving:
+        # a foreman that took over, finished the work and stood down left every
+        # blocker behind it summoning a human again. Six such entries, aged 7
+        # to 18 hours, were still on the attention list the morning after the
+        # work they described had been completed and merged.
+        #
+        # So: a successor in ANY state supersedes. Live is one case; created
+        # later is the other, and `created_at` decides it. The tie that
+        # timestamps cannot resolve -- two foremen appointed in the same second
+        # -- is why the live test is kept rather than replaced.
+        # SUCCESSION IS ORDERED BY `created_at`, and the mapping's own order
+        # cannot substitute for it: state is written with `sort_keys=True`, so
+        # `data["tasks"]` comes back in ALPHABETICAL ID ORDER. Task ids are
+        # random hex, which makes that ordering random -- an insertion-order
+        # reading of it looked right and failed intermittently.
+        #
+        # `created_at` has one-second resolution, so two foremen appointed in
+        # the same second tie and neither reads as later. That is why the LIVE
+        # test below is kept as well as the timestamp: in the tie that matters
+        # -- a replacement appointed moments after the escalation -- the
+        # replacement is still running.
+        created_at = task.get("created_at") or ""
+        for other in data.get("tasks", {}).values():
+            if other.get("role") != "foreman":
+                continue
+            if other.get("project_id") != task.get("project_id"):
+                continue
+            if other.get("id") == task_id:
+                continue
+            if other.get("status") in {"created", "allocated", "running"}:
+                return True
+            # A successor that took over and has SINCE FINISHED answers the
+            # escalation just as well as one still running. Requiring a live
+            # replacement was the original defect: every blocker behind a
+            # foreman that did the work and stood down started summoning again.
+            if (other.get("created_at") or "") > created_at:
+                return True
+        return False
 
     def pending_foreman_requests(
         self, project_id: str, *, data: dict[str, Any] | None = None
@@ -11516,6 +11702,22 @@ class Coordinator:
                     continue
             elif kind == "blocker":
                 if status != "blocked" or answered:
+                    continue
+                # A FOREMAN'S BLOCKER IS ANSWERED BY ITS REPLACEMENT. A
+                # foreman that escalates ends `blocked` and stays `blocked`
+                # forever -- there is no route out of that state for a task
+                # nobody will continue -- so this test alone kept summoning a
+                # human to escalations that had been dealt with hours before.
+                # Six of them, aged 7 to 18 hours, were still on the attention
+                # list the morning after the work they described was finished
+                # and merged. An attention list that is mostly answered items
+                # trains its reader to skim, which is the one failure it
+                # cannot afford.
+                #
+                # The record stays; only the summons is dropped.
+                if self._superseded_foreman_report(
+                    data, {"task_id": str(message.get("task_id") or "")}
+                ):
                     continue
             open_items.append({
                 "kind": kind,

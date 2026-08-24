@@ -1021,3 +1021,104 @@ class CliStatusTests(HelmTestCase):
         self.assertIn("a thing happened", run())
         # Nothing changed but the clock. It must stay silent.
         self.assertEqual(run().strip(), "")
+
+
+class ASupersededForemanBlockerLeavesTheAttentionListTests(HelmTestCase):
+    """The summons drops when a successor is appointed; the record stays.
+
+    `project_updates_for_watch` already knew this. `open_escalations` -- the
+    path `helm pending` actually reads for blockers -- did not, and a blocker
+    is live there for as long as its task is `blocked`. A foreman that
+    escalates ends `blocked` and there is no route out of that state for a
+    task nobody will continue, so those entries never left. Six of them, aged
+    7 to 18 hours, were still summoning a human the morning after the work
+    they described had been finished and merged.
+    """
+
+    def _blocked_foreman(self, project: dict, note: str) -> dict:
+        task = self.coordinator.create_task(
+            project["id"], "drive the project", role="foreman"
+        )
+        # A LIVE process, not `-c ""`. An immediately-exiting worker races
+        # its own blocker: Helm can settle it before the message is recorded,
+        # and the escalation then never exists -- which made this suite fail
+        # in both directions depending on who won.
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "blocker", note)
+        return task
+
+    def _project(self, name: str) -> dict:
+        root = self.repo(name)
+        return self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+
+    def _open(self, note: str) -> list:
+        return [e for e in self.coordinator.open_escalations() if note in e["text"]]
+
+    def test_a_foreman_blocker_stands_while_nobody_has_replaced_it(self) -> None:
+        project = self._project("alone")
+        self._blocked_foreman(project, "needs a decision alpha")
+        self.assertTrue(self._open("needs a decision alpha"))
+
+    def test_a_live_successor_answers_it(self) -> None:
+        project = self._project("livesucc")
+        self._blocked_foreman(project, "needs a decision beta")
+        self.coordinator.create_task(project["id"], "drive it", role="foreman")
+        self.assertEqual(self._open("needs a decision beta"), [])
+
+    def test_a_successor_THAT_HAS_SINCE_FINISHED_also_answers_it(self) -> None:
+        """The case that was broken, and the ordinary one.
+
+        A foreman takes over, does the work, reports and stands down. Its task
+        is then `completed`, so a rule that looked only for a LIVE successor
+        found none and every blocker behind it started summoning again.
+        """
+        project = self._project("finishedsucc")
+        self._blocked_foreman(project, "needs a decision gamma")
+        successor = self.coordinator.create_task(
+            project["id"], "drive it", role="foreman"
+        )
+        with self.coordinator.store.locked() as data:
+            entry = data["tasks"][successor["id"]]
+            entry["status"] = "completed"
+            # Stamped a second later on purpose. `created_at` has one-second
+            # resolution and a fixture creates both tasks inside the same
+            # second, which no real appointment does -- leaving it tied would
+            # be testing the clock, not the rule.
+            entry["created_at"] = "2099-01-01T00:00:00Z"
+        self.assertEqual(self._open("needs a decision gamma"), [])
+
+    def test_a_WORKER_blocker_is_never_superseded_by_a_foreman(self) -> None:
+        """The guard that matters. A worker's blocker is nobody else's ask.
+
+        Foremen come and go on a project constantly; if their arrival retired
+        worker escalations, the list would quietly empty itself of exactly the
+        items it exists for.
+        """
+        project = self._project("workerblock")
+        task = self.coordinator.create_task(project["id"], "do the work")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "needs a credential delta"
+        )
+        self.coordinator.create_task(project["id"], "drive it", role="foreman")
+        self.coordinator.create_task(project["id"], "drive it again", role="foreman")
+        self.assertTrue(
+            self._open("needs a credential delta"),
+            "a worker's blocker must survive any number of foremen",
+        )
+
+    def test_another_projects_foreman_does_not_answer_it(self) -> None:
+        project = self._project("mine")
+        other = self._project("theirs")
+        self._blocked_foreman(project, "needs a decision epsilon")
+        self.coordinator.create_task(other["id"], "drive it", role="foreman")
+        self.assertTrue(
+            self._open("needs a decision epsilon"),
+            "supersession must not cross a project boundary",
+        )
