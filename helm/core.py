@@ -550,6 +550,15 @@ def project_glyph(color: str) -> str:
     return "\N{LARGE PURPLE SQUARE}"
 
 
+#: Worker verdicts that are NOT an attention item. `working`, `driving` and
+#: `quiet` all mean the log is MOVING -- alive and busy, just not narrating --
+#: which no human can act on. `stalled` means gone dark and is absent here on
+#: purpose. Defined once: this set had drifted into four copies that disagreed.
+HEALTHY_WORKER_VERDICTS = frozenset(
+    {"healthy", "settled", "reported", "starting", "working", "driving", "quiet"}
+)
+
+
 class HelmError(RuntimeError):
     """An expected, user-facing coordinator error."""
 
@@ -9549,9 +9558,9 @@ class Coordinator:
             # signal that is usually wrong teaches the reader to skim the one
             # time it is right. `stalled` is the verdict that means gone dark and
             # it stays, as do every genuine fault and every ask.
-            "needs_attention": [h for h in health if h["verdict"] not in
-                                {"healthy", "settled", "reported", "starting",
-                                 "working", "driving", "quiet"}],
+            "needs_attention": [
+                h for h in health if h["verdict"] not in HEALTHY_WORKER_VERDICTS
+            ],
             "unmerged": [
                 {"task_id": t["id"], "status": t["status"], "branch": t.get("branch"),
                  "brief": _safe_text(t.get("brief", "")).strip().splitlines()[0][:120]}

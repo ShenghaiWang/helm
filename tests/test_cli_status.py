@@ -1168,3 +1168,29 @@ class BusyIsNotAnAttentionItemTests(HelmTestCase):
             ["stalled"],
             "stalled means no output at all and must survive the filter",
         )
+
+
+class OneDefinitionOfHealthyTests(HelmTestCase):
+    """The healthy-verdict set is defined once, not copied.
+
+    It had drifted into four literal copies -- one in core, three in the CLI.
+    Removing `quiet` from the core copy left the other three still listing it
+    as needing attention, so the fix changed nothing on the surface the
+    commander actually reads. A duplicated policy is not a style problem: it
+    is a rule that can be true in one place and false in another.
+    """
+
+    def test_no_source_file_carries_a_second_copy_of_the_set(self) -> None:
+        from helm.core import HEALTHY_WORKER_VERDICTS
+
+        marker = '"healthy", "settled", "reported"'
+        for name in ("core.py", "cli.py", "herdr.py"):
+            text = (REPO_ROOT / "helm" / name).read_text(encoding="utf-8")
+            self.assertLessEqual(
+                text.count(marker),
+                1 if name == "core.py" else 0,
+                f"{name} spells the healthy set out again; import "
+                f"HEALTHY_WORKER_VERDICTS instead",
+            )
+        self.assertIn("quiet", HEALTHY_WORKER_VERDICTS)
+        self.assertNotIn("stalled", HEALTHY_WORKER_VERDICTS)

@@ -17,6 +17,7 @@ from typing import Any
 from . import watchdog as watchdog_module
 from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .core import (
+    HEALTHY_WORKER_VERDICTS,
     EFFORT_LEVELS,
     AUTHORITY_ENV,
     DELIVERY_DECISION_KIND,
@@ -983,9 +984,7 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
         # Same healthy set as `watch`, `driving` included for the same reason:
         # a foreman waiting on a worker it launched is working, and listing it
         # as needing attention is how a real stall stops standing out.
-        if entry["verdict"] not in {
-            "healthy", "settled", "reported", "starting", "driving", "working",
-        }
+        if entry["verdict"] not in HEALTHY_WORKER_VERDICTS
         and (project_id is None or entry["project_id"] == project_id)
     ]
     if needs_attention:
@@ -3317,9 +3316,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"{update['glyph']} {update['project_id']}: {update['text']}",
                 ))
             for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
-                if entry["verdict"] in {
-                    "healthy", "settled", "reported", "starting", "driving", "working",
-                }:
+                if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
                     continue
                 glyph = _glyph_for(coordinator, entry["project_id"])
                 idle = max(
@@ -3441,9 +3438,7 @@ def main(argv: list[str] | None = None) -> int:
                 # "nothing is driving it" -- so the one row that was fine read
                 # exactly like the two that were genuinely down, and the whole
                 # signal stopped being worth reading.
-                healthy = entry["verdict"] in {
-                    "healthy", "settled", "reported", "starting", "driving", "working",
-                }
+                healthy = entry["verdict"] in HEALTHY_WORKER_VERDICTS
                 if healthy:
                     mark = ""
                 elif entry.get("role") == "foreman":
