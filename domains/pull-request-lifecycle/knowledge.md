@@ -13,6 +13,19 @@ Small by design: compose it with `{"extends": ["pull-request-lifecycle"]}`.
 
 ## Opening it
 
+**An independent review returns before anything reaches the remote.** Launched
+is not returned. The tempting order is fix, push, then review: the push makes
+the work visible, and a reply to a review comment is only honest once the fix is
+actually pushed. Both of those are true, and neither survives the consequence —
+a review that lands after the push finds its defects in code reviewers are
+already reading, and the branch becomes a record of churn rather than a change.
+On one project this order put four P1 defects, two of them consent failures in
+clinical audio capture, onto a branch that had already been pushed and replied
+to. The single exception is a repair that changes no behaviour, such as a
+dead-code error breaking a platform build; take it explicitly, and say in the
+request that you are taking it and why, so it is a stated choice rather than an
+assumed one.
+
 **Open it as a regular, non-draft change.** Automated review bots typically only
 trigger on non-draft changes, so a draft skips the automated pass entirely. "Not
 ready for a human yet" is expressed by **withholding the ready-for-review

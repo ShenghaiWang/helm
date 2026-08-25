@@ -1073,3 +1073,55 @@ class BusyAgentGetsAPointerNotAPasteTests(HelmTestCase):
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("idle\n", encoding="utf-8")
         self.assertTrue(adapter._wait_for_quiet(worker["id"]))
+
+
+class HandedOverMessageSaysWhatItIsAboutTests(HelmTestCase):
+    """The pane must show the subject, not just that a message exists.
+
+    A handed-over message used to arrive as a bare "Helm has a message for
+    you, written to <path>". The commander watching a foreman then saw that
+    something arrived and never what it asked for, so the pane stopped being
+    evidence of WHY the foreman did what it did next -- and the pane is the
+    one surface a human reads directly. The file is still the message; the
+    line in the pane is its subject.
+    """
+
+    def _worker(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "receive a brief")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        return adapter, herdr, worker
+
+    def test_the_pane_line_carries_the_first_line_of_the_message(self) -> None:
+        adapter, herdr, worker = self._worker("gist-shown")
+        brief = (
+            "STOP THE REVIEW LOOP: no round ten.\n"
+            + "Detail that nobody needs in the pane. " * 40
+        )
+        self.assertGreater(len(brief), HerdrAdapter.INLINE_MESSAGE_LIMIT)
+        self.assertTrue(adapter.answer_worker(worker["id"], brief))
+
+        sent = " ".join(text for _pane, text in herdr.sent_text)
+        self.assertIn("STOP THE REVIEW LOOP: no round ten.", sent)
+        # Still a handover, not a paste: the body does not go through the pane.
+        self.assertNotIn("Detail that nobody needs in the pane. Detail", sent)
+        self.assertIn("Read that file now", sent)
+
+    def test_a_message_with_no_title_line_claims_no_gist(self) -> None:
+        # The half that matters, and the one the existing suite caught me on.
+        # A message that is one long paragraph has NO title line, so there is no
+        # gist to be had -- and truncating its prose would put BODY TEXT through
+        # the pane, which is the exact thing the handover exists to stop. None
+        # is claimed rather than invented: a fabricated subject is both noise
+        # and a small lie about what the message says.
+        adapter, herdr, worker = self._worker("no-title")
+        brief = "PARAGRAPH. " * 200
+        self.assertTrue(adapter.answer_worker(worker["id"], brief))
+
+        sent = " ".join(text for _pane, text in herdr.sent_text)
+        self.assertNotIn("PARAGRAPH. PARAGRAPH.", sent)
+        self.assertIn("Helm has a message for you.", sent)
+        self.assertIn("Read that file now", sent)

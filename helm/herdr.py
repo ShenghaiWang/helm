@@ -2459,6 +2459,23 @@ class HerdrAdapter:
             time.sleep(0.2)
         return False
 
+    #: Longest first line still treated as a title rather than prose.
+    MESSAGE_GIST_LIMIT = 220
+
+    @classmethod
+    def _message_gist(cls, text: str) -> str:
+        """The first line of a message, when that line is short enough to be a
+        title. Empty otherwise: a long first line is prose, and truncating it
+        would put body text through the pane -- the thing the handover exists
+        to stop.
+        """
+        for line in text.splitlines():
+            gist = " ".join(line.split())
+            if not gist:
+                continue
+            return gist if len(gist) <= cls.MESSAGE_GIST_LIMIT else ""
+        return ""
+
     def answer_worker(self, worker_id: str, text: str) -> bool:
         """Deliver a coordinator answer into the worker's own session.
 
@@ -2515,11 +2532,14 @@ class HerdrAdapter:
                 note = inbox / f"{new_id('m')}.md"
                 note.write_text(text + "\n", encoding="utf-8")
                 os.chmod(note, 0o600)
+                # No gist for a busy agent: any text interleaves with a live
+                # redraw, and a subject line is still text.
+                gist = self._message_gist(text) if quiet else ""
+                headline = f"Helm: {gist}\n" if gist else "Helm has a message for you. "
                 delivered_text = (
-                    f"Helm has a message for you, written to {note} because it is "
-                    "too long to paste into a live session without garbling this "
-                    "pane. Read that file now and act on it as if it had been "
-                    "typed here."
+                    f"{headline}Full message written to {note} because pasting "
+                    "it whole would garble this pane. Read that file now and act "
+                    "on it as if it had been typed here."
                 )
         send_text(pane, delivered_text)
         # And a pause before Enter. Sent immediately, the newline races the
