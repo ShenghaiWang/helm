@@ -1439,3 +1439,60 @@ class ApprovalAfterAFailedRoundTests(HelmTestCase):
 
         with self.assertRaisesRegex(SafetyError, "w-lastround"):
             self.coordinator.approve_task(task["id"], "reviewed")
+
+
+class ReplacedForemanTabIsReleasedTests(HelmTestCase):
+    """A stopped foreman's pane is evidence until somebody acts on it.
+
+    A foreman that failed or blocked keeps its tab because a human has to
+    diagnose why it stopped. But once the project has a NEWER foreman running,
+    that diagnosis has happened: somebody looked, decided the driver was gone,
+    and started another. Without an expiry these panes accumulate one per
+    replacement and never leave -- and a retained `foreman (blocked)` tab looks
+    exactly like a live driver in the panel, which is how one project comes to
+    look as though it has several. Six of them had built up before this was
+    noticed.
+    """
+
+    def _stopped_foreman(self, adapter, project):
+        task = self.coordinator.create_foreman_task(project["id"])
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.coordinator.record_worker_message(worker["id"], "blocker", "the checkout is dirty")
+        # A foreman's blocker PAUSES it -- the session stays live and
+        # addressable, and Helm never closes a live pane. The panes that
+        # actually accumulated were stopped foremen: replaced because they were
+        # wedged or blocked, their worker settled, their tab left behind.
+        self.coordinator.stop_worker(worker["id"], "replaced")
+        return task, worker
+
+    def test_a_replaced_foreman_stops_holding_its_tab(self) -> None:
+        root = self.repo("replaced-foreman")
+        project = self.coordinator.register_project(
+            "Replaced", str(root), project_id="replaced-foreman"
+        )
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        _, worker = self._stopped_foreman(adapter, project)
+
+        # Alone, it is still the thing a human has to look at.
+        self.assertEqual(adapter.release_finished_tabs(), [])
+
+        # A newer foreman for the same project is the evidence that somebody
+        # looked, decided, and acted. The old pane now holds a question nobody
+        # is still asking.
+        self.coordinator.create_foreman_task(project["id"])
+        self.assertEqual(adapter.release_finished_tabs(), [worker["id"]])
+
+    def test_a_blocked_foreman_with_no_successor_keeps_its_tab(self) -> None:
+        # The half that must not break: only a NEWER foreman supersedes. A
+        # project whose only driver is blocked still needs that pane, and
+        # quieting it would hide the very fault the retention exists for.
+        root = self.repo("lone-foreman")
+        project = self.coordinator.register_project(
+            "Lone", str(root), project_id="lone-foreman"
+        )
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        self._stopped_foreman(adapter, project)
+        self.assertEqual(adapter.release_finished_tabs(), [])
+        self.assertEqual(herdr.closed_tabs, [])

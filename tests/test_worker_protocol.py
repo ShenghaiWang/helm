@@ -1585,3 +1585,74 @@ class ATruncatedReportSaysSoTests(HelmTestCase):
         ][-1]
 
         self.assertIn("truncated by Helm", stored["text"])
+
+
+class AnsweredBlockerClearsTheFlagTests(HelmTestCase):
+    """A foreman that escalated, was answered, and carried on is not blocked.
+
+    The flag used to be sticky. A notate foreman escalated at 10:19, was
+    answered three minutes later, resumed and ran four more review rounds --
+    and its task still read `blocked` an hour and a half afterwards. `helm
+    pending` already stopped showing an answered blocker, so the two records
+    disagreed about the same fact, and the task record is the one a fresh
+    coordinator reads to take a project over.
+    """
+
+    def _blocked_foreman(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        # A FOREMAN, deliberately. A plain worker's blocker ends its
+        # assignment -- a worker that cannot do its one job needs a new task,
+        # not a revived one. A foreman's blocker PAUSES instead, because a
+        # driver's whole job is to meet obstacles and escalate them, and it
+        # stays live and addressable. So this state only exists for a foreman.
+        task = self.coordinator.create_foreman_task(project["id"])
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "the base checkout is dirty and it is not my file"
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "blocked"
+        )
+        return task, worker
+
+    def test_an_answer_returns_a_blocked_task_to_running(self) -> None:
+        task, worker = self._blocked_foreman("answered-blocker")
+        self.coordinator.record_worker_message(
+            worker["id"], "answer", "cleared it, carry on"
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"],
+            "running",
+            "an answered blocker must not leave the task reading blocked",
+        )
+
+    def test_a_finished_worker_cannot_be_answered_at_all(self) -> None:
+        # The narrowness of the fix, pinned from the other side. A task that
+        # reported its result is finished and its assignment has ended, so an
+        # answer never reaches it -- Helm refuses the delivery outright rather
+        # than the transition quietly declining to fire. Worth a test because
+        # the fix's own guard (`only a blocked task moves`) would otherwise be
+        # the only thing standing between an answer and a resurrected task,
+        # and a guard nothing exercises is a guard nobody can trust.
+        root = self.repo("answered-terminal")
+        project = self.coordinator.register_project(
+            "answered-terminal", str(root), project_id="answered-terminal"
+        )
+        task = self.coordinator.create_task(project["id"], "finish and stop")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
+        )
+        with self.assertRaisesRegex(HelmError, r"no longer running"):
+            self.coordinator.record_worker_message(worker["id"], "answer", "noted")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"],
+            "completed",
+            "a refused answer must leave the finished task exactly as it was",
+        )

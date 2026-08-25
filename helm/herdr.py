@@ -1489,6 +1489,39 @@ class HerdrAdapter:
             for other in data.get("tasks", {}).values()
         )
 
+    @staticmethod
+    def _superseded_foreman(data: dict[str, Any], task: dict[str, Any]) -> bool:
+        """Whether this stopped foreman has since been replaced by a live one.
+
+        The same reasoning as a superseded reviewer, for the other role Helm
+        replaces rather than retries. A foreman's pane is kept because a human
+        has to diagnose why it stopped -- but once the project has a NEWER
+        foreman running, that diagnosis has been made and acted on: somebody
+        looked, decided the driver was gone, and started another. The pane then
+        holds a question nobody is still asking.
+
+        Without this the panes accumulate one per replacement and never leave,
+        and they are the worst kind of clutter: a retained `foreman (blocked)`
+        tab looks exactly like a live driver, which is how a project comes to
+        appear to have several.
+
+        A LIVE successor is what supersedes, not merely a later timestamp:
+        `created_at` has one-second granularity, so two tasks made in the same
+        second compare equal and a timestamp test silently never fires. Asking
+        whether the project has another foreman still driving says the thing
+        that actually matters -- somebody replaced this one and the replacement
+        is doing the job.
+        """
+        if task.get("role") != "foreman" or task.get("status") not in {"failed", "blocked"}:
+            return False
+        return any(
+            other.get("role") == "foreman"
+            and other.get("project_id") == task.get("project_id")
+            and other.get("id") != task.get("id")
+            and other.get("status") in {"created", "allocated", "running"}
+            for other in data.get("tasks", {}).values()
+        )
+
     def release_finished_tabs(self) -> list[str]:
         """Close the tab of every worker whose work is cleanly done.
 
@@ -1510,6 +1543,11 @@ class HerdrAdapter:
             task = data.get("tasks", {}).get(worker.get("task_id"))
             if task is None:
                 continue
+            if task.get("status") in keep and self._superseded_foreman(data, task):
+                # Replaced, and the replacement is proof somebody looked. See
+                # `_superseded_foreman`; the log and the record outlive the tab.
+                task = dict(task)
+                task["status"] = "completed"
             if task.get("status") in keep and self._superseded_reviewer(data, task):
                 # A reviewer killed by the OOM killer is a failure the retry
                 # already answered: another reviewer judged the same change and
@@ -2623,7 +2661,17 @@ class HerdrAdapter:
         for worker in task_workers:
             if worker.get("owned") is not True:
                 continue
-            self.client.tab_close(worker["tab_id"])
+            try:
+                self.client.tab_close(worker["tab_id"])
+            except HerdrNotFound:
+                # A tab Herdr no longer has is a tab that needs no closing, and
+                # the record of it is the only thing left to clean. Raising here
+                # left that record behind forever: the next cleanup found the
+                # same absent tab, raised again, and the orphan outlived every
+                # attempt to remove it. `stop_worker` already treats this as
+                # closed; cleanup must agree, or the two disagree about the same
+                # fact.
+                pass
             with self.coordinator.store.locked() as current:
                 self._herdr_state(current)["workers"].pop(worker["worker_id"], None)
             cleaned = True

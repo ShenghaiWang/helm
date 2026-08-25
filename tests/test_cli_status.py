@@ -1122,3 +1122,49 @@ class ASupersededForemanBlockerLeavesTheAttentionListTests(HelmTestCase):
             self._open("needs a decision epsilon"),
             "supersession must not cross a project boundary",
         )
+
+
+class BusyIsNotAnAttentionItemTests(HelmTestCase):
+    """A worker whose log is moving is not something a human can act on.
+
+    `working`, `driving` and `quiet` all mean the same underlying fact: the
+    worker's own log IS moving, so it is demonstrably alive and busy, and the
+    only thing absent is a protocol push. In one session those verdicts fired
+    eight times against workers that were mid-compile or writing to disk that
+    very second, and each one cost a verification round to dismiss. A signal
+    that is usually wrong teaches the reader to skim it the one time it is
+    right, which is the same failure as an attention list full of healthy
+    workers. `stalled` -- gone dark, no output at all -- is the verdict that
+    means something, and it must survive this filter.
+    """
+
+    def _status_with_verdict(self, name: str, verdict: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        entry = {
+            "worker_id": "w-fake",
+            "project_id": project["id"],
+            "verdict": verdict,
+            "detail": "constructed for this test",
+        }
+        with mock.patch.object(self.coordinator, "worker_health", return_value=[entry]):
+            status = self.coordinator.project_status(project["id"])
+        return [h["verdict"] for h in status["needs_attention"]]
+
+    def test_a_busy_worker_never_reaches_the_attention_list(self) -> None:
+        for verdict in ("working", "driving", "quiet"):
+            with self.subTest(verdict=verdict):
+                self.assertEqual(
+                    self._status_with_verdict(f"busy-{verdict}", verdict),
+                    [],
+                    f"{verdict!r} means the log is moving; a human cannot act on it",
+                )
+
+    def test_a_worker_that_has_gone_dark_still_reaches_it(self) -> None:
+        # The other half, and the one that matters: quieting the benign
+        # verdicts must not quiet the verdict that means a worker may be gone.
+        self.assertEqual(
+            self._status_with_verdict("dark", "stalled"),
+            ["stalled"],
+            "stalled means no output at all and must survive the filter",
+        )

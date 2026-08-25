@@ -415,6 +415,17 @@ reason a dead reviewer or a waiting gate goes unmentioned; they cannot ask about
 something they have not been told exists. `helm pending` is the whole list and
 is silent when nothing needs a human, so this costs nothing on a quiet root.
 
+**A decision the commander must make is asked, not listed.** Relaying it into a
+status report and then waiting is not asking — it leaves the work stalled until
+they happen to read closely enough to notice, and it quietly makes them
+responsible for polling. So when something is blocked on their word, put the
+question to them directly, in its own reply, with the recommendation and what
+happens either way; use the harness's own asking facility where there is one.
+Repeating the item in the next report is not a second ask, it is the same
+unanswered one aging in place, and three of those in one list teaches the reader
+to skim all three. The test is simple: if a branch, a gate or a merge has not
+moved because nobody answered, the fault is that nobody was asked.
+
 **Arm the attention watch at session start, with whatever your harness has.**
 The check-at-turn-start above is the floor every runtime can meet: run
 `python3 -m helm pending` when a turn begins and lead with what it prints.

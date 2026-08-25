@@ -5980,6 +5980,19 @@ class Coordinator:
         if kind == "blocker":
             task["status"] = "blocked"
             return
+        if kind == self.ANSWER_MESSAGE_KIND:
+            # An answered blocker is not a blocked task. Without this the flag
+            # was sticky: a foreman escalated, the coordinator answered, the
+            # foreman carried on and ran four more rounds, and its task still
+            # read "blocked" hours later. `helm pending` already stops showing
+            # an answered blocker, so the two disagreed -- and the task record
+            # is what a fresh coordinator reads to take the project over.
+            # Only a blocked task moves. An approval-needed pause is released
+            # by its own authorization, never by an answer, and a terminal
+            # state is not reopened by talking to a session that has ended.
+            if task["status"] == "blocked":
+                task["status"] = "running"
+            return
         if kind == "failure":
             task["status"] = "failed"
             return
@@ -9526,8 +9539,19 @@ class Coordinator:
                 state: sum(1 for t in tasks if t.get("status") == state)
                 for state in sorted({t.get("status", "?") for t in tasks})
             },
+            # `working`, `driving` and `quiet` all mean the worker's own log is
+            # MOVING -- it is demonstrably alive and busy, it simply has not
+            # pushed a protocol message lately. That is health information, not
+            # something a human can act on, and putting it in an attention list
+            # is how the list stops being read: in one session these fired eight
+            # times against workers that were mid-compile or writing to disk that
+            # very second, and every one cost a verification round to dismiss. A
+            # signal that is usually wrong teaches the reader to skim the one
+            # time it is right. `stalled` is the verdict that means gone dark and
+            # it stays, as do every genuine fault and every ask.
             "needs_attention": [h for h in health if h["verdict"] not in
-                                {"healthy", "settled", "reported", "starting"}],
+                                {"healthy", "settled", "reported", "starting",
+                                 "working", "driving", "quiet"}],
             "unmerged": [
                 {"task_id": t["id"], "status": t["status"], "branch": t.get("branch"),
                  "brief": _safe_text(t.get("brief", "")).strip().splitlines()[0][:120]}
