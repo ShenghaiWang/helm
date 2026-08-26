@@ -25,6 +25,7 @@ from .core import (
     WORKTREELESS_ROLES,
     _git,
     _safe_text,
+    base_after_merges,
     canonical,
     new_id,
     now,
@@ -2262,6 +2263,10 @@ class HerdrAdapter:
             # resolve yields nothing, which is not equal to `pinned` either.
             if _git(root, "merge-base", pinned, task["branch"], check=False).strip() == pinned:
                 base = pinned
+                # ...unless the branch merged its base branch back in, which
+                # put 514 files in front of a reviewer judging 25. See
+                # `base_after_merges` for why it only ever moves forward.
+                base = base_after_merges(root, task, pinned) or base
         if not base:
             # Prefer the remote-tracking ref over the local branch of the same
             # name. A local `main` is only as fresh as the last fetch, and a

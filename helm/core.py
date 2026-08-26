@@ -663,6 +663,39 @@ def _git(cwd: Path, *args: str, check: bool = True) -> str:
     return proc.stdout.strip()
 
 
+def base_after_merges(cwd: Path, task: dict[str, Any], pinned: str) -> str:
+    """The merge-base with the upstream base branch, when it is ahead of `pinned`.
+
+    A branch that merges its base branch back in carries everything that merge
+    brought with it, and all of it sits between the cut point and the tip -- so
+    diffing from the cut point hands a reader the base branch's work as this
+    branch's. Measured on one review: 514 files shown for a 25-file change, and
+    the same two files from main returned as findings three rounds running.
+
+    Empty when the merge-base is not ahead, and that restraint is the point.
+    Helm cuts a task branch from the project's HEAD, which can already carry
+    work nobody merged; there the merge-base sits BEHIND the cut point, and
+    moving back to it would drag a stranger's commit into the diff -- the defect
+    pinning a revision exists to prevent. Only a strict descendant is better.
+    """
+    branch = str(task.get("branch") or "").strip()
+    if not branch or not pinned:
+        return ""
+    candidates = (
+        str(task.get("base_upstream") or "").strip(),
+        str(task.get("base_branch") or "").strip(),
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        found = _git(cwd, "merge-base", candidate, branch, check=False).strip()
+        if not found or found == pinned:
+            continue
+        if _git(cwd, "merge-base", pinned, found, check=False).strip() == pinned:
+            return found
+    return ""
+
+
 def _git_root(path: Path) -> Path | None:
     result = _git(path, "rev-parse", "--show-toplevel", check=False)
     if not result:
@@ -11387,6 +11420,11 @@ class Coordinator:
             # reviewed diff. Fall back to the branch name only for a record
             # old enough to predate `base_revision`.
             base = task.get("base_revision") or task["base_branch"]
+            # ...unless the branch merged its base branch back in, which puts
+            # that branch's whole history between the pin and the tip. See
+            # `base_after_merges`, which moves forward only when it is safe.
+            with contextlib.suppress(HelmError, OSError, subprocess.SubprocessError):
+                base = base_after_merges(workspace, task, base) or base
             with contextlib.suppress(HelmError, OSError, subprocess.SubprocessError):
                 outcome["commits"] = [
                     line

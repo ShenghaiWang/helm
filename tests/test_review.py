@@ -16,6 +16,7 @@ from unittest import mock
 
 from helm.core import (
     HelmError,
+    base_after_merges,
     inside,
 )
 from helm import runtimes
@@ -1695,3 +1696,81 @@ class ExplicitReviewerSurvivesTheRetryTests(ReviewTests):
         # And it must not situationally exclude that same runtime, or the
         # named reviewer would be ruled out of its own retry.
         self.assertIsNone(retry.get("exclude"))
+
+
+class MergedBaseBranchStaysOutOfTheDiffTests(HelmTestCase):
+    """A branch that merges its base branch back in must not be reviewed for it.
+
+    Measured on a real review before this was fixed: 514 files put in front of a
+    reviewer judging a 25-file change, because two merges of `main` sat between
+    the cut point and the tip. The same two files from `main` came back as
+    findings three rounds running, and each round was spent disproving them.
+    """
+
+    def _run(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
+        ).stdout.strip()
+
+    def _repo(self) -> Path:
+        root = Path(self.temp.name) / f"repo-{self.id().rsplit('.', 1)[-1]}"
+        root.mkdir(parents=True)
+        self._run(root, "init", "-q", "-b", "main")
+        self._run(root, "config", "user.email", "t@example.invalid")
+        self._run(root, "config", "user.name", "T")
+        return root
+
+    def _commit(self, root: Path, name: str, text: str) -> str:
+        (root / name).write_text(text, encoding="utf-8")
+        self._run(root, "add", name)
+        self._run(root, "commit", "-q", "-m", f"add {name}")
+        return self._run(root, "rev-parse", "HEAD")
+
+    def test_the_base_moves_past_a_merged_in_base_branch(self):
+        root = self._repo()
+        cut = self._commit(root, "shared.txt", "one")
+
+        self._run(root, "checkout", "-q", "-b", "task")
+        self._commit(root, "ours.txt", "our work")
+
+        # main moves on independently, then the branch merges it in.
+        self._run(root, "checkout", "-q", "main")
+        self._commit(root, "theirs.txt", "somebody else's work")
+        self._run(root, "checkout", "-q", "task")
+        self._run(root, "merge", "-q", "--no-ff", "-m", "merge main", "main")
+
+        task = {"branch": "task", "base_branch": "main", "base_upstream": ""}
+        moved = base_after_merges(root, task, cut)
+
+        self.assertTrue(moved, "the merge-base is ahead of the cut point; it must move")
+        self.assertNotEqual(moved, cut)
+
+        changed = self._run(root, "diff", "--name-only", f"{moved}...task").split()
+        self.assertIn("ours.txt", changed)
+        self.assertNotIn(
+            "theirs.txt", changed,
+            "main's own file reached the review diff -- the whole defect",
+        )
+
+        # What the unfixed code did, kept here so the test states the contrast.
+        from_cut = self._run(root, "diff", "--name-only", f"{cut}...task").split()
+        self.assertIn("theirs.txt", from_cut)
+
+    def test_it_refuses_to_move_backwards_past_unmerged_project_work(self):
+        """The defect pinning a revision exists to prevent, still prevented."""
+        root = self._repo()
+        self._commit(root, "shared.txt", "one")
+
+        # A project HEAD carrying work nobody merged, and the task cut from it.
+        stranger = self._commit(root, "stranger.txt", "unmerged work")
+        self._run(root, "checkout", "-q", "-b", "task")
+        self._commit(root, "ours.txt", "our work")
+
+        task = {"branch": "task", "base_branch": "main", "base_upstream": ""}
+        # merge-base(main, task) is BEHIND the cut point here, so moving to it
+        # would drag the stranger's commit into the diff.
+        self.assertEqual(base_after_merges(root, task, stranger), "")
+
+        changed = self._run(root, "diff", "--name-only", f"{stranger}...task").split()
+        self.assertEqual(changed, ["ours.txt"])
