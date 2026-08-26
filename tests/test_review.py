@@ -1774,3 +1774,50 @@ class MergedBaseBranchStaysOutOfTheDiffTests(HelmTestCase):
 
         changed = self._run(root, "diff", "--name-only", f"{stranger}...task").split()
         self.assertEqual(changed, ["ours.txt"])
+
+
+class AScrapedCommandEchoIsNotAVerdictTests(HelmTestCase):
+    """The pane shows the reporting command too, and its argument looks like prose.
+
+    A reviewer ran `helm worker result` -- no such subcommand -- and the shell
+    drew `CHANGES-REQUESTED 0ms in /path` while the failed command spun. The
+    scrape matched that line and returned everything under it: the spinner, the
+    token counter and the argparse error, recorded as the reviewer's verdict.
+    The record then held a CHANGES-REQUESTED with no findings for a review that
+    was still running.
+    """
+
+    PANE = [
+        "CHANGES-REQUESTED 0ms in /Users/t/projects/helm",
+        "    ... 8 input + 1 output lines hidden - ctrl+o to expand",
+        "helm worker: error: argument worker_command: invalid choice: 'result'",
+        " Running  236.43k tokens",
+        "  GPT-5.6 Sol 272K Extra High - 34.6%",
+    ]
+
+    def _scrape(self, lines):
+        adapter = HerdrAdapter.__new__(HerdrAdapter)
+        adapter.coordinator = mock.Mock()
+        adapter.coordinator.worker_output.return_value = lines
+        return adapter._verdict_from_output("w-x", 0, brief="")
+
+    def test_a_command_echo_is_not_read_as_a_verdict(self):
+        self.assertIsNone(
+            self._scrape(self.PANE),
+            "the shell echoing the reporting command was scraped as the review",
+        )
+
+    def test_a_real_verdict_on_the_same_pane_still_recovers(self):
+        """The guard must not cost us the recovery it sits inside."""
+        lines = [
+            "CHANGES-REQUESTED",
+            "[P1] src/a.rs:12 -- the thing is wrong and here is why it matters.",
+        ] + self.PANE
+        found = self._scrape(lines)
+        self.assertIsNotNone(found, "a genuine verdict above the echo was lost")
+        self.assertIn("[P1] src/a.rs:12", found["text"])
+
+    def test_an_ordinary_verdict_line_is_untouched(self):
+        found = self._scrape(["APPROVED", "no actionable findings."])
+        self.assertIsNotNone(found)
+        self.assertTrue(found["text"].startswith("APPROVED"))

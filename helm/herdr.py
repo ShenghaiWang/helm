@@ -796,6 +796,16 @@ class HerdrAdapter:
     # the second with a comma, so neither shape can be mistaken for an answer
     # to it.
     _VERDICT_LINE = re.compile(r"^[\s>*#\-•]*(APPROVED|CHANGES-REQUESTED)(?=\s|$)")
+    #: A shell echoing the reporting command back, with the `--text` argument's
+    #: first word exactly where prose would be: `CHANGES-REQUESTED 0ms in /path`.
+    #: One of these was scraped as a verdict, dragging the spinner, the token
+    #: counter and the argparse error of the failed command in behind it -- so
+    #: the record held a CHANGES-REQUESTED with no findings while the reviewer
+    #: was still working. A verdict nobody wrote is the one thing this loop
+    #: exists to prevent.
+    _COMMAND_ECHO = re.compile(
+        r"^(?:APPROVED|CHANGES-REQUESTED)\s+\d+(?:\.\d+)?\s*m?s\s+in\s+\S"
+    )
 
     @staticmethod
     def _verdict_for_outcome(outcome: dict[str, Any]) -> str:
@@ -863,6 +873,8 @@ class HerdrAdapter:
                 continue
             candidate = " ".join(line.split())
             if instruction and candidate and candidate in instruction:
+                continue
+            if self._COMMAND_ECHO.match(candidate):
                 continue
             return {"text": "\n".join(lines[index:]).strip()}
         return None
