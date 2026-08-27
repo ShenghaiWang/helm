@@ -2549,9 +2549,16 @@ class HerdrAdapter:
                 note = inbox / f"{new_id('m')}.md"
                 note.write_text(text + "\n", encoding="utf-8")
                 os.chmod(note, 0o600)
-                # No gist for a busy agent: any text interleaves with a live
-                # redraw, and a subject line is still text.
-                gist = self._message_gist(text) if quiet else ""
+                # The gist goes through whether or not the agent is busy. It
+                # was withheld from a busy one on the grounds that a subject
+                # line is still text -- but the fallback pointer is ~180
+                # characters into that same pane, so the choice was never
+                # between text and silence, only between a line that says what
+                # arrived and one that does not. A foreman is almost never
+                # quiet, so the guard removed the feature exactly where it was
+                # wanted: the commander watching a live pane saw "Helm has a
+                # message for you" and had to open a file to learn what about.
+                gist = self._message_gist(text)
                 headline = f"Helm: {gist}\n" if gist else "Helm has a message for you. "
                 delivered_text = (
                     f"{headline}Full message written to {note} because pasting "

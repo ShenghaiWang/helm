@@ -1061,11 +1061,24 @@ class BusyAgentGetsAPointerNotAPasteTests(HelmTestCase):
                 )()
             return result
 
+        # A title line AND a body, so "pointer instead of paste" stays
+        # meaningfully testable. The old message was "carry on" -- eight
+        # characters, where the body IS the first line, so once a busy agent
+        # started getting a one-line gist the assertion tripped on a degenerate
+        # case rather than on the behaviour it guards.
+        brief = "RESUME THE ROUND.\n\nEvery detail that belongs in the file and not the pane."
         with mock.patch.object(Path, "stat", never_still):
-            adapter.answer_worker(worker["id"], "carry on")
+            adapter.answer_worker(worker["id"], brief)
         sent = self._sent_text(herdr)
-        self.assertNotIn("carry on", sent, "a busy agent must not be pasted into")
-        self.assertIn("Helm has a message for you", sent)
+        self.assertNotIn(
+            "Every detail that belongs in the file",
+            sent,
+            "a busy agent must not have the message BODY pasted into it",
+        )
+        self.assertIn("Read that file now", sent)
+        # The subject line is the one thing that does go through, so a commander
+        # watching the pane can see what arrived without opening the file.
+        self.assertIn("RESUME THE ROUND.", sent)
 
     def test_the_quiet_wait_says_whether_it_actually_found_a_gap(self) -> None:
         adapter, _herdr, worker = self._worker_in_a_pane("gap")
@@ -1108,6 +1121,28 @@ class HandedOverMessageSaysWhatItIsAboutTests(HelmTestCase):
         self.assertIn("STOP THE REVIEW LOOP: no round ten.", sent)
         # Still a handover, not a paste: the body does not go through the pane.
         self.assertNotIn("Detail that nobody needs in the pane. Detail", sent)
+        self.assertIn("Read that file now", sent)
+
+    def test_a_busy_agent_still_gets_the_gist(self) -> None:
+        """The case the guard removed, and the only one that happens in practice.
+
+        A handover fires when the message is long OR when the agent never went
+        quiet. The gist was computed only for a quiet one, on the grounds that a
+        subject line is still text -- but the fallback pointer is ~180 characters
+        into that same pane, so nothing was being kept out of it. A foreman is
+        almost never quiet, so the commander watching a live pane always saw
+        "Helm has a message for you" and had to open a file to learn what about.
+        """
+        adapter, herdr, worker = self._worker("gist-busy")
+        # Short enough to paste inline; the handover is triggered by the agent
+        # never falling quiet, which is what makes this the busy path.
+        brief = "STAGE 1 IS READ-ONLY: start it now.\n\nDetail nobody needs in the pane."
+        self.assertLess(len(brief), HerdrAdapter.INLINE_MESSAGE_LIMIT)
+        with mock.patch.object(HerdrAdapter, "_wait_for_quiet", return_value=False):
+            self.assertTrue(adapter.answer_worker(worker["id"], brief))
+        sent = " ".join(text for _pane, text in herdr.sent_text)
+        self.assertIn("STAGE 1 IS READ-ONLY: start it now.", sent)
+        self.assertNotIn("Helm has a message for you.", sent)
         self.assertIn("Read that file now", sent)
 
     def test_a_message_with_no_title_line_claims_no_gist(self) -> None:
