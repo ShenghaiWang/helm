@@ -1821,3 +1821,57 @@ class AScrapedCommandEchoIsNotAVerdictTests(HelmTestCase):
         found = self._scrape(["APPROVED", "no actionable findings."])
         self.assertIsNotNone(found)
         self.assertTrue(found["text"].startswith("APPROVED"))
+
+
+class AProjectThatDeclinedReviewRefusesTheReviewerTaskTests(HelmTestCase):
+    """`"review": false` is a boundary, not a sentence a foreman weighs.
+
+    The ruling used to live only in prose -- a knowledge line saying which
+    rounds deserved review -- and the last unnecessary reviewer was launched
+    by a foreman correctly weighing a line that had gone stale. A setting the
+    creation path enforces cannot go stale in someone's reading of it.
+    """
+
+    def _project(self, project_id: str, settings: dict | None = None):
+        import json as _json
+        root = self.repo(project_id)
+        if settings is not None:
+            helm_dir = root / ".helm"
+            helm_dir.mkdir(exist_ok=True)
+            (helm_dir / "project.json").write_text(
+                _json.dumps(settings), encoding="utf-8"
+            )
+        return self.coordinator.register_project(
+            project_id.title(), str(root), project_id=project_id
+        )
+
+    def test_a_reviewer_task_is_refused_and_names_the_way_out(self) -> None:
+        project = self._project("noreview", {"review": False})
+        task = self.coordinator.create_task(project["id"], "the work")
+        with self.assertRaisesRegex(HelmError, r"declined independent review"):
+            self.coordinator.create_task(
+                project["id"], "review it",
+                no_domain=True, role="reviewer", reviews=task["id"],
+            )
+
+    def test_worker_and_foreman_tasks_are_untouched_by_the_setting(self) -> None:
+        project = self._project("noreviewwork", {"review": False})
+        task = self.coordinator.create_task(project["id"], "the work")
+        self.assertEqual(task["status"], "created")
+        foreman = self.coordinator.create_task(
+            project["id"], "drive it", no_domain=True, role="foreman",
+        )
+        self.assertEqual(foreman["role"], "foreman")
+
+    def test_the_default_still_reviews(self) -> None:
+        project = self._project("reviewsbydefault", None)
+        task = self.coordinator.create_task(project["id"], "the work")
+        review = self.coordinator.create_task(
+            project["id"], "review it",
+            no_domain=True, role="reviewer", reviews=task["id"],
+        )
+        self.assertEqual(review["role"], "reviewer")
+
+    def test_a_non_boolean_setting_is_refused_at_discovery(self) -> None:
+        with self.assertRaisesRegex(HelmError, r"review must be true or false"):
+            self._project("badreview", {"review": "never"})

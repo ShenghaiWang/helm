@@ -2505,6 +2505,20 @@ class Coordinator:
             if not isinstance(wants, bool):
                 raise HelmError(f"project settings foreman must be true or false: {settings_file}")
             result["foreman"] = wants
+        # Review is the same shape, and exists for the same reason a prose
+        # line in knowledge.md is not enough: guidance is weighed, a setting
+        # is enforced. A commander who has ruled that a project's rounds run
+        # without independent review records it here once, and Helm refuses
+        # the reviewer task -- instead of every future foreman having to
+        # weigh a sentence against its own brief and sometimes launching a
+        # reviewer the commander already declined. Like foreman, it says
+        # only whether this project wants the loop, never what any agent may
+        # do -- authority stays Helm's.
+        if "review" in settings:
+            wants = settings["review"]
+            if not isinstance(wants, bool):
+                raise HelmError(f"project settings review must be true or false: {settings_file}")
+            result["review"] = wants
         # A project may name its own base branch explicitly rather than
         # leaving Helm to infer one from the checkout. This is the only
         # branch name accepted from project data without also verifying it
@@ -2605,6 +2619,8 @@ class Coordinator:
                         record["model"] = settings["model"]
                     if "foreman" in settings:
                         record["foreman"] = settings["foreman"]
+                    if "review" in settings:
+                        record["review"] = settings["review"]
                     # Only an explicit setting updates a recorded base branch.
                     # An already-registered project keeps whatever base it
                     # was registered with even if the checkout later switches
@@ -3298,6 +3314,21 @@ class Coordinator:
                 # is not gated behind its own confirmation.
                 if role == "worker" and not read_only and self.caller_role() == "foreman":
                     self._require_gates_confirmed(data, project_id)
+                # A project that has declined review declines it for every
+                # caller. This sits in creation, not in the review command,
+                # because a reviewer task is a reviewer task whichever door
+                # it came through -- and because the last unnecessary
+                # reviewer was launched by a foreman correctly weighing a
+                # prose line that had gone stale. Policy a commander has
+                # ruled on is recorded as a setting and enforced here, so it
+                # cannot be re-litigated by anything downstream.
+                if role == "reviewer" and not self._project_wants_review(project):
+                    raise HelmError(
+                        f"project {project_id} has declined independent review"
+                        ' ("review": false in its .helm/project.json).'
+                        " Merge on the worker's own evidence, or lift the"
+                        " setting if the commander wants this reviewed."
+                    )
                 selected_domain, domain_reason = self.resolve_domain(
                     project, brief, explicit=domain, no_domain=no_domain
                 )
@@ -9896,6 +9927,24 @@ class Coordinator:
             return True
         with contextlib.suppress(HelmError, SafetyError, OSError):
             return bool(self._discovery_settings(root).get("foreman", True))
+        return True
+
+    @staticmethod
+    def _project_wants_review(project: dict[str, Any]) -> bool:
+        """Whether this project runs the independent-review loop. Default: yes.
+
+        The record is preferred, then the project's own file, then the
+        default -- the same freshness order as the foreman flag. Static and
+        fed the already-loaded project so the reviewer-task refusal can run
+        under the state lock without loading the store twice.
+        """
+        if isinstance(project.get("review"), bool):
+            return project["review"]
+        root = canonical(project["root"])
+        if not (root / ".helm" / "project.json").exists():
+            return True
+        with contextlib.suppress(HelmError, SafetyError, OSError):
+            return bool(Coordinator._discovery_settings(root).get("review", True))
         return True
 
     def foreman_for(self, project_id: str) -> dict[str, Any] | None:
