@@ -152,3 +152,31 @@ as the final delivery state.
 **Pushing belongs to whoever holds the authorization**, which may not be the
 agent that wrote the fix. When it is not, the fix is committed to the branch and
 handed over for pushing, rather than attempted and reported as delivered.
+
+## Someone else may have already shipped it
+
+A task can sit blocked for weeks on work that landed without it. The ticket is
+worked by a human, or by a second attempt on a different branch, and the
+original task never hears about it — its blocker still names the obstacle it
+met, which reads like the work is outstanding when it is finished and merged.
+
+**So ask the remote before believing the blocker.** `gh pr list --search
+"<TICKET>" --state all` and a check for the change's own marker on the base
+branch — a file it adds, a symbol it introduces — answer in seconds whether the
+work exists upstream. Do that before reviving a task, re-briefing a worker, or
+reporting the item as still needing someone. A blocker message describes the
+moment it was written, not the state of the world now.
+
+**When the remote says it shipped, clear the local residue without asking.**
+A branch, a worktree and a task row whose change is already on the base branch
+hold nothing; deleting them loses nothing, and carrying them makes an attention
+list longer without making it truer. Review the merged PR on its merits if it
+has not been reviewed, and clean up the local setup as ordinary tidying. This is
+not the destructive-action gate: that gate exists for deleting *work*, and there
+is no work here to delete.
+
+**The check is what makes it safe, and it is not optional.** A branch carrying
+860 lines across thirteen files looks identical whether it is a duplicate of a
+merged PR or the only copy of unlanded work. Only the remote distinguishes them.
+Confirm the change is on the base branch, then delete; never infer it from the
+diff's size, the task's age, or how finished the commit message sounds.
