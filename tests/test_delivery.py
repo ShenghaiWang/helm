@@ -1545,3 +1545,63 @@ class ADirtyParentRepoDoesNotMakeAWorkspaceDirtyTests(HelmTestCase):
         _root, workspace = self._dirty_repo_with_a_bare_subdir()
         (workspace / "left-behind.txt").write_text("z", encoding="utf-8")
         self.assertFalse(self.coordinator._workspace_clean(workspace))
+
+
+class HelmsOwnOutputDoesNotBlockCleanupTests(HelmTestCase):
+    """The read-only lane writes its deliverable into `.helm-out/`.
+
+    That directory is Helm's, not the worker's, and the clean check could not
+    tell the difference: four finished tasks were held open by exactly one
+    untracked file under it. No operator action cleared them either, because
+    deleting the file by hand is the one move that discards the report.
+    """
+
+    def _repo_with(self, *relative_paths):
+        import subprocess
+        root = Path(self.temp.name) / "worktree"
+        root.mkdir(parents=True)
+        def g(*a):
+            subprocess.run(["git", "-C", str(root), *a], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "t@example.invalid")
+        g("config", "user.name", "T")
+        (root / "tracked.txt").write_text("x", encoding="utf-8")
+        g("add", "tracked.txt")
+        g("commit", "-q", "-m", "seed")
+        for rel in relative_paths:
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("y", encoding="utf-8")
+        return root
+
+    def test_an_untracked_report_under_helm_out_is_clean(self) -> None:
+        workspace = self._repo_with(".helm-out/layer-2-design.md")
+        self.assertTrue(
+            self.coordinator._workspace_clean(workspace),
+            "Helm's own output directory blocked cleanup of a finished task",
+        )
+
+    def test_a_whole_tree_of_helm_output_is_still_clean(self) -> None:
+        workspace = self._repo_with(
+            ".helm-out/findings.md", ".helm-out/nested/contact-sheet.txt",
+        )
+        self.assertTrue(self.coordinator._workspace_clean(workspace))
+
+    def test_real_work_beside_helm_output_is_still_dirty(self) -> None:
+        """Fail-closed: the exemption is one directory, not a general amnesty."""
+        workspace = self._repo_with(".helm-out/findings.md", "src/feature.py")
+        self.assertFalse(
+            self.coordinator._workspace_clean(workspace),
+            "uncommitted work was excused because .helm-out sat beside it",
+        )
+
+    def test_a_modified_tracked_file_is_still_dirty(self) -> None:
+        workspace = self._repo_with(".helm-out/findings.md")
+        (workspace / "tracked.txt").write_text("changed", encoding="utf-8")
+        self.assertFalse(self.coordinator._workspace_clean(workspace))
+
+    def test_a_path_merely_starting_with_the_name_is_still_dirty(self) -> None:
+        """`.helm-output/` is not `.helm-out/`, and prefix matching would take it."""
+        workspace = self._repo_with(".helm-outside/notes.md")
+        self.assertFalse(self.coordinator._workspace_clean(workspace))

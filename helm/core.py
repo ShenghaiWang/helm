@@ -11493,7 +11493,32 @@ class Coordinator:
             return True
         status = _git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
         unresolved = _git(workspace, "diff", "--name-only", "--diff-filter=U")
-        return not status and not unresolved
+        return not self._dirt_worth_keeping(status) and not unresolved
+
+    #: Helm's own output directory is not the worker's uncommitted work, and a
+    #: guard that cannot tell them apart blocks cleanup on the evidence Helm
+    #: put there itself. Four tasks were held open by exactly one untracked
+    #: file under `.helm-out/`, written by the read-only lane that has nowhere
+    #: else to put a deliverable. The task was finished, the checkout carried
+    #: nothing of the worker's, and no operator action could clear it: deleting
+    #: the file by hand is the one move that discards the report.
+    #:
+    #: Only this directory is disregarded, and only as a porcelain path. Build
+    #: output, editor state and a genuinely modified tracked file all still
+    #: count, because those are the cases the guard exists for.
+    def _dirt_worth_keeping(self, status: str) -> str:
+        kept = []
+        for line in status.splitlines():
+            path = line[3:].strip() if len(line) > 3 else ""
+            if path.startswith('"') and path.endswith('"'):
+                path = path[1:-1]
+            path = path.split(" -> ")[-1]
+            if path == self.READ_ONLY_OUTPUT_DIR or path.startswith(
+                self.READ_ONLY_OUTPUT_DIR + "/"
+            ):
+                continue
+            kept.append(line)
+        return "\n".join(kept)
 
     def merge_task(self, task_id: str) -> dict[str, Any]:
         self.authority("merging a task branch")
