@@ -11469,6 +11469,28 @@ class Coordinator:
         return outcome
 
     def _workspace_clean(self, workspace: Path) -> bool:
+        """Whether THIS workspace is clean -- never whether some other repo is.
+
+        `git status` run in a directory that is not a repository silently
+        ascends to the nearest enclosing one. A worktreeless role's directory
+        lives under the Helm state tree and has no boundary of its own, so the
+        question "is this workspace dirty" was being answered by the HELM
+        REPOSITORY: an empty reviewer directory read as dirty because Helm's own
+        checkout had an untracked file, and cleanup refused. A reviewer reported
+        the same ascent from the other side, seeing Helm's commits when it asked
+        for the project's.
+
+        Answering from the wrong repository is the fault, not the direction of
+        the answer -- the same read would have called a directory CLEAN because
+        the parent happened to be. So the toplevel is resolved first, and git is
+        trusted only when it is describing this directory. Otherwise the honest
+        measure of a plain directory is whether it holds anything.
+        """
+        toplevel = _git(workspace, "rev-parse", "--show-toplevel", check=False).strip()
+        if not toplevel or canonical(toplevel) != canonical(workspace):
+            with contextlib.suppress(OSError):
+                return not any(workspace.iterdir())
+            return True
         status = _git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
         unresolved = _git(workspace, "diff", "--name-only", "--diff-filter=U")
         return not status and not unresolved
@@ -12068,7 +12090,11 @@ task["status"] not in {"completed", "failed", "merged", "pr-merged"}
                     self.refresh_finalization_decisions(project["id"], data=data)
                 return task
             workspace = self._verify_workspace_record(data, project, task)
-            if task.get("role") != "foreman" and not self._workspace_clean(workspace):
+            # WORKTREELESS_ROLES own a directory, not a checkout, so neither has
+            # git state to be dirty. The exemption named only `foreman`, which
+            # left every reviewer cleanup running a git check against a
+            # directory that is not a repository -- see `_workspace_clean`.
+            if task.get("role") not in WORKTREELESS_ROLES and not self._workspace_clean(workspace):
                 raise SafetyError("refusing cleanup: workspace is dirty or has unresolved changes")
             # The clean check above is a snapshot; a session still alive in
             # this directory can write to it a moment later, and the removal

@@ -1496,3 +1496,52 @@ class ReplacedForemanTabIsReleasedTests(HelmTestCase):
         self._stopped_foreman(adapter, project)
         self.assertEqual(adapter.release_finished_tabs(), [])
         self.assertEqual(herdr.closed_tabs, [])
+
+
+class ADirtyParentRepoDoesNotMakeAWorkspaceDirtyTests(HelmTestCase):
+    """`git status` ascends when its directory is not a repository.
+
+    A worktreeless role's directory lives under the Helm state tree and has no
+    boundary of its own, so "is this workspace dirty" was answered by the HELM
+    repository. An empty reviewer directory read as dirty because Helm's own
+    checkout had one untracked file, and cleanup refused for three days.
+
+    The direction of the wrong answer is incidental: the same read would have
+    called a directory CLEAN because the parent happened to be.
+    """
+
+    def _dirty_repo_with_a_bare_subdir(self):
+        import subprocess
+        root = Path(self.temp.name) / "parent-repo"
+        (root / "state" / "reviewers" / "t-x").mkdir(parents=True)
+        def g(*a):
+            subprocess.run(["git", "-C", str(root), *a], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "t@example.invalid")
+        g("config", "user.name", "T")
+        (root / "tracked.txt").write_text("x", encoding="utf-8")
+        g("add", "tracked.txt")
+        g("commit", "-q", "-m", "seed")
+        # The parent is now dirty, exactly as the Helm root was with uv.lock.
+        (root / "untracked.txt").write_text("y", encoding="utf-8")
+        return root, root / "state" / "reviewers" / "t-x"
+
+    def test_an_empty_directory_under_a_dirty_repo_is_clean(self) -> None:
+        root, workspace = self._dirty_repo_with_a_bare_subdir()
+        # Sanity: git really does ascend from there to the dirty parent.
+        import subprocess
+        top = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True).stdout.strip()
+        self.assertEqual(Path(top).resolve(), root.resolve(),
+                         "precondition: git must ascend, or this test proves nothing")
+        self.assertTrue(
+            self.coordinator._workspace_clean(workspace),
+            "an empty directory was called dirty because its PARENT repo was",
+        )
+
+    def test_a_directory_holding_files_is_still_not_clean(self) -> None:
+        """Fail-closed: the fix must not turn every non-repo path into 'clean'."""
+        _root, workspace = self._dirty_repo_with_a_bare_subdir()
+        (workspace / "left-behind.txt").write_text("z", encoding="utf-8")
+        self.assertFalse(self.coordinator._workspace_clean(workspace))
