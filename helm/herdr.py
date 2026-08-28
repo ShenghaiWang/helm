@@ -2569,10 +2569,12 @@ class HerdrAdapter:
                 # wanted: the commander watching a live pane saw "Helm has a
                 # message for you" and had to open a file to learn what about.
                 gist = self._message_gist(text)
-                headline = f"Helm: {gist}\n" if gist else "Helm has a message for you. "
+                headline = (
+                    f"Helm instructs you: {gist}\n" if gist
+                    else "Helm has an instruction for you. "
+                )
                 delivered_text = (
-                    f"{headline}Full message written to {note} because pasting "
-                    "it whole would garble this pane. Read that file now and act "
+                    f"{headline}Full message in {note} — read it now and act "
                     "on it as if it had been typed here."
                 )
         send_text(pane, delivered_text)
