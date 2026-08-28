@@ -2481,16 +2481,26 @@ class HerdrAdapter:
 
     @classmethod
     def _message_gist(cls, text: str) -> str:
-        """The first line of a message, when that line is short enough to be a
-        title. Empty otherwise: a long first line is prose, and truncating it
-        would put body text through the pane -- the thing the handover exists
-        to stop.
+        """The first line of a message, cut to title length when it runs long.
+
+        This used to return EMPTY for a long first line, reasoning that
+        truncating prose would put body text through the pane. But most
+        coordinator messages open with a long sentence, so the guard removed
+        the title from almost every handover -- the commander watched "Helm
+        has a message for you" with no clue what about, which is the exact
+        complaint the gist was added to fix. A headline cut at a word
+        boundary garbles nothing; it is the difference between a subject
+        line and a blank one.
         """
         for line in text.splitlines():
             gist = " ".join(line.split())
             if not gist:
                 continue
-            return gist if len(gist) <= cls.MESSAGE_GIST_LIMIT else ""
+            if len(gist) <= cls.MESSAGE_GIST_LIMIT:
+                return gist
+            cut = gist[: cls.MESSAGE_GIST_LIMIT]
+            head, _, _ = cut.rpartition(" ")
+            return (head or cut).rstrip(",;:—-") + " …"
         return ""
 
     def answer_worker(self, worker_id: str, text: str) -> bool:
