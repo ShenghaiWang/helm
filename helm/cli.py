@@ -1638,6 +1638,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     pending.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "act on hard evidence of death: a running worker whose process is "
+            "provably gone is stopped so its task can move, and a dead FOREMAN "
+            "is replaced with a fresh appointment that composes its own "
+            "catch-up brief from the project record. Stalled or erroring "
+            "workers are reported, never touched -- thinking is not dying. "
+            "Built for the unattended watch, where a silent foreman death "
+            "otherwise waits on a human noticing"
+        ),
+    )
+    pending.add_argument(
         "--changes",
         action="store_true",
         help=(
@@ -2150,6 +2163,54 @@ def _start_foreman(
     else:
         worker = coordinator.launch_worker(task["id"], command, wait=False)
     return {"task": task, "worker": worker}
+
+
+def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | None:
+    """Stop a provably dead worker; replace it when it was the project's driver.
+
+    Returns the one-line report of what was done, or None when healing was not
+    possible -- in which case the caller prints the ordinary died line and a
+    human still sees it. Every action lands in the project record too, so the
+    healing is auditable after the fact, not just visible in one watch's
+    output.
+    """
+    worker_id = entry.get("worker_id")
+    project_id = entry.get("project_id")
+    if not worker_id:
+        return None
+    try:
+        data = coordinator.store.load()
+        worker = (data.get("workers") or {}).get(worker_id) or {}
+        task = (data.get("tasks") or {}).get(worker.get("task_id") or "") or {}
+        was_foreman = task.get("role") == "foreman"
+        coordinator.stop_worker(
+            worker_id,
+            reason=(
+                "healed by the attention watch: its process is provably gone "
+                "with no exit record"
+            ),
+        )
+        if not was_foreman:
+            return (
+                f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead worker "
+                f"{worker_id} stopped so its task can be reopened or retried"
+            )
+        replacement = _ensure_foreman(coordinator, project_id)
+        if replacement is None:
+            return (
+                f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead foreman "
+                f"{worker_id} stopped; project declines a foreman, so none was appointed"
+            )
+        return (
+            f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead foreman "
+            f"{worker_id} replaced by {replacement['worker']['id']}, which reads the "
+            "project record and carries on"
+        )
+    except (HelmError, SafetyError, OSError) as exc:
+        return (
+            f"{_glyph_for(coordinator, project_id)} {project_id} heal FAILED for "
+            f"{worker_id}: {exc}"
+        )
 
 
 def _ensure_foreman(
@@ -3318,6 +3379,21 @@ def main(argv: list[str] | None = None) -> int:
             for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
                 if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
                     continue
+                # --heal acts only on the one verdict that is EVIDENCE rather
+                # than inference: the process is gone. A stalled worker may be
+                # thinking and an erroring one may recover; killing either on
+                # a heuristic is how a healthy reviewer dies. Seven silent
+                # foreman deaths in one day, each waiting on a human to
+                # notice, are why the dead ones stop waiting.
+                if getattr(args, "heal", False) and entry["verdict"] == "died":
+                    healed = _heal_dead_worker(coordinator, entry)
+                    if healed:
+                        entries.append((
+                            _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                            healed[:220],
+                            healed,
+                        ))
+                        continue
                 glyph = _glyph_for(coordinator, entry["project_id"])
                 idle = max(
                     entry.get("output_idle_seconds") or 0.0,
