@@ -326,7 +326,36 @@ class HerdrAdapter:
         label = f"{purpose} {suffix}"
         # The ticket is what a human scans the tab list for; it goes first.
         ticket = str((task or {}).get("ticket") or "").strip()
-        return f"{ticket} {label}" if ticket else label
+        if ticket:
+            return f"{ticket} {label}"
+        # No ticket -- and "coder 7ded" beside "coder 8e99" tells a human
+        # nothing about which is which. A milestone or round marker in the
+        # brief's opening words is the same kind of handle a ticket is, so
+        # use it when the brief offers one. Not a slug of the whole opening
+        # line (that was tried and read as noise): just the short marker.
+        marker = cls._brief_marker(task)
+        return f"{marker} {label}" if marker else label
+
+    #: Short work markers a brief may open with when a project has no tracker
+    #: ids -- a milestone, a numbered round, a named stage.
+    _BRIEF_MARKER = re.compile(
+        r"\b(M\d+|MILESTONE\s*\d+|ROUND\s*\d+|STAGE\s*\d+|PHASE\s*\d+)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _brief_marker(cls, task: dict[str, Any] | None) -> str:
+        """A milestone/round marker from the first line of the brief, if any.
+
+        Only the first line is read: that is where a brief states what the
+        round IS, and later text is prose that would match by accident.
+        """
+        brief = str((task or {}).get("brief") or "")
+        first_line = brief.splitlines()[0] if brief else ""
+        match = cls._BRIEF_MARKER.search(first_line[:120])
+        if match is None:
+            return ""
+        return " ".join(match.group(0).split()).upper()
 
     @staticmethod
     def _worker_purpose(task: dict[str, Any] | None) -> str:

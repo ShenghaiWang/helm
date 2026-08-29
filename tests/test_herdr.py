@@ -1160,3 +1160,37 @@ class HandedOverMessageSaysWhatItIsAboutTests(HelmTestCase):
         self.assertNotIn("PARAGRAPH. PARAGRAPH.", sent)
         self.assertIn("Helm has a message for you.", sent)
         self.assertIn("Read that file now", sent)
+
+
+class TabsNameTheWorkWhenThereIsNoTicketTests(HelmTestCase):
+    """"coder 7ded" beside "coder 8e99" identifies neither.
+
+    A ticket already goes first when a project has one. A project that
+    numbers milestones instead has the same kind of handle sitting in the
+    brief's first line, so use it rather than leaving two hashes.
+    """
+
+    def _label(self, task):
+        from helm.herdr import HerdrAdapter
+        return HerdrAdapter._worker_tab_label(task, {"id": "w-7ded1234"})
+
+    def test_a_milestone_marker_replaces_the_bare_hash(self) -> None:
+        label = self._label({"brief": "M4 · Edit + share — the correctness core"})
+        self.assertTrue(label.startswith("M4 "), label)
+
+    def test_a_round_marker_is_taken_too(self) -> None:
+        label = self._label({"brief": "M3 FIX ROUND 11. Round 10's fixes were not..."})
+        self.assertTrue(label.startswith("M3 "), label)
+
+    def test_a_ticket_still_wins(self) -> None:
+        label = self._label({"brief": "M4 something", "ticket": "DSK-46"})
+        self.assertTrue(label.startswith("DSK-46 "), label)
+
+    def test_a_brief_with_no_marker_is_unchanged(self) -> None:
+        label = self._label({"brief": "Investigate the download stall"})
+        self.assertEqual(label, "coder 7ded")
+
+    def test_prose_after_the_first_line_never_matches(self) -> None:
+        """Fail-closed: a later mention of round 3 is not this round's name."""
+        label = self._label({"brief": "Fix the auditor\nas we did in round 3"})
+        self.assertEqual(label, "coder 7ded")
