@@ -121,3 +121,22 @@ round for the cost of a glance; a suspicion confirmed is a round saved, and
 one dismissed costs a sentence in the result ("checked, not real,
 because..."). The two lists must never blur: a suspicion presented as a
 finding wastes a fix; a finding demoted to a suspicion ships a bug.
+
+## Rerun the suite yourself when it is cheap
+
+The rule "the author ran it, do not duplicate" holds when a suite is
+expensive. When it is not — under roughly a minute — the reviewer runs it
+itself at the exact reviewed tip and reports what IT saw. The duplication is
+not waste; it is the difference between "the author says green" and "I saw
+green", and it deletes an entire class of round.
+
+That class is real and it is expensive: whether the payload is fresh for
+this tip, whether the exit status was masked by a pipe, whether a red is
+baseline or introduced — every one of those questions is settled in the time
+the suite takes to run. A project whose suite costs twenty seconds spent
+several rounds adjudicating reports about it.
+
+So: check the suite's own reported duration first. Cheap, run it. Expensive,
+judge the author's evidence as before, and say which you did. A reviewer that
+ran the suite states its own numbers and exit status in the verdict; the
+author's report then corroborates rather than substitutes.
