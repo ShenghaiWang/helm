@@ -10311,6 +10311,53 @@ class Coordinator:
                 )
             return dict(worker)
 
+    def reconcile_worker(self, worker_id: str, evidence: str) -> dict[str, Any]:
+        """Set a live-but-recorded-dead worker's record back to running.
+
+        The record and the session can disagree: a liveness probe that cannot
+        see inside a pane marks the worker failed while the agent in it keeps
+        working, proposes gates, and posts blockers. Every downstream guard
+        then believes the record -- `task continue` refuses for want of a
+        live foreman, gate decisions report undeliverable, and a coordinator
+        acting on the record stops a healthy driver. One mislabelled row
+        cascaded into a day of replacements before this command existed.
+
+        Root-only, and it demands written evidence of life -- a message the
+        worker posted after the row said failed, a pid, a pane -- because the
+        opposite mistake (reviving a genuinely dead worker) recreates the very
+        divergence being repaired. The evidence lands in the task's record, so
+        a reconciliation is auditable the way a stop is.
+        """
+        self.authority("reconciling a worker record to running")
+        evidence = _safe_text(evidence).strip()
+        if not evidence:
+            raise HelmError(
+                "reconcile requires --evidence: what shows this session is "
+                "alive despite the record (a message it posted after the row "
+                "said failed, a live pid, a pane)"
+            )
+        with self.store.locked() as data:
+            worker = (data.get("workers") or {}).get(worker_id)
+            if worker is None:
+                raise HelmError(f"unknown worker: {worker_id}")
+            if worker.get("status") == "running":
+                raise HelmError(f"worker {worker_id} is already recorded running")
+            task = self._task(data, worker["task_id"])
+            was_worker, was_task = worker.get("status"), task.get("status")
+            worker["status"] = "running"
+            for stale in ("exit_code", "stopped_at", "stop_reason"):
+                worker.pop(stale, None)
+            if task.get("status") in {"failed", "blocked"}:
+                task["status"] = "running"
+            project = self._project(data, task["project_id"])
+            self._message(
+                data, project, task, worker, "status",
+                f"Commander reconciled worker {worker_id} from {was_worker} to "
+                f"running (task {was_task} -> {task['status']}). Evidence: {evidence}",
+                {"reconciled_from": was_worker},
+            )
+        return {"worker": worker_id, "was": was_worker, "task": task["id"]}
+
     def stop_worker(
         self, worker_id: str, reason: str = "", *, grace: float | None = None
     ) -> dict[str, Any]:

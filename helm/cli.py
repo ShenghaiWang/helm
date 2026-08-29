@@ -1457,6 +1457,19 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--path")
     report.add_argument("--payload", help="JSON object payload")
 
+    reconcile = worker_commands.add_parser(
+        "reconcile",
+        help=(
+            "set a live-but-recorded-dead worker back to running; root-only, "
+            "requires --evidence of life"
+        ),
+    )
+    reconcile.add_argument("worker_id")
+    reconcile.add_argument(
+        "--evidence", default="",
+        help="what shows the session is alive despite the record",
+    )
+
     stop = worker_commands.add_parser(
         "stop", help="stop a running worker and settle its task as abandoned"
     )
@@ -3049,6 +3062,12 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         scope = f"task {item['task_id']}" if item.get("task_id") else "project"
                         print(f"  Commander decision pending on {scope}: {item['text']}")
+            elif args.worker_command == "reconcile":
+                result = coordinator.reconcile_worker(args.worker_id, args.evidence)
+                print(
+                    f"Reconciled {result['worker']} ({result['was']} -> running); "
+                    f"task {result['task']} follows"
+                )
             elif args.worker_command == "stop":
                 # Through the adapter, because a Herdr worker's pane is what
                 # is actually running it; core settles the record either way.
