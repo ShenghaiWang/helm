@@ -382,6 +382,14 @@ them: an item that needs the commander's own decision (an approval, a
 destructive gate), and a genuine emergency. Everything else about a
 closed-space project is answered only when asked.
 
+**One paragraph, one item.** A sentence that packs "nothing running", three
+PR numbers, a pending test and a policy note into one breath makes the
+reader unpack it themselves — which is work the report existed to save.
+Every item that waits on the commander gets its own line or bullet with its
+identifiers (ticket, PR number, link); status observations stand apart from
+asks; and nothing is comma-spliced onto an unrelated neighbour. The test:
+each paragraph or bullet should answer exactly one "what about X?".
+
 Report only what still needs attention: a running worker, an unanswered
 question, an unmerged branch, or a decision waiting on the commander —
 including the delivery decision Helm records for itself when a task's outcome
