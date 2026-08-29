@@ -171,6 +171,7 @@ class PreferenceSchemaTests(HelmTestCase):
                 "model.free",
                 "model.runtimes.<family>",
                 "review.agent",
+                "cleanup.after_merge",
                 "effort.default",
                 "effort.runtimes.<runtime>",
             },
@@ -677,3 +678,18 @@ class ReviewAgentPreferenceTests(HelmTestCase):
 
         with self.assertRaises(preferences.PreferencesError):
             preferences.apply(preferences.Preferences(), "review.agent", ["not a runtime"])
+
+
+class CleanupAfterMergeTests(PreferenceSchemaTests.__bases__[0]):
+    def test_round_trips_and_rejects_unknown_values(self) -> None:
+        path = Path(self.temp.name) / "prefs.json"
+        path.write_text('{"version": 1, "cleanup": {"after_merge": "auto"}}')
+        loaded = preferences.load(path)
+        self.assertEqual(loaded.cleanup_after_merge, "auto")
+        self.assertEqual(dict(loaded.document())["cleanup"], {"after_merge": "auto"})
+        path.write_text('{"version": 1, "cleanup": {"after_merge": "always"}}')
+        with self.assertRaisesRegex(preferences.PreferencesError, r"after_merge.*one of"):
+            preferences.load(path)
+        path.write_text('{"version": 1, "cleanup": {"pause": true}}')
+        with self.assertRaisesRegex(preferences.PreferencesError, r"unknown|not supported|pause"):
+            preferences.load(path)

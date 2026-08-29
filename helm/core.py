@@ -11718,7 +11718,18 @@ class Coordinator:
             )
             with contextlib.suppress(HelmError, OSError):
                 self.refresh_finalization_decisions(project["id"], data=data)
-            return task
+        # Auto-cleanup, behind the root's own opt-in (cleanup.after_merge =
+        # auto). The merge above was --ff-only into the base the task was cut
+        # from, so the branch is provably contained in what just landed and
+        # the residue holds nothing. This is the ONLY case the preference can
+        # reach: failed, blocked, completed-unmerged and PR-delivery work all
+        # still require the commander's word, and so does every root that
+        # never opted in. A refusal here (dirty workspace, held branch)
+        # un-merges nothing -- the manual path remains exactly as it was.
+        if self.preferences().cleanup_after_merge == "auto":
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                self.cleanup_task(task_id, delete_branch=True)
+        return task
 
     def _session_still_live(self, worker: dict[str, Any]) -> bool:
         """True when the OS session behind a settled worker is not known to be over.

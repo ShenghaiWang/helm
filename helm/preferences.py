@@ -81,11 +81,19 @@ KEY_MODEL_FREE = "model.free"
 KEY_EFFORT_DEFAULT = "effort.default"
 KEY_EFFORT_RUNTIMES = "effort.runtimes"
 KEY_REVIEW_AGENT = "review.agent"
+KEY_CLEANUP_AFTER_MERGE = "cleanup.after_merge"
 
 #: The whole vocabulary `model.free` understands. Deliberately enumerated:
 #: a narrow preference cannot be stretched into a standing order to downgrade
 #: work, and an unknown value is refused rather than half-understood.
 FREE_MODEL_VALUES = ("prefer", "off")
+
+#: What `cleanup.after_merge` understands. "auto" lets a clean local merge
+#: shed its own worktree and branch immediately -- ONLY when the merge just
+#: fast-forwarded, so the branch is provably contained in the base and the
+#: residue holds nothing. "ask" keeps the shipped default: cleanup waits for
+#: the commander's explicit word.
+CLEANUP_AFTER_MERGE_VALUES = ("auto", "ask")
 
 #: key -> (takes a list?, one-line description). Printed by `helm prefs keys`
 #: and quoted in every "unknown key" error, so this is the documentation.
@@ -123,6 +131,12 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         "runtime this root reviews on, below an explicit --reviewer-agent and "
         "above automatic selection (independence is still enforced: a reviewer "
         "that would match the author is refused, not silently accepted)",
+    ),
+    KEY_CLEANUP_AFTER_MERGE: (
+        False,
+        "shed a merged task's worktree and branch immediately after a clean "
+        "fast-forward merge (values: auto, ask); default ask keeps cleanup "
+        "behind the commander's word",
     ),
     KEY_MODEL_FREE: (
         False,
@@ -224,6 +238,7 @@ class Preferences:
     #: judged competent; `off` records the opposite, explicitly; None is the
     #: shipped default of no opinion. Never a model id and never an order.
     free_model: str | None = None
+    cleanup_after_merge: str | None = None
 
     def constraint_for(self, model: str | None) -> tuple[str, frozenset[str]] | None:
         """The family restriction that applies to a model, if any is enabled.
@@ -259,6 +274,8 @@ class Preferences:
             }
         if self.free_model:
             model["free"] = self.free_model
+        if self.cleanup_after_merge:
+            document["cleanup"] = {"after_merge": self.cleanup_after_merge}
         if model:
             document["model"] = model
         if self.review_agent:
@@ -293,6 +310,8 @@ class Preferences:
             rows.append((f"{KEY_MODEL_RUNTIMES}.{family}", ", ".join(sorted(allowed))))
         if self.free_model:
             rows.append((KEY_MODEL_FREE, self.free_model))
+        if self.cleanup_after_merge:
+            rows.append((KEY_CLEANUP_AFTER_MERGE, self.cleanup_after_merge))
         if self.review_agent:
             rows.append((KEY_REVIEW_AGENT, self.review_agent))
         if self.default_effort:
@@ -364,7 +383,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
             f"understands {', '.join(str(item) for item in SUPPORTED_VERSIONS)}"
         )
     _reject_unknown(
-        document, {"version", "agent", "model", "effort", "review"}, "", where
+        document, {"version", "agent", "model", "effort", "review", "cleanup"}, "", where
     )
 
     agent = _object(document.get("agent"), "agent", where)
@@ -397,6 +416,19 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         if review.get("agent") is not None
         else None
     )
+
+    cleanup = _object(document.get("cleanup"), "cleanup", where)
+    _reject_unknown(cleanup, {"after_merge"}, "cleanup", where)
+    cleanup_after_merge = None
+    if cleanup.get("after_merge") is not None:
+        value = cleanup["after_merge"]
+        if not isinstance(value, str) or value not in CLEANUP_AFTER_MERGE_VALUES:
+            raise PreferencesError(
+                f"cleanup.after_merge{where} must be one of "
+                + ", ".join(repr(v) for v in CLEANUP_AFTER_MERGE_VALUES)
+                + f", not {value!r}"
+            )
+        cleanup_after_merge = value
 
     model = _object(document.get("model"), "model", where)
     _reject_unknown(model, {"default", "runtimes", "free"}, "model", where)
@@ -439,6 +471,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         review_agent=review_agent,
         model_runtimes=runtimes_by_family,
         free_model=free_model,
+        cleanup_after_merge=cleanup_after_merge,
         default_effort=default_effort,
         effort_runtimes=effort_runtimes,
     )
@@ -697,6 +730,12 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
             model.pop("free", None)
         else:
             model["free"] = listed[0]
+    elif key == KEY_CLEANUP_AFTER_MERGE:
+        cleanup_section = document.setdefault("cleanup", {})
+        if listed is None:
+            cleanup_section.pop("after_merge", None)
+        else:
+            cleanup_section["after_merge"] = listed[0]
     elif key == KEY_REVIEW_AGENT:
         if listed is None:
             review_section.pop("agent", None)
