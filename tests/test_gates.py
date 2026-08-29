@@ -1049,3 +1049,83 @@ class AConfirmedGateIsNotOverwrittenSilentlyTests(HelmTestCase):
         updated = self.coordinator.propose_gate(task["id"], "solution", "how")
         self.assertEqual(updated["gates"]["solution"]["text"], "how")
         self.assertIsNotNone(updated["gates"]["requirement"]["confirmed_at"])
+
+
+class ParallelGateSlotTests(HelmTestCase):
+    """One foreman drives several tasks, so several pairs must be decidable.
+
+    The slot used to hold exactly one binding: a pair spent on task A blocked
+    proposing task B's pair until A finished, and two live workers sat idle
+    waiting for a slot rather than for a decision. Spending is exercised
+    through `_require_gates_confirmed` directly -- root's own task creation
+    carries full authority and is deliberately never gated.
+    """
+
+    def _foreman_with_pair(self):
+        root = self.repo("parallelgates")
+        project = self.coordinator.register_project(
+            "PG", str(root), project_id="parallelgates"
+        )
+        foreman = self.coordinator.create_task(
+            project["id"], "drive it", no_domain=True, role="foreman"
+        )
+        self._confirm_pair(foreman["id"], "A")
+        # A running foreman worker record: `_require_gates_confirmed` looks
+        # the foreman up by liveness, and these tests exercise that path.
+        with self.coordinator.store.locked() as data:
+            data.setdefault("workers", {})["w-pgforeman"] = {
+                "id": "w-pgforeman",
+                "task_id": foreman["id"],
+                "project_id": project["id"],
+                "status": "running",
+            }
+            self.coordinator.store.save(data)
+        return project, foreman
+
+    def _confirm_pair(self, foreman_id: str, label: str) -> None:
+        for gate_type in ("requirement", "solution"):
+            self.coordinator.propose_gate(foreman_id, gate_type, f"{gate_type} {label}")
+            self.coordinator.decide_gate(
+                foreman_id, gate_type, confirm=True, skip=False
+            )
+
+    def _spend(self, foreman_id: str, task_id: str) -> None:
+        """Bind the live pair to a task, the way a foreman's create does."""
+        with self.coordinator.store.locked() as data:
+            gates = data["tasks"][foreman_id]["gates"]
+            gates["bound_task_id"] = task_id
+            gates["bound_at"] = "2026-08-29T00:00:00Z"
+            self.coordinator.store.save(data)
+
+    def test_a_second_pair_may_be_proposed_while_the_first_is_spent(self) -> None:
+        _project, foreman = self._foreman_with_pair()
+        self._spend(foreman["id"], "t-first")
+        self._confirm_pair(foreman["id"], "B")
+        gates = self.coordinator.store.load()["tasks"][foreman["id"]]["gates"]
+        self.assertIsNone(gates.get("bound_task_id"), "the slot must be free again")
+        self.assertIn("t-first", gates.get("spent") or {})
+
+    def test_the_first_task_stays_authorized_after_its_pair_is_archived(self) -> None:
+        project, foreman = self._foreman_with_pair()
+        self._spend(foreman["id"], "t-first")
+        self._confirm_pair(foreman["id"], "B")
+        self._spend(foreman["id"], "t-second")
+        data = self.coordinator.store.load()
+        # Both tasks remain authorized: the archived one by its record, the
+        # live one by its binding. Neither re-prompts the commander.
+        self.coordinator._require_gates_confirmed(
+            data, project["id"], consume_for_task_id="t-first"
+        )
+        self.coordinator._require_gates_confirmed(
+            data, project["id"], consume_for_task_id="t-second"
+        )
+
+    def test_one_pair_still_authorizes_only_one_new_task(self) -> None:
+        """Fail-closed: archiving must not hand out a second task per pair."""
+        project, foreman = self._foreman_with_pair()
+        self._spend(foreman["id"], "t-first")
+        data = self.coordinator.store.load()
+        with self.assertRaisesRegex(HelmError, r"already authorized"):
+            self.coordinator._require_gates_confirmed(
+                data, project["id"], consume_for_task_id="t-second"
+            )

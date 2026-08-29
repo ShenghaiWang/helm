@@ -9097,6 +9097,14 @@ class Coordinator:
                     f"{foreman_task['id']} --type {gate_type} --confirm|--skip); "
                     "no state-changing worker can launch until it is decided"
                 )
+        # A task whose authorization was archived by a later proposal is
+        # still authorized: continuation rounds on it must not re-prompt the
+        # commander for a decision that was made and spent on this very task.
+        if (
+            consume_for_task_id is not None
+            and consume_for_task_id in (gates.get("spent") or {})
+        ):
+            return
         bound_task_id = gates.get("bound_task_id")
         if bound_task_id is not None and bound_task_id != consume_for_task_id:
             raise HelmError(
@@ -9225,13 +9233,30 @@ class Coordinator:
                 if (gates.get(name) or {}).get("confirmed_at")
                 and not gates.get("bound_task_id")
             ]
-            # Any new proposal is a material change in what is being
-            # confirmed, so a binding this pair already spent on an earlier
-            # task no longer describes what the commander is about to decide.
-            # Clearing it here (rather than only where a pair is consumed)
-            # means re-proposing is the one and only way to free the pair for
-            # another task, matching the refusal message in
-            # `_require_gates_confirmed`.
+            # A SPENT PAIR IS ARCHIVED, NOT ERASED -- and archiving is what
+            # makes the slot parallel. The pair the commander confirmed for
+            # task X keeps describing task X forever; a new proposal is about
+            # a DIFFERENT piece of work and needs its own slot, so the spent
+            # one moves to `spent` (keyed by the task it authorized) and the
+            # live slot opens immediately.
+            #
+            # Before this, a foreman driving two tasks could not propose the
+            # second one's gates until the first task finished, because the
+            # single slot was still held by a binding nobody could release --
+            # observed stalling M3 behind M2 for forty minutes with both
+            # workers idle. The authorization accounting is unchanged: one
+            # confirmed pair still authorizes exactly one task, and the
+            # archive is what proves which.
+            bound = gates.get("bound_task_id")
+            if bound is not None:
+                archive = dict(gates.get("spent") or {})
+                archive[bound] = {
+                    "requirement": copy.deepcopy(gates.get("requirement")),
+                    "solution": copy.deepcopy(gates.get("solution")),
+                    "bound_at": gates.get("bound_at"),
+                    "pair_owner": gates.get("pair_owner"),
+                }
+                gates["spent"] = archive
             gates["bound_task_id"] = None
             gates["bound_at"] = None
             # The proposing side owns the pair: only it may later spend the
