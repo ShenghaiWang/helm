@@ -121,3 +121,29 @@ round for the cost of a glance; a suspicion confirmed is a round saved, and
 one dismissed costs a sentence in the result ("checked, not real,
 because..."). The two lists must never blur: a suspicion presented as a
 finding wastes a fix; a finding demoted to a suspicion ships a bug.
+
+## Every finding is a class until proven singular
+
+The measured shape of a long review loop: one project ran 38 reviews for 2
+approvals, and the blocking findings clustered — 14 on surfacing state to the
+user, 9 on one lexical matcher, 6 on concurrency. The same mechanism came back
+under a new line number, round after round, because each round fixed the
+instance the reviewer pointed at.
+
+So the author's first move on any finding is not the fix. It is the question:
+**is this the only place?** Grep the mechanism, list every site, and either
+convert them all in that round or say in the result which you left and why.
+A reviewer verifying an enumeration is cheap; a reviewer discovering instance
+four next round costs a full cycle.
+
+The reviewer's half of the same bargain: when a finding smells like a class,
+say so — "this pattern likely repeats at X and Y" belongs in the verdict,
+even unverified. Naming the class is worth more than proving the instance.
+
+## Slice for one reviewable pass, not for one feature
+
+A milestone sized to a feature carries five to seven independent findings, and
+each round can only close what the last one exposed. Size the increment to what
+one reviewer can hold at once — a single mechanism with its tests, not a screen
+with its whole supporting stack. Two increments reviewed once each beat one
+increment reviewed five times, and the arithmetic is not close.
