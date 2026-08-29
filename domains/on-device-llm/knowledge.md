@@ -95,6 +95,11 @@ one or two. Before calling an increment done, check every instance of:
   that gives up, a background completion nobody observed — each needs a
   visible state and an affordance, not only a log line. The generic loading
   copy hiding a recorded failure is a defect, not a cosmetic.
-- **Fresh exact-tip evidence.** The suite payload names the tip it ran at
-  and its unmasked exit; evidence for the previous tip is absence, and the
-  round spent arguing it is the most expensive no-op in the loop.
+- **Fresh exact-tip evidence — run the suite LAST, after the final commit.**
+  The payload names the tip it ran at and its unmasked exit. The failure is
+  never forgetting to run it; it is running it, then committing once more (a
+  doc fix, a sweep follow-on) and reporting the older payload. So the order
+  is fixed: finish every commit, THEN run the suites, THEN report. If you
+  commit again after running, you have no evidence — run again. A round
+  returned for stale evidence is the most expensive no-op in the loop, and
+  it has cost this project several.
