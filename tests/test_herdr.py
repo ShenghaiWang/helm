@@ -1194,3 +1194,52 @@ class TabsNameTheWorkWhenThereIsNoTicketTests(HelmTestCase):
         """Fail-closed: a later mention of round 3 is not this round's name."""
         label = self._label({"brief": "Fix the auditor\nas we did in round 3"})
         self.assertEqual(label, "coder 7ded")
+
+
+class ReviewerTabsNameTheWorkTheyCheckTests(HelmTestCase):
+    """A reviewer's own brief says nothing about which milestone it checks.
+
+    It opens with "Run every git command in ...", so the marker lives one hop
+    away on the authored task. Without that hop the panel showed "M4 coder"
+    and "M2 coder" beside a bare "reviewer" -- the one label a human most
+    needs placed, since a review of the wrong milestone reads exactly like a
+    review of the right one.
+    """
+
+    def _label(self, reviewer_task, data):
+        from helm.herdr import HerdrAdapter
+        return HerdrAdapter._worker_tab_label(
+            reviewer_task, {"id": "w-ab12cdef"}, data
+        )
+
+    def test_the_reviewed_milestone_names_the_tab(self) -> None:
+        data = {"tasks": {"t-auth": {"brief": "M4 · Edit + share"}}}
+        label = self._label(
+            {"role": "reviewer", "reviews": "t-auth", "brief": "Run every git command in /x"},
+            data,
+        )
+        self.assertEqual(label, "M4 reviewer ab12")
+
+    def test_the_reviewed_ticket_wins_over_a_marker(self) -> None:
+        data = {"tasks": {"t-auth": {"brief": "M4 x", "ticket": "DSK-46"}}}
+        label = self._label(
+            {"role": "reviewer", "reviews": "t-auth", "brief": "Run every git command in /x"},
+            data,
+        )
+        self.assertEqual(label, "DSK-46 reviewer ab12")
+
+    def test_a_reviewed_task_with_no_marker_leaves_the_tab_plain(self) -> None:
+        data = {"tasks": {"t-auth": {"brief": "Investigate the stall"}}}
+        label = self._label(
+            {"role": "reviewer", "reviews": "t-auth", "brief": "Run every git command in /x"},
+            data,
+        )
+        self.assertEqual(label, "reviewer ab12")
+
+    def test_a_dangling_reviews_link_is_harmless(self) -> None:
+        """Fail-closed: a missing reviewed task must not raise."""
+        label = self._label(
+            {"role": "reviewer", "reviews": "t-gone", "brief": "Run every git command in /x"},
+            {"tasks": {}},
+        )
+        self.assertEqual(label, "reviewer ab12")

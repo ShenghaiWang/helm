@@ -299,7 +299,12 @@ class HerdrAdapter:
         return f"{glyph} {project['id']}" if glyph else str(project["id"])
 
     @classmethod
-    def _worker_tab_label(cls, task: dict[str, Any], worker: dict[str, Any]) -> str:
+    def _worker_tab_label(
+        cls,
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        data: dict[str, Any] | None = None,
+    ) -> str:
         # A foreman is one per project and its brief is the same standing text
         # every time, so slugging it produced a tab named after the opening
         # words of that text -- "you-are-this-projects-f-fe58" -- which says
@@ -334,7 +339,30 @@ class HerdrAdapter:
         # use it when the brief offers one. Not a slug of the whole opening
         # line (that was tried and read as noise): just the short marker.
         marker = cls._brief_marker(task)
+        if not marker and data is not None:
+            # A reviewer names the work it CHECKS: its own brief opens with
+            # "Run every git command in ...", so the milestone lives one hop
+            # away on the reviewed task.
+            marker = cls._reviewed_marker(task, data)
         return f"{marker} {label}" if marker else label
+
+    @classmethod
+    def _reviewed_marker(cls, task: dict[str, Any] | None, data: dict[str, Any]) -> str:
+        """A reviewer's marker comes from the task it reviews, not its own.
+
+        A reviewer's brief opens with "Run every git command in ..." -- the
+        milestone it is checking is stated on the authored task, one hop away
+        through `reviews`. Without this hop the tab list showed "M4 coder"
+        and "M2 coder" beside a bare "reviewer", which is the one label a
+        human most needs placed: a review of the wrong milestone reads as a
+        review of the right one.
+        """
+        reviewed_id = (task or {}).get("reviews")
+        if not reviewed_id:
+            return ""
+        reviewed = (data.get("tasks") or {}).get(reviewed_id)
+        ticket = str((reviewed or {}).get("ticket") or "").strip()
+        return ticket or cls._brief_marker(reviewed)
 
     #: Short work markers a brief may open with when a project has no tracker
     #: ids -- a milestone, a numbered round, a named stage.
@@ -653,7 +681,7 @@ class HerdrAdapter:
             domain=domain,
             agent=agent,
         )
-        worker_label = self._worker_tab_label(task, worker)
+        worker_label = self._worker_tab_label(task, worker, self.coordinator.store.load())
         worker_layout: dict[str, Any] | None = None
         tab: dict[str, Any] | None = None
         try:
@@ -1605,7 +1633,7 @@ class HerdrAdapter:
                 # Kept as evidence -- but say so on the tab. A retained pane
                 # looks exactly like a working one in the panel, which is how a
                 # stopped foreman gets mistaken for a second live driver.
-                retained = self._worker_tab_label(task, worker)
+                retained = self._worker_tab_label(task, worker, data)
                 if retained != layout.get("label"):
                     with contextlib.suppress(HerdrUnavailable, HerdrNotFound):
                         self.client.tab_rename(tab_id, retained)
@@ -1714,7 +1742,7 @@ class HerdrAdapter:
             if not tab_id or worker is None:
                 continue
             task = data.get("tasks", {}).get(worker.get("task_id"))
-            label = self._worker_tab_label(task or {}, worker)
+            label = self._worker_tab_label(task or {}, worker, data)
             try:
                 self.client.tab_rename(tab_id, label)
                 renamed.append({"kind": "tab", "id": tab_id, "label": label})
