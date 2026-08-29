@@ -68,3 +68,33 @@ schema acceptance), read the shipped runtime source or probe on device —
 render the template, parse the model container, run the grammar — rather
 than trusting docs or a findings summary. Where a reference app and your
 measurements disagree, your on-device measurement outranks their docs.
+
+## The author's pre-submit sweep — the classes review keeps finding
+
+Independent review of concurrent Swift app code around a local model found
+the same defect classes on every large increment, one layer per round. An
+author who sweeps for them BEFORE reporting turns four review rounds into
+one or two. Before calling an increment done, check every instance of:
+
+- **Replay-on-subscribe.** Every observation API (AsyncStream builders,
+  snapshot feeds) must yield the CURRENT state to a new subscriber before
+  streaming future events. A publish that fired before the first subscriber
+  existed otherwise vanishes — the freshly-opened-view shape. Test it by
+  subscribing AFTER the terminal event, never only before.
+- **Subscribe-before-start.** Notification and event subscriptions register
+  synchronously BEFORE the machinery they observe starts; a Task spawned
+  after start() races the first event.
+- **Callback ordering across hops.** Forwarding delegate callbacks in
+  independent Tasks reorders them; completion can outrun the last progress.
+  Preserve order at the boundary (one serial hop, not N racing ones).
+- **Executor hops at framework callbacks.** Audio, URLSession and other
+  framework callbacks never touch actor-isolated state synchronously; a
+  closure literal formed in an isolated context silently inherits that
+  isolation and traps at runtime on the framework's queue.
+- **Every failure path reaches the user.** A retry that exhausts, a queue
+  that gives up, a background completion nobody observed — each needs a
+  visible state and an affordance, not only a log line. The generic loading
+  copy hiding a recorded failure is a defect, not a cosmetic.
+- **Fresh exact-tip evidence.** The suite payload names the tip it ran at
+  and its unmasked exit; evidence for the previous tip is absence, and the
+  round spent arguing it is the most expensive no-op in the loop.
