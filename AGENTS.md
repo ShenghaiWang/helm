@@ -116,6 +116,21 @@ root.
    reviewed worker/branch tip and tree; any mutation after approval requires
    re-review.
 
+### Match the ceremony to the change
+
+A one-asset swap does not need screenshots in two appearances and an
+independent review; a concurrency fix does. The protocol is sized for the
+second and applied by default to both, which turns an eleven-minute change
+into an hour: the evidence, the capture tooling question, the review round
+and the write-up all cost more than the work.
+
+So say the shape in the brief. For a small, visually-obvious, low-blast-radius
+change — an asset, a colour token, a string, a layout constant — ask for the
+change, the suite, and the result: no evidence captures, no review round, no
+artifact report. The commander looks at it and knows. Reserve the full
+protocol for changes whose correctness cannot be seen: concurrency, state
+machines, persistence, anything where a screenshot proves nothing.
+
 ## Mandatory delegation — the coordinator never does the work
 
 The agent started in the Helm root is the **coordinator**. It does not edit,
