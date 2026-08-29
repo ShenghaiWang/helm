@@ -477,8 +477,42 @@ class _Doctor:
         self._check_profiles()
         self._check_runtimes()
         self._check_herdr()
+        self._check_watchdog()
         self._check_authority()
         return self._state_ok
+
+    def _check_watchdog(self) -> None:
+        """Is the out-of-session backstop installed on this machine?
+
+        The reporting chain's last hop -- reaching a human while no session is
+        open -- only exists if the platform scheduler runs `helm watchdog`.
+        Nothing machine-specific is tracked in the repository, so a fresh
+        clone has no watchdog until someone runs the install; a root without
+        one works, but silently loses exactly the notifications it most needs,
+        which is why this is a warning and not a note.
+        """
+        import platform as _platform
+        from pathlib import Path as _Path
+        if _platform.system() == "Darwin":
+            entry = _Path.home() / "Library" / "LaunchAgents" / "com.helm.watchdog.plist"
+            present = entry.exists()
+        elif _platform.system() == "Linux":
+            entry = (
+                _Path.home() / ".config" / "systemd" / "user" / "helm-watchdog.timer"
+            )
+            present = entry.exists()
+        else:
+            self.ok("root.watchdog", "no scheduler integration for this platform")
+            return
+        if present:
+            self.ok("root.watchdog", f"watchdog scheduler entry present ({entry.name})")
+        else:
+            self.warning(
+                "root.watchdog",
+                "no watchdog scheduler entry: nothing reaches a human while no "
+                "session is open",
+                "run helm watchdog install",
+            )
 
     def _check_layout(self) -> None:
         assert self.root is not None
