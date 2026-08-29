@@ -109,3 +109,15 @@ wrong, where, and what would go wrong because of it.
 ## Approved learning: document-only review
 - Fact: When the change under review produces no compilable artifact — a design document, a plan, a README — do not require a build, and do not record 'nothing was compiled' as a caveat on the verdict. There was nothing to compile, so the caveat implies a gap that does not exist. Verify such a change by reading every claim it makes about the code against the code as it stands, and state the base commit those claims were checked against.
 - Rationale: For document-only changes, the relevant verification is whether the document's claims match the repository. A build caveat adds noise when no buildable artifact exists.
+
+## Report suspicions too — labelled as suspicions
+
+A verdict that carries only verified findings is honest but narrow: the
+reviewer noticed three other smells and spent its budget proving the two it
+reported, so the smells surface one per round. End every verdict with a
+clearly separated **Unverified suspicions** section — one line each, file
+and reason, no obligation of proof. The author checks them in the same fix
+round for the cost of a glance; a suspicion confirmed is a round saved, and
+one dismissed costs a sentence in the result ("checked, not real,
+because..."). The two lists must never blur: a suspicion presented as a
+finding wastes a fix; a finding demoted to a suspicion ships a bug.
