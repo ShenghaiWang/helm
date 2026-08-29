@@ -79,7 +79,14 @@ class _quiet:
 
 
 def pending_text(root: Path | None) -> str:
-    """Run `helm pending` in-process and capture it."""
+    """Run `helm pending --heal` in-process and capture it.
+
+    --heal because this is the process that runs when nobody else is awake:
+    a provably dead worker is stopped and a dead foreman replaced right here,
+    instead of the death waiting for a session or a human. The healing line
+    it prints then reaches the commander through the same notification path
+    as everything else.
+    """
     from . import cli
 
     import io
@@ -88,7 +95,7 @@ def pending_text(root: Path | None) -> str:
     argv = ["--root", str(root)] if root else []
     buffer = io.StringIO()
     with _contextlib.redirect_stdout(buffer):
-        cli.main([*argv, "pending"])
+        cli.main([*argv, "pending", "--heal"])
     return buffer.getvalue().strip()
 
 
