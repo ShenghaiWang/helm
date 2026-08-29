@@ -1945,6 +1945,16 @@ class StateStore:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+
+def _dt_now():
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _parse_iso(value: str):
+    import datetime as _dt
+    return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
 class Coordinator:
     def __init__(self, store: StateStore | None = None):
         self.store = store or StateStore()
@@ -7780,6 +7790,12 @@ class Coordinator:
 
     LIVE_SILENCE_GRACE = 3.0
 
+    #: A worker younger than this is never judged unhealthy: its first
+    #: minutes are indistinguishable from death by every available signal,
+    #: and every false verdict issued in that window today was acted on by
+    #: something downstream.
+    STARTUP_GRACE_SECONDS = 180.0
+
     def worker_health(
         self,
         *,
@@ -7843,8 +7859,33 @@ class Coordinator:
             if liveness is not None and not finished and worker.get("execution") != "process":
                 with contextlib.suppress(Exception):
                     alive = liveness(worker)
-            if alive is False and not finished:
-                vanished = True
+            # Two restraints learned the expensive way, in one day:
+            #
+            # STARTUP GRACE. A worker's first minutes look exactly like death
+            # to every signal here -- no output yet, no report yet, a pane
+            # whose agent the provider has not recognised. Judging it in that
+            # window produced the false "died" that a heal then acted on,
+            # executing each new launch inside its first poll interval.
+            #
+            # PID-GRADE EVIDENCE. For a pane worker the provider's "not
+            # alive" is an inference about recognition, not a process fact --
+            # the runner-in-pane shape reads as unknown or dead while the
+            # agent inside works, proposes gates, and posts blockers. So a
+            # pane worker is called dead only when the provider says so AND
+            # it has never produced a byte or a message: silence corroborates,
+            # activity acquits.
+            age_seconds: float | None = None
+            with contextlib.suppress(Exception):
+                started = worker.get("started_at") or worker.get("created_at")
+                if started:
+                    age_seconds = (
+                        _dt_now() - _parse_iso(started)
+                    ).total_seconds()
+            in_grace = age_seconds is not None and age_seconds < self.STARTUP_GRACE_SECONDS
+            ever_active = bool(last_message) or bool(output_idle is not None)
+            if alive is False and not finished and not in_grace:
+                if worker.get("execution") == "process" or not ever_active:
+                    vanished = True
             # An agent CLI keeps its session open after it finishes, so a
             # worker that has already delivered a terminal message is idle, not
             # stalled.  Calling that "attention" every time would train the
