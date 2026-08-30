@@ -138,3 +138,31 @@ flag says nothing about what is drawn.
 The rule generalises: when a change produces something a person will hold —
 a document, a screen, a message, an exported file — at least one check must
 inspect that thing, in the form they will receive it.
+
+## A screenshot of the wrong state beats a log of the crash
+
+A list crash took three attempts and three wrong diagnoses. Each attempt had a
+crash log — the exception, the counts, the stack — and each time the log
+described the MOMENT OF FAILURE, which is downstream of the cause. Three fixes
+landed, all reasonable, none of them the bug.
+
+What solved it was a photograph of the app NOT crashing: the user cancelled the
+delete and the row had vanished anyway, leaving a gap. Nothing had been
+deleted, so the fault could not be in the delete path — one image eliminated
+every hypothesis that three logs had supported.
+
+**The cause was upstream of everything anyone had looked at.** A destructive
+swipe-action role made the framework remove the row before the handler ran; the
+handler only presented a confirmation. Cancel left a hole, confirm
+double-counted the removal, and the assertion fired in code nobody had written.
+
+**So when a report and a fix keep missing each other, ask for the state, not
+the failure.** What did the screen look like when it went wrong but did not
+crash? What happens on the path that does nothing — cancel, dismiss, back?
+Those paths are rarely tested and they isolate a cause by subtraction: if
+nothing was done and something still changed, whatever you were blaming is
+innocent.
+
+And test the do-nothing path. Three attempts here wrote tests that drove the
+deletion directly; not one of them went through the button the user actually
+taps, which is where the defect lived.
