@@ -109,3 +109,32 @@ And when a test claims a property that matters, **demonstrate its teeth**:
 break the production code the test is supposed to guard, confirm the test goes
 red, restore it, and report both. A test that cannot fail is worse than no
 test, because it retires the doubt that would otherwise have found the bug.
+
+## Verify the artefact, not the process that made it
+
+Four defects in one day survived thorough verification because every check
+looked at the machinery and none looked at what the machinery produced.
+
+- A list section was "sized correctly" by a passing test while the rows were
+  invisible on a real screen.
+- A serialisation test measured a duplicate of the production gate; deleting
+  the real one left it green.
+- A test selector named cases that did not exist, so the suite passed having
+  run nothing.
+- A share path cleared two independent review rounds — the provenance gate,
+  the sender identity, temp-file cleanup — and nobody opened the PDF. It was
+  cutting clauses in half at the page break.
+
+The last one is the clearest: every check was about how the document was
+made, and the document itself was malformed. The reviews were not lazy; they
+examined the wrong object.
+
+**So make the deliverable the assertion.** Extract the text from the rendered
+PDF and confirm concatenating the pages reproduces the source with nothing
+lost or duplicated. Capture the screen and look at it. Read the file the user
+will receive. A page COUNT says nothing about where the cut fell, and a status
+flag says nothing about what is drawn.
+
+The rule generalises: when a change produces something a person will hold —
+a document, a screen, a message, an exported file — at least one check must
+inspect that thing, in the form they will receive it.
