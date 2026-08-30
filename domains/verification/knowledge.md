@@ -82,3 +82,30 @@ What the evidence has to be able to survive:
 Report the same facts in your own prose too — a human reads that — but the
 payload is what a reviewer is shown. Prose alone is a misfiling, and it looks
 identical to never having run the suite at all.
+
+## A green run proves nothing until you know what ran
+
+Three separate times in one day, a suite reported success while the thing
+under test never executed. Each time the exit code was 0 and the report said
+"passed".
+
+**The concrete trap, measured:** `xcodebuild test -only-testing` with a
+METHOD-level path into a Swift Testing suite matches zero cases. XCTest prints
+`Executed 0 tests` and exits 0. A run that tested nothing is byte-for-byte
+indistinguishable, in exit status, from a run that tested everything and
+passed. Select at SUITE level, or verify the count.
+
+**The general shape** is wider than that one tool. A test that grades a
+copy of the production mechanism passes when production is deleted. A test
+asserting on sizing state passes while the view is invisible on a device. A
+selector naming a suite that was renamed matches nothing. In every case the
+signal is the same and it is worthless.
+
+So: **report the case count per suite, never a total, and never an exit code
+alone.** Thirty-five cases with two absent looks exactly like thirty-five with
+two passing. A total is the one number that cannot reveal the failure.
+
+And when a test claims a property that matters, **demonstrate its teeth**:
+break the production code the test is supposed to guard, confirm the test goes
+red, restore it, and report both. A test that cannot fail is worse than no
+test, because it retires the doubt that would otherwise have found the bug.
