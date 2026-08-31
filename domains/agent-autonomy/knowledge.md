@@ -44,3 +44,34 @@ Maintain a state file as the single source of truth rather than relying on
 conversation memory, and re-read it whenever you are unsure what has already
 happened. Track per piece: id, stage, branch, change number(s), verification
 attempts so far, and what it is blocked on.
+
+## A refusing model looks exactly like a working one
+
+An agent that cannot serve its configured model does not crash. It accepts the
+launch, prints its banner, receives every instruction, and answers each one
+with a line like *"There's an issue with the selected model (X). It may not
+exist or you may not have access to it."* The session stays alive, so a
+liveness probe reports it healthy and a silence check reports it **stalled** —
+the same verdict a worker earns while thinking hard about a difficult file.
+
+Measured in one day: two workers burned forty minutes each and a third
+forty-five, all producing zero file changes, while the record said they were
+running.
+
+**The commonest cause is a runtime/model mismatch, and it is created by the
+launch, not by the model.** Pinning `--agent claude` while the root's model
+default is a cursor-only id asks Claude Code for a model it has never had.
+Effort has the same shape: cursor cannot be told one, so a task carrying
+`--effort high` refuses to launch on it at all. When a runtime is named
+explicitly, everything else in that launch has to be made consistent with it.
+
+**And the failure can impersonate a result.** A reviewer that never ran echoed
+its own brief back with the model error appended; the brief contained the word
+CHANGES-REQUESTED, and that was recorded as a verdict. A review that never
+happened is more dangerous than no review, because work gets sent back to chase
+findings that do not exist.
+
+So: **treat a model-access error in any agent output as a FAILED LAUNCH,
+whatever else the output contains** — before reading it as a status, a result,
+or a verdict. And when a worker has been quiet, check its log for that string
+before concluding it is thinking.
