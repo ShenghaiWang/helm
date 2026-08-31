@@ -166,3 +166,33 @@ innocent.
 And test the do-nothing path. Three attempts here wrote tests that drove the
 deletion directly; not one of them went through the button the user actually
 taps, which is where the defect lived.
+
+## "Additive" is not a synonym for "safe" in a persistent store
+
+A rename is the schema hazard everyone watches for. On one project the
+coordinator guarded a property rename four separate times — insisting the
+stored name be kept, demanding a migration test, refusing to accept a
+fresh-store test as proof — and the change shipped safely.
+
+The same release then crashed every existing install on launch, because a
+DIFFERENT change added a NON-OPTIONAL property with no default. CoreData
+refused the store outright: *"Cannot migrate store in-place: Validation error
+missing attribute values on mandatory destination attribute."* Existing rows
+have no value for a mandatory new column, and lightweight migration cannot
+invent one.
+
+**The question is not "am I renaming something".** It is: *does this change
+alter what the store must contain?* A required new property does. A new entity
+usually does not — purely additive entities migrate cleanly, and that one was
+fine. Knowing which is which is the whole skill; assuming "additive means
+safe" is what shipped the crash.
+
+**And the test that would have caught it is not the test anyone writes.**
+Every suite here passed, because every suite built a FRESH store, where a
+mandatory property is simply populated on creation. The defect only exists on
+an UPGRADE. So the permanent guard is a test that writes a store in the
+PREVIOUS shape, on disk, with real rows, and then opens it with the current
+code — red before the fix, green after.
+
+Write that test the first time a model changes, not the first time an install
+crashes.
