@@ -3400,6 +3400,29 @@ def main(argv: list[str] | None = None) -> int:
                     f"{_when_label(stamp)} {update['glyph']} {update['project_id']}: {update['text'][:220]}",
                     f"{update['glyph']} {update['project_id']}: {update['text']}",
                 ))
+            # A request that reached a foreman and was never acted on. This is
+            # derived, not marked: `pending_foreman_requests` asks whether the
+            # foreman has spoken at all since the request arrived, so it cannot
+            # drift and needs nothing written. It already existed and was
+            # already correct -- but it was only ever read by `project status`,
+            # which nobody runs on a turn, so an unacted instruction sat in the
+            # record where no reader would meet it. Twice in one day a project
+            # went quiet with its driver idle on a delivered message, and both
+            # times the commander noticed before Helm did. Delivery is not
+            # action, and this is the line that says so.
+            for project in coordinator.list_projects():
+                for request in coordinator.pending_foreman_requests(project["id"]):
+                    glyph = _glyph_for(coordinator, project["id"])
+                    first = next(
+                        (line.strip() for line in request["text"].splitlines() if line.strip()),
+                        "",
+                    )
+                    stamp = str(request.get("at") or "")
+                    entries.append((
+                        stamp,
+                        f"{_when_label(stamp)} {glyph} {project['id']} foreman has not acted on: {first[:100]}",
+                        f"{glyph} {project['id']} foreman has not acted on: {first}",
+                    ))
             for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
                 if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
                     continue

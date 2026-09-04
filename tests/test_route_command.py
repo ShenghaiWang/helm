@@ -187,6 +187,50 @@ class RouteCommandTests(HelmTestCase):
         coordinator.record_worker_message(foreman["id"], "status", "on it")
         self.assertEqual(coordinator.pending_foreman_requests(project["id"]), [])
 
+    def test_pending_surfaces_a_request_the_foreman_has_not_acted_on(self) -> None:
+        """`helm pending` must carry it, not just `helm project status`.
+
+        The derivation was correct and had a test, but its only caller was
+        `project status` -- a command nobody runs on a turn. So an instruction
+        that reached a foreman and was never acted on sat in the record where
+        no reader would meet it, and the project went quiet with its driver
+        idle on a delivered message. Twice in one day the commander noticed
+        before Helm did. Delivery is not action, and the command that runs
+        every turn is where that has to be said.
+        """
+        helm_root = self._helm_root("pending-unacted-root")
+        coordinator, project = self._project_root(helm_root, "pending-unacted")
+        # A foreman that STAYS alive. `helm pending` reconciles workers whose
+        # process is gone, so a command that exits immediately would be settled
+        # by the very command under test and the next message would be refused.
+        command = shlex.join([sys.executable, "-c", "import time; time.sleep(600)"])
+        self._route(helm_root, project["id"], "first request", "--command", command)
+        foreman = coordinator.foreman_for(project["id"])
+        self.assertIsNotNone(foreman)
+        coordinator.record_worker_message(foreman["id"], "status", "picked that up")
+
+        def pending_text() -> str:
+            result = subprocess.run(
+                [sys.executable, "-m", "helm", "pending"],
+                cwd=helm_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.stdout + result.stderr
+
+        self.assertNotIn("has not acted on", pending_text())
+
+        coordinator.record_worker_message(foreman["id"], "answer", "now investigate TICKET-77")
+        surfaced = pending_text()
+        self.assertIn("has not acted on", surfaced)
+        self.assertIn("TICKET-77", surfaced)
+
+        # The foreman's own next push is what clears it, exactly as the
+        # derivation says -- nothing is marked, so nothing can drift.
+        coordinator.record_worker_message(foreman["id"], "status", "on it")
+        self.assertNotIn("has not acted on", pending_text())
+
     def test_route_passes_through_agent_and_model_when_appointing_a_foreman(self) -> None:
         """`route` must offer the same fit/restriction controls `helm foreman` does.
 
