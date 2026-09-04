@@ -1127,6 +1127,18 @@ class LiveButSilentWorkerTests(HelmTestCase):
     def _age(self, worker, seconds: float) -> None:
         stamp = time.time() - seconds
         os.utime(worker["log_file"], (stamp, stamp))
+        # And age the worker record itself. Aging only the log file describes
+        # something that cannot happen -- a worker created a moment ago whose
+        # output has been idle for five minutes -- and it put every case in
+        # this class inside the startup grace, where no verdict is issued at
+        # all.
+        data = self.coordinator.store.load()
+        born = _dt.datetime.fromtimestamp(stamp, _dt.timezone.utc).isoformat()
+        record = data["workers"][worker["id"]]
+        record["created_at"] = born
+        if record.get("started_at"):
+            record["started_at"] = born
+        self.coordinator.store.save(data)
 
     def test_a_live_worker_silent_for_minutes_is_working_not_stalled(self) -> None:
         worker = self._paneless("thinking")

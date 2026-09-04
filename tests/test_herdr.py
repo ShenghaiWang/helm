@@ -734,8 +734,14 @@ class HerdrTests(HelmTestCase):
         self.assertTrue(adapter.answer_worker(worker["id"], brief))
 
         sent = " ".join(text for _pane, text in herdr.sent_text)
-        self.assertNotIn("PARAGRAPH. PARAGRAPH.", sent)
-        self.assertIn("Read that file now", sent)
+        # The pane gets a headline and a pointer, never the body. A gist is a
+        # subject line cut at MESSAGE_GIST_LIMIT, so asserting the body's own
+        # words are absent would fail on any message whose opening words are
+        # the ones repeated later; what actually protects the pane is that
+        # what goes through it stays bounded however long the message is.
+        self.assertLess(len(sent), HerdrAdapter.MESSAGE_GIST_LIMIT + 400)
+        self.assertLess(len(sent), len(brief) // 4)
+        self.assertIn("read it now", sent)
 
         inbox = self.coordinator.store.directory / "workers" / worker["id"] / "inbox"
         notes = list(inbox.glob("*.md"))
@@ -1075,7 +1081,7 @@ class BusyAgentGetsAPointerNotAPasteTests(HelmTestCase):
             sent,
             "a busy agent must not have the message BODY pasted into it",
         )
-        self.assertIn("Read that file now", sent)
+        self.assertIn("read it now", sent)
         # The subject line is the one thing that does go through, so a commander
         # watching the pane can see what arrived without opening the file.
         self.assertIn("RESUME THE ROUND.", sent)
@@ -1121,7 +1127,7 @@ class HandedOverMessageSaysWhatItIsAboutTests(HelmTestCase):
         self.assertIn("STOP THE REVIEW LOOP: no round ten.", sent)
         # Still a handover, not a paste: the body does not go through the pane.
         self.assertNotIn("Detail that nobody needs in the pane. Detail", sent)
-        self.assertIn("Read that file now", sent)
+        self.assertIn("read it now", sent)
 
     def test_a_busy_agent_still_gets_the_gist(self) -> None:
         """The case the guard removed, and the only one that happens in practice.
@@ -1143,23 +1149,41 @@ class HandedOverMessageSaysWhatItIsAboutTests(HelmTestCase):
         sent = " ".join(text for _pane, text in herdr.sent_text)
         self.assertIn("STAGE 1 IS READ-ONLY: start it now.", sent)
         self.assertNotIn("Helm has a message for you.", sent)
-        self.assertIn("Read that file now", sent)
+        self.assertIn("read it now", sent)
 
-    def test_a_message_with_no_title_line_claims_no_gist(self) -> None:
-        # The half that matters, and the one the existing suite caught me on.
-        # A message that is one long paragraph has NO title line, so there is no
-        # gist to be had -- and truncating its prose would put BODY TEXT through
-        # the pane, which is the exact thing the handover exists to stop. None
-        # is claimed rather than invented: a fabricated subject is both noise
-        # and a small lie about what the message says.
+    def test_a_long_opening_line_is_cut_into_a_gist_rather_than_withheld(self) -> None:
+        # This used to assert the opposite: a message that is one long
+        # paragraph has no title line, so no gist was claimed, on the grounds
+        # that truncating prose puts body text through the pane. That guard
+        # was removed on purpose, because most coordinator messages open with
+        # one long sentence and it was withholding the subject line from
+        # almost every handover -- the commander watched "Helm has an
+        # instruction for you" with no clue what about. So the rule now is a
+        # headline cut at a word boundary, and what still protects the pane is
+        # the bound, not the silence.
         adapter, herdr, worker = self._worker("no-title")
         brief = "PARAGRAPH. " * 200
         self.assertTrue(adapter.answer_worker(worker["id"], brief))
 
         sent = " ".join(text for _pane, text in herdr.sent_text)
-        self.assertNotIn("PARAGRAPH. PARAGRAPH.", sent)
-        self.assertIn("Helm has a message for you.", sent)
-        self.assertIn("Read that file now", sent)
+        self.assertIn("Helm instructs you:", sent)
+        self.assertIn("read it now", sent)
+        # Bounded however long the message is, and cut at a word boundary.
+        self.assertLess(len(sent), HerdrAdapter.MESSAGE_GIST_LIMIT + 400)
+        self.assertLess(len(sent), len(brief) // 4)
+        self.assertIn("…", sent)
+
+    def test_a_message_with_no_text_at_all_claims_no_gist(self) -> None:
+        # A fabricated subject is both noise and a small lie about what the
+        # message says, so when there is genuinely nothing to title -- a
+        # message that is only whitespace -- none is invented.
+        adapter, herdr, worker = self._worker("no-text")
+        brief = "   \n\n \t \n" + " " * 500
+        self.assertTrue(adapter.answer_worker(worker["id"], brief))
+
+        sent = " ".join(text for _pane, text in herdr.sent_text)
+        self.assertIn("Helm has an instruction for you.", sent)
+        self.assertIn("read it now", sent)
 
 
 class TabsNameTheWorkWhenThereIsNoTicketTests(HelmTestCase):
@@ -1183,8 +1207,8 @@ class TabsNameTheWorkWhenThereIsNoTicketTests(HelmTestCase):
         self.assertTrue(label.startswith("M3 "), label)
 
     def test_a_ticket_still_wins(self) -> None:
-        label = self._label({"brief": "M4 something", "ticket": "DSK-46"})
-        self.assertTrue(label.startswith("DSK-46 "), label)
+        label = self._label({"brief": "M4 something", "ticket": "ACME-46"})
+        self.assertTrue(label.startswith("ACME-46 "), label)
 
     def test_a_brief_with_no_marker_is_unchanged(self) -> None:
         label = self._label({"brief": "Investigate the download stall"})
@@ -1221,12 +1245,12 @@ class ReviewerTabsNameTheWorkTheyCheckTests(HelmTestCase):
         self.assertEqual(label, "M4 reviewer ab12")
 
     def test_the_reviewed_ticket_wins_over_a_marker(self) -> None:
-        data = {"tasks": {"t-auth": {"brief": "M4 x", "ticket": "DSK-46"}}}
+        data = {"tasks": {"t-auth": {"brief": "M4 x", "ticket": "ACME-46"}}}
         label = self._label(
             {"role": "reviewer", "reviews": "t-auth", "brief": "Run every git command in /x"},
             data,
         )
-        self.assertEqual(label, "DSK-46 reviewer ab12")
+        self.assertEqual(label, "ACME-46 reviewer ab12")
 
     def test_a_reviewed_task_with_no_marker_leaves_the_tab_plain(self) -> None:
         data = {"tasks": {"t-auth": {"brief": "Investigate the stall"}}}
