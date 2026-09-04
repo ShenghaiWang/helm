@@ -1293,6 +1293,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "dropping it")
     create.add_argument("--ticket",
         help="tracker id for this work; goes in the branch name so a human can find it")
+    create.add_argument("--base",
+        help="branch this one task starts from, overriding the project's "
+        "configured base_branch; for a fix that must sit on a release branch. "
+        "To change it for every task, set base_branch in .helm/project.json")
     create.add_argument(
         "--read-only", action="store_true",
         help="pure investigation/status work that changes nothing; exempt from the "
@@ -2718,6 +2722,7 @@ def main(argv: list[str] | None = None) -> int:
                     ticket=args.ticket,
                     no_domain=args.no_domain,
                     read_only=args.read_only,
+                    base=args.base,
                 )
                 print(f"Created task {task['id']} [{task['status']}] project={task['project_id']} policy={task['delivery_policy']}")
             elif args.task_command == "allocate":

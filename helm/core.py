@@ -3276,6 +3276,7 @@ class Coordinator:
         reviews: str | None = None,
         ticket: str | None = None,
         read_only: bool = False,
+        base: str | None = None,
     ) -> dict[str, Any]:
         brief = _safe_text(brief).strip()
         if not brief:
@@ -3287,6 +3288,13 @@ class Coordinator:
         # creation with a git error nobody can map back to the input.
         ticket = _validate_ticket_id(ticket, "task") if ticket else None
         model = _validate_model_id(model, "task") if model else None
+        # Same reason as the ticket above: this becomes a git ref, so a bad
+        # name fails here rather than deep in worktree creation. A task-level
+        # base is for the one-off -- a fix that must sit on a release branch
+        # while every other task on the project still starts from its
+        # configured default. Pinning every task belongs in the project's own
+        # `base_branch`, not in a flag repeated by hand.
+        base = _validate_branch_name(base, "--base") if base else None
         if agent is not None:
             _validate_agent_id(agent, "--agent")
         if agent is not None and effort:
@@ -3356,7 +3364,12 @@ class Coordinator:
                 if not _has_head(root):
                     raise HelmError("project has no commit from which to allocate a worktree")
                 snapshot_root = project["root"]
-                snapshot_base_branch = project["base_branch"]
+                snapshot_project_base = project["base_branch"]
+                # An explicit --base overrides the project's configured
+                # default for this one task. Both are kept: the effective
+                # base is what phase 2 resolves against, and the project's
+                # own value is what phase 3 re-checks for a concurrent edit.
+                snapshot_base_branch = base or snapshot_project_base
 
             # Phase 2: resolve the immutable base this task starts from. This
             # is deliberately outside Helm's state lock: a worktree-backed
@@ -3381,7 +3394,14 @@ class Coordinator:
             try:
                 with self.store.locked() as data:
                     project = self._project(data, project_id)
-                    if project["root"] != snapshot_root or project["base_branch"] != snapshot_base_branch:
+                    # The project's base_branch is only worth re-checking
+                    # when this task actually derived its base from it. With
+                    # an explicit --base, a concurrent edit to the project
+                    # default changes nothing about what was resolved, and
+                    # failing on it would be a retry for no reason.
+                    if project["root"] != snapshot_root or (
+                        base is None and project["base_branch"] != snapshot_project_base
+                    ):
                         raise _StaleBaseResolution()
                     if learn_default and not self._project_domains(project):
                         # Learn the project's default from the first domain
@@ -9374,12 +9394,27 @@ class Coordinator:
         the same key.
         """
         marker = f"{task_id}:{gate_type}"
-        with contextlib.suppress(OSError):
+        try:
             with self._status_transaction(project_id) as status:
                 for item in status["action_items"]:
                     if item.get("key") == marker and item.get("status", "open") == "open":
                         item["status"] = reason
                         item["resolved_at"] = now()
+        except OSError as exc:
+            # The gate decision itself already committed in its own earlier
+            # transaction, so failing here cannot un-decide it -- raising
+            # would report a decision that was in fact recorded. But staying
+            # silent is worse than it looks: the commander-visible item stays
+            # open, `helm pending` keeps asking for a decision that was
+            # already made, and the only symptom is a gate that will not stop
+            # nagging. Say so on the one surface the caller is reading.
+            print(
+                f"warning: the {gate_type} gate on {task_id} was {reason}, but its "
+                f"commander-visible item could not be closed ({exc}). It will keep "
+                f"showing in `helm pending`; re-run this decide once the status "
+                f"record for {project_id} is writable.",
+                file=sys.stderr,
+            )
 
     @staticmethod
     def _live_foreman_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
