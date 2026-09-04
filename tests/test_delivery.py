@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import re
@@ -87,6 +88,58 @@ class DeliveryTests(HelmTestCase):
         cleaned = self.coordinator.cleanup_task(task["id"])
         self.assertTrue(cleaned["workspace_removed"])
         self.assertFalse(workspace.exists())
+
+    def test_auto_cleanup_after_merge_delivers_before_it_destroys_the_worktree(self) -> None:
+        """The render must survive a merge that also cleans up.
+
+        Auto-cleanup ran at the end of merge_task on the reasoning that a
+        fast-forwarded branch leaves residue holding nothing. That is true of
+        TRACKED files, which is exactly the set the merge already moved -- and
+        false of the build output, which is gitignored, lives only in the
+        worktree, and is the actual product. The caller delivered afterwards,
+        found no worktree, and raised into a suppressed exception, so a
+        finished 51-second video was deleted with every record saying the
+        merge went fine.
+        """
+        root = self.repo("autoclean")
+        (root / ".helm").mkdir()
+        (root / ".helm" / "project.json").write_text(json.dumps({"deliver": ["renders"]}))
+        (root / ".gitignore").write_text("renders/\n")
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "settings"], check=True)
+        project = self.coordinator.register_project(
+            "Autoclean", str(root), project_id="autoclean"
+        )
+        task = self.coordinator.create_task(project["id"], "render and commit")
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('renders').mkdir(exist_ok=True); "
+            "Path('renders/video.mp4').write_text('the actual product'); "
+            "Path('tracked.txt').write_text('a tracked change'); "
+            "subprocess.run(['git','add','-A'],check=True); "
+            "subprocess.run(['git','commit','-qm','work'],check=True)"
+        )
+        worker = self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        self.assertEqual(worker["status"], "completed")
+        self.coordinator.record_worker_message(worker["id"], "result", "rendered")
+        self.await_session_exit(worker)
+        workspace = Path(self.coordinator.inspect_task(task["id"])["task"]["workspace"])
+
+        self.coordinator.approve_task(task["id"])
+        self.coordinator._preferences_source = dataclasses.replace(
+            self.coordinator.preferences(), cleanup_after_merge="auto"
+        )
+        try:
+            self.coordinator.merge_task(task["id"])
+        finally:
+            self.coordinator._preferences_source = None
+
+        # The worktree is gone, which is what auto-cleanup is for...
+        self.assertFalse(workspace.exists())
+        # ...and the render got out first.
+        self.assertEqual(
+            (root / "renders" / "video.mp4").read_text(), "the actual product"
+        )
 
     def test_build_outputs_reach_the_project_instead_of_dying_in_the_worktree(self) -> None:
         root = self.repo("deliver")

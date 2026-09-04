@@ -31,3 +31,12 @@ venv/
 
 # macOS
 .DS_Store
+
+# Helm's own state lock, which lands here whenever a command is run with the
+# repository root as its state directory. Empty, private, and never content.
+/.lock
+
+# uv's resolved lockfile. This repository is a plain-stdlib tool with no
+# runtime dependencies; the lockfile only appears when a test run is invoked
+# through uv, and pinning it would claim a dependency set the code does not have.
+/uv.lock

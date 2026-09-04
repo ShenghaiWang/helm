@@ -2833,9 +2833,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Merged task {task['id']} with local fast-forward")
                 # A merge moves tracked files only. Without this the rendered
                 # video -- the actual product -- stays in the worktree and dies
-                # with it.
-                with contextlib.suppress(HelmError, OSError):
+                # with it. Auto-cleanup delivers first, so this is usually a
+                # no-op reporting "identical"; it still runs for the roots that
+                # do not auto-clean.
+                try:
                     _print_delivery(coordinator.deliver_task_artifacts(args.task_id))
+                except (HelmError, OSError) as error:
+                    # Never silent. A swallowed failure here is how a finished
+                    # render was lost with every record saying the merge went
+                    # fine.
+                    print(
+                        f"  WARNING: build outputs were NOT delivered: {error}",
+                        file=sys.stderr,
+                    )
                 _release_finished_space(coordinator, task)
             elif args.task_command == "continue":
                 task = coordinator.continue_task(

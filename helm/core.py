@@ -1947,9 +1947,21 @@ class StateStore:
             os.chmod(self.lock_file, 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             data = self.load()
+            # Write only what changed. This block used to save unconditionally,
+            # and most callers under it observe rather than mutate -- a poll
+            # that finds a worker still running changes nothing at all. Saving
+            # anyway meant a directory sweep, a full sorted re-serialisation of
+            # the whole document, an fsync and a rename, under the global
+            # exclusive lock, for every look. On a mature root that document is
+            # tens of megabytes, and one `worker launch` polling in its wait
+            # loop held the lock so continuously that status pushes from every
+            # other project queued behind it for forty-five minutes. Comparing
+            # costs a second serialisation and no disk at all.
+            before = json.dumps(data, indent=2, sort_keys=True)
             try:
                 yield data
-                self.save(data)
+                if json.dumps(data, indent=2, sort_keys=True) != before:
+                    self.save(data)
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -7639,7 +7651,15 @@ class Coordinator:
                 return worker
             if timeout is not None and time.monotonic() - started >= timeout:
                 return worker
-            time.sleep(0.05)
+            # Back off. A fixed 50ms was chosen for a test that finishes in
+            # under a second and then applied to a worker that runs for an
+            # hour, which is twenty state reads a second for the whole hour.
+            # The first polls stay fast, because that is what makes a short
+            # launch feel immediate; a long one settles to a check every two
+            # seconds, which is far below the resolution anyone waiting on a
+            # model actually needs.
+            waited = time.monotonic() - started
+            time.sleep(0.05 if waited < 2 else min(2.0, waited / 20))
 
     # ---------- explicit approval and local delivery ----------
 
@@ -11804,6 +11824,16 @@ class Coordinator:
         # never opted in. A refusal here (dirty workspace, held branch)
         # un-merges nothing -- the manual path remains exactly as it was.
         if self.preferences().cleanup_after_merge == "auto":
+            # Deliver BEFORE the worktree is destroyed. The comment above says
+            # the residue holds nothing, and that is true of TRACKED files --
+            # which is exactly the set a merge already moved. A build output
+            # is the other set: gitignored, living only in the worktree, and
+            # the actual product. Cleaning first deleted a finished render and
+            # the caller's own delivery call then found no worktree and said
+            # so into a suppressed exception, so nothing anywhere reported
+            # that the deliverable was gone.
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                self.deliver_task_artifacts(task_id)
             with contextlib.suppress(HelmError, SafetyError, OSError):
                 self.cleanup_task(task_id, delete_branch=True)
         return task
