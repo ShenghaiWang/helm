@@ -676,17 +676,20 @@ class HerdrTests(HelmTestCase):
             HerdrAdapter._worker_tab_label(
                 {"brief": "implement nextest adoption", "ticket": "TCK-123"}, worker
             ),
-            "TCK-123 coder abcd",
+            "TCK-123 author abcd",
         )
+        # Without a ticket the subject leads instead, because "author abcd"
+        # beside "author 6d0e" identifies neither pane. Still not a slug of the
+        # whole line -- a few content words, and the purpose stays.
         self.assertEqual(
             HerdrAdapter._worker_tab_label(
                 {"brief": "implement nextest adoption"}, worker
             ),
-            "coder abcd",
+            "implement nextest adoption author abcd",
         )
 
     def test_a_tab_says_whether_it_reviews_writes_or_only_reads(self) -> None:
-        """reviewer/coder is the distinction that matters most -- they run on
+        """reviewer/author is the distinction that matters most -- they run on
         different models by design, and confusing them is how a review gets
         read as authorship. A read-only round is a `scout`: it can be left
         running without wondering whether it is mid-edit."""
@@ -1187,7 +1190,7 @@ class HandedOverMessageSaysWhatItIsAboutTests(HelmTestCase):
 
 
 class TabsNameTheWorkWhenThereIsNoTicketTests(HelmTestCase):
-    """"coder 7ded" beside "coder 8e99" identifies neither.
+    """"author 7ded" beside "author 8e99" identifies neither.
 
     A ticket already goes first when a project has one. A project that
     numbers milestones instead has the same kind of handle sitting in the
@@ -1206,18 +1209,50 @@ class TabsNameTheWorkWhenThereIsNoTicketTests(HelmTestCase):
         label = self._label({"brief": "M3 FIX ROUND 11. Round 10's fixes were not..."})
         self.assertTrue(label.startswith("M3 "), label)
 
+    def test_a_brief_with_no_marker_is_named_by_its_subject(self) -> None:
+        """"coder 86e5" beside "coder 6d0e" names neither.
+
+        Those four characters are a worker id: true, unique, and meaningless
+        to a person scanning a panel. When a brief offers no ticket and no
+        milestone, what the round is ABOUT is still sitting in its first
+        line, and that is the handle a person actually looks for.
+        """
+        label = self._label({"brief": "PRODUCE THE APP STORE MARKETING SCREENSHOTS. The version page is open."})
+        self.assertTrue(label.startswith("app store marketing"), label)
+
+    def test_the_identifying_number_survives_a_comma(self) -> None:
+        # "ROW 105, ELIZABETH HOLMES" cut at the comma loses 105, which is the
+        # most identifying thing in the line.
+        label = self._label({"brief": "UPLOAD AND SCHEDULE ROW 105, ELIZABETH HOLMES. Approved by the commander."})
+        self.assertIn("105", label)
+
+    def test_the_meaningful_words_come_first(self) -> None:
+        # A narrow panel truncates from the right, so the subject has to
+        # survive the cut while the worker id is what gets dropped.
+        label = self._label({"brief": "FIX THE BILLING-GRACE ENTITLEMENT DROP in EntitlementStore."})
+        self.assertLess(label.index("billing-grace"), label.index("author"))
+
     def test_a_ticket_still_wins(self) -> None:
         label = self._label({"brief": "M4 something", "ticket": "ACME-46"})
         self.assertTrue(label.startswith("ACME-46 "), label)
 
     def test_a_brief_with_no_marker_is_unchanged(self) -> None:
         label = self._label({"brief": "Investigate the download stall"})
-        self.assertEqual(label, "coder 7ded")
+        # No milestone and no round number in the line, so no MARKER is
+        # invented -- but the line still says what the round is about, and
+        # that now leads the label instead of a bare worker id.
+        self.assertTrue(label.startswith("investigate download stall "), label)
+        self.assertTrue(label.endswith("author 7ded"), label)
 
     def test_prose_after_the_first_line_never_matches(self) -> None:
         """Fail-closed: a later mention of round 3 is not this round's name."""
         label = self._label({"brief": "Fix the auditor\nas we did in round 3"})
-        self.assertEqual(label, "coder 7ded")
+        # The round-3 marker on the SECOND line is still ignored -- only the
+        # first line says what a round is. What the first line does now give
+        # is its subject, which is the point: "auditor author 7ded" names the
+        # pane where "author 7ded" named nothing.
+        self.assertNotIn("round 3", label.lower())
+        self.assertTrue(label.startswith("auditor "), label)
 
 
 class ReviewerTabsNameTheWorkTheyCheckTests(HelmTestCase):

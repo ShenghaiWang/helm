@@ -295,6 +295,15 @@ class HerdrAdapter:
     def _workspace_label(cls, project: dict[str, Any]) -> str:
         # The glyph carries the project's colour in one character, so identity
         # survives without the hex value pushing the ID out of view.
+        #
+        # Just the name. Two alternatives were tried against the real panel and
+        # both were worse: initials alone ("ec") win the width but turn the
+        # space list into a memory test, and name-plus-short-form makes the
+        # label LONGER than the thing it was meant to shorten. Herdr shows this
+        # one label in both the space list and the agents list, so it cannot be
+        # tuned for either without hurting the other -- and the width the
+        # agents line actually needed came from naming the WORK in the tab
+        # label instead of hashing the worker id.
         glyph = project_glyph(project.get("color", ""))
         return f"{glyph} {project['id']}" if glyph else str(project["id"])
 
@@ -344,7 +353,23 @@ class HerdrAdapter:
             # "Run every git command in ...", so the milestone lives one hop
             # away on the reviewed task.
             marker = cls._reviewed_marker(task, data)
-        return f"{marker} {label}" if marker else label
+        if marker:
+            return f"{marker} {label}"
+        # Still nothing. "coder 86e5" beside "coder 6d0e" names neither, and
+        # the four hex characters are a worker id -- true, unique, and
+        # meaningless to a person scanning a panel. So fall back to what the
+        # round is ABOUT, taken from the brief's opening line. Slugging the
+        # whole line was tried and produced noise like
+        # "dsk-719-pr-19699-deli-617c"; this takes a couple of content words
+        # instead, and puts them FIRST, because a narrow panel truncates from
+        # the right and the meaningful half has to survive that cut.
+        # Not for a reviewer. Its brief always opens with the harness's own
+        # preamble -- "Run every git command in /Users/..." -- so a subject
+        # taken from it reads "git command x reviewer ab12", which is worse
+        # than the plain label. A reviewer's identity comes from the task it
+        # checks, and _reviewed_marker above is the only honest source for it.
+        subject = "" if purpose == "reviewer" else cls._brief_subject(task)
+        return f"{subject} {label}" if subject else label
 
     @classmethod
     def _reviewed_marker(cls, task: dict[str, Any] | None, data: dict[str, Any]) -> str:
@@ -385,22 +410,66 @@ class HerdrAdapter:
             return ""
         return " ".join(match.group(0).split()).upper()
 
+    #: Words a brief opens with that say nothing about its subject.
+    _BRIEF_LEAD_NOISE = frozenset(
+        "a an and the this that these those of for to in on at with from your"
+        " you we i it its is are be do does make made take taken produce"
+        " create build fix close write add update decide run go now first"
+        " then please just only exactly every all new one two both".split()
+    )
+
+    @classmethod
+    def _brief_subject(cls, task: dict[str, Any] | None) -> str:
+        """Two or three words naming what the round is about.
+
+        The brief's first line is where a round says what it IS. Dropping the
+        leading imperative and the filler around it leaves the subject, which
+        is the handle a person actually scans for: "app store screenshots"
+        rather than "coder 86e5".
+        """
+        brief = str((task or {}).get("brief") or "")
+        first_line = brief.splitlines()[0] if brief else ""
+        # Stop at the first sentence end; a brief's opening line often runs on.
+        # A comma is deliberately NOT a stop: "ROW 105, ELIZABETH HOLMES" cut
+        # there loses the number, which is the most identifying thing in it.
+        for stop in (". ", " -- ", " \u2014 ", ": "):
+            cut = first_line.find(stop)
+            if cut > 0:
+                first_line = first_line[:cut]
+        words: list[str] = []
+        for raw in first_line.split():
+            word = "".join(ch for ch in raw if ch.isalnum() or ch in "-").lower()
+            if not word or word in cls._BRIEF_LEAD_NOISE:
+                continue
+            words.append(word)
+            if len(words) == 4:
+                break
+        return " ".join(words)
+
     @staticmethod
     def _worker_purpose(task: dict[str, Any] | None) -> str:
         """What this agent is for, in one word a human recognises.
 
-        `reviewer` and `coder` are the distinction that matters most: they run
+        `reviewer` and `author` are the distinction that matters most: they run
         on different models by design, and confusing them is how a review gets
         read as authorship. `scout` is a read-only round -- it can be left
         running without wondering whether it is mid-edit, which is exactly the
         question a tab list should answer at a glance.
+
+        The writing role is `author`, not `coder`. Helm drives projects that
+        produce videos, research and datasets as well as software, and on
+        those a tab reading "coder" is simply false -- a video round sources
+        footage, cuts it and renders it without touching a line of code. What
+        the label has to say is whether this agent is CHANGING something,
+        only reading, or checking someone else's work, and `author` says that
+        whatever the medium.
         """
         role = (task or {}).get("role")
         if role == "reviewer":
             return "reviewer"
         if (task or {}).get("read_only"):
             return "scout"
-        return "coder"
+        return "author"
 
     def _herdr_state(self, data: dict[str, Any]) -> dict[str, Any]:
         integrations = data.setdefault("integrations", {})

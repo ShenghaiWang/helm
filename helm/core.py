@@ -11833,7 +11833,12 @@ class Coordinator:
             # so into a suppressed exception, so nothing anywhere reported
             # that the deliverable was gone.
             with contextlib.suppress(HelmError, SafetyError, OSError):
-                self.deliver_task_artifacts(task_id)
+                # Reported back on the returned record so the caller does not
+                # have to ask again. Asking again is what produced a "build
+                # outputs were NOT delivered" warning on every healthy
+                # auto-cleaning merge: delivery had just succeeded, and the
+                # second attempt found the worktree correctly gone.
+                task["delivered_artifacts"] = self.deliver_task_artifacts(task_id)
             with contextlib.suppress(HelmError, SafetyError, OSError):
                 self.cleanup_task(task_id, delete_branch=True)
         return task

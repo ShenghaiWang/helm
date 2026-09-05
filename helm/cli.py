@@ -2837,7 +2837,12 @@ def main(argv: list[str] | None = None) -> int:
                 # no-op reporting "identical"; it still runs for the roots that
                 # do not auto-clean.
                 try:
-                    _print_delivery(coordinator.deliver_task_artifacts(args.task_id))
+                    delivered = task.get("delivered_artifacts")
+                    _print_delivery(
+                        delivered
+                        if delivered is not None
+                        else coordinator.deliver_task_artifacts(args.task_id)
+                    )
                 except (HelmError, OSError) as error:
                     # Never silent. A swallowed failure here is how a finished
                     # render was lost with every record saying the merge went
