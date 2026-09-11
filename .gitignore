@@ -1,0 +1,42 @@
+# Helm root content. The .gitkeep files are tracked defaults; everything else
+# is local content and must stay out of this repository.
+/projects/*
+!/projects/.gitkeep
+# Domain knowledge is Helm repository content and is committed, so it travels
+# with the repo and is shared through GitHub rather than living only on one
+# machine. Nothing under /domains/ is ignored: keep private or company-specific
+# knowledge in a project's own .helm/knowledge.md, which is not tracked.
+/agents/*
+!/agents/.gitkeep
+/state/*
+!/state/.gitkeep
+# Root-local operator preferences: this installation's own default agent and
+# model, the runtimes it will not pay to start, and any model-family/runtime
+# restriction it has chosen. The schema, the CLI, the docs and the tests are
+# tracked; one operator's answers are not, because committing them would ship
+# one machine's cost policy to everybody who clones the repository.
+/preferences.json
+# Defensive coverage for worktrees if a caller places them at the root.
+/worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Helm's own state lock, which lands here whenever a command is run with the
+# repository root as its state directory. Empty, private, and never content.
+/.lock
+
+# uv's resolved lockfile. This repository is a plain-stdlib tool with no
+# runtime dependencies; the lockfile only appears when a test run is invoked
+# through uv, and pinning it would claim a dependency set the code does not have.
+/uv.lock

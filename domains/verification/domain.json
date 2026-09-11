@@ -1,0 +1,4 @@
+{
+  "inferable": false,
+  "applies_to": "Deciding whether a change needs an observed run rather than passing tests, and proving it."
+}

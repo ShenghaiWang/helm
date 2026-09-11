@@ -1,0 +1,4 @@
+{
+  "inferable": false,
+  "applies_to": "Recording the assumptions behind a code change so a reviewer can check them against the diff."
+}

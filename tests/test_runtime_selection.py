@@ -1,0 +1,1500 @@
+"""Choosing and launching the agent runtime and model for a task."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from unittest import mock
+
+from helm import cli, runtimes
+from helm.core import (
+    Coordinator,
+    HelmError,
+    RUNTIME_DEFAULT_MODEL,
+    StateStore,
+    worker_environment,
+)
+
+from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS
+
+
+class RuntimeSelectionTests(HelmTestCase):
+    def _fake_agent_cli(self, *names: str) -> Path:
+        """Put stub agent executables on PATH so runtime checks are hermetic."""
+        bin_dir = Path(self.temp.name) / f"bin-{'-'.join(names)}"
+        bin_dir.mkdir(exist_ok=True)
+        for name in names:
+            executable = bin_dir / name
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+        return bin_dir
+
+    def _runtime_root(
+        self,
+        project_id: str,
+        settings: dict[str, object] | None = None,
+        *,
+        prefs: dict[str, object] | None = None,
+    ) -> Path:
+        helm_root = self._helm_root(f"helm-{project_id}")
+        if prefs is not None:
+            self.write_preferences(helm_root, **prefs)
+        project_root = self.repo(f"repo-{project_id}")
+        destination = helm_root / "projects" / project_id
+        shutil.move(str(project_root), str(destination))
+        if settings is not None:
+            (destination / ".helm").mkdir()
+            (destination / ".helm" / "project.json").write_text(json.dumps(settings))
+        return helm_root
+
+    def test_agent_selection_validates_availability_and_records_reason(self) -> None:
+        helm_root = self._helm_root()
+        project_root = self.repo("agents")
+        destination = helm_root / "projects" / "agents"
+        shutil.move(str(project_root), str(destination))
+        settings = destination / ".helm"
+        settings.mkdir()
+        (settings / "project.json").write_text(json.dumps({"domains": ["publishing"]}))
+        profiles = {
+            "agents": [
+                {"id": "bad", "command": ["definitely-not-installed-helm-agent"], "domains": ["publishing"]},
+                {
+                    "id": "publishing-editor",
+                    "command": [sys.executable, "-c", ""],
+                    "domains": ["publishing"],
+                    "capabilities": ["shorts"],
+                },
+                {"id": "generic", "command": [sys.executable, "-c", ""], "capacity": 2},
+            ]
+        }
+        (helm_root / "agents.json").write_text(json.dumps(profiles))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "agents")
+        automatic = coordinator.create_task(project["id"], "Prepare the next artifact")
+        worker = coordinator.launch_worker(automatic["id"], None)
+        self.assertEqual(worker["agent_id"], "publishing-editor")
+        self.assertIn("domain match", worker["agent_reason"])
+        explicit = coordinator.create_task(project["id"], "Prepare the next artifact", agent="generic")
+        selected = coordinator.launch_worker(explicit["id"], None)
+        self.assertEqual(selected["agent_id"], "generic")
+        self.assertIn("explicit", selected["agent_reason"])
+        unavailable = coordinator.create_task(project["id"], "another task", agent="bad")
+        with self.assertRaisesRegex(HelmError, r"bad is unavailable"):
+            coordinator.launch_worker(unavailable["id"], None)
+
+    def test_pi_runtime_approves_project_files_in_both_launch_modes(self) -> None:
+        runtime = runtimes.builtin_runtime("pi")
+        assert runtime is not None
+
+        prompt = "assignment prompt"
+        self.assertEqual(
+            runtime.command(interactive=True),
+            ["pi", "--approve", runtimes.PROMPT_PLACEHOLDER],
+        )
+        self.assertEqual(
+            runtime.command(interactive=False),
+            ["pi", "--approve", "--print", runtimes.PROMPT_PLACEHOLDER],
+        )
+        # Model insertion remains before the approval/print flags, and prompt
+        # substitution still leaves the prompt as the final argument.
+        self.assertEqual(
+            runtime.with_model("pi/model", interactive=True),
+            ["pi", "--model", "pi/model", "--approve", runtimes.PROMPT_PLACEHOLDER],
+        )
+        self.assertEqual(
+            runtimes.apply_prompt(
+                runtime.with_model("pi/model", interactive=False), prompt
+            ),
+            ["pi", "--model", "pi/model", "--approve", "--print", prompt],
+        )
+
+    def test_cursor_runtime_forces_approval_and_keeps_the_prompt_last(self) -> None:
+        """The executable is `cursor-agent`, and `--force` is what makes it usable.
+
+        Cursor publishes both `--add-dir` and `--sandbox`, the pair that
+        usually means writes are confined and Helm's state is out of reach --
+        the failure that silenced every codex worker. It is not confined under
+        `--force`, which was established by running it and watching a write to
+        an absolute path outside the working directory land. Without `--force`
+        a worker stops on an approval prompt nobody is watching.
+        """
+        runtime = runtimes.builtin_runtime("cursor")
+        assert runtime is not None
+        self.assertEqual(runtime.name, "Cursor CLI")
+
+        # The binary is cursor-agent; `cursor` is the editor and is not it.
+        self.assertEqual(
+            runtime.command(interactive=True),
+            ["cursor-agent", "--force", runtimes.PROMPT_PLACEHOLDER],
+        )
+        self.assertEqual(
+            runtime.command(interactive=False),
+            ["cursor-agent", "--force", "--print", runtimes.PROMPT_PLACEHOLDER],
+        )
+        prompt = "assignment prompt"
+        self.assertEqual(
+            runtimes.apply_prompt(
+                runtime.with_model("gpt-5", interactive=False), prompt
+            ),
+            ["cursor-agent", "--model", "gpt-5", "--force", "--print", prompt],
+        )
+        # A credential is forwarded for roots that authenticate by environment;
+        # a model name never is, because model choice belongs to the task.
+        self.assertIn("CURSOR_API_KEY", runtime.env_passthrough)
+        self.assertNotIn("CURSOR_MODEL", runtime.env_passthrough)
+
+    def test_opencode_runtime_auto_approves_and_keeps_the_prompt_last(self) -> None:
+        """A reviewer that cannot report is worse than no reviewer.
+
+        opencode has no --add-dir analogue, so the flag that matters is
+        `--auto`: without it the worker stops on a permission prompt nobody is
+        watching. With it, writes outside the working directory succeed, which
+        is what `helm worker message` needs to reach Helm's state.
+        """
+        runtime = runtimes.builtin_runtime("opencode")
+        assert runtime is not None
+
+        prompt = "assignment prompt"
+        self.assertEqual(
+            runtime.command(interactive=True),
+            ["opencode", "--auto", "--prompt", runtimes.PROMPT_PLACEHOLDER],
+        )
+        self.assertEqual(
+            runtime.command(interactive=False),
+            ["opencode", "run", "--auto", runtimes.PROMPT_PLACEHOLDER],
+        )
+        # `with_model` inserts directly after argv[0], which puts --model
+        # ahead of the `run` subcommand. opencode accepts it in that position;
+        # the prompt still has to end up last so nothing swallows it.
+        self.assertEqual(
+            runtimes.apply_prompt(
+                runtime.with_model("openrouter/~anthropic/claude-opus-latest", interactive=False),
+                prompt,
+            ),
+            [
+                "opencode",
+                "--model",
+                "openrouter/~anthropic/claude-opus-latest",
+                "run",
+                "--auto",
+                prompt,
+            ],
+        )
+
+    def test_worker_runtime_defaults_to_the_agent_this_helm_session_runs_under(self) -> None:
+        helm_root = self._runtime_root("session")
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "session")
+        task = coordinator.create_task(project["id"], "Draft the release note")
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CLAUDECODE": "1",
+            "HELM_AGENT": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+        self.assertEqual(worker["agent_id"], "claude")
+        self.assertIn("same runtime as this Helm session", worker["agent_reason"])
+        # Interactive form in a pane, and the assignment reaches an agent CLI
+        # as a prompt rather than as an unread environment variable.
+        self.assertEqual(Path(worker["command"][0]).name, "claude")
+        self.assertNotIn("--print", worker["command"])
+        self.assertIn(worker["context_file"], worker["command"][-1])
+        self.assertIn("Draft the release note", worker["command"][-1])
+
+    def test_process_fallback_starts_a_runtime_in_its_non_interactive_form(self) -> None:
+        helm_root = self._runtime_root("fallback")
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "fallback")
+        task = coordinator.create_task(project["id"], "Draft the release note")
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CLAUDECODE": "1",
+            "HELM_AGENT": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="process")
+        # Without a terminal a full-screen TUI would only write escape noise
+        # into the log, so the same runtime is started in print mode.
+        self.assertIn("--print", worker["command"])
+
+    def test_a_task_runs_on_the_model_it_was_given(self) -> None:
+        """Choosing a runtime is not choosing a model.
+
+        Knowing which model suits a task is worth nothing if there is no way to
+        say it, so the model has to survive all the way into the argv the
+        worker is actually started with.
+        """
+        helm_root = self._runtime_root("modelled")
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "modelled")
+        task = coordinator.create_task(
+            project["id"], "Classify these tickets", model="claude-haiku-4-5"
+        )
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CLAUDECODE": "1",
+            "HELM_AGENT": "",
+            "HELM_MODEL": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+        command = worker["command"]
+        # Immediately after the executable, so a variadic option later in the
+        # argv cannot swallow it, and the prompt still ends up last.
+        self.assertEqual(command[1:3], ["--model", "claude-haiku-4-5"])
+        self.assertIn("Classify these tickets", command[-1])
+        self.assertIn("task names model claude-haiku-4-5", worker["agent_reason"])
+
+    def test_model_resolution_prefers_the_task_then_the_project_then_the_root(self) -> None:
+        """Same precedence as the runtime rules: stated beats inferred.
+
+        There is deliberately no detection step. A wrong runtime guess fails
+        loudly on a missing executable; a wrong model guess runs, bills, and
+        answers, so the last resort is to say nothing at all.
+        """
+        helm_root = self._runtime_root("layered", {"agent": "claude", "model": "claude-sonnet-5"})
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "layered")
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CLAUDECODE": "1",
+            "HELM_AGENT": "",
+            "HELM_MODEL": "claude-opus-5",
+        }
+
+        # The project's pin outranks the root default.
+        pinned = coordinator.create_task(project["id"], "Refactor the client")
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(pinned["id"], None, execution="herdr")
+        self.assertEqual(worker["command"][1:3], ["--model", "claude-sonnet-5"])
+
+        # The task's own choice outranks both.
+        named = coordinator.create_task(
+            project["id"], "Port the parser", model="claude-fable-5"
+        )
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(named["id"], None, execution="herdr")
+        self.assertEqual(worker["command"][1:3], ["--model", "claude-fable-5"])
+
+        # With nothing stated anywhere, Helm sends no model and the runtime
+        # keeps its own default rather than Helm guessing one.
+        bare_root = self._runtime_root("bare", {"agent": "claude"})
+        bare = Coordinator(StateStore(bare_root / "state", helm_root=bare_root))
+        bare_project = bare.discover_project(bare_root, "bare")
+        quiet = bare.create_task(bare_project["id"], "Tidy the changelog")
+        with mock.patch.dict(os.environ, {**env, "HELM_MODEL": ""}):
+            worker = bare.prepare_external_worker(quiet["id"], None, execution="herdr")
+        self.assertNotIn("--model", worker["command"])
+
+    def test_claude_family_identifiers_are_recognised_without_over_matching(self) -> None:
+        """The classifier decides which launches are refused, so its edges matter.
+
+        Too narrow and a gateway spelling walks straight through the boundary;
+        too wide and an unrelated model is refused for a policy that was never
+        about it.
+        """
+        claude = [
+            "claude-opus-5",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+            "anthropic/claude-opus-5",
+            "openrouter/anthropic/claude-3.5-sonnet",
+            "bedrock/us.anthropic.claude-sonnet-4-v1:0",
+            "vertex:claude-sonnet-4",
+            # Gateways that flatten the provider into the model half of one
+            # segment leave no `anthropic` path element to find.
+            "azure/anthropic-claude-sonnet-4",
+            "anthropic.claude-3-haiku",
+            "gateway/anthropic-opus",
+            "sonnet",
+            "opus-4.1",
+            "haiku",
+            "sonnet-4-5",
+            "fable-5",
+            "CLAUDE-OPUS-5",
+        ]
+        for model in claude:
+            with self.subTest(model=model):
+                self.assertTrue(runtimes.is_claude_model(model))
+        others = [
+            "gpt-5.6-sol",
+            "gemini-2.5-pro",
+            "openai-codex/gpt-5.6-sol",
+            # Substring lookalikes: refusing these would be a policy about
+            # spelling rather than about which vendor runs the model.
+            "opus-magnum",
+            "sonnetize",
+            "haiku-poet-9000",
+            "claudette-1",
+            "myanthropic-model",
+            "anthropical-1",
+            "unclaude",
+            "",
+            None,
+        ]
+        for model in others:
+            with self.subTest(model=model):
+                self.assertFalse(runtimes.is_claude_model(model))
+
+    CLAUDE_ONLY = {"model": {"runtimes": {"claude": ["claude"]}}}
+
+    def test_a_restricted_family_launches_on_its_runtime_and_nowhere_else(self) -> None:
+        """A cross-provider runtime would accept the name and bill for it.
+
+        So where a root has asked for the restriction, it is enforced wherever
+        the model and the runtime meet, for every source that can name a model,
+        rather than at whichever entry point somebody happened to notice.
+        """
+        bin_dir = self._fake_agent_cli("claude", "pi", "opencode", "omp", "codex")
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CLAUDECODE": "1",
+            "HELM_AGENT": "",
+            "HELM_MODEL": "",
+        }
+
+        # Accepted: the built-in claude runtime is the one that may run these.
+        helm_root = self._runtime_root("claudeok", prefs=self.CLAUDE_ONLY)
+        ok = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = ok.discover_project(helm_root, "claudeok")
+        for model in ("claude-opus-5", "anthropic/claude-opus-5", "sonnet-4-5"):
+            task = ok.create_task(project["id"], "Port the parser", model=model)
+            with mock.patch.dict(os.environ, env):
+                worker = ok.prepare_external_worker(
+                    task["id"], None, execution="herdr", agent="claude"
+                )
+            self.assertEqual(worker["agent_id"], "claude")
+            self.assertEqual(worker["command"][1:3], ["--model", model])
+
+        # Refused on every other runtime, whichever source named the model,
+        # and named rather than silently swapped for a runtime that may run it.
+        for agent in ("pi", "opencode", "omp", "codex"):
+            task = ok.create_task(
+                project["id"], "Port the parser", model="claude-opus-5", agent=agent
+            )
+            with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
+                HelmError, r"restrict to the claude runtime"
+            ) as caught:
+                ok.prepare_external_worker(task["id"], None, execution="herdr")
+            self.assertIn(agent, str(caught.exception))
+            # The refusal has to say the restriction is this root's, and how
+            # to remove it, or it reads as a product rule nobody chose.
+            self.assertIn("helm prefs unset model.runtimes.claude", str(caught.exception))
+
+        # A project pin and HELM_MODEL are the same attempt by another route.
+        pinned_root = self._runtime_root(
+            "claudepin",
+            {"agent": "pi", "model": "anthropic/claude-opus-5"},
+            prefs=self.CLAUDE_ONLY,
+        )
+        pinned = Coordinator(StateStore(pinned_root / "state", helm_root=pinned_root))
+        pinned_project = pinned.discover_project(pinned_root, "claudepin")
+        pinned_task = pinned.create_task(pinned_project["id"], "Port the parser")
+        with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
+            HelmError, r"anthropic/claude-opus-5 is in the claude model family"
+        ):
+            pinned.prepare_external_worker(pinned_task["id"], None, execution="herdr")
+
+        ambient_root = self._runtime_root(
+            "claudeambient", {"agent": "opencode"}, prefs=self.CLAUDE_ONLY
+        )
+        ambient = Coordinator(StateStore(ambient_root / "state", helm_root=ambient_root))
+        ambient_project = ambient.discover_project(ambient_root, "claudeambient")
+        ambient_task = ambient.create_task(ambient_project["id"], "Port the parser")
+        with mock.patch.dict(
+            os.environ, {**env, "HELM_MODEL": "opus-4.1"}
+        ), self.assertRaisesRegex(HelmError, r"restrict to the claude runtime"):
+            ambient.prepare_external_worker(ambient_task["id"], None, execution="herdr")
+
+    def test_a_profile_inheriting_a_runtime_cannot_smuggle_a_restricted_model(self) -> None:
+        """A profile is a name for a runtime, not a way around its pairing."""
+        helm_root = self._runtime_root("profiled", prefs=self.CLAUDE_ONLY)
+        (helm_root / "agents.json").write_text(
+            json.dumps({"agents": [{"id": "reviewer", "runtime": "pi"}]})
+        )
+        bin_dir = self._fake_agent_cli("pi", "claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "profiled")
+        task = coordinator.create_task(
+            project["id"], "Review the parser", model="claude-opus-5", agent="reviewer"
+        )
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_MODEL": ""}
+        with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
+            HelmError, r"restrict to the claude runtime"
+        ):
+            coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+
+    def test_a_command_that_bakes_a_restricted_model_into_argv_is_refused(self) -> None:
+        """A boundary checked only where Helm places a model is one argv walks past.
+
+        A profile or a caller-supplied command can select the model itself, so
+        the visible argv forms are inspected at launch rather than trusted.
+        """
+        helm_root = self._runtime_root("baked", prefs=self.CLAUDE_ONLY)
+        (helm_root / "agents.json").write_text(
+            json.dumps({
+                "agents": [
+                    {"id": "sneaky", "command": ["pi", "--model", "claude-opus-5", "{prompt}"]},
+                    {"id": "inline", "command": ["opencode", "--model=anthropic/claude-opus-5", "{prompt}"]},
+                    {"id": "honest", "command": ["pi", "--model", "gpt-5.6-sol", "{prompt}"]},
+                    # A profile may call itself claude and start something
+                    # else. The executable is what decides.
+                    {"id": "claude", "command": ["pi", "--model", "claude-opus-5", "{prompt}"]},
+                ]
+            })
+        )
+        bin_dir = self._fake_agent_cli("pi", "opencode", "claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "baked")
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_MODEL": ""}
+
+        for agent in ("sneaky", "inline", "claude"):
+            task = coordinator.create_task(project["id"], "Port the parser", agent=agent)
+            with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
+                HelmError, r"its launch command selects that model"
+            ):
+                coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+
+        # A non-Claude model in the same shape is ordinary configuration and
+        # is left exactly alone.
+        fine = coordinator.create_task(project["id"], "Port the parser", agent="honest")
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(fine["id"], None, execution="herdr")
+        self.assertIn("gpt-5.6-sol", worker["command"])
+
+        # A caller-supplied command is the same route without a profile...
+        direct = coordinator.create_task(project["id"], "Port the parser")
+        coordinator.allocate_task(direct["id"])
+        with mock.patch.dict(os.environ, env), self.assertRaisesRegex(
+            HelmError, r"claude-opus-5 is in the claude model family"
+        ):
+            coordinator.prepare_external_worker(
+                direct["id"],
+                ["pi", "--model", "claude-opus-5", "{prompt}"],
+                execution="process",
+            )
+
+        # ...and Claude Code selecting a Claude model is the allowed pairing,
+        # so an ordinary custom command still launches.
+        allowed = coordinator.create_task(project["id"], "Port the parser")
+        coordinator.allocate_task(allowed["id"])
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(
+                allowed["id"],
+                ["claude", "--model", "claude-opus-5", "{prompt}"],
+                execution="process",
+            )
+        self.assertIn("claude-opus-5", worker["command"])
+
+    def test_an_opaque_command_is_a_stated_limit_not_a_silent_one(self) -> None:
+        """Helm reads argv; it cannot introspect a wrapper script.
+
+        A wrapper that chooses a model from its own config or environment is
+        outside what any launch-time check can see, so the boundary says so in
+        the code that implements it rather than implying a guarantee it has
+        no way to keep.
+        """
+        self.assertIsNone(
+            runtimes.model_in_command(["/usr/local/bin/run-agent.sh", "{prompt}"])
+        )
+        self.assertIn("opaque wrapper", runtimes.model_in_command.__doc__ or "")
+        # And what is visible is still found, in both spellings.
+        self.assertEqual(
+            runtimes.model_in_command(["pi", "--model", "sonnet-4-5"]), "sonnet-4-5"
+        )
+        self.assertEqual(
+            runtimes.model_in_command(["pi", "--model=claude-opus-5"]), "claude-opus-5"
+        )
+        # `--model=` states an empty value; the argument after it is the
+        # prompt, and reading it as a model would refuse a launch over
+        # whatever the brief happened to mention.
+        self.assertIsNone(
+            runtimes.model_in_command(
+                ["pi", "--model=", "Rewrite the migration notes for opus-4.1"]
+            )
+        )
+
+    def test_launch_identity_comes_from_the_executable_not_the_profile_label(self) -> None:
+        """Metadata claiming to be Claude Code is not Claude Code.
+
+        A profile is a label; argv[0] is the program that will actually run. If
+        the label won, the boundary would accept the one answer that lets a
+        Claude model launch on another vendor's CLI.
+        """
+        restricted_root = self._runtime_root("identity", prefs=self.CLAUDE_ONLY)
+        restricted = Coordinator(
+            StateStore(restricted_root / "state", helm_root=restricted_root)
+        )
+        claude_label = {"id": "claude", "builtin": True}
+        for executable in ("pi", "opencode", "/usr/local/bin/omp"):
+            with self.subTest(executable=executable):
+                self.assertEqual(
+                    Coordinator._launch_runtime_id(
+                        claude_label, [executable, "--model", "claude-opus-5"]
+                    ),
+                    Path(executable).name,
+                )
+                with self.assertRaisesRegex(
+                    HelmError, r"its launch command selects that model"
+                ):
+                    restricted._with_model(
+                        claude_label, [executable, "--model", "claude-opus-5"], None, ""
+                    )
+        # A profile that names its runtime rather than being one loses to argv
+        # in exactly the same way.
+        self.assertEqual(
+            Coordinator._launch_runtime_id(
+                {"id": "house", "runtime": "claude"}, ["pi", "{prompt}"]
+            ),
+            "pi",
+        )
+        # The converse: non-Claude metadata over a command that visibly starts
+        # Claude Code is Claude Code, so the allowed pairing still launches.
+        pi_label = {"id": "pi", "builtin": True}
+        self.assertEqual(
+            Coordinator._launch_runtime_id(pi_label, ["claude", "--model", "claude-opus-5"]),
+            "claude",
+        )
+        self.assertEqual(
+            restricted._with_model(
+                pi_label, ["claude", "--model", "claude-opus-5", "{prompt}"], None, ""
+            ),
+            ["claude", "--model", "claude-opus-5", "{prompt}"],
+        )
+        # An unrecognized program is evidence of nothing, so the profile is
+        # what is left to go on.
+        self.assertEqual(
+            Coordinator._launch_runtime_id(pi_label, ["/usr/local/bin/wrapper.sh"]), "pi"
+        )
+        self.assertIsNone(
+            Coordinator._launch_runtime_id({"id": "default"}, ["/usr/local/bin/wrapper.sh"])
+        )
+
+    def test_a_restricted_reviewer_model_only_ever_runs_on_its_runtime(self) -> None:
+        """Review is the path most likely to reach for a cross-provider runtime.
+
+        `--reviewer-model` exists precisely to buy independence through the
+        model, so it is exactly where a Claude model would otherwise land on pi
+        or opencode.
+        """
+        self.write_preferences(**self.CLAUDE_ONLY)
+        bin_dir = self._fake_agent_cli("claude", "pi", "opencode")
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
+            # Named explicitly: refused, and the required runtime is named.
+            with self.assertRaisesRegex(
+                HelmError, r"restrict to the claude runtime"
+            ):
+                self.coordinator.pick_reviewer_agent(
+                    "codex", explicit="pi", model="anthropic/claude-opus-5"
+                )
+            # Claude Code itself is the accepted pairing.
+            choice = self.coordinator.pick_reviewer_agent(
+                "pi", explicit="claude", model="claude-opus-5"
+            )
+            self.assertEqual(choice["agent"], "claude")
+            self.assertIn("claude-opus-5", choice["command"])
+
+            # Chosen automatically, a Claude reviewer model narrows the field
+            # to Claude Code rather than landing on whatever is installed.
+            automatic = self.coordinator.pick_reviewer_agent("pi", model="sonnet-4-5")
+            self.assertEqual(automatic["agent"], "claude")
+            self.assertEqual(automatic["independence"], "different-runtime")
+
+        without_claude = self._fake_agent_cli("pi", "opencode")
+        with mock.patch.dict(os.environ, {"PATH": str(without_claude)}):
+            # No substitution: say the pairing cannot be honoured here.
+            with self.assertRaisesRegex(
+                HelmError, r"no installed reviewer runtime may run that model family"
+            ):
+                self.coordinator.pick_reviewer_agent("pi", model="claude-opus-5")
+
+        only_claude = self._fake_agent_cli("claude")
+        with mock.patch.dict(os.environ, {"PATH": str(only_claude)}):
+            # The documented same-runtime fallback still holds for Claude.
+            fallback = self.coordinator.pick_reviewer_agent("claude", model="claude-opus-5")
+            self.assertEqual(fallback["independence"], "different-model")
+
+        only_pi = self._fake_agent_cli("pi")
+        with mock.patch.dict(os.environ, {"PATH": str(only_pi)}):
+            # ...but it must not quietly become pi running a Claude model.
+            with self.assertRaisesRegex(HelmError, r"restrict to the claude runtime"):
+                self.coordinator.pick_reviewer_agent("pi", model="claude-opus-5")
+
+    def test_a_model_is_refused_rather_than_dropped_when_helm_cannot_place_it(self) -> None:
+        """A custom command has no model flag Helm knows.
+
+        Dropping it silently would leave the coordinator believing it had
+        instructed a model it never sent, and the bill is the only place that
+        difference would ever show up.
+        """
+        helm_root = self._runtime_root("custom")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "custom")
+        task = coordinator.create_task(
+            project["id"], "Summarise the log", model="claude-haiku-4-5"
+        )
+        coordinator.allocate_task(task["id"])
+        with self.assertRaisesRegex(HelmError, r"only built-in runtimes publish a model flag"):
+            coordinator.prepare_external_worker(
+                task["id"], ["/bin/echo", "{prompt}"], execution="process"
+            )
+
+    def test_a_project_pins_its_own_runtime_over_the_session_default(self) -> None:
+        helm_root = self._runtime_root("pinned", {"agent": "codex"})
+        bin_dir = self._fake_agent_cli("codex", "claude", "pi")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "pinned")
+        self.assertEqual(project["agent"], "codex")
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "CLAUDECODE": "1",
+            "HELM_AGENT": "",
+        }
+        task = coordinator.create_task(project["id"], "Prepare the migration")
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+        self.assertEqual(worker["agent_id"], "codex")
+        self.assertIn("pins agent codex", worker["agent_reason"])
+        # An agent named for this one task still outranks the project's pin.
+        explicit = coordinator.create_task(project["id"], "Prepare the migration", agent="pi")
+        with mock.patch.dict(os.environ, env):
+            chosen = coordinator.prepare_external_worker(explicit["id"], None, execution="herdr")
+        self.assertEqual(chosen["agent_id"], "pi")
+        self.assertIn("explicit", chosen["agent_reason"])
+
+    def test_launch_time_agent_override_may_name_a_built_in_runtime(self) -> None:
+        helm_root = self._runtime_root("launch-agent")
+        bin_dir = self._fake_agent_cli("pi")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "launch-agent")
+        task = coordinator.create_task(project["id"], "Prepare the migration")
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_AGENT": ""}
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(
+                task["id"], None, execution="herdr", agent="pi"
+            )
+        self.assertEqual(worker["agent_id"], "pi")
+        self.assertIn("explicit", worker["agent_reason"])
+
+    def test_unknown_and_unavailable_runtimes_fail_with_the_known_agent_list(self) -> None:
+        helm_root = self._runtime_root("unknown")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "unknown")
+        task = coordinator.create_task(project["id"], "Do the thing", agent="not-an-agent")
+        with self.assertRaisesRegex(HelmError, r"unknown agent: not-an-agent.*claude.*codex.*pi"):
+            coordinator.prepare_external_worker(task["id"], None)
+        # A known runtime that is not installed is unavailable, never invented.
+        missing = coordinator.create_task(project["id"], "Do the thing", agent="codex")
+        with mock.patch.dict(os.environ, {"PATH": str(Path(self.temp.name) / "empty-bin")}):
+            with self.assertRaisesRegex(HelmError, r"codex is unavailable"):
+                coordinator.prepare_external_worker(missing["id"], None)
+        # Nothing pinned, nothing configured, nothing detectable: Helm asks
+        # instead of guessing a provider command.
+        undetectable = coordinator.create_task(project["id"], "Do the thing")
+        with mock.patch.dict(os.environ, {"HELM_AGENT": "none"}):
+            with self.assertRaisesRegex(HelmError, r"no worker runtime is available"):
+                coordinator.prepare_external_worker(undetectable["id"], None)
+
+    def test_a_profile_may_inherit_a_built_in_runtime_by_name(self) -> None:
+        helm_root = self._runtime_root("profiles", {"domains": ["publishing"]})
+        bin_dir = self._fake_agent_cli("codex", "pi")
+        (helm_root / "agents.json").write_text(json.dumps({
+            "agents": [
+                {"id": "shorts", "runtime": "codex", "domains": ["publishing"]},
+                {"id": "pi", "capacity": 2},
+            ]
+        }))
+        (helm_root / "domains" / "publishing").mkdir(parents=True)
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "profiles")
+        task = coordinator.create_task(project["id"], "Prepare the next artifact")
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_AGENT": ""}
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+        self.assertEqual(worker["agent_id"], "shorts")
+        self.assertEqual(Path(worker["command"][0]).name, "codex")
+        # A profile whose id is a runtime id needs no command either.
+        named = coordinator.create_task(project["id"], "Prepare the next artifact", agent="pi")
+        with mock.patch.dict(os.environ, env):
+            chosen = coordinator.prepare_external_worker(named["id"], None, execution="herdr")
+        self.assertEqual(Path(chosen["command"][0]).name, "pi")
+
+    def test_runtime_credentials_pass_through_without_widening_the_scrub(self) -> None:
+        helm_root = self._runtime_root("creds", {"agent": "claude"})
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "creds")
+        task = coordinator.create_task(project["id"], "Draft the note")
+        env = {
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "ANTHROPIC_API_KEY": "sk-test-key",
+            "UNRELATED_SECRET": "do-not-forward",
+            "HELM_AGENT": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+        config = json.loads(Path(worker["config_file"]).read_text())
+        self.assertEqual(config["worker_env"]["ANTHROPIC_API_KEY"], "sk-test-key")
+        self.assertNotIn("UNRELATED_SECRET", config["worker_env"])
+        # The scrub itself is untouched: only the runtime's declared names are
+        # added back, for this one assignment.
+        self.assertNotIn("UNRELATED_SECRET", worker_environment(os.environ | env))
+        self.assertNotIn("ANTHROPIC_API_KEY", worker_environment(os.environ | env))
+
+    def test_agent_check_reports_built_in_runtimes_when_nothing_is_configured(self) -> None:
+        helm_root = self._runtime_root("builtins")
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        # Only the stub is on PATH, so availability reflects this machine
+        # rather than whatever the developer happens to have installed.
+        env = {"PATH": str(bin_dir), "CLAUDECODE": "1"}
+        with mock.patch.dict(os.environ, env):
+            report = {entry["id"]: entry for entry in coordinator.agent_availability()}
+        self.assertEqual(
+            set(report), {"claude", "codex", "pi", "opencode", "omp", "cursor"}
+        )
+        self.assertTrue(report["claude"]["available"])
+        self.assertTrue(report["claude"]["detected"])
+        self.assertFalse(report["codex"]["available"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.dict(os.environ, env):
+            self.assertEqual(cli.main(["--root", str(helm_root), "agent", "check"]), 0)
+        self.assertIn("claude (Claude Code) [built-in, available] <- this session", output.getvalue())
+
+    def test_agent_check_reports_herdr_integration_inventory_without_paths(self) -> None:
+        helm_root = self._runtime_root("herdr-integrations")
+        bin_dir = self._fake_agent_cli("claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        statuses = runtimes.parse_herdr_integration_status(
+            "claude: current (v7) (/Users/test/.claude/hooks/herdr-agent-state.sh)\n"
+            "copilot: current (v2) (/Users/test/.copilot/hooks/herdr-agent-state.sh)\n"
+            "kimi: not installed (/Users/test/.kimi-code/hooks/herdr-agent-state.sh)\n"
+        )
+        self.assertEqual(statuses["claude"], "current")
+        self.assertEqual(statuses["copilot"], "current")
+        self.assertEqual(statuses["kimi"], "not installed")
+        self.assertNotIn("/Users/test", " ".join(statuses.values()))
+
+        env = {"PATH": str(bin_dir), "CLAUDECODE": "1"}
+        with mock.patch.dict(os.environ, env), mock.patch(
+            "helm.runtimes.herdr_integration_status", return_value=statuses
+        ):
+            report = {entry["id"]: entry for entry in coordinator.agent_availability()}
+        self.assertEqual(report["claude"]["herdr_integration"], "current")
+        self.assertTrue(report["claude"]["herdr_integrated"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.dict(os.environ, env), mock.patch(
+            "helm.runtimes.herdr_integration_status", return_value=statuses
+        ):
+            self.assertEqual(cli.main(["--root", str(helm_root), "agent", "check"]), 0)
+        text = output.getvalue()
+        self.assertIn("claude (Claude Code) [built-in, available, herdr=current]", text)
+        self.assertIn("Herdr integrations not in Helm's built-ins: copilot (Herdr-only)", text)
+        self.assertNotIn("/Users/test", text)
+
+    def test_a_reviewer_is_never_the_agent_that_wrote_the_code(self) -> None:
+        bin_dir = self._fake_agent_cli("claude", "codex")
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
+            # Two runtimes installed: independence comes from the runtime.
+            choice = self.coordinator.pick_reviewer_agent("claude")
+            self.assertEqual(choice["agent"], "codex")
+            self.assertEqual(choice["independence"], "different-runtime")
+            self.assertEqual(self.coordinator.pick_reviewer_agent("codex")["agent"], "claude")
+
+        only_one = self._fake_agent_cli("claude")
+        with mock.patch.dict(os.environ, {"PATH": str(only_one)}):
+            # One runtime and no model: refuse rather than let an agent review
+            # its own work and call the result independent.
+            with self.assertRaisesRegex(HelmError, r"no independent reviewer is available"):
+                self.coordinator.pick_reviewer_agent("claude")
+            # A different model on the same runtime is the documented fallback.
+            fallback = self.coordinator.pick_reviewer_agent("claude", model="claude-sonnet-5")
+            self.assertEqual(fallback["independence"], "different-model")
+            self.assertIn("--model", fallback["command"])
+            self.assertIn("claude-sonnet-5", fallback["command"])
+            # The model flag must not land where a variadic option eats it.
+            self.assertLess(
+                fallback["command"].index("claude-sonnet-5"),
+                fallback["command"].index(runtimes.PROMPT_PLACEHOLDER),
+            )
+
+    def test_an_excluded_runtime_is_never_started_for_any_task(self) -> None:
+        """The exclusion is about starting a runtime, not only about reviewing.
+
+        Scoping it to reviews left the expensive runtime one `--agent` away,
+        one project pin away, or one lucky detection away.
+        """
+        root = self.repo("noexpensive")
+        project = self.coordinator.register_project(
+            "NoExpensive", str(root), project_id="noexpensive"
+        )
+        bin_dir = self._fake_agent_cli("claude", "codex")
+        path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        with mock.patch.dict(
+            os.environ, {"PATH": path, "HELM_EXCLUDE_AGENTS": "codex"}
+        ):
+            # Naming it explicitly is refused rather than silently substituted,
+            # which would hide that the request was overridden.
+            named = self.coordinator.create_task(project["id"], "work", agent="codex")
+            with self.assertRaisesRegex(HelmError, r"codex is excluded from this Helm root"):
+                self.coordinator.launch_worker(named["id"], None, wait=False)
+
+            # A project pin is the same attempt by another route, and the
+            # refusal has to name the source, because that is what a human
+            # then has to go and change.
+            with self.state.locked() as data:
+                data["projects"][project["id"]]["agent"] = "codex"
+            pinned = self.coordinator.create_task(project["id"], "work")
+            with self.assertRaisesRegex(HelmError, r"pins agent codex"):
+                self.coordinator.launch_worker(pinned["id"], None, wait=False)
+
+    def test_a_runtime_the_root_excludes_is_never_picked_to_review(self) -> None:
+        """Cost policy: some runtimes are too expensive to spend a review on.
+
+        Independence still comes first -- an excluded runtime is skipped, not
+        substituted for the author, so an exclusion can never quietly downgrade
+        a review into the agent checking its own work.
+        """
+        bin_dir = self._fake_agent_cli("claude", "codex", "pi")
+        with mock.patch.dict(
+            os.environ, {"PATH": str(bin_dir), "HELM_REVIEW_EXCLUDE_AGENTS": "codex"}
+        ):
+            choice = self.coordinator.pick_reviewer_agent("claude")
+            self.assertEqual(choice["agent"], "pi")
+            self.assertEqual(choice["independence"], "different-runtime")
+            # Naming it explicitly must not route around the policy.
+            with self.assertRaisesRegex(HelmError, r"codex is excluded from reviews"):
+                self.coordinator.pick_reviewer_agent("claude", explicit="codex")
+
+        only_author_and_excluded = self._fake_agent_cli("claude", "codex")
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": str(only_author_and_excluded), "HELM_REVIEW_EXCLUDE_AGENTS": "codex"},
+        ):
+            # Refuse rather than fall back to the author reviewing itself, and
+            # say that the exclusion is why nothing independent was left.
+            with self.assertRaisesRegex(HelmError, r"Excluded from reviews in this root: codex"):
+                self.coordinator.pick_reviewer_agent("claude")
+
+    def test_codex_launch_permits_the_reporting_directory_it_names(self) -> None:
+        # Codex refuses --add-dir outright unless the sandbox allows extra
+        # writable roots, so omitting --sandbox did not keep the sandbox
+        # narrow: it killed every codex worker at launch, which took the
+        # independent reviewer with it and silently reduced code review to
+        # same-runtime self-review.
+        codex = runtimes.builtin_runtime("codex")
+        assert codex is not None
+        for command in (codex.interactive, codex.noninteractive):
+            self.assertIn("--add-dir", command)
+            self.assertIn("--sandbox", command)
+            mode = command[command.index("--sandbox") + 1]
+            # workspace-write is the narrower of the two modes that allow it;
+            # danger-full-access would drop the sandbox entirely.
+            self.assertEqual(mode, "workspace-write")
+
+    def test_codex_launch_permits_the_shared_git_directory(self) -> None:
+        # A task worktree's `.git` is a file pointing into the project's own
+        # `.git/worktrees/<id>`, and a commit writes there and into the common
+        # objects and refs -- outside the worktree that workspace-write allows.
+        # A codex author could edit everything and then not commit any of it.
+        codex = runtimes.builtin_runtime("codex")
+        assert codex is not None
+        for command in (codex.interactive, codex.noninteractive):
+            roots = [
+                command[i + 1] for i, part in enumerate(command) if part == "--add-dir"
+            ]
+            self.assertEqual(
+                roots,
+                [runtimes.STATE_DIR_PLACEHOLDER, runtimes.GIT_COMMON_DIR_PLACEHOLDER],
+            )
+        filled = runtimes.apply_prompt(
+            codex.noninteractive, "p", "/w", "/state", "/repo/.git"
+        )
+        self.assertEqual(filled.count("--add-dir"), 2)
+        self.assertIn("/repo/.git", filled)
+        # No git directory known: the slot and its flag both go, rather than
+        # handing codex an empty writable root it would refuse at launch.
+        bare = runtimes.apply_prompt(codex.noninteractive, "p", "/w", "/state")
+        self.assertEqual(bare.count("--add-dir"), 1)
+        self.assertNotIn("", bare)
+
+
+class EffortCapabilityTests(HelmTestCase):
+    """Effort is a property of the runtime, expressed four different ways.
+
+    Encoding it as "every CLI has --effort" would have been wrong for three of
+    the five runtimes Helm ships, and wrong silently: the level would vanish
+    and the commander would pay for a quality difference nobody could see.
+    """
+
+    def test_each_runtime_declares_how_it_takes_effort(self) -> None:
+        from helm import runtimes
+        claude = runtimes.builtin_runtime("claude")
+        self.assertEqual(claude.effort_mechanism, runtimes.EFFORT_FLAG)
+        self.assertIn("high", claude.effort_levels)
+        codex = runtimes.builtin_runtime("codex")
+        self.assertEqual(codex.effort_mechanism, runtimes.EFFORT_CONFIG)
+        # OpenAI's vocabulary, not Claude Code's.
+        self.assertIn("minimal", codex.effort_levels)
+        self.assertNotIn("xhigh", codex.effort_levels)
+        for runtime_id in ("pi", "opencode", "omp", "cursor"):
+            runtime = runtimes.builtin_runtime(runtime_id)
+            self.assertEqual(
+                runtime.effort_mechanism, runtimes.EFFORT_UNSUPPORTED, runtime_id
+            )
+            self.assertFalse(runtime.accepts_effort("high"), runtime_id)
+
+    def test_a_flag_runtime_carries_effort_beside_the_model(self) -> None:
+        from helm import runtimes
+        runtime = runtimes.builtin_runtime("claude")
+        command = runtime.with_effort(
+            runtime.with_model("claude-opus-5", interactive=True), "high"
+        )
+        self.assertEqual(command[1:5], ["--effort", "high", "--model", "claude-opus-5"])
+
+    def test_a_config_runtime_carries_effort_as_an_override(self) -> None:
+        from helm import runtimes
+        runtime = runtimes.builtin_runtime("codex")
+        command = runtime.with_effort(runtime.command(interactive=True), "high")
+        self.assertEqual(command[1:3], ["-c", "model_reasoning_effort=high"])
+
+    def test_effort_is_never_added_twice(self) -> None:
+        from helm import runtimes
+        runtime = runtimes.builtin_runtime("claude")
+        once = runtime.with_effort(runtime.command(interactive=True), "high")
+        self.assertEqual(runtime.with_effort(once, "high"), once)
+
+
+class EffortResolutionTests(HelmTestCase):
+    def _project_task(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the work")
+        return project, task
+
+    def test_the_task_outranks_the_project_pin(self) -> None:
+        project, _ = self._project_task("effortladder")
+        with self.coordinator.store.locked() as data:
+            data["projects"][project["id"]]["effort"] = "low"
+        task = self.coordinator.create_task(
+            project["id"], "careful work", effort="high"
+        )
+        loaded = self.coordinator.store.load()
+        effort, reason, _source = self.coordinator._resolve_effort(
+            loaded["projects"][project["id"]], loaded["tasks"][task["id"]]
+        )
+        self.assertEqual(effort, "high")
+        self.assertIn("task", reason)
+
+    def test_the_project_pin_applies_when_the_task_is_silent(self) -> None:
+        project, task = self._project_task("effortpin")
+        with self.coordinator.store.locked() as data:
+            data["projects"][project["id"]]["effort"] = "medium"
+        loaded = self.coordinator.store.load()
+        effort, reason, _source = self.coordinator._resolve_effort(
+            loaded["projects"][project["id"]], loaded["tasks"][task["id"]]
+        )
+        self.assertEqual(effort, "medium")
+        self.assertIn(project["id"], reason)
+
+    def test_nothing_chosen_means_the_runtimes_own_default(self) -> None:
+        """Helm never invents a level: unset stays unset, so the runtime keeps
+        whatever the machine is configured for."""
+        project, task = self._project_task("effortunset")
+        loaded = self.coordinator.store.load()
+        effort, reason, _source = self.coordinator._resolve_effort(
+            loaded["projects"][project["id"]], loaded["tasks"][task["id"]]
+        )
+        self.assertIsNone(effort)
+        self.assertEqual(reason, "")
+
+    def test_an_unknown_level_is_refused_at_the_edge(self) -> None:
+        from helm.core import HelmError
+        project, _ = self._project_task("effortbogus")
+        with self.assertRaises(HelmError):
+            self.coordinator.create_task(project["id"], "work", effort="turbo")
+
+
+class EffortRefusalTests(HelmTestCase):
+    """A level the runtime cannot express is refused, never dropped.
+
+    Dropping it would spend the commander's money at a level they did not
+    choose and leave nothing in the record to show the difference.
+    """
+
+    def test_a_runtime_without_effort_refuses_rather_than_dropping_it(self) -> None:
+        from helm.core import HelmError
+        with self.assertRaises(HelmError) as caught:
+            self.coordinator._require_effort_supported(
+                "high", "opencode", "project x pins high effort"
+            )
+        self.assertIn("opencode", str(caught.exception))
+        self.assertIn("high", str(caught.exception))
+
+    def test_a_level_outside_the_runtimes_vocabulary_is_refused(self) -> None:
+        from helm.core import HelmError
+        with self.assertRaises(HelmError) as caught:
+            self.coordinator._require_effort_supported(
+                "xhigh", "codex", "task asks for xhigh effort"
+            )
+        # Names what it does take, so the fix is obvious from the message.
+        self.assertIn("minimal", str(caught.exception))
+
+    def test_a_supported_level_passes_silently(self) -> None:
+        self.coordinator._require_effort_supported("high", "claude", "task")
+        self.coordinator._require_effort_supported(None, "opencode", "task")
+
+
+class EffortAtLaunchTests(HelmTestCase):
+    def test_the_launch_records_the_effort_it_applied(self) -> None:
+        """The trustworthy record is Helm's, not the agent's self-report: an
+        agent knows what it was told, not what it is running."""
+        import sys
+        root = self.repo("effortlaunch")
+        project = self.coordinator.register_project(
+            "Launch", str(root), project_id="effortlaunch"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "careful work", effort="high"
+        )
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        recorded = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(recorded["effort"], "high")
+        self.assertIn("high", recorded["effort_reason"])
+        self.coordinator.stop_worker(worker["id"], reason="test cleanup")
+
+    def test_a_launch_refuses_an_effort_the_runtime_cannot_express(self) -> None:
+        """The refusal has to bite where the launch happens, not only in the
+        helper: this is the path a real task takes."""
+        from helm.core import HelmError
+        root = self.repo("effortrefuse")
+        project = self.coordinator.register_project(
+            "Refuse", str(root), project_id="effortrefuse"
+        )
+        task = self.coordinator.create_task(project["id"], "work", effort="high")
+        with self.assertRaises(HelmError):
+            self.coordinator.launch_worker(
+                task["id"], ["opencode", "--auto", "{prompt}"], wait=False
+            )
+
+
+class EffortByModelSwapTests(HelmTestCase):
+    """Some runtimes have no effort setting and express depth by model.
+
+    Refusing those outright was the wrong answer: the commander's intent is
+    reachable through the mechanism the runtime actually has, and only the
+    map from level to model needs teaching — which is a root's job, because
+    model names change constantly.
+    """
+
+    def _taught(self, spec: str):
+        import json
+        from helm import preferences
+        root = self._helm_root(f"swap{abs(hash(spec)) % 10000}")
+        path = root / preferences.PREFERENCES_FILENAME
+        path.write_text(
+            json.dumps({
+                "version": preferences.PREFERENCES_VERSION,
+                "effort": {"runtimes": {"pi": spec}},
+            }),
+            encoding="utf-8",
+        )
+        return preferences.load(path)
+
+    def test_a_taught_map_makes_a_swap_runtime_accept_effort(self) -> None:
+        from helm import runtimes
+        loaded = self._taught("model::high=pi-large,low=pi-small")
+        mechanism, _argument, pairs = loaded.effort_runtimes["pi"]
+        self.assertEqual(mechanism, "model")
+        self.assertEqual(dict(pairs), {"high": "pi-large", "low": "pi-small"})
+        runtime = runtimes.AgentRuntime(
+            id="pi", name="pi", interactive=(), noninteractive=(),
+            env_passthrough=(), detect_env=(),
+            effort_mechanism=runtimes.EFFORT_MODEL, effort_models=dict(pairs),
+        )
+        self.assertTrue(runtime.accepts_effort("high"))
+        self.assertEqual(runtime.effort_model("high"), "pi-large")
+        # A level nobody taught stays unreachable rather than guessed at.
+        self.assertFalse(runtime.accepts_effort("max"))
+
+    def test_a_mapping_without_a_model_is_refused(self) -> None:
+        from helm import preferences
+        with self.assertRaises(preferences.PreferencesError):
+            self._taught("model::high=")
+
+    def test_replacing_a_model_never_names_it_twice(self) -> None:
+        from helm import runtimes
+        replaced = runtimes.replace_model(["pi", "--model", "small", "--prompt", "x"], "big")
+        self.assertEqual(replaced.count("--model"), 1)
+        self.assertIn("big", replaced)
+        self.assertNotIn("small", replaced)
+
+    def test_a_pinned_model_and_a_swap_effort_refuse_rather_than_override(self) -> None:
+        """Satisfying the effort would mean running a model the commander did
+        not choose. Both were stated; Helm surfaces the conflict instead of
+        silently preferring one."""
+        import json
+        import sys
+        from helm import preferences
+        from helm.core import Coordinator, HelmError, StateStore
+
+        root = self._helm_root("swapconflict")
+        (root / preferences.PREFERENCES_FILENAME).write_text(
+            json.dumps({
+                "version": preferences.PREFERENCES_VERSION,
+                "effort": {"runtimes": {"pi": "model::high=pi-large"}},
+            }),
+            encoding="utf-8",
+        )
+        coordinator = Coordinator(StateStore(root / "state", helm_root=root))
+        repo = self.repo("swapconflictrepo")
+        project = coordinator.register_project(
+            "Swap", str(repo), project_id="swapconflictrepo"
+        )
+        task = coordinator.create_task(
+            project["id"], "write", model="pi-small", effort="high"
+        )
+        with self.assertRaises(HelmError) as caught:
+            coordinator.launch_worker(
+                task["id"], ["pi", "--model", "pi-small", "{prompt}"], wait=False
+            )
+        message = str(caught.exception)
+        self.assertIn("pi-large", message)
+        self.assertIn("pi-small", message)
+
+
+class EffortReachesTheRecordTests(HelmTestCase):
+    """Both halves of "did the effort take" — the CLI path that stores it, and
+    the command that shows it.
+
+    Found in use, not in test: a foreman asked to verify an effort it had
+    passed discovered `task create` dropped the flag silently and `task
+    inspect` could not have shown it either way. A setting nobody can inspect
+    is a setting nobody can check was honoured.
+    """
+
+    def _project(self, name: str):
+        root = self.repo(name)
+        return self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+
+    def test_task_create_stores_the_effort_it_was_given(self) -> None:
+        import contextlib as _ctx
+        import io
+        from helm import cli
+
+        project = self._project("effortcreate")
+        out = io.StringIO()
+        with _ctx.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "task", "create", "--project", project["id"],
+                "--brief", "careful work", "--effort", "high",
+            ])
+        self.assertEqual(code, 0)
+        task_id = out.getvalue().split()[2]
+        stored = self.coordinator.store.load()["tasks"][task_id]
+        self.assertEqual(stored["effort"], "high")
+
+    def test_inspect_shows_what_the_task_will_run_as(self) -> None:
+        import contextlib as _ctx
+        import io
+        from helm import cli
+
+        project = self._project("effortinspect")
+        task = self.coordinator.create_task(
+            project["id"], "careful work", agent="claude", effort="high"
+        )
+        out = io.StringIO()
+        with _ctx.redirect_stdout(out):
+            cli.main([
+                "--state-dir", str(self.state.directory),
+                "task", "inspect", task["id"],
+            ])
+        shown = out.getvalue()
+        self.assertIn("effort: high", shown)
+        self.assertIn("agent: claude", shown)
+
+
+class AgentHelpNamesEveryRuntimeTests(HelmTestCase):
+    """The `--agent` help is the only place most operators learn what they may name.
+
+    It was hand-written, so it went stale the moment a runtime was added: it
+    still said four when six shipped, which reads as "cursor is not supported"
+    to anyone who trusts it.
+    """
+
+    def _agent_help(self, parser, path):
+        action = parser
+        for name in path:
+            action = action._subparsers._group_actions[0].choices[name]  # type: ignore[union-attr]
+        for candidate in action._actions:
+            if "--agent" in candidate.option_strings:
+                return candidate.help or ""
+        self.fail(f"no --agent option on {' '.join(path)}")
+
+    def test_every_built_in_runtime_is_named_in_the_agent_help(self) -> None:
+        parser = cli._build_parser()
+        for path in (("run",), ("task", "create"), ("worker", "launch"), ("foreman",)):
+            help_text = self._agent_help(parser, path)
+            for runtime in runtimes.BUILTIN_RUNTIMES:
+                self.assertIn(
+                    runtime.id,
+                    help_text,
+                    f"{' '.join(path)} --agent help omits the built-in runtime {runtime.id}",
+                )
+
+
+class ForemanEffortTests(HelmTestCase):
+    """A foreman is an agent Helm starts, so effort must resolve for it too.
+
+    It did not: `--model` and `--agent` were both there and `--effort` was not,
+    so the only way to run a driver at a chosen level was an environment
+    variable -- which is a session-wide setting standing in for a per-appointment
+    one.
+    """
+
+    def test_foreman_appointment_accepts_and_records_an_effort(self) -> None:
+        parser = cli._build_parser()
+        parsed = parser.parse_args(["foreman", "media", "--effort", "high"])
+        self.assertEqual(parsed.effort, "high")
+
+    def test_a_foreman_task_carries_the_effort_it_was_appointed_with(self) -> None:
+        root = self.repo("driver")
+        project = self.coordinator.register_project("Driver", str(root), project_id="driver")
+        task = self.coordinator.create_foreman_task(project["id"], effort="high")
+        self.assertEqual(task["effort"], "high")
+
+    def test_an_unappointed_effort_stays_unset_rather_than_invented(self) -> None:
+        root = self.repo("driver2")
+        project = self.coordinator.register_project("Driver2", str(root), project_id="driver2")
+        task = self.coordinator.create_foreman_task(project["id"])
+        self.assertIsNone(task.get("effort"))
+
+
+class RuntimeProbeTests(HelmTestCase):
+    """A probe reports what happened; it never downgrades availability.
+
+    The whole reason this exists is that a runtime whose executable is present
+    can still die the moment it starts. The reason it must not flip
+    ``available`` is that the non-interactive form it probes can fail while the
+    interactive form Helm actually launches works perfectly -- both were
+    observed on the same runtime within an hour.
+    """
+
+    def test_an_unknown_runtime_is_an_error_not_a_verdict(self) -> None:
+        with self.assertRaises(HelmError):
+            self.coordinator.probe_runtime("not-a-runtime")
+
+    def test_a_missing_executable_reports_absent_without_running_anything(self) -> None:
+        with mock.patch("helm.core.shutil.which", return_value=None):
+            verdict = self.coordinator.probe_runtime("claude")
+        self.assertEqual(verdict["verdict"], "absent")
+
+    def test_a_rejected_credential_is_named_as_auth_not_as_a_generic_failure(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["claude"], returncode=1, stdout="", stderr="Your stored authentication is invalid.",
+        )
+        with mock.patch("helm.core.shutil.which", return_value="/usr/bin/claude"), \
+                mock.patch("helm.core.subprocess.run", return_value=completed):
+            verdict = self.coordinator.probe_runtime("claude")
+        self.assertEqual(verdict["verdict"], "auth")
+
+    def test_a_probe_failure_leaves_the_runtime_listed_as_available(self) -> None:
+        # cursor failed --print with a transport error while running fine in a
+        # pane. A probe that marked it unavailable would have hidden a usable
+        # runtime, which is the worse direction for this check.
+        completed = subprocess.CompletedProcess(
+            args=["cursor-agent"], returncode=1, stdout="",
+            stderr="RetriableError: WritableIterable is closed",
+        )
+        with mock.patch("helm.core.shutil.which", return_value="/usr/bin/cursor-agent"), \
+                mock.patch("helm.core.subprocess.run", return_value=completed):
+            verdict = self.coordinator.probe_runtime("cursor")
+        self.assertEqual(verdict["verdict"], "failed")
+        rows = {row["id"]: row for row in self.coordinator.builtin_runtime_availability()}
+        self.assertNotIn("probe", rows["cursor"], "a probe verdict must not leak into availability")
+
+    def test_a_timeout_is_its_own_verdict(self) -> None:
+        with mock.patch("helm.core.shutil.which", return_value="/usr/bin/claude"), \
+                mock.patch("helm.core.subprocess.run",
+                           side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
+            verdict = self.coordinator.probe_runtime("claude")
+        self.assertEqual(verdict["verdict"], "timeout")
+
+
+class ImpossibleEffortIsRefusedWhereItCanStillBeFixedTests(HelmTestCase):
+    """An effort the named runtime cannot express must fail at CREATION.
+
+    It used to fail only at launch. `--agent cursor --effort low` was
+    accepted and recorded, and every launch then refused it -- with no
+    command to clear an effort off an existing task, so the task was
+    unlaunchable from the instant it existed. A foreman spent three launch
+    attempts on one and correctly reported it rather than working around it.
+    The launch check stays for runtimes only resolved there; this one catches
+    the pairing while the caller can still act on it.
+    """
+
+    def _project(self, name: str):
+        root = self.repo(name)
+        return self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+
+    def test_a_runtime_with_no_effort_setting_is_refused_at_creation(self) -> None:
+        project = self._project("impossible")
+        with self.assertRaisesRegex(HelmError, r"cannot be told a reasoning effort"):
+            self.coordinator.create_task(
+                project["id"], "mechanical apply", agent="cursor", effort="low"
+            )
+
+    def test_a_level_the_runtime_does_not_offer_is_refused_at_creation(self) -> None:
+        project = self._project("badlevel")
+        # codex takes minimal/low/medium/high and has no xhigh.
+        with self.assertRaisesRegex(HelmError, r"does not accept effort"):
+            self.coordinator.create_task(
+                project["id"], "careful work", agent="codex", effort="xhigh"
+            )
+
+    def test_an_effort_the_runtime_accepts_still_creates(self) -> None:
+        project = self._project("fine")
+        task = self.coordinator.create_task(
+            project["id"], "careful work", agent="claude", effort="xhigh"
+        )
+        self.assertEqual(task["effort"], "xhigh")
+
+    def test_an_effort_with_no_agent_named_is_left_to_launch(self) -> None:
+        # The runtime is not knowable yet -- a project pin or the session
+        # default may well accept it -- so refusing here would reject work
+        # that is perfectly launchable.
+        project = self._project("later")
+        task = self.coordinator.create_task(project["id"], "careful work", effort="high")
+        self.assertEqual(task["effort"], "high")
+
+
+class RuntimeDefaultModelTests(HelmTestCase):
+    """"Let the runtime choose" had no rung on the ladder.
+
+    The resolution docstring has always promised that saying nothing leaves the
+    model to the runtime. That was only true on a root with no `model.default`.
+    Once one is set it intercepts every unset case, so a caller could not ask
+    for the runtime's own default at all: a reviewer launched on codex with no
+    model drew this root's claude default and was then correctly refused by
+    `model.runtimes.claude`. The instruction was impossible to obey, and it
+    cost a review round before anyone noticed the rung was missing.
+    """
+
+    def _project(self) -> dict:
+        root = self.repo("runtimedefault")
+        return self.coordinator.register_project(
+            "RuntimeDefault", str(root), project_id="runtimedefault"
+        )
+
+    def test_the_sentinel_beats_a_root_default(self) -> None:
+        """This is the whole point: it must STOP the ladder, not fall through."""
+        self.write_preferences(**{"model": {"default": "claude-fable-5"}})
+        model, reason = self.coordinator._resolve_model(
+            self._project(), {"model": RUNTIME_DEFAULT_MODEL}
+        )
+        self.assertFalse(model, "the sentinel must resolve to no model at all")
+        self.assertIn("runtime", reason)
+
+    def test_an_unset_model_still_takes_the_root_default(self) -> None:
+        """Absence and the sentinel mean different things, and must stay different.
+
+        Absence means "nothing stated here, keep looking". The sentinel means
+        "stop looking". Collapsing the two would silently disable every root
+        default on the machine.
+        """
+        self.write_preferences(**{"model": {"default": "claude-fable-5"}})
+        model, _ = self.coordinator._resolve_model(self._project(), {})
+        self.assertEqual(model, "claude-fable-5")
+
+    def test_an_explicit_model_is_still_honoured(self) -> None:
+        self.write_preferences(**{"model": {"default": "claude-fable-5"}})
+        model, reason = self.coordinator._resolve_model(
+            self._project(), {"model": "gpt-6-astra"}
+        )
+        self.assertEqual(model, "gpt-6-astra")
+        self.assertIn("task names model", reason)
+
+    def test_an_empty_model_adds_no_flag_to_the_launch_command(self) -> None:
+        """The sentinel is only worth anything if it reaches the command.
+
+        Resolving to "" would be pointless if the launcher then passed
+        `--model ''`, which is how a runtime ends up parsing an empty value.
+        """
+        command = ["claude", "--dangerously-skip-permissions"]
+        built = self.coordinator._with_model(
+            {"id": "claude"}, command, "", "the task asks for the runtime's default"
+        )
+        self.assertEqual(built, command, "no model must mean no --model flag")
+
+    def test_the_sentinel_survives_the_reviewer_path(self) -> None:
+        """The reviewer path builds its command directly and bypasses the ladder.
+
+        So a sentinel the ladder understands was baked into argv as a literal
+        `--model runtime` -- the exact failure it exists to prevent, on the exact
+        path where the need arose. Found by running it, not by reading it.
+        """
+        choice = self.coordinator.pick_reviewer_agent(
+            "claude", explicit="codex", model=RUNTIME_DEFAULT_MODEL
+        )
+        argv = " ".join(map(str, choice.get("command") or []))
+        self.assertNotIn("--model", argv, "the sentinel must mean no --model flag")
+        real = self.coordinator.pick_reviewer_agent(
+            "claude", explicit="codex", model="gpt-6-astra"
+        )
+        self.assertIn("gpt-6-astra", " ".join(map(str, real.get("command") or [])))
+
+
+class ARootDefaultEffortIsAFloorNotADemandTests(HelmTestCase):
+    """The day effort.default was set, every cursor launch was refused.
+
+    Cursor cannot be told an effort. A stated level -- the task's, the
+    project's, HELM_EFFORT -- still refuses, because dropping it would spend
+    money at a level nobody chose. A root *default* is the commander's floor
+    for runtimes that take one; a runtime with no such setting was always
+    running at its own default, and now launches with that written down.
+    """
+
+    def _cursor_task(self, name: str, prefs: dict[str, object]):
+        helm_root = RuntimeSelectionTests._runtime_root(self, name, prefs=prefs)
+        bin_dir = RuntimeSelectionTests._fake_agent_cli(self, "cursor-agent", "claude")
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, name)
+        task = coordinator.create_task(project["id"], "review it", agent="cursor", read_only=True)
+        return coordinator, task, bin_dir
+
+    def test_the_default_is_dropped_and_recorded_where_the_runtime_takes_none(self) -> None:
+        coordinator, task, bin_dir = self._cursor_task("floor", {"effort": {"default": "medium"}})
+        with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_EFFORT": ""}):
+            worker = coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+        self.assertNotIn("--effort", worker["command"])
+        launched = coordinator.store.load()["tasks"][task["id"]]
+        self.assertIsNone(launched["effort"])
+        self.assertIn("cannot be told one", launched["effort_reason"])
+        self.assertIn("root preferences set medium effort", launched["effort_reason"])
+
+    def test_a_stated_level_still_refuses(self) -> None:
+        coordinator, task, bin_dir = self._cursor_task("demand", {"effort": {"default": "medium"}})
+        with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_EFFORT": "medium"}):
+            with self.assertRaisesRegex(HelmError, r"cannot be told a reasoning effort"):
+                coordinator.prepare_external_worker(task["id"], None, execution="herdr")

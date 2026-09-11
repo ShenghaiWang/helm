@@ -1,0 +1,1961 @@
+"""The worker protocol, worker/foreman process lifecycle and health."""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as _dt
+import io
+import os
+import json
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from unittest import mock
+
+from helm import cli
+from helm.core import (
+    CORE_SAFETY_RULES,
+    HelmError,
+    _git_root,
+    inside,
+)
+from helm.herdr import HerdrAdapter
+
+from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS, wait_for_exit
+
+
+class WorkerProtocolTests(HelmTestCase):
+    def _runner_config(self, name: str) -> Path:
+        root = self.repo(name)
+        base = Path(self.temp.name) / f"{name}-runner"
+        base.mkdir()
+        common_dir = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        config_path = base / "runner.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "command": [sys.executable, "-c", "print('hello from the worker')"],
+                    "cwd": str(root),
+                    "git_common_dir": common_dir,
+                    "log": str(base / "output.log"),
+                    "exit": str(base / "exit.json"),
+                    "worker_env": {"HELM_WORKER_ID": "w-visible"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+        return config_path
+
+    def _foreman_runner_config(self, name: str, *, workspace: Path, state_dir: Path) -> Path:
+        base = Path(self.temp.name) / f"{name}-foreman-runner"
+        base.mkdir()
+        config_path = base / "runner.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "command": [sys.executable, "-c", "print('foreman is driving')"],
+                    "cwd": str(workspace),
+                    "git_common_dir": str(base / "unused-common-dir"),
+                    "workspace_kind": "state-directory",
+                    "state_dir": str(state_dir),
+                    "log": str(base / "output.log"),
+                    "exit": str(base / "exit.json"),
+                    "worker_env": {"HELM_WORKER_ID": "w-foreman"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+        return config_path
+
+    def test_run_delegates_to_a_herdr_worker_space_by_default(self) -> None:
+        parser = cli._build_parser()
+        default = parser.parse_args(["run", "media", "prepare the next artifact"])
+        self.assertTrue(default.herdr)
+        opted_out = parser.parse_args(["run", "media", "prepare the next artifact", "--no-herdr"])
+        self.assertFalse(opted_out.herdr)
+
+    def test_worker_messages_are_routed_and_worker_output_is_data(self) -> None:
+        root = self.repo("messages")
+        project = self.coordinator.register_project("Messages", str(root), project_id="messages")
+        task = self.coordinator.create_task(project["id"], "report a blocker")
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import json; print(json.dumps({'helm': 1, 'type': 'blocker', "
+                "'text': 'needs credentials'})); print('plain output')"
+            ),
+        ]
+        worker = self.coordinator.launch_worker(task["id"], command)
+        # It reported a blocker and then exited cleanly. The blocker is the
+        # outcome -- of the task and of the worker -- and the orderly exit is
+        # kept beside it as evidence rather than read back as success.
+        # docs/worker-lifecycle.md is the contract; tests/test_worker_lifecycle.py
+        # holds it in both orders.
+        self.assertEqual(worker["status"], "failed")
+        self.assertEqual(worker["protocol_outcome"], "blocker")
+        self.assertEqual(worker["process_exit_code"], 0)
+        inspected = self.coordinator.inspect_task(task["id"])
+        self.assertTrue(
+            any(message["kind"] == "exit-evidence" for message in inspected["messages"])
+        )
+        self.assertEqual(inspected["project"]["id"], "messages")
+        self.assertEqual(inspected["task"]["status"], "blocked")
+        self.assertTrue(any(message["kind"] == "blocker" for message in inspected["messages"]))
+        # Plain output is still data, and it is still kept -- in the worker's
+        # own log, which is what `helm tail` reads. It is deliberately not a
+        # second copy in shared state: half a million such lines had grown to
+        # 99.4% of a 224 MB state file that a save rewrites in full.
+        self.assertFalse(any(message["kind"] == "output" for message in inspected["messages"]))
+        self.assertIn(
+            "plain output", "\n".join(self.coordinator.worker_output(worker["id"], 50))
+        )
+
+    def test_helm_sees_a_stalled_worker_without_anyone_opening_its_ui(self) -> None:
+        root = self.repo("health")
+        project = self.coordinator.register_project("Health", str(root), project_id="health")
+        task = self.coordinator.create_task(project["id"], "go quiet")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        # Fresh output and nothing reported yet is starting up, not a fault:
+        # flagging every new worker would make the attention list noise.
+        healthy = {entry["worker_id"]: entry for entry in self.coordinator.worker_health()}
+        self.assertEqual(healthy[worker["id"]]["verdict"], "starting")
+
+        # Age the log past the threshold with no protocol message: this is the
+        # failure a human would otherwise only find by looking at the pane.
+        stale = time.time() - 10_000
+        os.utime(worker["log_file"], (stale, stale))
+        stalled = {entry["worker_id"]: entry for entry in self.coordinator.worker_health()}
+        self.assertEqual(stalled[worker["id"]]["verdict"], "stalled")
+        self.assertIn("no terminal output", stalled[worker["id"]]["detail"])
+
+        # A worker that already delivered a terminal message is idle, not
+        # stalled; flagging it would make the attention list worthless.
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        reported = {entry["worker_id"]: entry for entry in self.coordinator.worker_health()}
+        if worker["id"] in reported:
+            self.assertEqual(reported[worker["id"]]["verdict"], "reported")
+
+    def test_sweep_settles_a_worker_that_finished_while_nobody_was_looking(self) -> None:
+        root = self.repo("sweep")
+        project = self.coordinator.register_project("Sweep", str(root), project_id="sweep")
+        task = self.coordinator.create_task(project["id"], "finish unobserved")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        # The process ended and wrote its exit record, but no one polled it, so
+        # the task sits in `running` for as long as nobody looks.
+        Path(worker["exit_file"]).write_text(json.dumps({"returncode": 0}) + "\n", encoding="utf-8")
+        self.assertEqual(self.coordinator.inspect_task(task["id"])["task"]["status"], "running")
+        report = {entry["worker_id"]: entry for entry in self.coordinator.sweep_workers()}
+        self.assertEqual(report[worker["id"]]["verdict"], "settled")
+        self.assertNotEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "running"
+        )
+        # Repair stops at the unambiguous: a stalled worker is reported, never
+        # silently failed, because its pane is the evidence for diagnosing it.
+        self.assertEqual(self.coordinator.sweep_workers(), [])
+
+    def test_a_worker_terminal_message_ends_the_task_without_a_process_exit(self) -> None:
+        root = self.repo("settle")
+        project = self.coordinator.register_project("Settle", str(root), project_id="settle")
+        task = self.coordinator.create_task(project["id"], "report then linger")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        # An agent CLI keeps its session open after finishing, and a session
+        # killed with its pane never writes an exit record at all -- the
+        # protocol result itself must settle the lifecycle for review.
+        self.coordinator.record_worker_message(worker["id"], "result", "work done")
+        settled = self.coordinator.inspect_task(task["id"])["workers"][0]
+        self.assertEqual(settled["status"], "completed")
+        self.assertEqual(self.coordinator.inspect_task(task["id"])["task"]["status"], "completed")
+
+        # A blocker settles to blocked, not completed: the worker's own word
+        # decides the outcome, and settling never invents success.
+        other = self.coordinator.create_task(project["id"], "hit a wall")
+        blocked = self.coordinator.launch_worker(
+            other["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(blocked["id"], "blocker", "needs a credential")
+        self.coordinator.settle_reported_worker(blocked["id"])
+        self.assertEqual(self.coordinator.inspect_task(other["id"])["task"]["status"], "blocked")
+
+        # A worker that has said nothing terminal is not settled by guesswork.
+        quiet_task = self.coordinator.create_task(project["id"], "say nothing")
+        quiet = self.coordinator.launch_worker(
+            quiet_task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        with self.assertRaisesRegex(HelmError, r"not delivered a terminal message"):
+            self.coordinator.settle_reported_worker(quiet["id"])
+
+    def test_a_foreman_tab_is_called_foreman(self) -> None:
+        """Its brief is standing text, so slugging it named the tab after that.
+
+        Every foreman got a tab reading like the opening words of "You are this
+        project's foreman...", which says nothing about which pane it is.
+        """
+        foreman_task = {"role": "foreman", "brief": "You are this project's foreman. You own..."}
+        worker = {"id": "w-fe58cded506e"}
+        self.assertEqual(HerdrAdapter._worker_tab_label(foreman_task, worker), "foreman")
+
+        # An ordinary worker still gets its brief and a disambiguating suffix,
+        # because a project has many of those at once.
+        worker_task = {"role": "worker", "brief": "Implement slice S0 of the migration"}
+        label = HerdrAdapter._worker_tab_label(worker_task, worker)
+        self.assertNotEqual(label, "foreman")
+        self.assertIn("fe58", label)
+
+    def test_a_reviewer_gets_no_checkout_and_no_branch(self) -> None:
+        """A reviewer reads a diff; it never writes one.
+
+        Giving each review its own worktree cost a full clone per review --
+        thirty-five of them on one project, every branch deleted as empty when
+        the tasks were cleaned up.
+        """
+        root = self.repo("reviewrole")
+        project = self.coordinator.register_project(
+            "Reviewrole", str(root), project_id="reviewrole"
+        )
+        task = self.coordinator.create_task(project["id"], "read it", role="reviewer")
+
+        self.assertIsNone(task["branch"])
+        workspace = Path(task["workspace"])
+        self.assertIn("reviewers", workspace.parts)
+        # Inside Helm's own state, never the project or a user's checkout.
+        self.assertTrue(str(workspace).startswith(str(self.state.directory)))
+
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        worktrees = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list"],
+            check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout
+        self.assertNotIn(task["id"], worktrees)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(root), "branch", "--list", f"helm/{project['id']}/*"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            "",
+        )
+
+    def test_a_foreman_drives_one_project_and_is_never_work_to_merge(self) -> None:
+        root = self.repo("foremanning")
+        project = self.coordinator.register_project(
+            "Foreman", str(root), project_id="foremanning"
+        )
+        self.coordinator.record_situation(project["id"], "the trailer is waiting on audio")
+        task = self.coordinator.create_foreman_task(project["id"])
+
+        # It is started with the state of play, not with a conversation.
+        self.assertEqual(task["role"], "foreman")
+        self.assertIn("the trailer is waiting on audio", task["brief"])
+        self.assertIn("You cannot approve, merge, publish, push, delete", task["brief"])
+        # Its domain is about driving, never about the work it drives: a
+        # driver carrying the work's domain would leak it into every task it
+        # creates, including the ones that are not code.
+        self.assertEqual(task["domain"], "driving-delegated-work")
+
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+        self.assertEqual(self.coordinator.foreman_for(project["id"])["id"], worker["id"])
+
+        # A foreman produces no branch, so it is never offered as work to
+        # merge and never gets a card on the board.
+        self.coordinator.record_worker_message(worker["id"], "result", "driving")
+        status = self.coordinator.project_status(project["id"])
+        self.assertNotIn(task["id"], [entry["task_id"] for entry in status["unmerged"]])
+        cards = [card["id"] for group in self.coordinator.board() for card in group["tasks"]]
+        self.assertNotIn(task["id"], cards)
+
+    def test_an_idle_foreman_stands_down_so_its_project_can_release_its_space(self) -> None:
+        # A foreman was appointed once and never terminated, and releasing a
+        # space requires no running worker -- so for every project with a
+        # driver, which is every project by default, "a finished project
+        # releases its space" could never fire.
+        root = self.repo("standing-down")
+        project = self.coordinator.register_project(
+            "Down", str(root), project_id="standing-down"
+        )
+        work = self.coordinator.create_task(project["id"], "the work", no_domain=True)
+        worker = self.coordinator.launch_worker(
+            work["id"], [sys.executable, "-c", ""], wait=False
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.launch_worker(
+            foreman_task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+        # While the work it drives is unfinished, it stays.
+        self.assertIsNone(self.coordinator.stand_down_idle_foreman(project["id"]))
+
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        self.coordinator.wait_worker(worker["id"])
+        stood = self.coordinator.stand_down_idle_foreman(project["id"])
+        self.assertIsNotNone(stood)
+        self.assertEqual(stood["id"], foreman["id"])
+        self.assertEqual(stood["status"], "completed")
+        settled = self.coordinator.store.load()
+        self.assertEqual(settled["tasks"][foreman_task["id"]]["status"], "completed")
+        # Idempotent, and nothing left running to block a space release.
+        self.assertIsNone(self.coordinator.stand_down_idle_foreman(project["id"]))
+        self.assertFalse(
+            [w for w in settled["workers"].values() if w.get("status") == "running"]
+        )
+
+    def test_a_foreman_waiting_on_its_own_worker_is_not_reported_as_a_fault(self) -> None:
+        # A driver blocked on the review it launched is doing its job. Calling
+        # that a fault trains the reader to ignore the attention list.
+        root = self.repo("waiting-foreman")
+        project = self.coordinator.register_project(
+            "Waiting", str(root), project_id="waiting-foreman"
+        )
+        driven_task = self.coordinator.create_task(project["id"], "the work", no_domain=True)
+        self.coordinator.launch_worker(
+            driven_task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.launch_worker(
+            foreman_task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+        health = {h["worker_id"]: h for h in self.coordinator.worker_health(silence_seconds=0)}
+        self.assertEqual(health[foreman["id"]]["verdict"], "driving")
+        self.assertIn("waiting on", health[foreman["id"]]["detail"])
+
+    def test_a_foreman_is_told_it_is_the_foreman_not_the_worker(self) -> None:
+        # The foreman is launched down the same path as any worker, so it used
+        # to open by being told it was "Helm's delegated worker for this task"
+        # and to "work only in the assigned worktree" -- directly contradicting
+        # the brief that follows, and nudging it toward doing the work itself.
+        root = self.repo("named")
+        project = self.coordinator.register_project("Named", str(root), project_id="named")
+        foreman = self.coordinator.create_foreman_task(project["id"])
+        worker_task = self.coordinator.create_task(project["id"], "do the actual work")
+        context = Path(self.temp.name) / "context.json"
+
+        driving = self.coordinator._worker_prompt(project, foreman, context)
+        self.assertIn("You are the foreman", driving)
+        self.assertNotIn("delegated worker", driving)
+        self.assertNotIn("work only in the assigned worktree", driving)
+
+        working = self.coordinator._worker_prompt(project, worker_task, context)
+        self.assertIn("delegated worker", working)
+
+    def test_a_foreman_gets_no_worktree_and_no_branch_to_edit(self) -> None:
+        # It drives work rather than doing it, so a checkout and a task branch
+        # are both an invitation and a branch to shed for a task that never
+        # held a change.
+        root = self.repo("driving")
+        project = self.coordinator.register_project("Driving", str(root), project_id="driving")
+        foreman = self.coordinator.create_foreman_task(project["id"])
+        self.assertEqual(foreman["role"], "foreman")
+        self.assertIsNone(foreman["branch"])
+
+        allocated = self.coordinator.allocate_task(foreman["id"])
+        workspace = Path(allocated["workspace"])
+        self.assertTrue(workspace.is_dir())
+        # Helm-owned state, never a checkout of the project.
+        self.assertTrue(inside(workspace, self.coordinator.store.directory))
+        self.assertNotEqual(_git_root(workspace), workspace)
+        branches = subprocess.run(
+            ["git", "-C", str(root), "branch", "--format=%(refname:short)"],
+            check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.split()
+        self.assertEqual([b for b in branches if b.startswith("helm/")], [])
+        # And the project's own checkout is untouched by any of it.
+        self.assertEqual(len(self.coordinator._task_workers(self.coordinator.store.load(), foreman["id"])), 0)
+
+    def test_a_finished_worker_wakes_its_foreman_instead_of_waiting_to_be_polled(self) -> None:
+        root = self.repo("waking")
+        project = self.coordinator.register_project(
+            "Wake", str(root), project_id="waking"
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""]
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        coder = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        delivered: list[tuple[str, str]] = []
+
+        with mock.patch.object(
+            adapter, "answer_worker", side_effect=lambda w, t: delivered.append((w, t)) or True
+        ):
+            # Routine progress must not interrupt the driver: a foreman told
+            # about every push spends its attention reading, not driving.
+            self.coordinator.record_worker_message(coder["id"], "status", "still going")
+            self.assertFalse(adapter.notify_foreman(coder["id"]))
+            self.assertEqual(delivered, [])
+
+            # A status explicitly marked as an intermediate outcome summary
+            # does wake the driver; this is how a long coding/review loop
+            # reports the shape of progress without spamming every heartbeat.
+            self.coordinator.record_worker_message(
+                coder["id"],
+                "status",
+                "round 3 implementation done; waiting on reviewer",
+                payload={"summary": True},
+            )
+            self.assertTrue(adapter.notify_foreman(coder["id"]))
+            self.assertIn("round 3 implementation done", delivered[-1][1])
+            status = self.coordinator.project_status(project["id"])
+            self.assertTrue(any("Worker summary:" in entry["text"] for entry in status["situation"]))
+
+            # A terminal message is the whole point. Without this the foreman
+            # only learns its delegated work finished by happening to poll.
+            self.coordinator.record_worker_message(
+                coder["id"], "result", "Done. Commit abc1234, comments only."
+            )
+            self.assertTrue(adapter.notify_foreman(coder["id"]))
+            self.assertEqual(delivered[-1][0], foreman["id"])
+            told = delivered[-1][1]
+            self.assertIn(coder["id"], told)
+            self.assertIn("Commit abc1234", told)
+            # Hand it the next command, not just the news.
+            self.assertIn(f"helm review {task['id']}", told)
+
+            # A foreman's own report goes to Helm, never back into itself.
+            delivered.clear()
+            self.coordinator.record_worker_message(
+                foreman["id"],
+                "status",
+                "task round 5: reviewer approved, waiting on merge decision",
+                payload={"summary": True},
+            )
+            status = self.coordinator.project_status(project["id"])
+            self.assertTrue(any("Foreman report:" in entry["text"] and "task round 5" in entry["text"] for entry in status["situation"]))
+            self.coordinator.record_worker_message(foreman["id"], "result", "project driven")
+            self.assertFalse(adapter.notify_foreman(foreman["id"]))
+            self.assertEqual(delivered, [])
+
+    def test_a_worker_that_died_right_after_reporting_is_not_called_healthy(self) -> None:
+        root = self.repo("vanishing")
+        project = self.coordinator.register_project(
+            "Vanish", str(root), project_id="vanishing"
+        )
+        task = self.coordinator.create_task(project["id"], "edit a file")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(120)"], wait=False
+        )
+        # It reports, as a working agent does.
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "edited the file; committing next"
+        )
+        healthy = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(healthy[worker["id"]]["verdict"], "healthy")
+
+        # Then its process dies without an exit record -- which is what an
+        # agent CLI in one-shot mode does the moment its turn ends, mid-task
+        # and before committing. Judging liveness from its own messages called
+        # this healthy indefinitely: the last push is always fresh, because it
+        # died right after making it.
+        os.kill(worker["pid"], signal.SIGKILL)
+        wait_for_exit(worker["pid"])
+        Path(worker["exit_file"]).unlink(missing_ok=True)
+
+        after = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(after[worker["id"]]["verdict"], "died")
+        self.assertIn("uncommitted", after[worker["id"]]["detail"])
+
+    def test_a_launched_worker_gets_a_tab_so_a_foremans_agents_are_visible(self) -> None:
+        parser = cli._build_parser()
+        # A foreman spawns through `helm worker launch`. When that went
+        # straight to the process launcher, every agent a foreman started was
+        # invisible while the foreman itself sat in a tab -- and a project's
+        # space is supposed to hold one tab per worker.
+        self.assertTrue(parser.parse_args(["worker", "launch", "t-1"]).herdr)
+        self.assertFalse(
+            parser.parse_args(["worker", "launch", "t-1", "--no-herdr"]).herdr
+        )
+
+        root = self.repo("tabbed")
+        project = self.coordinator.register_project(
+            "Tabbed", str(root), project_id="tabbed"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        seen: list[str] = []
+
+        def record(task_id, command, **kwargs):
+            seen.append(task_id)
+            return {"id": "w-x", "status": "running", "task_id": task_id,
+                    "project_id": project["id"], "execution": "herdr"}
+
+        with mock.patch.object(HerdrAdapter, "launch_task", side_effect=record), \
+             mock.patch.object(cli, "_ensure_foreman"):
+            self.assertEqual(
+                cli.main(["--state-dir", str(self.state.directory),
+                          "worker", "launch", task["id"], "--async"]),
+                0,
+            )
+        self.assertEqual(seen, [task["id"]])
+
+    def test_an_over_long_situation_note_is_refused_rather_than_silently_cut(self) -> None:
+        root = self.repo("noting")
+        project = self.coordinator.register_project(
+            "Note", str(root), project_id="noting"
+        )
+        # A note used to be trimmed to the limit without a word said, which
+        # destroyed exactly the wrong end: what to do next goes last, so a
+        # long note lost its point and still looked complete. A foreman read
+        # one of those, found no goal, and started the wrong work.
+        goal = "NEXT: redo F1, and nothing else."
+        overlong = ("x" * self.coordinator.SITUATION_LINE_LIMIT) + " " + goal
+        with self.assertRaises(HelmError) as caught:
+            self.coordinator.record_situation(project["id"], overlong)
+        # The error has to say how to fix it, or the writer just trims by hand
+        # and loses the same content deliberately instead of accidentally.
+        self.assertIn("Split it into separate notes", str(caught.exception))
+        self.assertEqual(self.coordinator.project_status(project["id"])["situation"], [])
+
+        # A note inside the limit is stored whole -- no ellipsis, no trim.
+        exact = "y" * self.coordinator.SITUATION_LINE_LIMIT
+        entry = self.coordinator.record_situation(project["id"], exact)
+        self.assertEqual(entry["text"], exact)
+        self.coordinator.record_situation(project["id"], goal)
+        recorded = [
+            e["text"] for e in self.coordinator.project_status(project["id"])["situation"]
+        ]
+        self.assertEqual(recorded[-1], goal)
+
+    def test_stopping_a_worker_settles_it_so_nothing_stays_running_forever(self) -> None:
+        root = self.repo("stopping")
+        project = self.coordinator.register_project(
+            "Stop", str(root), project_id="stopping"
+        )
+        task = self.coordinator.create_task(project["id"], "run for a long time")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(120)"], wait=False
+        )
+        self.assertEqual(worker["status"], "running")
+
+        stopped = self.coordinator.stop_worker(worker["id"], "abandoned by the commander")
+        self.assertTrue(stopped["signalled"])
+        self.assertEqual(stopped["status"], "failed")
+        # The process is actually gone, not merely recorded as gone.
+        with self.assertRaises(OSError):
+            os.kill(worker["pid"], 0)
+
+        data = self.coordinator.store.load()
+        # The task leaves `running`, which is what lets cleanup and a new
+        # foreman proceed. Before this there was no way out at all.
+        self.assertEqual(data["tasks"][task["id"]]["status"], "failed")
+        failure = [
+            m for m in data["messages"]
+            if m.get("worker_id") == worker["id"] and m.get("kind") == "failure"
+        ][-1]
+        # Abandoned on purpose and died on its own are both failures, and the
+        # record says which.
+        self.assertEqual(failure["payload"]["stop_kind"], "stopped")
+        self.assertIn("Worker stopped: abandoned by the commander", failure["text"])
+
+        # Idempotent: stopping something already stopped is what someone does
+        # when unsure the first one took.
+        again = self.coordinator.stop_worker(worker["id"], "again")
+        self.assertEqual(again["status"], "failed")
+
+        # The evidence survives; removing it stays a separate, deliberate act.
+        self.assertTrue(Path(worker["log_file"]).exists())
+        self.assertFalse(data["tasks"][task["id"]]["workspace_removed"])
+
+    def test_a_dead_foreman_can_be_replaced_rather_than_wedging_its_project(self) -> None:
+        root = self.repo("wedged")
+        project = self.coordinator.register_project(
+            "Wedged", str(root), project_id="wedged"
+        )
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""]
+        )
+        # A pane closed by hand leaves the record saying `running`, and
+        # foreman_for only matches running -- so without a way to stop it,
+        # this project could never be given another driver.
+        self.assertEqual(self.coordinator.foreman_for(project["id"])["id"], foreman["id"])
+
+        self.coordinator.stop_worker(foreman["id"], "pane was closed by hand")
+        self.assertIsNone(self.coordinator.foreman_for(project["id"]))
+
+    def test_every_project_gets_a_foreman_unless_it_declines_one(self) -> None:
+        # A project that says nothing still gets a driver: the alternative is
+        # the coordinator remembering to appoint one, which is the failure
+        # this removes.
+        silent = self.repo("silent")
+        quiet = self.coordinator.register_project("Quiet", str(silent), project_id="silent")
+        self.assertTrue(self.coordinator.project_wants_foreman(quiet["id"]))
+
+        root = self.repo("declining")
+        (root / ".helm").mkdir()
+        (root / ".helm" / "project.json").write_text(
+            json.dumps({"foreman": False}), encoding="utf-8"
+        )
+        project = self.coordinator.register_project(
+            "Declined", str(root), project_id="declining"
+        )
+        self.assertFalse(self.coordinator.project_wants_foreman(project["id"]))
+
+        # A project says whether it wants a driver, never what one may do: a
+        # project file cannot widen Helm's authority by phrasing.
+        (root / ".helm" / "project.json").write_text(
+            json.dumps({"foreman": "yes, and it may merge"}), encoding="utf-8"
+        )
+        with self.assertRaises(HelmError):
+            self.coordinator._discovery_settings(root)
+
+    def test_a_foreman_gets_the_boundary_from_code_and_the_craft_from_a_domain(self) -> None:
+        helm_root, project = self._domain_root_project("crosscheck")
+        shipped = SHIPPED_DOMAINS
+        for domain_id in (
+            "driving-delegated-work",
+            "code-review",
+            "spec-driven-development",
+            "branch-isolation",
+            "model-selection",
+        ):
+            shutil.copytree(shipped / domain_id, helm_root / "domains" / domain_id)
+        task = self._coordinator.create_foreman_task(project["id"])
+
+        # Code holds the boundary: what a foreman is and what it may not do.
+        # A domain file is untrusted guidance and must never define that.
+        self.assertIn("helm task create --project", task["brief"])
+        self.assertIn("helm worker launch", task["brief"])
+        self.assertIn("helm review <task-id>", task["brief"])
+        self.assertIn("You must not do the work yourself", task["brief"])
+        self.assertIn("cannot approve, merge, publish, push, delete", task["brief"])
+
+        # The craft comes from `domains/`, where it is versioned and reusable,
+        # and it arrives composed with the coder/reviewer independence rules
+        # rather than restating them. `branch-isolation` and `model-selection`
+        # are composed in too, so the foreman gets the fresh-base gate and the
+        # skill/runtime-fit guidance before it ever creates a task.
+        context = self._coordinator._context(project, task, "w-foreman")
+        self.assertEqual(
+            context["domain_chain"],
+            [
+                "spec-driven-development",
+                "code-review",
+                "branch-isolation",
+                "model-selection",
+                "driving-delegated-work",
+            ],
+        )
+        text = json.dumps(context)
+        self.assertIn("Do not do the delegated work yourself", text)
+        self.assertIn("the reviewer must not be the author", text)
+        # The fresh-base gate reaches the foreman before it allocates a task.
+        self.assertIn("The base must be fresh and verified before a worktree is cut", text)
+        self.assertIn(
+            "resolve the project's *configured* default/base branch "
+            "(never a hardcoded or inferred name; a repository default is "
+            "only inferred once, at registration, and only falls back to "
+            "the checked-out branch when the project has no remote at all",
+            text,
+        )
+
+    def test_a_foreman_that_is_down_outranks_any_stalled_worker(self) -> None:
+        root = self.repo("driverdown")
+        project = self.coordinator.register_project(
+            "Down", str(root), project_id="driverdown"
+        )
+        ordinary = self.coordinator.create_task(project["id"], "write the code")
+        self.coordinator.prepare_external_worker(ordinary["id"], [sys.executable, "-c", ""])
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        foreman = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""]
+        )
+
+        health = self.coordinator.worker_health()
+        # Foreman first: it is the thing that would have noticed the other.
+        self.assertEqual(health[0]["worker_id"], foreman["id"])
+        self.assertEqual(health[0]["role"], "foreman")
+        self.assertEqual(health[1]["role"], "worker")
+
+    def test_output_recovery_reads_only_the_round_that_asked_for_it(self) -> None:
+        root = self.repo("marking")
+        project = self.coordinator.register_project("Mark", str(root), project_id="marking")
+        task = self.coordinator.create_task(project["id"], "produce output")
+        worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        Path(worker["log_file"]).write_text("APPROVED round one\n", encoding="utf-8")
+        mark = self.coordinator.worker_output_mark(worker["id"])
+        with Path(worker["log_file"]).open("a", encoding="utf-8") as handle:
+            handle.write("CHANGES-REQUESTED round two\n")
+        # A stale verdict from an earlier round must not answer this one.
+        self.assertEqual(
+            self.coordinator.worker_output(worker["id"], since=mark),
+            ["CHANGES-REQUESTED round two"],
+        )
+
+    def test_recovery_never_reads_the_brief_back_as_the_answer_to_itself(self) -> None:
+        """An agent that draws a TUI draws its own prompt into the pane.
+
+        Two pi reviewers "reported" the instruction verbatim: the pane wrapped
+        mid-sentence so a line began `CHANGES-REQUESTED -- Helm reads...`, and
+        the single-line guards missed it because the words that would have
+        disqualified it -- the other verdict word, and `FIRST WORD` -- had
+        wrapped onto the line above. Helm wrote that brief, so it can tell its
+        own instruction from an answer to it.
+        """
+        root = self.repo("echoed")
+        project = self.coordinator.register_project("Echo", str(root), project_id="echoed")
+        task = self.coordinator.create_task(project["id"], "produce output")
+        worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        brief = (
+            "Finish with one result message whose FIRST WORD is APPROVED or "
+            "CHANGES-REQUESTED -- Helm reads that word to decide whether the loop "
+            "continues -- followed by your findings."
+        )
+        # Exactly how the pane wrapped it: the disqualifying words are above.
+        Path(worker["log_file"]).write_text(
+            "Finish with one result message whose FIRST WORD is APPROVED or\n"
+            "CHANGES-REQUESTED -- Helm reads that word to decide whether the loop\n"
+            "continues -- followed by your findings.\n"
+            "  Working...\n",
+            encoding="utf-8",
+        )
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        self.assertIsNone(
+            adapter._verdict_from_output(worker["id"], 0, brief),
+            "the reviewer's own instruction was recovered as its verdict",
+        )
+        # A real verdict in the same pane is still found.
+        with Path(worker["log_file"]).open("a", encoding="utf-8") as handle:
+            handle.write("APPROVED no blocking findings\n")
+        recovered = adapter._verdict_from_output(worker["id"], 0, brief)
+        self.assertIsNotNone(recovered)
+        self.assertTrue(recovered["text"].startswith("APPROVED"))
+
+    def test_worker_output_is_decoded_once_rather_than_by_every_reader(self) -> None:
+        root = self.repo("tailing")
+        project = self.coordinator.register_project("Tail", str(root), project_id="tailing")
+        task = self.coordinator.create_task(project["id"], "produce output")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        Path(worker["log_file"]).write_text(
+            "\x1b[38;5;153mcoloured line\x1b[0m\n\n\x1b]0;title\x07second line\n"
+            # A CSI sequence may carry intermediate bytes before its final
+            # letter. Agent CLIs emit this cursor-shape one constantly, and
+            # missing it littered "[0 q" through every decoded line.
+            "\x1b[0 qthird line\x1b[2 q\n",
+            encoding="utf-8",
+        )
+        out = self.coordinator.worker_output(worker["id"], lines=10)
+        # Escapes stripped, blank lines dropped, newest last.
+        self.assertEqual(out, ["coloured line", "second line", "third line"])
+        self.assertEqual(self.coordinator.worker_output(worker["id"], lines=1), ["third line"])
+
+    def test_reflection_gathers_evidence_without_drawing_conclusions(self) -> None:
+        root = self.repo("reflecting")
+        project = self.coordinator.register_project("Reflect", str(root), project_id="reflecting")
+        task = self.coordinator.create_task(project["id"], "do a thing")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "blocker", "needs a credential")
+        evidence = self.coordinator.reflection_evidence(since_hours=24)
+        self.assertEqual(evidence["tasks_created"], 1)
+        self.assertIn(task["id"], evidence["tasks_without_domain"])
+        self.assertTrue(any("credential" in f["text"] for f in evidence["failures_and_blockers"]))
+        # It gathers; it does not judge. The prompt is what asks for judgement,
+        # because deciding whether a pattern is a defect needs reading.
+        self.assertIn("Reflect on this", evidence["prompt"])
+        self.assertNotIn("recommendation", evidence)
+        # A narrow window excludes older activity rather than reporting it.
+        self.assertEqual(self.coordinator.reflection_evidence(since_hours=0)["tasks_created"], 0)
+
+    def test_a_worker_that_broke_in_its_own_session_is_noticed(self) -> None:
+        root = self.repo("breaking")
+        project = self.coordinator.register_project("Break", str(root), project_id="breaking")
+        task = self.coordinator.create_task(project["id"], "break midway")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "status", "working")
+        Path(worker["log_file"]).write_text(
+            "doing the work\nAPI Error: Connection closed mid-response\n", encoding="utf-8"
+        )
+        # While the session keeps writing past the failure text it has
+        # recovered: the signature in scrollback is history, not the state.
+        fresh = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        if worker["id"] in fresh:
+            self.assertNotEqual(fresh[worker["id"]]["verdict"], "erroring")
+        # Once the output has also gone quiet, the failure is the last word.
+        stale = time.time() - self.coordinator.SILENCE_SECONDS - 60
+        os.utime(worker["log_file"], (stale, stale))
+        # Helm cannot see inside the session, but the evidence was already on
+        # disk and simply never read.
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(health[worker["id"]]["verdict"], "erroring")
+        self.assertIn("API Error", health[worker["id"]]["detail"])
+
+        # A worker that broke but then reported a terminal message has told us
+        # itself; its own word wins over a scraped signature.
+        self.coordinator.record_worker_message(worker["id"], "result", "recovered and finished")
+        after = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        if worker["id"] in after:
+            self.assertNotEqual(after[worker["id"]]["verdict"], "erroring")
+
+        # Ordinary output is not a failure: the check must stay narrow or the
+        # warning stops meaning anything.
+        Path(worker["log_file"]).write_text("compiling\nall tests pass\n", encoding="utf-8")
+        self.assertEqual(self.coordinator.worker_failures(worker["id"]), [])
+
+    def test_an_answer_clears_the_input_and_does_not_race_the_newline(self) -> None:
+        root = self.repo("answering")
+        project = self.coordinator.register_project("Ans", str(root), project_id="answering")
+        task = self.coordinator.create_task(project["id"], "wait for an answer")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        adapter.ANSWER_SETTLE_SECONDS = 0
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.assertEqual(adapter.answer_worker(worker["id"], "carry on"), "typed")
+
+        # No Escape, ever: it cancelled whatever tool call the agent was inside,
+        # which is how a foreman lost the review it was blocked on. Enter only
+        # after the text, because sent together the newline races the paste
+        # and submits a fragment.
+        self.assertEqual([key for _, key in herdr.sent_keys], ["Enter"])
+        self.assertEqual([text for _, text in herdr.sent_text], ["carry on"])
+        # The whole text went into an idle session and was taken, so the note
+        # it was also written to counts as read.
+        self.assertEqual(self.coordinator.inbox_notes(worker["id"]), [])
+        read = self.coordinator.inbox_notes(worker["id"], unread_only=False)
+        self.assertEqual([n["text"].strip() for n in read], ["carry on"])
+
+    def test_run_returns_without_waiting_so_the_session_stays_responsive(self) -> None:
+        parser = cli._build_parser()
+        default = parser.parse_args(["run", "media", "a task"])
+        self.assertTrue(default.asynchronous)
+        blocking = parser.parse_args(["run", "media", "a task", "--wait"])
+        self.assertFalse(blocking.asynchronous)
+
+    def test_a_worker_can_ask_and_helm_answers_into_its_session(self) -> None:
+        root = self.repo("asking")
+        project = self.coordinator.register_project("Asking", str(root), project_id="asking")
+        task = self.coordinator.create_task(project["id"], "build it")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        # Asking is not blocking: the task keeps running.
+        self.coordinator.record_worker_message(worker["id"], "question", "which base branch?")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "running"
+        )
+
+        self.coordinator.record_worker_message(worker["id"], "answer", "branch off main")
+        self.assertTrue(adapter.answer_worker(worker["id"], "branch off main"))
+        # send-text alone does not submit; Enter must follow as its own call.
+        self.assertEqual(herdr.sent_text[-1][1], "branch off main")
+        self.assertEqual(herdr.sent_keys[-1][1], "Enter")
+        self.assertEqual(herdr.sent_text[-1][0], herdr.sent_keys[-1][0])
+        kinds = [m["kind"] for m in self.coordinator.inspect_task(task["id"])["messages"]]
+        self.assertIn("question", kinds)
+        self.assertIn("answer", kinds)
+
+    def test_worker_context_carries_a_push_reporting_contract(self) -> None:
+        root = self.repo("reporting")
+        project = self.coordinator.register_project("Reporting", str(root), project_id="reporting")
+        task = self.coordinator.create_task(project["id"], "report as you go")
+        context = self.coordinator._context(project, task, "w-report")
+        reporting = context["reporting"]
+        self.assertEqual(reporting["mode"], "push")
+        self.assertIn("worker message", reporting["command"])
+        self.assertIn("w-report", reporting["command"])
+        self.assertIn("status", reporting["types"])
+        self.assertIn("blocker", reporting["types"])
+        # The worker is told the coordinator is not watching it.
+        self.assertTrue(any("does not watch" in line for line in reporting["instructions"]))
+        self.assertIn("Report your own progress", CORE_SAFETY_RULES)
+
+    def test_a_worker_sends_confirmations_to_helm_instead_of_pausing(self) -> None:
+        root = self.repo("confirmations")
+        project = self.coordinator.register_project("Confirm", str(root), project_id="confirm")
+        task = self.coordinator.create_task(project["id"], "ask rather than stall")
+        reporting = self.coordinator._context(project, task, "w-confirm")["reporting"]
+        instructions = " ".join(reporting["instructions"])
+        # An agent CLI's habit is to pause and ask the person in front of it.
+        # Nobody is in front of it, so the confirmation has to reach Helm.
+        for required in ("confirmation", "--type question", "silent stall"):
+            self.assertIn(required, instructions)
+        self.assertIn("question", reporting["types"])
+        rules = CORE_SAFETY_RULES
+        self.assertIn("Send every confirmation to Helm", rules)
+        self.assertIn("should I proceed?", rules)
+        self.assertIn("do not idle waiting", rules)
+        # Deciding a confirmation never becomes authority over a protected
+        # action: those still reach a human.
+        for protected in ("merging, publishing, pushing, deleting", "still require a\n  human"):
+            self.assertIn(protected, rules)
+
+    def test_a_herdr_worker_can_route_its_own_pushes(self) -> None:
+        root = self.repo("routing-env")
+        project = self.coordinator.register_project("Routing", str(root), project_id="routing")
+        task = self.coordinator.create_task(project["id"], "push and route")
+        herdr = FakeHerdr()
+        worker = HerdrAdapter(self.coordinator, herdr).launch_task(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        config = json.loads(Path(worker["config_file"]).read_text(encoding="utf-8"))
+        # Without this marker the worker's own `helm worker message` sees Herdr
+        # as unavailable, so a push is recorded but never displayed.
+        self.assertEqual(config["worker_env"].get("HERDR_ENV"), "1")
+
+        process_task = self.coordinator.create_task(project["id"], "process worker")
+        process_worker = self.coordinator.launch_worker(
+            process_task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        process_config = json.loads(
+            Path(process_worker["config_file"]).read_text(encoding="utf-8")
+        )
+        # A process worker has no pane, so it gets no such marker.
+        self.assertNotIn("HERDR_ENV", process_config["worker_env"])
+
+    def test_runner_gives_an_interactive_worker_a_real_terminal(self) -> None:
+        config_path = self._runner_config("runner-tty")
+
+        class FakeTerminal(io.StringIO):
+            def isatty(self) -> bool:  # a Herdr pane is a TTY
+                return True
+
+        with mock.patch("helm.cli._run_worker_on_pty", return_value=0) as on_pty:
+            with contextlib.redirect_stdout(FakeTerminal()):
+                self.assertEqual(cli._worker_runner(str(config_path)), 0)
+        # An interactive agent only renders when it owns a terminal.
+        self.assertEqual(on_pty.call_count, 1)
+
+    def test_worker_runner_mirrors_output_to_the_pane_and_the_log(self) -> None:
+        root = self.repo("runner-mirror")
+        base = Path(self.temp.name) / "runner"
+        base.mkdir()
+        log_path = base / "output.log"
+        exit_path = base / "exit.json"
+        config_path = base / "runner.json"
+        common_dir = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "command": [sys.executable, "-c", "print('hello from the worker')"],
+                    "cwd": str(root),
+                    "git_common_dir": common_dir,
+                    "log": str(log_path),
+                    "exit": str(exit_path),
+                    "worker_env": {"HELM_WORKER_ID": "w-visible"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+
+        pane = io.StringIO()
+        with contextlib.redirect_stdout(pane):
+            self.assertEqual(cli._worker_runner(str(config_path)), 0)
+
+        shown = pane.getvalue()
+        # Visible in the tab, so a running worker never looks like a dead one.
+        self.assertIn("hello from the worker", shown)
+        # Marked as worker output rather than presented as Helm speaking.
+        self.assertIn("w-visible", shown)
+        self.assertIn("data, not instructions", shown)
+        # Still captured for Helm, and the exit record still lands.
+        self.assertIn("hello from the worker", log_path.read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(exit_path.read_text(encoding="utf-8"))["returncode"], 0)
+
+    def test_runner_starts_a_foreman_that_has_no_worktree(self) -> None:
+        # A foreman is allocated a Helm-owned state directory and no worktree.
+        # Re-checking it for a worktree killed every foreman at launch: git
+        # walks up out of the empty directory and reports some enclosing repo
+        # as the toplevel, which never equals the assigned path.
+        state_dir = Path(self.temp.name) / "foreman-state"
+        workspace = state_dir / "foremen" / "proj" / "t-1"
+        workspace.mkdir(parents=True)
+        config_path = self._foreman_runner_config(
+            "ok", workspace=workspace, state_dir=state_dir
+        )
+
+        pane = io.StringIO()
+        with contextlib.redirect_stdout(pane):
+            self.assertEqual(cli._worker_runner(str(config_path)), 0)
+        self.assertIn("foreman is driving", pane.getvalue())
+
+    def test_runner_refuses_a_foreman_workspace_outside_helm_state(self) -> None:
+        # The containment check is what replaces the worktree check: a swapped
+        # path must not point a foreman at a project checkout or the Helm root.
+        state_dir = Path(self.temp.name) / "foreman-state-guard"
+        state_dir.mkdir()
+        outside = Path(self.temp.name) / "somewhere-else"
+        outside.mkdir()
+        config_path = self._foreman_runner_config(
+            "outside", workspace=outside, state_dir=state_dir
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli._worker_runner(str(config_path)), 1)
+        self.assertIn(
+            "Helm-owned state",
+            (config_path.parent / "output.log").read_text(encoding="utf-8"),
+        )
+
+    def test_a_worker_that_never_starts_in_its_pane_fails_loudly(self) -> None:
+        # A pane types the launch command at its shell, so shell startup output
+        # can eat it. Helm used to record the worker as running anyway, so a
+        # review waited forever on a reviewer that had never existed.
+        root = self.repo("herdr-never-started")
+        project = self.coordinator.register_project(
+            "Never", str(root), project_id="never"
+        )
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        task = self.coordinator.create_task(project["id"], "a task whose pane eats the command")
+
+        # pane_run accepts the command and nothing runs: exactly what a shell
+        # prompt swallowing the first character looks like to Helm.
+        herdr.runs_start_the_runner = False
+        adapter.RUNNER_START_TIMEOUT = 0.5
+        with self.assertRaises(HelmError) as raised:
+            adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.assertIn("never started", str(raised.exception))
+
+        worker = next(
+            w
+            for w in self.coordinator.store.load()["workers"].values()
+            if w["task_id"] == task["id"]
+        )
+        self.assertEqual(worker["status"], "failed")
+
+    def test_external_wait_expiring_does_not_kill_a_working_worker(self) -> None:
+        """A budget running out means we stopped waiting, not that it died.
+
+        An agent worker takes minutes.  Failing the assignment on expiry marked
+        live workers dead after five seconds and wrote them a returncode-1 exit
+        record while they were still working and still pushing messages.
+        """
+        root = self.repo("slow-herdr")
+        project = self.coordinator.register_project("Slow", str(root), project_id="slow")
+        task = self.coordinator.create_task(project["id"], "still working")
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        waited = adapter.wait_worker(worker["id"], timeout=0.01)
+
+        self.assertEqual(waited["status"], "running")
+        self.assertIsNone(waited.get("exit_code"))
+        # No fabricated exit record: the worker writes its own, and inventing
+        # one makes a live worker unrecoverable even after it finishes.
+        self.assertFalse(Path(waited["exit_file"]).exists())
+        inspected = self.coordinator.inspect_task(task["id"])
+        self.assertEqual(inspected["task"]["status"], "running")
+        self.assertEqual(
+            [m for m in inspected["messages"] if m["kind"] == "failure"], []
+        )
+
+    def test_external_wait_recovers_a_worker_whose_pane_disappeared(self) -> None:
+        """Real loss is still recovered -- on the provider's evidence, not a clock."""
+
+        class VanishedPaneHerdr(FakeHerdr):
+            def pane_status(self, pane_id: str) -> dict[str, object]:
+                return {"result": {"pane": {"status": "missing"}}}
+
+        root = self.repo("lost-herdr")
+        project = self.coordinator.register_project("Lost", str(root), project_id="lost")
+        task = self.coordinator.create_task(project["id"], "lost pane")
+        adapter = HerdrAdapter(self.coordinator, VanishedPaneHerdr())
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+        recovered = adapter.wait_worker(worker["id"], timeout=0.01)
+
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["exit_code"], 1)
+        self.assertTrue(Path(recovered["exit_file"]).exists())
+
+    def test_a_worker_that_exits_zero_is_never_recorded_as_failed(self) -> None:
+        """The flake this fixes, driven through the public path."""
+        root = self.repo("exitrace")
+        project = self.coordinator.register_project(
+            "Exit", str(root), project_id="exitrace"
+        )
+        for _ in range(6):
+            task = self.coordinator.create_task(project["id"], "exit cleanly")
+            worker = self.coordinator.launch_worker(
+                task["id"], [sys.executable, "-c", "print('done')"]
+            )
+            self.assertEqual(worker["status"], "completed", worker.get("exit_code"))
+            self.assertEqual(
+                self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
+            )
+
+
+def _stamp_ago(seconds: float) -> str:
+    moment = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+class LiveButSilentWorkerTests(HelmTestCase):
+    """A silent worker is not a dead one, and a live one is not a healthy one."""
+
+    def _paneless(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "think for a while")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        # A Herdr worker has no pid here, which is precisely why output was the
+        # only signal and a long model call read as a stall.
+        data = self.coordinator.store.load()
+        data["workers"][worker["id"]]["execution"] = "herdr"
+        self.coordinator.store.save(data)
+        return worker
+
+    def _age(self, worker, seconds: float) -> None:
+        stamp = time.time() - seconds
+        os.utime(worker["log_file"], (stamp, stamp))
+        # And age the worker record itself. Aging only the log file describes
+        # something that cannot happen -- a worker created a moment ago whose
+        # output has been idle for five minutes -- and it put every case in
+        # this class inside the startup grace, where no verdict is issued at
+        # all.
+        data = self.coordinator.store.load()
+        born = _dt.datetime.fromtimestamp(stamp, _dt.timezone.utc).isoformat()
+        record = data["workers"][worker["id"]]
+        record["created_at"] = born
+        if record.get("started_at"):
+            record["started_at"] = born
+        self.coordinator.store.save(data)
+
+    def test_a_live_worker_silent_for_minutes_is_working_not_stalled(self) -> None:
+        worker = self._paneless("thinking")
+        self._age(worker, 320)  # just past the 300s threshold
+
+        blind = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(blind[worker["id"]]["verdict"], "stalled")
+
+        health = {
+            e["worker_id"]: e
+            for e in self.coordinator.worker_health(liveness=lambda w: True)
+        }
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "working")
+        self.assertIn("long model call", entry["detail"])
+
+    def test_being_alive_only_buys_a_grace_period_not_silence_forever(self) -> None:
+        """The reviewer that looped for hours was alive the whole time.
+
+        The verdict must not claim more than liveness proves: a silent live
+        worker may be wedged OR waiting on a slow model, and calling it stuck
+        is how a reader is talked into killing work that was only thinking.
+        """
+        worker = self._paneless("runaway")
+        self._age(worker, 4_000)
+
+        health = {
+            e["worker_id"]: e
+            for e in self.coordinator.worker_health(liveness=lambda w: True)
+        }
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "stalled")
+        self.assertIn("slow, wedged or looping, not gone", entry["detail"])
+
+    def test_a_provider_that_says_the_session_is_gone_settles_it_as_died(self) -> None:
+        worker = self._paneless("gone")
+        self._age(worker, 320)
+        health = {
+            e["worker_id"]: e
+            for e in self.coordinator.worker_health(liveness=lambda w: False)
+        }
+        self.assertEqual(health[worker["id"]]["verdict"], "died")
+
+    def test_an_unavailable_provider_is_not_evidence_either_way(self) -> None:
+        worker = self._paneless("unknown")
+        self._age(worker, 320)
+        for probe in (lambda w: None, lambda w: (_ for _ in ()).throw(RuntimeError("herdr down"))):
+            health = {
+                e["worker_id"]: e
+                for e in self.coordinator.worker_health(liveness=probe)
+            }
+            entry = health[worker["id"]]
+            self.assertEqual(entry["verdict"], "stalled")
+            self.assertNotIn("still alive", entry["detail"])
+
+    def test_a_worker_still_producing_output_is_not_a_fault_at_five_minutes(self) -> None:
+        """Its log is moving, so it is working; only the protocol push is late.
+
+        This landed in the "needs a human" list at just over five minutes,
+        which is an agent mid-edit. An attention list full of healthy workers
+        trains its reader to skip it -- the same failure as reporting nothing.
+        """
+        worker = self._paneless("mid-edit")
+        # Output fresh (the log was just written), but nothing reported yet.
+        self.coordinator.record_worker_message(worker["id"], "status", "starting")
+        data = self.coordinator.store.load()
+        # `last_reported_at` is the worker's OWN push, which is what the
+        # health check reads -- not the message log.
+        data["workers"][worker["id"]]["last_reported_at"] = _stamp_ago(320)
+        self.coordinator.store.save(data)
+
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "working")
+        self.assertIn("within the reporting grace", entry["detail"])
+
+    def test_a_worker_that_never_reports_is_still_surfaced_eventually(self) -> None:
+        """A worker that reports nothing is indistinguishable from a dead one."""
+        worker = self._paneless("silent")
+        self.coordinator.record_worker_message(worker["id"], "status", "starting")
+        data = self.coordinator.store.load()
+        data["workers"][worker["id"]]["last_reported_at"] = _stamp_ago(4_000)
+        self.coordinator.store.save(data)
+
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertEqual(health[worker["id"]]["verdict"], "quiet")
+
+
+class FailureScanReadsTextNotEscapesTests(HelmTestCase):
+    """A failure signature must be matched against what a human would read.
+
+    An interactive agent emits terminal capability queries and cursor
+    programming continuously. Matching those raw bytes let an escape blob be
+    reported as a worker failure -- a reviewer that was writing 31KB every six
+    seconds was flagged as `erroring`, with `[>0q+q4d73Gi=31337,s=1,v=1,a` as
+    the stated reason. It matters in both directions: fewer false positives,
+    and a reported line a human can actually read.
+    """
+
+    def test_terminal_escapes_are_not_read_as_failures(self) -> None:
+        root = self.repo("escapes")
+        project = self.coordinator.register_project(
+            "Escapes", str(root), project_id="escapes"
+        )
+        task = self.coordinator.create_task(project["id"], "emit terminal noise")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        log = Path(worker["log_file"])
+        log.write_text(
+            "\x1b[>0q\x1b+q4d73Gi=31337,s=1,v=1,a=q\x1b[>4;0m\x1b[>5u\n"
+            "\x1b[?2026h\x1b[?25l\x1b[38;5;60mPercolating\x1b[0m\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.coordinator.worker_failures(worker["id"]), [])
+
+    def test_a_real_failure_still_reports_and_reports_readably(self) -> None:
+        root = self.repo("realfail")
+        project = self.coordinator.register_project(
+            "Realfail", str(root), project_id="realfail"
+        )
+        task = self.coordinator.create_task(project["id"], "fail for real")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        log = Path(worker["log_file"])
+        # A genuine failure, wearing the colour codes a real pane puts on it.
+        log.write_text(
+            "\x1b[?25l\x1b[31mAPI Error: overloaded, retrying\x1b[0m\x1b[?25h\n",
+            encoding="utf-8",
+        )
+        failures = self.coordinator.worker_failures(worker["id"])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0], "API Error: overloaded, retrying")
+        self.assertNotIn("\x1b", failures[0], "the reported reason must be readable")
+
+    def test_prose_about_a_killed_process_is_not_a_killed_process(self) -> None:
+        """An agent whose job is writing about failures writes the word often.
+
+        `Killed` as a bare substring matched a foreman DESCRIBING its own fix
+        -- "a staleness horizon so a writer killed mid-append cannot wedge the
+        day" -- and reported it as a worker that had died. The signature has to
+        say WHERE the word must appear, not only what it says.
+        """
+        root = self.repo("prose")
+        project = self.coordinator.register_project(
+            "Prose", str(root), project_id="prose"
+        )
+        task = self.coordinator.create_task(project["id"], "write about failures")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        log = Path(worker["log_file"])
+        log.write_text(
+            "a staleness horizon so a writer killed mid-append cannot wedge the day\n"
+            "the process was killed by the OOM killer, so the lock must expire\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.coordinator.worker_failures(worker["id"]), [])
+
+    def test_the_shell_kill_report_is_still_a_failure(self) -> None:
+        """Narrowing must not blind the check to the thing it exists for."""
+        root = self.repo("oomed")
+        project = self.coordinator.register_project(
+            "Oomed", str(root), project_id="oomed"
+        )
+        task = self.coordinator.create_task(project["id"], "get killed")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        for report in ("Killed", "Killed: 9", "zsh: killed  node dist/main.js",
+                       "Killed process 4821 (node)"):
+            Path(worker["log_file"]).write_text(report + "\n", encoding="utf-8")
+            self.assertEqual(
+                self.coordinator.worker_failures(worker["id"]), [report],
+                f"{report!r} is the report this check exists for",
+            )
+
+    def test_the_reported_failure_contains_the_reason_not_the_line_start(self) -> None:
+        """A pane redraw is one enormous "line", and the match can be far into it.
+
+        An interactive agent rewrites its whole screen without newlines, so a
+        single line can be a hundred thousand characters. Reporting its first
+        160 gave the commander cursor programming and never the cause -- the
+        real match sat 66,611 characters in and said `command not found:
+        docker`. Evidence has to contain the thing it is evidence of.
+        """
+        root = self.repo("faraway")
+        project = self.coordinator.register_project(
+            "Faraway", str(root), project_id="faraway"
+        )
+        task = self.coordinator.create_task(project["id"], "redraw a lot")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        noise = "\x1b[>4;0m\x1b[?25l" * 4000
+        Path(worker["log_file"]).write_text(
+            f"{noise}zsh: command not found: docker{noise}\n", encoding="utf-8"
+        )
+
+        failures = self.coordinator.worker_failures(worker["id"])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("command not found: docker", failures[0])
+        self.assertLess(len(failures[0]), 400, "an excerpt, not the whole pane")
+
+
+class OneDriverPerWorkerTests(HelmTestCase):
+    """Two answers to one worker inside two minutes is two drivers racing.
+
+    A root and a project's foreman both answered the same question within a
+    minute. The second `send-text` arrived while the agent was already acting
+    on the first, interleaved with its own redraw, and the session read the
+    arriving keystrokes as an interrupt. They happened to agree that time, so
+    the only casualty was an unreadable pane -- two answers that DISAGREED
+    would have raced, and the later one would have won silently.
+    """
+
+    def _running_worker(self, name: str) -> dict:
+        """A worker that is still alive, so an answer can be recorded against it."""
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "ask something")
+        return self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+    def test_a_second_answer_inside_the_window_is_seen_as_a_race(self) -> None:
+        worker = self._running_worker("race")
+        self.coordinator.record_worker_message(worker["id"], "answer", "first answer")
+        racing = self.coordinator.recent_answer(worker["id"])
+        self.assertIsNotNone(racing)
+        self.assertEqual(racing["text"], "first answer")
+
+    def test_an_older_answer_is_not_a_race_so_a_later_push_still_works(self) -> None:
+        # Answering is not the only thing this path carries: a driver also
+        # pushes fresh instructions to a worker that asked nothing. Refusing
+        # those to prevent the rare double-answer would break the common case.
+        worker = self._running_worker("older")
+        self.coordinator.record_worker_message(worker["id"], "answer", "long ago")
+        with self.coordinator.store.locked() as data:
+            for message in data["messages"]:
+                if message.get("worker_id") == worker["id"] and message.get("kind") == "answer":
+                    message["created_at"] = "2020-01-01T00:00:00Z"
+        self.assertIsNone(self.coordinator.recent_answer(worker["id"]))
+
+    def test_a_worker_never_answered_is_never_a_race(self) -> None:
+        worker = self._running_worker("fresh")
+        self.assertIsNone(self.coordinator.recent_answer(worker["id"]))
+
+    def test_the_cli_exposes_a_force_escape_hatch(self) -> None:
+        parser = cli._build_parser()
+        parsed = parser.parse_args(["worker", "answer", "w-1", "--text", "x", "--force"])
+        self.assertTrue(parsed.force)
+        self.assertFalse(parser.parse_args(["worker", "answer", "w-1", "--text", "x"]).force)
+
+
+class OneProjectPerMessageTests(HelmTestCase):
+    """An agent may not hand a message to a worker in another project.
+
+    Isolation was enforced where work HAPPENS -- worktrees, branches, composed
+    context -- and nowhere on the path where agents TALK. On 2026-08-23 a
+    foreman's review brief, naming another project's runbook, its tracker rows
+    and a commander decision, was delivered into a second project's foreman by
+    a mistyped worker id. Nothing refused it. The receiving foreman read
+    enough to identify the misroute, refused to act, and stood down -- which
+    was correct, and is also the cost: a message is context, and it cannot be
+    unread.
+    """
+
+    def _worker_in(self, name: str) -> dict:
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "do the work")
+        return self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+    def test_an_agent_cannot_address_another_projects_worker(self) -> None:
+        mine = self._worker_in("alpha")
+        theirs = self._worker_in("beta")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": mine["id"]}):
+            with self.assertRaisesRegex(HelmError, r"belongs to project beta"):
+                self.coordinator.require_same_project(theirs["id"], "worker answer")
+
+    def test_an_agent_may_address_its_own_projects_worker(self) -> None:
+        mine = self._worker_in("gamma")
+        sibling = self._worker_in("gamma2")
+        # Same project, different worker: allowed. A foreman answers the
+        # workers it drives.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": mine["id"]}):
+            self.coordinator.require_same_project(mine["id"], "worker answer")
+        self.assertIsNotNone(sibling["id"])
+
+    def test_the_root_addresses_any_project(self) -> None:
+        # The root coordinates every project by design; confining it would
+        # break the only thing that can route between them.
+        theirs = self._worker_in("delta")
+        env = {k: v for k, v in os.environ.items() if k != "HELM_WORKER_ID"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.coordinator.require_same_project(theirs["id"], "worker answer")
+
+    def test_the_refusal_names_both_projects_and_the_worker(self) -> None:
+        mine = self._worker_in("epsilon")
+        theirs = self._worker_in("zeta")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": mine["id"]}):
+            try:
+                self.coordinator.require_same_project(theirs["id"], "worker answer")
+            except HelmError as error:
+                message = str(error)
+            else:
+                self.fail("expected a refusal")
+        # A refusal that does not say which project is which leaves the caller
+        # guessing at exactly the moment they mistyped an opaque hex id.
+        self.assertIn("zeta", message)
+        self.assertIn("epsilon", message)
+        self.assertIn(theirs["id"], message)
+
+
+class AnArtifactMayLiveInTheWorkerDirectoryTests(HelmTestCase):
+    """Two shipped rules contradicted each other and a compliant worker lost.
+
+    Helm's reporting document tells every worker to report each file it
+    produces with `--type artifact --path`. The verification guidance tells it
+    to write reports and logs into its OWN directory and never into the
+    worktree, because an untracked file there either pollutes the branch or
+    blocks approval. The validator then accepted only worktree paths. Obey
+    both instructions and you produce exactly what the third rejects: one
+    worker failed five artifact calls in four seconds doing as it was told.
+    """
+
+    def _worker_and_task(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name
+        )
+        task = self.coordinator.create_task(project["id"], "produce a report")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        return task, worker
+
+    def _artifacts(self, task_id: str) -> list:
+        """ACCEPTED artifacts, not the worker's report of them.
+
+        The `artifact` message is recorded either way -- it is what the worker
+        said. Acceptance is the separate record Helm builds after the path
+        check, so that is what these tests read.
+        """
+        return [
+            a for a in self.coordinator.store.load().get("artifacts", [])
+            if a.get("task_id") == task_id
+        ]
+
+    def _rejections(self, task_id: str) -> list:
+        return [
+            m for m in self.coordinator.store.load().get("messages", [])
+            if m.get("task_id") == task_id and m.get("kind") == "artifact-rejected"
+        ]
+
+    def test_a_report_in_the_workers_own_directory_is_accepted(self) -> None:
+        task, worker = self._worker_and_task("ownerdir")
+        report = self.coordinator.store.directory / "workers" / worker["id"] / "FINDINGS.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("what I found\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "the round's findings", payload={"path": str(report)}
+        )
+        self.assertEqual(self._rejections(task["id"]), [])
+        self.assertEqual(len(self._artifacts(task["id"])), 1)
+
+    def test_a_file_in_the_worktree_is_still_accepted(self) -> None:
+        # The ordinary case must not regress: a real build output lives in the
+        # worktree and that is where a reviewer expects to find it.
+        task, worker = self._worker_and_task("worktreedir")
+        produced = Path(task["workspace"]) / "built.txt"
+        produced.write_text("output\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "a build output", payload={"path": str(produced)}
+        )
+        self.assertEqual(self._rejections(task["id"]), [])
+        self.assertEqual(len(self._artifacts(task["id"])), 1)
+
+    def test_a_path_in_neither_place_is_still_refused(self) -> None:
+        # The boundary that matters. Widening to the worker directory must not
+        # widen to anywhere at all.
+        task, worker = self._worker_and_task("elsewhere")
+        stray = Path(self.temp.name) / "not-mine.txt"
+        stray.write_text("someone else's\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "a stray file", payload={"path": str(stray)}
+        )
+        self.assertEqual(len(self._rejections(task["id"])), 1)
+        self.assertEqual(self._artifacts(task["id"]), [])
+
+    def test_another_workers_directory_is_refused(self) -> None:
+        # "The worker's own directory" means its OWN. Isolation still forbids
+        # reaching into a sibling's state.
+        task, worker = self._worker_and_task("mine")
+        _other_task, other = self._worker_and_task("theirs")
+        theirs = self.coordinator.store.directory / "workers" / other["id"] / "THEIRS.md"
+        theirs.parent.mkdir(parents=True, exist_ok=True)
+        theirs.write_text("not yours\n", encoding="utf-8")
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "a neighbour's report", payload={"path": str(theirs)}
+        )
+        self.assertEqual(len(self._rejections(task["id"])), 1)
+
+
+class ATruncatedReportSaysSoTests(HelmTestCase):
+    """A cut that nobody can see is worse than a cut.
+
+    A worker's design report arrived at exactly the limit and lost its last two
+    verdicts mid-heading. The reader saw a section title with nothing under it,
+    and a truncated report and an author who simply stopped writing look
+    identical -- but one needs the missing part requested and the other needs
+    the finding chased. The marker is what tells them apart.
+    """
+
+    def test_an_oversized_message_carries_its_own_truncation_notice(self) -> None:
+        from helm.core import SAFE_TEXT_LIMIT, _safe_text
+
+        rendered = _safe_text("x" * (SAFE_TEXT_LIMIT + 5_000))
+
+        self.assertLessEqual(len(rendered), SAFE_TEXT_LIMIT)
+        self.assertIn("truncated by Helm", rendered)
+        # The reader needs the size of the hole, not just its existence: it is
+        # the difference between a lost sentence and a lost half.
+        self.assertIn("5000 more were dropped", rendered)
+
+    def test_text_within_the_limit_is_returned_untouched(self) -> None:
+        from helm.core import _safe_text
+
+        self.assertEqual(_safe_text("a result that fits"), "a result that fits")
+
+    def test_a_truncated_worker_report_reaches_the_reader_marked(self) -> None:
+        """End to end: the marker must survive the protocol, not just the helper."""
+        from helm.core import SAFE_TEXT_LIMIT
+
+        root = self.repo("truncreport")
+        project = self.coordinator.register_project(
+            "Truncreport", str(root), project_id="truncreport"
+        )
+        task = self.coordinator.create_task(project["id"], "produce a report")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "B1 verdict... " + "y" * (SAFE_TEXT_LIMIT + 400)
+        )
+
+        stored = [
+            m for m in self.coordinator.store.load()["messages"]
+            if m.get("worker_id") == worker["id"] and m.get("kind") == "result"
+        ][-1]
+
+        self.assertIn("truncated by Helm", stored["text"])
+
+
+class AnsweredBlockerClearsTheFlagTests(HelmTestCase):
+    """A foreman that escalated, was answered, and carried on is not blocked.
+
+    The flag used to be sticky. A notate foreman escalated at 10:19, was
+    answered three minutes later, resumed and ran four more review rounds --
+    and its task still read `blocked` an hour and a half afterwards. `helm
+    pending` already stopped showing an answered blocker, so the two records
+    disagreed about the same fact, and the task record is the one a fresh
+    coordinator reads to take a project over.
+    """
+
+    def _blocked_foreman(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        # A FOREMAN, deliberately. A plain worker's blocker ends its
+        # assignment -- a worker that cannot do its one job needs a new task,
+        # not a revived one. A foreman's blocker PAUSES instead, because a
+        # driver's whole job is to meet obstacles and escalate them, and it
+        # stays live and addressable. So this state only exists for a foreman.
+        task = self.coordinator.create_foreman_task(project["id"])
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "the base checkout is dirty and it is not my file"
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "blocked"
+        )
+        return task, worker
+
+    def test_an_answer_returns_a_blocked_task_to_running(self) -> None:
+        task, worker = self._blocked_foreman("answered-blocker")
+        self.coordinator.record_worker_message(
+            worker["id"], "answer", "cleared it, carry on"
+        )
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"],
+            "running",
+            "an answered blocker must not leave the task reading blocked",
+        )
+
+    def test_a_finished_worker_cannot_be_answered_at_all(self) -> None:
+        # The narrowness of the fix, pinned from the other side. A task that
+        # reported its result is finished and its assignment has ended, so an
+        # answer never reaches it -- Helm refuses the delivery outright rather
+        # than the transition quietly declining to fire. Worth a test because
+        # the fix's own guard (`only a blocked task moves`) would otherwise be
+        # the only thing standing between an answer and a resurrected task,
+        # and a guard nothing exercises is a guard nobody can trust.
+        root = self.repo("answered-terminal")
+        project = self.coordinator.register_project(
+            "answered-terminal", str(root), project_id="answered-terminal"
+        )
+        task = self.coordinator.create_task(project["id"], "finish and stop")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "result", "done")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
+        )
+        with self.assertRaisesRegex(HelmError, r"no longer running"):
+            self.coordinator.record_worker_message(worker["id"], "answer", "noted")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"],
+            "completed",
+            "a refused answer must leave the finished task exactly as it was",
+        )
+
+
+class InboxTests(HelmTestCase):
+    """The inbox is the message; the pane is at most a wake.
+
+    Keystrokes into a TUI mean different things depending on what the UI is
+    doing, and Helm can only guess at that. A file means the same thing
+    whatever the agent is doing, and reading it is an act Helm can see.
+    """
+
+    def _worker(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "do the thing")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        adapter.ANSWER_SETTLE_SECONDS = 0
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        pane = self.state.load()["integrations"]["herdr"]["workers"][worker["id"]]["pane_id"]
+        return adapter, herdr, worker, pane
+
+    def _as_worker(self, worker_id: str, argv: list[str]) -> tuple[int, str]:
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker_id}), \
+             contextlib.redirect_stdout(out):
+            code = cli.main(["--state-dir", str(self.state.directory), *argv])
+        return code, out.getvalue()
+
+    def test_a_blocked_agent_gets_nothing_typed_and_keeps_the_note(self) -> None:
+        adapter, herdr, worker, pane = self._worker("blocked")
+        herdr.agent_status[pane] = "blocked"
+        self.assertEqual(adapter.answer_worker(worker["id"], "use main"), "")
+        self.assertEqual(adapter.last_wake_outcome, "blocked")
+        # A dialog is up: Enter would answer the dialog, not deliver this.
+        self.assertEqual(herdr.sent_text, [])
+        self.assertEqual(herdr.sent_keys, [])
+        unread = self.coordinator.inbox_notes(worker["id"])
+        self.assertEqual([n["text"].strip() for n in unread], ["use main"])
+
+    def test_a_working_agent_gets_a_pointer_not_the_body_and_no_escape(self) -> None:
+        adapter, herdr, worker, pane = self._worker("working")
+        herdr.agent_status[pane] = "working"
+        brief = "RESUME THE ROUND.\n\nEvery detail that belongs in the file and not the pane."
+        self.assertEqual(adapter.answer_worker(worker["id"], brief), "nudged")
+        sent = " ".join(text for _pane, text in herdr.sent_text)
+        self.assertIn("RESUME THE ROUND.", sent)
+        self.assertNotIn("Every detail that belongs in the file", sent)
+        self.assertIn("read it now", sent)
+        self.assertNotIn("Escape", [key for _pane, key in herdr.sent_keys])
+        # Nudged is not read: the note waits for the worker's own act.
+        self.assertEqual(len(self.coordinator.inbox_notes(worker["id"])), 1)
+
+    def test_a_watched_inbox_is_never_typed_into(self) -> None:
+        adapter, herdr, worker, pane = self._worker("watched")
+        # A watch is evidence: the loop calling in with --changes, recently.
+        code, out = self._as_worker(worker["id"], ["worker", "inbox", "--changes"])
+        self.assertEqual((code, out), (0, ""))
+        self.assertTrue(self.coordinator.inbox_watch_live(worker["id"]))
+        self.assertEqual(adapter.answer_worker(worker["id"], "carry on"), "watched")
+        self.assertEqual(herdr.sent_text, [])
+        self.assertEqual(herdr.sent_keys, [])
+        self.assertEqual(len(self.coordinator.inbox_notes(worker["id"])), 1)
+        # And the loop's next call is what delivers it.
+        code, out = self._as_worker(worker["id"], ["worker", "inbox", "--changes"])
+        self.assertIn("carry on", out)
+        # A watch that stopped calling in is no watch: the pane wake returns.
+        stale = time.time() - 600
+        os.utime(self.coordinator._inbox_dir(worker["id"]) / ".watch", (stale, stale))
+        self.assertFalse(self.coordinator.inbox_watch_live(worker["id"]))
+        self.assertEqual(adapter.answer_worker(worker["id"], "and again"), "typed")
+
+    def test_a_worker_reads_its_own_inbox_and_that_marks_it_read(self) -> None:
+        adapter, herdr, worker, pane = self._worker("reader")
+        herdr.agent_status[pane] = "working"
+        adapter.answer_worker(worker["id"], "switch to the staging backend")
+        code, out = self._as_worker(worker["id"], ["worker", "inbox"])
+        self.assertEqual(code, 0)
+        self.assertIn("switch to the staging backend", out)
+        self.assertIn("[helm inbox] 1 message", out)
+        self.assertEqual(self.coordinator.inbox_notes(worker["id"]), [])
+        # A watch loop asks for changes: nothing new prints nothing at all.
+        code, out = self._as_worker(worker["id"], ["worker", "inbox", "--changes"])
+        self.assertEqual((code, out), (0, ""))
+        # Waiting with nothing there says so, distinctly, so a loop can go round.
+        code, out = self._as_worker(worker["id"], ["worker", "inbox", "--wait", "0.1"])
+        self.assertEqual(code, 3)
+        self.assertIn("run this again", out)
+
+    def test_peeking_does_not_mark_read(self) -> None:
+        adapter, herdr, worker, pane = self._worker("peek")
+        herdr.agent_status[pane] = "working"
+        adapter.answer_worker(worker["id"], "hold the push")
+        code, out = self._as_worker(worker["id"], ["worker", "inbox", "--peek"])
+        self.assertEqual(code, 0)
+        self.assertIn("hold the push", out)
+        self.assertEqual(len(self.coordinator.inbox_notes(worker["id"])), 1)
+
+    def test_every_worker_command_prints_the_unread_inbox_first(self) -> None:
+        # The earliest moment a busy worker can act on a message is its next
+        # helm command, on every runtime, with nothing to remember.
+        adapter, herdr, worker, pane = self._worker("piggyback")
+        herdr.agent_status[pane] = "working"
+        adapter.answer_worker(worker["id"], "rebase before you continue")
+        code, out = self._as_worker(
+            worker["id"],
+            ["worker", "message", worker["id"], "--type", "status", "--text", "still going"],
+        )
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("rebase before you continue"), out.index("Recorded"))
+        self.assertEqual(self.coordinator.inbox_notes(worker["id"]), [])
+        # And not twice: the next command has nothing to show.
+        code, out = self._as_worker(
+            worker["id"],
+            ["worker", "message", worker["id"], "--type", "status", "--text", "done"],
+        )
+        self.assertNotIn("rebase before you continue", out)
+
+    def test_a_worker_cannot_read_another_workers_inbox(self) -> None:
+        adapter, herdr, first, _ = self._worker("first")
+        _, _, second, second_pane = self._worker("second")
+        herdr.agent_status[second_pane] = "working"
+        adapter.answer_worker(second["id"], "for the second worker only")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": first["id"]}), \
+             contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(
+                ["--state-dir", str(self.state.directory), "worker", "inbox", second["id"]]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("reads only its own inbox", err.getvalue())
+        self.assertEqual(len(self.coordinator.inbox_notes(second["id"])), 1)
+
+    def test_interrupt_is_its_own_verb(self) -> None:
+        adapter, herdr, worker, pane = self._worker("interrupt")
+        self.assertTrue(adapter.interrupt_worker(worker["id"]))
+        self.assertEqual(herdr.sent_keys, [(pane, "Escape")])
+        self.assertEqual(herdr.sent_text, [])
+
+    def test_answer_says_how_the_note_reached_its_reader(self) -> None:
+        adapter, herdr, worker, pane = self._worker("wording")
+        herdr.agent_status[pane] = "blocked"
+        out = io.StringIO()
+        with mock.patch.object(cli, "HerdrAdapter", lambda coordinator: adapter), \
+             contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "worker", "answer", worker["id"], "--text", "wait for the reviewer",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("at a dialog, so nothing was typed", out.getvalue())
+        unread = self.coordinator.inbox_notes(worker["id"])
+        self.assertEqual([n["text"].strip() for n in unread], ["wait for the reviewer"])
+        # The note carries the recorded message's id: one record, two places.
+        answer = self.coordinator.recent_answer(worker["id"])
+        self.assertEqual(unread[0]["id"], answer["id"])
+
+
+class QuestionReturnsItsAnswerTests(HelmTestCase):
+    """Request and response inside the worker's own tool call."""
+
+    def _worker(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "decide something")
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        adapter.ANSWER_SETTLE_SECONDS = 0
+        return adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+    def _ask(self, worker_id: str, wait: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker_id}), \
+             contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "worker", "message", worker_id,
+                "--type", "question", "--text", "which base branch?", "--wait", wait,
+            ])
+        return code, out.getvalue()
+
+    def test_an_unanswered_wait_says_so_and_how_to_keep_waiting(self) -> None:
+        worker = self._worker("unanswered")
+        code, out = self._ask(worker["id"], "0.1")
+        self.assertEqual(code, 3)
+        self.assertIn("Keep waiting with", out)
+        self.assertIn("--wait", out)
+        # The question itself was still recorded: waiting is not asking twice.
+        kinds = [m["kind"] for m in self.coordinator.inspect_task(worker["task_id"])["messages"]]
+        self.assertEqual(kinds.count("question"), 1)
+
+    def test_the_answer_arrives_inside_the_wait_and_is_printed(self) -> None:
+        import threading
+        worker = self._worker("answered")
+        timer = threading.Timer(
+            0.3, lambda: self.coordinator.leave_inbox_note(worker["id"], "branch off main")
+        )
+        timer.start()
+        try:
+            code, out = self._ask(worker["id"], "5")
+        finally:
+            timer.cancel()
+        self.assertEqual(code, 0)
+        self.assertIn("branch off main", out)
+        self.assertEqual(self.coordinator.inbox_notes(worker["id"]), [])
+
+    def test_wait_belongs_to_questions_only(self) -> None:
+        worker = self._worker("misused")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}), \
+             contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "worker", "message", worker["id"],
+                "--type", "status", "--text", "hello", "--wait", "1",
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("--wait goes with --type question", err.getvalue())
+
+
+class ClaudeWorkersWatchTheirInboxTests(HelmTestCase):
+    def test_a_claude_worker_is_launched_with_a_hook_that_arms_the_watch(self) -> None:
+        root = self.repo("hooked")
+        project = self.coordinator.register_project("Hooked", str(root), project_id="hooked")
+        task = self.coordinator.create_task(project["id"], "watch your inbox")
+        bin_dir = Path(self.temp.name) / "bin-claude"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "claude").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "claude").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
+            worker = self.coordinator.prepare_external_worker(
+                task["id"], None, execution="herdr", agent="claude"
+            )
+        argv = worker["command"]
+        self.assertIn("--settings", argv)
+        settings = Path(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings.parent, Path(worker["context_file"]).parent)
+        hook = json.loads(settings.read_text())["hooks"]["SessionStart"][0]["hooks"][0]
+        self.assertEqual(hook["type"], "command")
+        self.assertIn("Monitor tool", hook["command"])
+        self.assertIn(f"worker inbox {worker['id']} --changes", hook["command"])
+        # The instruction the hook prints is a shell-safe single argument.
+        parts = shlex.split(hook["command"])
+        self.assertEqual(parts[0], "printf")
+        self.assertIn("arm your inbox watch", parts[-1])
+
+    def test_other_runtimes_get_no_settings_flag(self) -> None:
+        from helm import runtimes
+        codex = runtimes.builtin_runtime("codex")
+        assert codex is not None
+        self.assertNotIn("--settings", runtimes.apply_prompt(codex.noninteractive, "p", "/w", "/s", "/g"))
+        claude = runtimes.builtin_runtime("claude")
+        assert claude is not None
+        bare = runtimes.apply_prompt(claude.interactive, "p", "/w", "/s", "/g")
+        self.assertNotIn("--settings", bare)
+        with_file = runtimes.apply_prompt(claude.interactive, "p", "/w", "/s", "/g", "/w/claude-settings.json")
+        self.assertEqual(with_file[with_file.index("--settings") + 1], "/w/claude-settings.json")
+
+
+class UnreadAnswersSurfaceInPendingTests(HelmTestCase):
+    def test_pending_names_a_message_nobody_has_read(self) -> None:
+        root = self.repo("unread")
+        project = self.coordinator.register_project("Unread", str(root), project_id="unread")
+        task = self.coordinator.create_task(project["id"], "read your mail")
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(self.coordinator, herdr)
+        adapter.ANSWER_SETTLE_SECONDS = 0
+        worker = adapter.launch_task(task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False)
+        pane = self.state.load()["integrations"]["herdr"]["workers"][worker["id"]]["pane_id"]
+        herdr.agent_status[pane] = "blocked"
+        adapter.answer_worker(worker["id"], "stop waiting on that dialog")
+
+        def pending() -> str:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cli.main(["--state-dir", str(self.state.directory), "pending"])
+            return out.getvalue()
+
+        # Fresh: nothing to say yet; a worker mid-command has not had its chance.
+        self.assertNotIn("unread", pending())
+        note = Path(self.coordinator.inbox_notes(worker["id"])[0]["path"])
+        stale = time.time() - cli.INBOX_UNREAD_STALL_SECONDS - 60
+        os.utime(note, (stale, stale))
+        report = pending()
+        self.assertIn(f"message to {worker['id']} unread for", report)
+        # Read, and it leaves the list -- the reader's act settles it.
+        self.coordinator.read_inbox(worker["id"])
+        self.assertNotIn("unread", pending())
+        self.coordinator.stop_worker(worker["id"])
