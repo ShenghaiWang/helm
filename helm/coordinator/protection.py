@@ -29,12 +29,14 @@ from ..errors import HelmError, SafetyError
 from ..git import _git
 from ..paths import _file_digest, canonical
 from ..values import (
+    DELIVERED_TASK_STATES,
     HOLD_OPEN_STATUSES,
     HOLD_TASK_STATUS,
     HOLD_TRANSITIONS,
     PROTECTED_ACTIONS,
     WORKTREELESS_ROLES,
     _safe_text,
+    _validate_grantable_action,
     _validate_project_id,
     _validate_protected_action,
     new_id,
@@ -42,6 +44,16 @@ from ..values import (
     shape_policy,
     task_owns_branch,
 )
+
+
+def _stamp_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 class ProtectionMixin:
@@ -515,6 +527,7 @@ class ProtectionMixin:
         project_id: str | None = None,
         note: str,
         granted_by: str = "user",
+        stale_days: int | None = None,
     ) -> dict[str, Any]:
         """Record one scoped standing approval a human decided in advance.
 
@@ -522,8 +535,12 @@ class ProtectionMixin:
         per task. It lives here, in Helm-owned state: a project or domain file
         is untrusted guidance and must never be able to authorize a protected
         action, and neither can a worker message.
+
+        A `cleanup` grant lets `helm watch` and the watchdog shed what a
+        delivered task still holds; with `stale_days` it also sheds failed,
+        never-launched and undelivered-completed tasks older than that.
         """
-        action = _validate_protected_action(action)
+        action = _validate_grantable_action(action)
         self.authority(f"granting a standing approval for {action}")
         note = _safe_text(note).strip()
         if not note:
@@ -531,6 +548,11 @@ class ProtectionMixin:
             # reason, nobody reviewing it later can tell whether it still
             # reflects what the human wanted.
             raise HelmError("a standing approval requires --note explaining what it permits and why")
+        if stale_days is not None:
+            if action != "cleanup":
+                raise HelmError("--stale-days applies to a cleanup grant only")
+            if int(stale_days) < 1:
+                raise HelmError("--stale-days must be at least 1")
         with self.store.locked() as data:
             if project_id is not None:
                 project_id = _validate_project_id(project_id)
@@ -545,6 +567,7 @@ class ProtectionMixin:
                 "created_at": now(),
                 "revoked_at": None,
                 "revoked_note": "",
+                "stale_days": int(stale_days) if stale_days is not None else None,
             }
             data["approval_grants"][grant_id] = grant
             return dict(grant)
@@ -575,7 +598,7 @@ class ProtectionMixin:
         narrower policy is the one recorded as the authority. Scope never
         widens: a grant for one project says nothing about another.
         """
-        action = _validate_protected_action(action)
+        action = _validate_grantable_action(action)
         candidates = [
             grant
             for grant in self.list_approval_grants()
@@ -1045,6 +1068,13 @@ class ProtectionMixin:
             workspace = self._verify_workspace_record(data, project, task)
             if not self._workspace_clean(workspace):
                 raise SafetyError("approval requires a clean reviewed worker workspace")
+            check = task.get("shape_check") or {}
+            if task.get("shape") == "small" and check.get("suggested") == "critical":
+                raise SafetyError(
+                    "task is shaped small, but its review found "
+                    f"{'; '.join(check.get('findings') or [])[:300]}. Re-shape it before approving: "
+                    f"helm task shape {task_id} critical --reason '...' (or standard, if the finding is wrong)"
+                )
             if shape_policy(task).get("evidence_required"):
                 # A critical change is approved on evidence, not on a
                 # reviewer's word: the full suite's exit, recorded against
@@ -1526,6 +1556,60 @@ class ProtectionMixin:
             # awaiting review, and review reads the branch.
             return f"holds {ahead} unmerged commit(s) on {branch}"
         return None
+    def sweep_residue_under_grants(self, *, now_epoch: float | None = None) -> dict[str, Any]:
+        """Shed what delivered and stale tasks still hold, where a cleanup grant says so.
+
+        Cleanup stays the commander's decision; a grant is that decision made
+        once. A delivered task (`merged`, `pr-merged`) holds nothing worth
+        keeping, so its worktree, worker directories and branch go. With
+        `stale_days` on the grant, a failed or never-launched task older than
+        that goes too, branch included, and a completed-but-undelivered one
+        sheds its worktree and directories while its branch -- finished work
+        nobody decided on -- is kept and named. Every refusal cleanup would
+        make by hand it still makes here, and is reported.
+        """
+        import time
+
+        current = time.time() if now_epoch is None else now_epoch
+        data = self.store.load()
+        cleaned: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        without_grant = 0
+        for task in sorted(data.get("tasks", {}).values(), key=lambda t: t.get("created_at") or ""):
+            if not self.task_retained_resources(task, data):
+                continue
+            status = task.get("status")
+            if status in {"approval-needed", "approved", "pr-open"} or task.get("role") == "foreman":
+                continue
+            grant = self.approval_grant_for("cleanup", task.get("project_id"))
+            if grant is None:
+                without_grant += 1
+                continue
+            delivered = status in DELIVERED_TASK_STATES
+            stale_days = grant.get("stale_days")
+            created = _stamp_epoch(task.get("created_at"))
+            age_days = (current - created) / 86400 if created else 0.0
+            if delivered:
+                reason, delete_branch = f"delivered ({status})", True
+            elif stale_days is not None and age_days >= stale_days and status in {"failed", "created", "allocated", "blocked"}:
+                reason, delete_branch = f"{status} for {age_days:.0f} days", True
+            elif stale_days is not None and age_days >= stale_days and status == "completed":
+                reason, delete_branch = f"completed but undelivered for {age_days:.0f} days", False
+            else:
+                continue
+            try:
+                self.cleanup_task(task["id"], delete_branch=delete_branch)
+            except (SafetyError, HelmError) as exc:
+                skipped.append({"task_id": task["id"], "reason": _safe_text(str(exc))[:160]})
+                continue
+            with self.store.locked() as live:
+                record = live["tasks"].get(task["id"])
+                if record is not None:
+                    record["cleaned_under_grant"] = grant["id"]
+                    record["cleaned_under_grant_reason"] = reason
+            cleaned.append({"task_id": task["id"], "reason": reason, "grant_id": grant["id"]})
+        return {"cleaned": cleaned, "skipped": skipped, "without_grant": without_grant}
+
     def release_project(self, project_id: str) -> dict[str, Any]:
         """Release what a finished project still holds, and report what it kept.
 

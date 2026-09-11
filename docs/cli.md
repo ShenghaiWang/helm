@@ -19,6 +19,23 @@ Use `helm init` only when explicitly initializing a root; it creates missing
 Helm directories without overwriting existing projects. A normal checkout is
 already a root and needs no initialization.
 
+## Adopting a repository: `helm adopt`
+
+```sh
+helm adopt ~/code/widgets --delivery pr --domain software-delivery [--id widgets] [--label "Widgets"]
+helm adopt projects/widgets --no-review        # already under projects/: adopted in place
+```
+
+Clones the repository into `projects/<id>` from its own `origin` when it has
+one (otherwise from the path; the original is never moved or touched), writes
+`.helm/project.json` with the label, delivery policy, domains and any
+`--base-branch`, `--no-foreman`, `--no-review`, `--agent`, `--model` or
+`--effort` you passed — only when there is none; an existing file is the
+owner's and is read instead — registers the project, then runs `helm doctor
+--project <id>` and prints it. The exit code is that preflight's verdict for
+the project: `1` when something would stop its first task, such as a domain
+it declares that this root does not carry.
+
 ## Preflight: `helm doctor`
 
 `helm doctor` inspects a root without changing it — layout and root identity,
@@ -115,5 +132,12 @@ default) while the same list still stands, and runs `--notify-command` on
 each — a shell command of the commander's own, with `HELM_TITLE` and
 `HELM_MESSAGE` in its environment and the whole list on stdin, which is how a
 notification reaches a chat channel or a phone rather than a banner that is
-gone in seconds. `helm watchdog restart` makes a running watchdog pick up
-new code.
+gone in seconds. It also heals: a worker that reads as provably dead on two
+checks a minute apart — its process gone with no exit record, or the pane
+gone and the worker silent past the threshold, never a worker still in its
+startup grace — is stopped so its task can be reopened or retried, a dead
+foreman is replaced by one that reads the project record and carries on,
+and a project with running workers and no driver gets a foreman appointed.
+Stalled or erroring workers are reported and never touched; `--no-heal`
+turns the healing off. `helm watchdog restart` makes a running watchdog
+pick up new code.

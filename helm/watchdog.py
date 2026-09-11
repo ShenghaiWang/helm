@@ -46,6 +46,13 @@ DEFAULT_REMIND_MINUTES = 60
 #: list on stdin. Set by `install --notify-command`, which writes it into the
 #: scheduler entry as this environment variable.
 NOTIFY_ENV = "HELM_WATCHDOG_NOTIFY"
+#: A death is acted on only when it reads the same on two checks this far
+#: apart. The one time healing ran on a single reading it killed each new
+#: launch inside its first poll: the probe returns false death for a worker
+#: still starting and for the runner-in-pane shape. Two readings a minute
+#: apart, on top of the health check's own startup grace and pid-grade rule,
+#: is the difference between evidence and a glitch.
+HEAL_CONFIRM_SECONDS = 60
 
 
 def _fingerprint(text: str) -> str:
@@ -182,7 +189,80 @@ def sync_pull_requests(root: Path | None) -> dict[str, object]:
     from .state import StateStore
 
     store = StateStore(root / "state", helm_root=root) if root else StateStore()
-    return Coordinator(store).sync_open_pull_requests()
+    coordinator = Coordinator(store)
+    synced = coordinator.sync_open_pull_requests()
+    # The same pass sheds what a standing cleanup grant covers, and archives
+    # the records that then hold nothing -- housekeeping nobody has to run.
+    swept = coordinator.sweep_residue_under_grants()
+    if swept["cleaned"]:
+        coordinator.archive_tasks([entry["task_id"] for entry in swept["cleaned"]])
+    synced["cleaned"] = [entry["task_id"] for entry in swept["cleaned"]]
+    return synced
+
+
+def heal_pass(root: Path | None, memory: Path) -> list[str]:
+    """Settle workers that are provably dead, and re-drive a project left without a driver.
+
+    Only the `died` verdict is acted on -- the process is gone, or the
+    provider says the pane is and the worker has been silent past the
+    threshold -- and only once it has read that way on two checks at least
+    `HEAL_CONFIRM_SECONDS` apart; `memory` holds the first sighting. A dead
+    foreman is replaced by `_heal_dead_worker` itself. A project whose
+    foreman is gone while a worker of it is still running is re-driven, so a
+    worker's next question is answered rather than recorded into nothing.
+    Stalled or erroring workers are reported, never touched.
+    """
+    import json
+
+    from . import cli
+    from .core import Coordinator
+    from .state import StateStore
+
+    store = StateStore(root / "state", helm_root=root) if root else StateStore()
+    coordinator = Coordinator(store)
+    seen: dict[str, float] = {}
+    with _quiet():
+        seen = {k: float(v) for k, v in json.loads(memory.read_text(encoding="utf-8")).items()}
+    current: dict[str, float] = {}
+    reports: list[str] = []
+    moment = time.time()
+    for entry in coordinator.worker_health(liveness=cli._liveness_probe(coordinator)):
+        if entry.get("verdict") != "died" or not entry.get("worker_id"):
+            continue
+        first = seen.get(entry["worker_id"], moment)
+        if moment - first < HEAL_CONFIRM_SECONDS:
+            current[entry["worker_id"]] = first
+            continue
+        healed = cli._heal_dead_worker(coordinator, entry)
+        if healed:
+            reports.append(healed)
+        else:
+            current[entry["worker_id"]] = first
+    with _quiet():
+        memory.write_text(json.dumps(current), encoding="utf-8")
+    data = store.load()
+    for project in data.get("projects", {}).values():
+        project_id = project["id"]
+        driving = coordinator.foreman_for(project_id, data=data)
+        if driving is not None:
+            continue
+        running = [
+            worker for worker in data.get("workers", {}).values()
+            if worker.get("project_id") == project_id and worker.get("status") == "running"
+            and (data.get("tasks", {}).get(worker.get("task_id")) or {}).get("role") != "foreman"
+        ]
+        if not running:
+            continue
+        with _quiet():
+            if not coordinator.project_wants_foreman(project_id):
+                continue
+            appointed = cli._ensure_foreman(coordinator, project_id)
+            if appointed:
+                reports.append(
+                    f"helm watchdog: {project_id} had {len(running)} running worker(s) and no "
+                    f"foreman; appointed {appointed['worker']['id']}"
+                )
+    return reports
 
 
 def run(
@@ -192,6 +272,7 @@ def run(
     *,
     notify_command: str | None = None,
     remind_minutes: float = DEFAULT_REMIND_MINUTES,
+    heal: bool = True,
 ) -> int:
     """Check now, then every `interval` seconds until stopped.
 
@@ -207,7 +288,14 @@ def run(
     rather than as news.
     """
     state = Path(os.environ.get("TMPDIR", "/tmp")) / "helm-watchdog.last"
+    memory = Path(os.environ.get("TMPDIR", "/tmp")) / "helm-watchdog.dead"
     while True:
+        if heal:
+            try:
+                for line in heal_pass(root, memory):
+                    print(line, flush=True)
+            except Exception as exc:  # noqa: BLE001 - healing is a courtesy, never the reason to die
+                print(f"helm watchdog: heal skipped: {exc}", file=sys.stderr, flush=True)
         try:
             synced = sync_pull_requests(root)
             for task_id in synced.get("merged", []):
@@ -252,9 +340,11 @@ def _xml_escape(value: str) -> str:
 
 
 def _launchd_plist(
-    root: Path, interval: int, log: Path, *, notify_command: str = "", remind_minutes: float = DEFAULT_REMIND_MINUTES
+    root: Path, interval: int, log: Path, *, notify_command: str = "",
+    remind_minutes: float = DEFAULT_REMIND_MINUTES, heal: bool = True,
 ) -> str:
     executable = sys.executable
+    heal_flag = "" if heal else "    <string>--no-heal</string>\n"
     environment = (
         f"  <key>EnvironmentVariables</key>\n  <dict>\n    <key>{NOTIFY_ENV}</key>"
         f"<string>{_xml_escape(notify_command)}</string>\n  </dict>\n"
@@ -273,7 +363,7 @@ def _launchd_plist(
     <string>watchdog</string><string>run</string>
     <string>--interval</string><string>{interval}</string>
     <string>--remind-after</string><string>{remind_minutes:g}</string>
-  </array>
+{heal_flag}  </array>
 {environment}  <key>WorkingDirectory</key><string>{root}</string>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
@@ -285,9 +375,11 @@ def _launchd_plist(
 
 
 def _systemd_units(
-    root: Path, interval: int, *, notify_command: str = "", remind_minutes: float = DEFAULT_REMIND_MINUTES
+    root: Path, interval: int, *, notify_command: str = "",
+    remind_minutes: float = DEFAULT_REMIND_MINUTES, heal: bool = True,
 ) -> tuple[str, str]:
     executable = sys.executable
+    heal_flag = "" if heal else " --no-heal"
     environment = (
         f'Environment="{NOTIFY_ENV}={notify_command.replace(chr(34), chr(92) + chr(34))}"\n'
         if notify_command else ""
@@ -298,7 +390,7 @@ Description=Helm watchdog: surface what needs a human
 [Service]
 Type=simple
 WorkingDirectory={root}
-{environment}ExecStart={executable} -m helm --root {root} watchdog run --interval {interval} --remind-after {remind_minutes:g}
+{environment}ExecStart={executable} -m helm --root {root} watchdog run --interval {interval} --remind-after {remind_minutes:g}{heal_flag}
 Restart=always
 """
     timer = f"""[Unit]
@@ -364,7 +456,8 @@ def restart() -> int:
 
 
 def install(
-    root: Path, interval: int, *, notify_command: str = "", remind_minutes: float = DEFAULT_REMIND_MINUTES
+    root: Path, interval: int, *, notify_command: str = "",
+    remind_minutes: float = DEFAULT_REMIND_MINUTES, heal: bool = True,
 ) -> int:
     """Generate and load the platform's own scheduler entry."""
     system = platform.system()
@@ -373,7 +466,9 @@ def install(
         log = root / "state" / "watchdog.log"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
-            _launchd_plist(root, interval, log, notify_command=notify_command, remind_minutes=remind_minutes),
+            _launchd_plist(
+                root, interval, log, notify_command=notify_command, remind_minutes=remind_minutes, heal=heal,
+            ),
             encoding="utf-8",
         )
         with _quiet():
@@ -387,6 +482,11 @@ def install(
         print(f"  then saying it again every {remind_minutes:g} minutes while it still waits.")
         if notify_command:
             print(f"  Each notification also runs your command: {notify_command}")
+        print(
+            "  A worker that reads as dead on two checks a minute apart is stopped, a dead foreman "
+            "replaced, and a project with running workers and no driver re-driven."
+            if heal else "  Healing is off (--no-heal): deaths are reported, never acted on."
+        )
         if result.returncode != 0:
             print("  launchctl load reported a problem; run it by hand to see why.")
             return 1
@@ -395,7 +495,7 @@ def install(
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
         service, _timer = _systemd_units(
-            root, interval, notify_command=notify_command, remind_minutes=remind_minutes
+            root, interval, notify_command=notify_command, remind_minutes=remind_minutes, heal=heal,
         )
         # A continuously-polling service needs no timer: a timer would restart
         # it on a cadence, which is the very latency this is removing.

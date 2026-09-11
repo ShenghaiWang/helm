@@ -17,7 +17,7 @@ from typing import Any
 
 from . import watchdog as watchdog_module
 from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
-from .values import TASK_SHAPES
+from .values import GRANTABLE_ACTIONS, TASK_SHAPES
 from .core import (
     HEALTHY_WORKER_VERDICTS,
     EFFORT_LEVELS,
@@ -788,8 +788,9 @@ def _print_approval_grants(coordinator: Coordinator, *, include_revoked: bool = 
     for grant in grants:
         state = "revoked" if grant.get("revoked_at") else "live"
         scope = grant["project_id"] or "all projects"
+        stale = f" (stale after {grant['stale_days']} days)" if grant.get("stale_days") else ""
         print(
-            f"{grant['id']} [{state}] {grant['action']} for {scope} "
+            f"{grant['id']} [{state}] {grant['action']} for {scope}{stale} "
             f"granted_by={grant['granted_by']}: {grant['note']}"
         )
 
@@ -1070,6 +1071,9 @@ def _print_inspect(report: dict[str, Any]) -> None:
             f"  shape: {task['shape']}"
             + (f" -- {task['shape_reason']}" if task.get("shape_reason") else "")
         )
+        check = task.get("shape_check") or {}
+        for finding in check.get("findings") or []:
+            print(f"    shape check: {finding}")
     print(f"  policy: {task['delivery_policy']}")
     print(f"  branch: {task['branch']}")
     print(f"  workspace: {task['workspace']}")
@@ -1304,6 +1308,12 @@ def _build_parser() -> argparse.ArgumentParser:
              "full-suite evidence required before approval)",
     )
     create.add_argument("--shape-reason", default="", help="one line on why this shape; recorded on the task")
+    reshape = task_commands.add_parser(
+        "shape", help="change a task's shape -- after a review's shape check said the first one was wrong"
+    )
+    reshape.add_argument("task_id")
+    reshape.add_argument("shape", choices=TASK_SHAPES)
+    reshape.add_argument("--reason", default="", help="why; recorded with the old and new shape")
     create.add_argument("--delivery", choices=("local", "pr"))
     create.add_argument("--domain", help="explicit domain override for ambiguous tasks")
     create.add_argument("--no-domain", action="store_true")
@@ -1640,6 +1650,25 @@ def _build_parser() -> argparse.ArgumentParser:
     note_cmd.add_argument("--text", required=True)
     eval_commands.add_parser("report", help="every ticket, every arm, side by side")
 
+    adopt = commands.add_parser(
+        "adopt",
+        help=(
+            "bring a repository under Helm in one command: clone or take it in place under "
+            "projects/, describe it in .helm/project.json, register it, and run the preflight"
+        ),
+    )
+    adopt.add_argument("path", help="the repository; cloned into projects/<id> unless it is already there")
+    adopt.add_argument("--id", dest="project_id", help="project id (default: the directory name)")
+    adopt.add_argument("--label", help="display name (default: the id)")
+    adopt.add_argument("--delivery", choices=("local", "pr"), default="local")
+    adopt.add_argument("--domain", dest="domains", action="append", help="domain default; repeatable (default: software-delivery)")
+    adopt.add_argument("--base-branch", help="pin the base branch instead of resolving it from the remote")
+    adopt.add_argument("--no-foreman", action="store_true", help="this project is driven by the coordinator directly")
+    adopt.add_argument("--no-review", action="store_true", help="skip the independent review loop for this project")
+    adopt.add_argument("--agent", help=f"pin every worker of this project to a runtime (built in: {_BUILTIN_AGENT_NAMES})")
+    adopt.add_argument("--model", help="pin the model")
+    adopt.add_argument("--effort", choices=EFFORT_LEVELS, help="pin the effort")
+
     ledger_cmd = commands.add_parser(
         "ledger",
         help="what each task cost and what came of it, per task, from Helm's own records",
@@ -1815,6 +1844,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     for target_parser in (watchdog_run,):
         target_parser.add_argument(
+            "--no-heal", action="store_true",
+            help="report deaths but never act on them; by default a worker that reads as dead on two "
+                 "checks a minute apart is stopped, a dead foreman replaced, a driverless project re-driven",
+        )
+        target_parser.add_argument(
             "--notify-command",
             help="a shell command run on every notification, with HELM_TITLE and HELM_MESSAGE "
                  "in its environment and the pending list on stdin -- a chat message, a phone",
@@ -1838,6 +1872,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--remind-after", type=float, default=watchdog_module.DEFAULT_REMIND_MINUTES,
         help="minutes before a standing list is said again; 0 never",
     )
+    watchdog_install.add_argument("--no-heal", action="store_true", help="install without healing (see run --no-heal)")
     watchdog_commands.add_parser("uninstall", help="remove the scheduler entry")
 
     pending = commands.add_parser(
@@ -1985,7 +2020,11 @@ def _build_parser() -> argparse.ArgumentParser:
     grant = approval_commands.add_parser(
         "grant", help="pre-authorize one protected action so Helm need not ask again"
     )
-    grant.add_argument("action", choices=sorted(PROTECTED_ACTIONS))
+    grant.add_argument("action", choices=sorted(GRANTABLE_ACTIONS))
+    grant.add_argument(
+        "--stale-days", type=int, default=None,
+        help="cleanup grants only: also shed failed, never-launched and undelivered tasks older than this many days",
+    )
     grant.add_argument("--project", dest="project_id", help="limit to one project (default: all)")
     grant.add_argument("--note", required=True, help="what this permits and why (required)")
     project_release = project_commands.add_parser(
@@ -2028,7 +2067,7 @@ def _build_parser() -> argparse.ArgumentParser:
     check_grant = approval_commands.add_parser(
         "check", help="report whether a standing approval covers an action"
     )
-    check_grant.add_argument("action", choices=sorted(PROTECTED_ACTIONS))
+    check_grant.add_argument("action", choices=sorted(GRANTABLE_ACTIONS))
     check_grant.add_argument("--project", dest="project_id")
     release_hold = approval_commands.add_parser(
         "release",
@@ -3278,6 +3317,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if task["status"] == "pr-merged":
                     _release_finished_space(coordinator, task)
+            elif args.task_command == "shape":
+                reshaped = coordinator.reshape_task(args.task_id, args.shape, reason=args.reason)
+                history = reshaped.get("shape_history") or [{}]
+                print(
+                    f"Task {reshaped['id']} is now shaped {reshaped['shape']}"
+                    f" (was {history[-1].get('from')})"
+                    + (f": {args.reason}" if args.reason else "")
+                )
             elif args.task_command == "cost":
                 usage = coordinator.task_usage(args.task_id, with_reviews=not args.no_reviews)
                 if args.as_json:
@@ -3894,11 +3941,13 @@ def main(argv: list[str] | None = None) -> int:
                 return watchdog_module.run(
                     root_path, args.interval, once=args.once,
                     notify_command=args.notify_command, remind_minutes=args.remind_after,
+                    heal=not args.no_heal,
                 )
             if args.watchdog_command == "install":
                 return watchdog_module.install(
                     root_path, args.interval,
                     notify_command=args.notify_command, remind_minutes=args.remind_after,
+                    heal=not args.no_heal,
                 )
             if args.watchdog_command == "restart":
                 return watchdog_module.restart()
@@ -3906,6 +3955,38 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "eval":
             return _eval_command(coordinator, args)
+        if args.command == "adopt":
+            if helm_root is None:
+                raise HelmError("adopt needs a Helm root; run it from one, or pass --root")
+            adopted = coordinator.adopt_project(
+                args.path, helm_root=helm_root, project_id=args.project_id, label=args.label,
+                delivery_policy=args.delivery, domains=args.domains, base_branch=args.base_branch,
+                foreman=not args.no_foreman, review=not args.no_review,
+                agent=args.agent, model=args.model, effort=args.effort,
+            )
+            project = adopted["project"]
+            print(f"Adopted {project['id']} at {adopted['root']}")
+            if adopted["cloned_from"]:
+                print(f"  cloned from {adopted['cloned_from']}; the original was not touched")
+            if adopted["settings_written"] is not None:
+                print(f"  wrote {adopted['settings_file']}:")
+                for key, value in adopted["settings_written"].items():
+                    print(f"    {key}: {value}")
+            else:
+                print(f"  kept the existing {adopted['settings_file']}")
+            print(f"  base branch: {project.get('base_branch')}   delivery: {project.get('delivery_policy')}")
+            print(f"  foreman: {'no' if project.get('foreman') is False else 'appointed on the first request'}"
+                  f"   review: {'no' if project.get('review') is False else 'independent, on a different model'}")
+            report = doctor_module.run(coordinator, helm_root, project["id"])
+            for line in doctor_module.render_text(report):
+                print(line)
+            print(f"Next: helm route {project['id']} \"<what you want done, in your own words>\"")
+            # The project is adopted either way; the exit code says whether
+            # its own preflight found something that would stop the first
+            # task. Root-level warnings are printed above and are not this
+            # project's fault.
+            broken = [f for f in report.findings if f.scope == "project" and f.severity == doctor_module.ERROR]
+            return 1 if broken else 0
         if args.command == "ledger":
             report = coordinator.ledger(days=args.days, project_id=args.project_id)
             if args.as_json:
@@ -4227,6 +4308,17 @@ def main(argv: list[str] | None = None) -> int:
                     for task_id in synced["merged"]:
                         with contextlib.suppress(HelmError, OSError):
                             _release_finished_space(coordinator, coordinator.inspect_task(task_id)["task"])
+            # Residue a standing cleanup grant covers is shed here, and the
+            # records that then hold nothing leave the live document.
+            with contextlib.suppress(HelmError, OSError):
+                swept = coordinator.sweep_residue_under_grants()
+                if swept["cleaned"]:
+                    print(f"Cleanup under standing grant: {len(swept['cleaned'])} task(s)")
+                    for entry in swept["cleaned"]:
+                        print(f"  {entry['task_id']}: {entry['reason']} (grant {entry['grant_id']})")
+                    coordinator.archive_tasks([entry["task_id"] for entry in swept["cleaned"]])
+                for entry in swept["skipped"]:
+                    print(f"  cleanup of {entry['task_id']} refused: {entry['reason']}")
             updates = coordinator.project_updates_for_watch()
             # A settled worker's pane is no longer evidence; leaving it open
             # makes the panel harder to read for no benefit.
@@ -4514,7 +4606,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "approval":
             if args.approval_command == "grant":
                 granted = coordinator.grant_approval(
-                    args.action, project_id=args.project_id, note=args.note
+                    args.action, project_id=args.project_id, note=args.note, stale_days=args.stale_days,
                 )
                 scope = granted["project_id"] or "all projects"
                 print(f"Granted {granted['id']}: {granted['action']} for {scope}")

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
-from .values import shape_policy
+from .values import shape_check, shape_policy
 from .core import (
     Coordinator,
     HelmError,
@@ -1196,6 +1196,7 @@ class HerdrAdapter:
                 artifact_handoff = self._artifact_handoff(review_data, task_id)
                 full_suite_evidence = self._full_suite_evidence(review_data, task_id)
                 diff_handoff, _diff_path = self._precomputed_diff(task, review_base)
+                shape_handoff = self._shape_handoff(task, review_base)
                 # Terminal protocol results settle workers even when their
                 # interactive pane remains open. Do not reopen a completed
                 # worker for another review round; launch a fresh reviewer task.
@@ -1250,6 +1251,7 @@ class HerdrAdapter:
                         # reviewer alive, so nothing may crowd it off the end
                         # of a brief truncated at 20,000 characters.
                         f"{diff_handoff}"
+                        f"{shape_handoff}"
                         # Mandatory and Helm's own, so it precedes the author's
                         # untrusted text below for the same reason the rest of
                         # this brief does: nothing the author writes may crowd
@@ -2062,6 +2064,39 @@ class HerdrAdapter:
         if len(fragment) > 2:
             return f"{entry} {fragment}{marker}"
         return f"{entry} {cls._ARTIFACT_DESCRIPTION_OMITTED}"
+
+    def _shape_handoff(self, task: dict[str, Any], review_base: str) -> str:
+        """Check the declared shape against the diff, record it, tell the reviewer.
+
+        The shape is the foreman's word, and it switched rounds, effort and
+        the evidence gate. A reviewer handed a "small" change that touches a
+        migration needs to know the ceremony was set for something else.
+        """
+        workspace = task.get("workspace")
+        branch = task.get("branch")
+        if not workspace or not branch:
+            return ""
+        try:
+            numstat = _git(Path(workspace), "diff", "--numstat", f"{review_base}...{branch}", check=False)
+        except (OSError, HelmError):
+            return ""
+        check = shape_check(task, numstat)
+        with contextlib.suppress(HelmError, OSError):
+            with self.coordinator.store.locked() as data:
+                live = data["tasks"].get(task["id"])
+                if live is not None:
+                    live["shape_check"] = check
+        if not check["findings"]:
+            return ""
+        lines = "\n".join(f"- {finding}" for finding in check["findings"])
+        advice = (
+            f" Read it as {check['suggested']} work, whatever the brief says."
+            if check.get("suggested") else ""
+        )
+        return (
+            f"\n\nSHAPE CHECK: this task is shaped {check['shape']}, but its diff says otherwise:\n"
+            f"{lines}\n{advice}"
+        )
 
     def _precomputed_diff(self, task: dict[str, Any], review_base: str) -> tuple[str, str]:
         """Write the diff to a file so the reviewer never has to run `git diff`.

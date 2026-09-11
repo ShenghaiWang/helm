@@ -62,3 +62,68 @@ class WatchdogTests(HelmTestCase):
         service, _timer = watchdog._systemd_units(Path("/root"), 20, notify_command="post it", remind_minutes=30)
         self.assertIn('Environment="HELM_WATCHDOG_NOTIFY=post it"', service)
         self.assertIn("--remind-after 30", service)
+
+    def test_a_death_is_healed_only_after_it_reads_the_same_twice_a_minute_apart(self) -> None:
+        import json
+        import sys
+
+        root = self.repo("healed")
+        project = self.coordinator.register_project("Healed", str(root), project_id="healed")
+        task = self.coordinator.create_task(project["id"], "work")
+        worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        died = {"worker_id": worker["id"], "project_id": project["id"], "verdict": "died"}
+        healed: list[str] = []
+        memory = Path(self.temp.name) / "dead.json"
+        from helm import cli
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[died]), \
+             mock.patch.object(cli, "_heal_dead_worker", side_effect=lambda c, e: healed.append(e["worker_id"]) or "healed"), \
+             mock.patch.object(cli, "_ensure_foreman", return_value=None), \
+             mock.patch("helm.watchdog.Coordinator", return_value=self.coordinator, create=True), \
+             mock.patch("helm.core.Coordinator", return_value=self.coordinator):
+            with mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
+                first = watchdog.heal_pass(None, memory)
+                self.assertEqual(first, [])
+                self.assertEqual(healed, [])
+                self.assertIn(worker["id"], json.loads(memory.read_text()))
+                # The same reading a minute later is evidence; act on it.
+                seen = json.loads(memory.read_text())
+                seen[worker["id"]] = seen[worker["id"]] - watchdog.HEAL_CONFIRM_SECONDS - 1
+                memory.write_text(json.dumps(seen))
+                second = watchdog.heal_pass(None, memory)
+        self.assertEqual(second, ["healed"])
+        self.assertEqual(healed, [worker["id"]])
+        self.assertEqual(json.loads(memory.read_text()), {})
+
+    def test_a_project_with_running_workers_and_no_foreman_is_re_driven(self) -> None:
+        import sys
+
+        root = self.repo("driverless")
+        project = self.coordinator.register_project("Driverless", str(root), project_id="driverless")
+        task = self.coordinator.create_task(project["id"], "work")
+        worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.assertEqual(self.state.load()["workers"][worker["id"]]["status"], "running")
+        appointed: list[str] = []
+        from helm import cli
+
+        def appoint(coordinator, project_id, **kwargs):
+            appointed.append(project_id)
+            return {"worker": {"id": "w-new-foreman"}}
+
+        memory = Path(self.temp.name) / "dead2.json"
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
+             mock.patch.object(cli, "_ensure_foreman", side_effect=appoint), \
+             mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
+             mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
+            reports = watchdog.heal_pass(None, memory)
+        self.assertEqual(appointed, [project["id"]])
+        self.assertIn("appointed w-new-foreman", reports[0])
+        # A project that declined a foreman is left alone.
+        with self.state.locked() as data:
+            data["projects"][project["id"]]["foreman"] = False
+        appointed.clear()
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
+             mock.patch.object(cli, "_ensure_foreman", side_effect=appoint), \
+             mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
+             mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
+            self.assertEqual(watchdog.heal_pass(None, memory), [])
+        self.assertEqual(appointed, [])

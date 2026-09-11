@@ -175,6 +175,21 @@ any worker configuration. The agent then:
 
 `helm init <other-root>` exists only for creating a separate custom root.
 
+To bring your own repository under Helm, one command does the four steps a
+newcomer would otherwise have to know:
+
+```sh
+helm adopt ~/code/widgets --delivery pr --domain software-delivery
+```
+
+It clones the repository into `projects/widgets` (from its own `origin`, so
+the clone's upstream is the real remote; the original is untouched), writes
+`.helm/project.json` with the label, delivery policy, domain and any pins
+you passed, registers the project, runs the preflight for it, and prints
+the `helm route` line to try first. A repository already under `projects/`
+is adopted in place, and an existing `.helm/project.json` is read, not
+overwritten.
+
 ## Helm root layout
 
 Only the placeholder files are tracked; the contents below are local and
@@ -375,18 +390,20 @@ Herdr ownership.
 
 ```text
 helm init [ROOT]
+helm adopt PATH [--id ID] [--label L] [--delivery local|pr] [--domain D]... [--base-branch B] [--no-foreman] [--no-review] [--agent A] [--model M] [--effort E]
 helm doctor [--project PROJECT_ID] [--json] [--probe-runtimes]
 helm status [--project PROJECT_ID] · pending [--changes] · ack PROJECT · ask record|show
-helm watch [--silence SECONDS] [--nudge] · watchdog install|run [--notify-command CMD] [--remind-after MIN] · restart|uninstall
+helm watch [--silence SECONDS] [--nudge] · watchdog install|run [--notify-command CMD] [--remind-after MIN] [--no-heal] · restart|uninstall
 helm route PROJECT TEXT [--agent A] [--model M] [--no-herdr]
 helm foreman PROJECT [--agent A] [--command CMD] [--no-herdr]
 helm gate propose|decide FOREMAN_TASK --type requirement|solution
 helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async]
 helm task create --project P --brief TEXT [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--base B] [--new]
+helm task shape TASK_ID small|standard|critical [--reason TEXT]
 helm task allocate|inspect|continue|reopen|evidence|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|cleanup
 helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N]
 helm worker launch|round|poll|wait|message|report|answer|inbox|interrupt|action-start|reconcile|stop
-helm approval grant|list|check|revoke|release|repair
+helm approval grant ACTION [--project P] [--note N] [--stale-days D] · list|check|revoke|release|repair
 helm authority init|status
 helm learning propose|list|inspect|edit|approve|reject|apply
 helm project add|list|status|note|action|domain|release|remove

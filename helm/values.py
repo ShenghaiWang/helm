@@ -29,6 +29,11 @@ DELIVERY_POLICIES = {"local", "pr"}
 # line, in review, rather than accumulating quietly in configuration.
 PROTECTED_ACTIONS = frozenset({"merge", "push", "publish", "delete", "external"})
 
+#: What a standing grant may name. `cleanup` is not a hold a worker can
+#: request -- it is the commander's own sweep of delivered and stale residue,
+#: decided once instead of per task -- so it is grantable and nothing else.
+GRANTABLE_ACTIONS = PROTECTED_ACTIONS | frozenset({"cleanup"})
+
 
 def now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -81,6 +86,13 @@ def _safe_text(value: Any, default: str = "") -> str:
 def _validate_protected_action(action: Any) -> str:
     if not isinstance(action, str) or action not in PROTECTED_ACTIONS:
         known = ", ".join(sorted(PROTECTED_ACTIONS))
+        raise HelmError(f"protected action must be one of: {known}")
+    return action
+
+
+def _validate_grantable_action(action: Any) -> str:
+    if not isinstance(action, str) or action not in GRANTABLE_ACTIONS:
+        known = ", ".join(sorted(GRANTABLE_ACTIONS))
         raise HelmError(f"protected action must be one of: {known}")
     return action
 
@@ -176,6 +188,65 @@ def _validate_shape(shape: Any, source: str = "") -> str:
 def shape_policy(task: dict[str, Any]) -> dict[str, Any]:
     """The policy for this task's shape; a record with none is standard."""
     return SHAPE_POLICY[_validate_shape(task.get("shape") or "standard", "task record")]
+
+
+#: Path fragments whose presence in a diff says the change is not small,
+#: whatever the foreman called it: places where correctness cannot be seen.
+RISKY_PATH_MARKERS: tuple[str, ...] = (
+    "migration", "migrate", "schema", "auth", "oauth", "token", "secret", "credential",
+    "password", "session", "permission", "billing", "payment", "invoice", "checkout",
+    "crypto", "encrypt", "lock", "mutex", "concurren", "persist", "storage", "database",
+)
+
+#: Changed lines past which a `small` change is not small, and past which any
+#: change wants splitting (the change-sizing domain's target is ~500).
+SMALL_SHAPE_MAX_LINES = 200
+SPLIT_ADVICE_LINES = 1500
+
+
+def shape_check(task: dict[str, Any], numstat: str) -> dict[str, Any]:
+    """Compare a task's declared shape with what its diff touches.
+
+    `numstat` is `git diff --numstat base...tip`. The verdict is advice a
+    reviewer and the commander see, and a gate only in one direction: a
+    `small` task whose diff reaches a risky path cannot be approved until
+    somebody re-shapes it, because "small" was the word that switched the
+    evidence and the rounds off.
+    """
+    shape = _validate_shape(task.get("shape") or "standard", "task record")
+    lines = 0
+    risky: list[str] = []
+    for row in numstat.splitlines():
+        parts = row.split("\t")
+        if len(parts) < 3:
+            continue
+        added, removed, path = parts[0], parts[1], parts[2]
+        lines += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
+        lowered = path.lower()
+        hit = next((marker for marker in RISKY_PATH_MARKERS if marker in lowered), None)
+        if hit:
+            risky.append(f"{path} ({hit})")
+    findings: list[str] = []
+    suggested: str | None = None
+    if risky and shape != "critical":
+        findings.append(
+            "touches " + ", ".join(risky[:6]) + (" …" if len(risky) > 6 else "")
+            + ": correctness there cannot be seen, which is what critical is for"
+        )
+        suggested = "critical"
+    if shape == "small" and lines > SMALL_SHAPE_MAX_LINES:
+        findings.append(f"{lines} changed lines is not a small change")
+        suggested = suggested or "standard"
+    if lines > SPLIT_ADVICE_LINES:
+        findings.append(f"{lines} changed lines: consider splitting at a natural boundary (change-sizing)")
+    return {
+        "shape": shape,
+        "changed_lines": lines,
+        "risky_paths": risky,
+        "findings": findings,
+        "suggested": suggested,
+        "mismatch": bool(findings) and suggested is not None,
+    }
 
 
 #: Ask for the runtime's own default model instead of naming one.

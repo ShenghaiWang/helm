@@ -134,7 +134,9 @@ constant — ask for the change, the suite, and the result: no evidence
 captures, at most one review round, no artifact report. The commander looks
 at it and knows. Reserve critical for changes whose correctness cannot be
 seen: concurrency, state machines, persistence, auth, money, anything where
-a screenshot proves nothing.
+a screenshot proves nothing. The review checks the shape against the diff
+and reports a mismatch; a `small` task whose diff reaches such a path is
+re-shaped with `helm task shape <task> critical` before it can be approved.
 
 ## Mandatory delegation — the coordinator never does the work
 
@@ -250,8 +252,11 @@ a worker agent the coordinator spawns for that task.
   still holds and pointing at `helm task cleanup <task>` (or `helm project
   release <id>`); it repeats in `helm status` and `helm watch` until it is
   answered. Relay it and get the commander's approval — cleanup deletes a
-  checkout and a branch, so Helm never runs it by itself, and it is never
-  raised for a task that holds nothing. What it names comes from Helm's record
+  checkout and a branch, so Helm never runs it by itself unless the
+  commander granted `cleanup` in advance (`helm approval grant cleanup`,
+  optionally `--stale-days N`), under which `helm watch` sheds delivered and
+  stale residue and says so — and it is never raised for a task that holds
+  nothing. What it names comes from Helm's record
   of what the task owns, not from probing the disk, so a moved or unreadable
   project root can never read as "already cleaned" — cleanup is what reconciles
   a resource somebody removed outside Helm. It resolves only for what cleanup

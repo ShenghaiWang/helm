@@ -66,6 +66,24 @@ with a required note saying why it exists. Granting `publish` never grants
 grants appear in `helm status` so a standing permission cannot be forgotten;
 revoked ones stay listed as provenance and approve nothing.
 
+One grantable action is not a hold a worker can request: `cleanup`. Cleanup
+deletes a checkout and a branch, so Helm never runs it on its own — but a
+commander who has decided that delivered work holds nothing worth keeping
+can say so once:
+
+```sh
+helm approval grant cleanup --note "delivered tasks hold nothing I want"
+helm approval grant cleanup --project media --stale-days 14 --note "and failed or undelivered work older than two weeks"
+```
+
+Under it, `helm watch` and the watchdog shed what every `merged` and
+`pr-merged` task still holds, branch included, and archive the record. With
+`--stale-days`, a failed, never-launched or blocked task older than that goes
+the same way, and a completed-but-undelivered one sheds its worktree and
+worker directories while its branch — finished work nobody decided on — is
+kept and named. Every refusal cleanup makes by hand (a dirty workspace, a
+live session) it still makes here, and reports.
+
 Grants live in Helm's own state. A project file, a domain file, or a worker
 message can never create or widen one, and Helm's coordinator never creates
 one on its own initiative: a grant records the commander's policy, and only

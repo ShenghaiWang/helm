@@ -6,6 +6,7 @@ import contextlib
 import io
 import subprocess
 import sys
+from pathlib import Path
 from unittest import mock
 
 from helm import cli
@@ -111,3 +112,74 @@ class ShapeTests(HelmTestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(["--state-dir", str(self.state.directory), "inspect", task_id]), 0)
         self.assertIn("shape: small -- one asset", out.getvalue())
+
+    def test_the_shape_check_reads_the_diff_and_the_review_hands_it_over(self) -> None:
+        from helm.values import shape_check
+        small = {"shape": "small"}
+        self.assertEqual(shape_check(small, "3\t1\tsrc/theme/colors.ts\n")["findings"], [])
+        risky = shape_check(small, "40\t2\tdb/migrations/0042_add_index.sql\n1\t1\tREADME.md\n")
+        self.assertTrue(risky["mismatch"])
+        self.assertEqual(risky["suggested"], "critical")
+        self.assertIn("migration", risky["findings"][0])
+        big = shape_check(small, "150\t80\tsrc/a.ts\n")
+        self.assertEqual(big["suggested"], "standard")
+        self.assertEqual(shape_check({"shape": "critical"}, "40\t2\tauth/login.py\n")["findings"], [])
+        huge = shape_check({"shape": "standard"}, "1000\t600\tsrc/big.ts\n")
+        self.assertFalse(huge["mismatch"])
+        self.assertIn("splitting", huge["findings"][0])
+
+        # The review runs it against the real diff and tells the reviewer.
+        project = self._project("checked")
+        task = self.coordinator.create_task(project["id"], "tiny tweak", shape="small", shape_reason="one line")
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        workspace = Path(task["workspace"])
+        (workspace / "migrations").mkdir()
+        (workspace / "migrations" / "001_users.sql").write_text("alter table users add column x int;\n")
+        subprocess.run(["git", "-C", str(workspace), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "migration"], check=True)
+        seen: list[str] = []
+
+        def capture(project_id, brief, **kwargs):
+            seen.append(brief)
+            raise HelmError("stop here; the brief is what this test is about")
+
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        with mock.patch.object(self.coordinator, "create_task", side_effect=capture), \
+             mock.patch.object(self.coordinator, "pick_reviewer_agent", return_value={
+                 "agent": "codex", "command": None, "independence": "different-runtime", "reason": "test",
+             }), \
+             self.assertRaises(HelmError):
+            adapter.run_review_cycle(task["id"], timeout=0.01)
+        self.assertIn("SHAPE CHECK: this task is shaped small", seen[0])
+        self.assertIn("migrations/001_users.sql (migration)", seen[0])
+        recorded = self.state.load()["tasks"][task["id"]]["shape_check"]
+        self.assertEqual(recorded["suggested"], "critical")
+
+    def test_a_small_task_the_check_calls_critical_is_re_shaped_before_approval(self) -> None:
+        project = self._project("reshaped")
+        task = self.coordinator.create_task(project["id"], "tiny tweak", shape="small")
+        code = (
+            "from pathlib import Path; import subprocess; Path('auth_tokens.py').write_text('x = 1\\n'); "
+            "subprocess.run(['git','add','auth_tokens.py'],check=True); subprocess.run(['git','commit','-qm','t'],check=True)"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        data = self.state.load()
+        data["tasks"][task["id"]]["shape_check"] = {
+            "shape": "small", "suggested": "critical", "findings": ["touches auth_tokens.py (auth)"], "mismatch": True,
+        }
+        self.state.save(data)
+        with self.assertRaisesRegex(SafetyError, "helm task shape"):
+            self.coordinator.approve_task(task["id"], "looks fine")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main([
+                "--state-dir", str(self.state.directory), "task", "shape", task["id"], "standard",
+                "--reason", "the file is a fixture, not auth code",
+            ]), 0)
+            self.assertEqual(cli.main(["--state-dir", str(self.state.directory), "inspect", task["id"]]), 0)
+        text = out.getvalue()
+        self.assertIn("is now shaped standard (was small)", text)
+        self.assertIn("shape check: touches auth_tokens.py", text)
+        reshaped = self.state.load()["tasks"][task["id"]]
+        self.assertEqual(reshaped["shape_history"][-1]["from"], "small")
+        self.assertEqual(self.coordinator.approve_task(task["id"], "ok")["status"], "approved")

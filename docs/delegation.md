@@ -127,6 +127,16 @@ gets no board card. `helm watch` lists foremen first and calls a broken one
 urgent: a stalled worker costs one task, while a stalled foreman costs
 everything the project was going to do next.
 
+### A dead driver is replaced
+
+Sessions die — the laptop sleeps, the OS reclaims memory, a provider
+returns errors for an hour. The watchdog settles a worker that reads as
+provably dead on two checks a minute apart, replaces a dead foreman with one
+that reads the project record and carries on, and appoints a foreman to a
+project whose workers are running with nobody to answer them. Nothing acts
+on a stall: a silent worker may be thinking, and killing it on a heuristic
+is how a healthy reviewer dies.
+
 ### One driver per task
 
 A foreman runs the review loop because its brief says to; a coordinator that
@@ -195,7 +205,13 @@ every change:
 
 `helm review --rounds` and `--reviewer-effort` override the shape for one
 review; an effort named on the task outranks the shape's floor; the worker
-is told its task's shape and what it means. The rubric — small for an asset,
+is told its task's shape and what it means. The shape is the foreman's
+word, so the review checks it against the diff: a change that touches a
+migration, auth, tokens, billing, a lock or persistence, or a `small`
+change of more than 200 lines, is reported to the reviewer as a shape
+mismatch and recorded on the task, and a `small` task the check calls
+critical cannot be approved until `helm task shape <task> critical` (or
+`standard`, if the finding is wrong) puts it right. The rubric — small for an asset,
 a string, a colour token; critical for auth, money, data loss, concurrency,
 persistence, a migration, a lock — lives in the `driving-delegated-work`
 domain, and the shape follows what the change touches, not how big the diff

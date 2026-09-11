@@ -170,7 +170,10 @@ nothing, and resolved as soon as the record says the residue is gone. It
 resolves only for what cleanup actually shed, so a branch kept because it
 holds unmerged commits leaves the item open, naming just the branch. Cleanup
 stays explicit — Helm never runs it for you, because it deletes a checkout
-and a branch — and its refusals are unchanged: a dirty workspace, a live
+and a branch — unless you have granted it in advance (`helm approval grant
+cleanup`, see [approvals.md](approvals.md#standing-approvals)), in which
+case `helm watch` and the watchdog shed delivered residue under that grant
+and say so. Its refusals are unchanged either way: a dirty workspace, a live
 session, work still awaiting approval, and an unmerged branch are all
 preserved and reported. The work is not finalized until that approved cleanup
 decision is resolved.

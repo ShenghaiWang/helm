@@ -391,6 +391,25 @@ class LifecycleMixin:
     def list_projects(self, *, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         data = data if data is not None else self.store.load()
         return sorted(data["projects"].values(), key=lambda item: item["created_at"])
+    def reshape_task(self, task_id: str, shape: str, *, reason: str = "") -> dict[str, Any]:
+        """Change a task's shape, keeping the old one and why it changed on the record.
+
+        A review's shape check can say the foreman's word was wrong; this is
+        how it is put right before approval, and the history is kept so a
+        re-shape to `small` after a critical finding is visible for what it is.
+        """
+        shape = _validate_shape(shape, "task")
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            previous = task.get("shape") or "standard"
+            task.setdefault("shape_history", []).append({
+                "from": previous, "to": shape, "reason": _safe_text(reason).strip(), "at": now(),
+            })
+            task["shape"] = shape
+            if reason:
+                task["shape_reason"] = _safe_text(reason).strip()
+            return dict(task)
+
     @staticmethod
     def _open_task_for_ticket(
         data: dict[str, Any], project: dict[str, Any], ticket: str, base_branch: str | None
