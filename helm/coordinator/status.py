@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .. import archive
 from ..authority import AUTHORITY_ENV, Authority
 from ..errors import HelmError, SafetyError
 from ..paths import _private_dir, _write_private_text, canonical, overlaps
@@ -668,6 +669,15 @@ class StatusMixin:
 
         tasks = [t for t in data.get("tasks", {}).values() if recent(t.get("created_at"))]
         messages = [m for m in data.get("messages", []) if recent(m.get("created_at"))]
+        # A task cleaned up inside the window has left the live document; its
+        # archive file is what still carries its evidence.
+        for task_id in archive.archived_task_ids(self.store.directory, modified_since=cutoff):
+            record = archive.read_task(self.store.directory, task_id)
+            if record is None:
+                continue
+            if recent(record["task"].get("created_at")):
+                tasks.append(record["task"])
+            messages.extend(m for m in record.get("messages", []) if recent(m.get("created_at")))
         by_kind: dict[str, int] = {}
         for message in messages:
             by_kind[message.get("kind", "?")] = by_kind.get(message.get("kind", "?"), 0) + 1

@@ -34,6 +34,7 @@ from ..paths import (
 from ..policy import CORE_SAFETY_RULES
 from ..values import (
     WORKTREELESS_ROLES,
+    shape_policy,
     _TERMINAL_WORKER_TASK_STATES,
     _safe_text,
     _validate_agent_id,
@@ -337,6 +338,12 @@ class LaunchMixin:
                 "base_revision": task["base_revision"],
                 "domain": domain_id,
                 "domain_selection": task.get("domain_selection"),
+                # How much ceremony this change gets, so the worker does not
+                # produce evidence captures for a colour token or skip them
+                # on a migration.
+                "shape": task.get("shape") or "standard",
+                "shape_reason": task.get("shape_reason") or "",
+                "shape_means": shape_policy(task).get("means"),
             },
             "worker": {
                 "id": worker_id,

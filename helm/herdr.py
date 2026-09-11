@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
+from .values import shape_policy
 from .core import (
     Coordinator,
     HelmError,
@@ -1108,10 +1109,15 @@ class HerdrAdapter:
         reviewer_agent: str | None = None,
         reviewer_model: str | None = None,
         reviewer_effort: str | None = None,
-        rounds: int = 2,
+        rounds: int | None = None,
         timeout: float = 1800.0,
     ) -> dict[str, Any]:
         """Run author and reviewer against each other until both are satisfied.
+
+        The round budget and the reviewer's effort come from the task's shape
+        unless the caller names them: one round at low effort for a small
+        change, two for standard work, three at high effort for a critical
+        change.
 
         The author keeps its session, so a review round is delivered into it
         rather than starting a new author who would have lost the context that
@@ -1124,6 +1130,11 @@ class HerdrAdapter:
         if task is None:
             raise HelmError(f"unknown task: {task_id}")
         project = data["projects"].get(task["project_id"])
+        policy = shape_policy(task)
+        if rounds is None:
+            rounds = int(policy["review_rounds"])
+        if reviewer_effort is None:
+            reviewer_effort = policy.get("reviewer_effort")
         author = next(
             (w for w in data["workers"].values() if w["task_id"] == task_id), None
         )

@@ -131,6 +131,9 @@ One request travels like this:
    verified base — never from whatever the checkout happens to sit on.
 4. **Brief and launch.** One worker, one runtime, model and effort chosen for
    the task, one context document holding exactly one project's knowledge.
+   The task's shape — small, standard or critical — sizes the review rounds,
+   the effort floor and the evidence gate, so a colour token and a migration
+   do not get the same ceremony.
 5. **Drive.** The worker pushes `status`, `question`, `result`, `blocker`
    and `approval-needed` messages; questions are answered into its inbox; a
    protected action pauses the task until the root releases it.
@@ -374,22 +377,25 @@ Herdr ownership.
 helm init [ROOT]
 helm doctor [--project PROJECT_ID] [--json] [--probe-runtimes]
 helm status [--project PROJECT_ID] · pending [--changes] · ack PROJECT · ask record|show
-helm watch [--silence SECONDS] [--nudge] · watchdog install|run|restart|uninstall
+helm watch [--silence SECONDS] [--nudge] · watchdog install|run [--notify-command CMD] [--remind-after MIN] · restart|uninstall
 helm route PROJECT TEXT [--agent A] [--model M] [--no-herdr]
 helm foreman PROJECT [--agent A] [--command CMD] [--no-herdr]
 helm gate propose|decide FOREMAN_TASK --type requirement|solution
 helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async]
-helm task create|allocate|inspect|continue|reopen|evidence|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|cleanup
+helm task create --project P --brief TEXT [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--base B] [--new]
+helm task allocate|inspect|continue|reopen|evidence|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|cleanup
 helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N]
 helm worker launch|round|poll|wait|message|report|answer|inbox|interrupt|action-start|reconcile|stop
 helm approval grant|list|check|revoke|release|repair
 helm authority init|status
 helm learning propose|list|inspect|edit|approve|reject|apply
-helm project add|list|status|note|action|domain|release
+helm project add|list|status|note|action|domain|release|remove
+helm state stats|archive [--dry-run] [--reconcile] [TASK_ID ...]
 helm domain list · skills PROJECT [--agent A] [--brief TEXT]
 helm agent list|check|models · prefs path|show|keys|set|unset|migrate
 helm herdr launch|poll|wait|relabel|cleanup|cleanup-project|cleanup-coordinator
 helm eval add|list|settings|run|status|checks|judge|sanitize|note|report
+helm ledger [--days N] [--project P] [--json]
 helm board [--out PATH] [--open] · tail WORKER_ID [-n LINES] · reflect [--hours N] · inspect TASK_ID
 ```
 

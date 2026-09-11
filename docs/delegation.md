@@ -180,6 +180,27 @@ or `--state-changing` — with no default and no inheritance from the round
 before. Leaving it unstated would let a finished read-only investigation
 silently continue as state-changing work.
 
+## The shape of the change sizes the ceremony
+
+Every task carries a shape, stated by whoever creates it with a one-line
+reason: `helm task create --shape small|standard|critical --shape-reason
+"..."`. Helm sizes the protocol from it rather than applying all of it to
+every change:
+
+| Shape | Review rounds | Effort floor | Evidence before approval |
+| --- | --- | --- | --- |
+| `small` | at most 1, and not required | low, author and reviewer | no |
+| `standard` (default) | up to 2 | the ordinary ladder | no |
+| `critical` | up to 3 | high, author and reviewer | the full suite's exit recorded with `helm task evidence` for the final tip |
+
+`helm review --rounds` and `--reviewer-effort` override the shape for one
+review; an effort named on the task outranks the shape's floor; the worker
+is told its task's shape and what it means. The rubric — small for an asset,
+a string, a colour token; critical for auth, money, data loss, concurrency,
+persistence, a migration, a lock — lives in the `driving-delegated-work`
+domain, and the shape follows what the change touches, not how big the diff
+looks.
+
 ## What a worker may start from
 
 Workers start in their assigned `helm/<project>/<ticket>-<task>` worktree, cut

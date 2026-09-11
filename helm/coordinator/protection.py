@@ -39,6 +39,7 @@ from ..values import (
     _validate_protected_action,
     new_id,
     now,
+    shape_policy,
     task_owns_branch,
 )
 
@@ -1044,6 +1045,27 @@ class ProtectionMixin:
             workspace = self._verify_workspace_record(data, project, task)
             if not self._workspace_clean(workspace):
                 raise SafetyError("approval requires a clean reviewed worker workspace")
+            if shape_policy(task).get("evidence_required"):
+                # A critical change is approved on evidence, not on a
+                # reviewer's word: the full suite's exit, recorded against
+                # the exact revision being approved.
+                head = _git(workspace, "rev-parse", "HEAD").strip()
+                reports = [
+                    (message.get("payload") or {}).get("full_suite")
+                    for message in data.get("messages", [])
+                    if message.get("task_id") == task_id
+                    and isinstance((message.get("payload") or {}).get("full_suite"), dict)
+                ]
+                green = [
+                    report for report in reports
+                    if head.startswith(str(report.get("tip") or "\0")) or str(report.get("tip") or "").startswith(head)
+                ]
+                if not any(int(report.get("exit", 1) or 0) == 0 for report in green):
+                    raise SafetyError(
+                        f"task is shaped critical, so approval needs the full suite's exit recorded "
+                        f"for revision {head[:10]}: helm task evidence {task_id} --tip {head[:10]} "
+                        "--command '<suite command>' --exit 0"
+                    )
             grant = None
             if grant_id is not None:
                 grant = data["approval_grants"].get(grant_id)

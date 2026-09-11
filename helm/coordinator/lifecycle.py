@@ -47,6 +47,7 @@ from ..values import (
     _validate_agent_id,
     _validate_branch_name,
     _validate_effort,
+    _validate_shape,
     _validate_model_id,
     _validate_project_id,
     _validate_ticket_id,
@@ -426,6 +427,8 @@ class LifecycleMixin:
         read_only: bool = False,
         base: str | None = None,
         new: bool = False,
+        shape: str | None = None,
+        shape_reason: str | None = None,
     ) -> dict[str, Any]:
         brief = _safe_text(brief).strip()
         if not brief:
@@ -437,6 +440,7 @@ class LifecycleMixin:
         # creation with a git error nobody can map back to the input.
         ticket = _validate_ticket_id(ticket, "task") if ticket else None
         model = _validate_model_id(model, "task") if model else None
+        shape = _validate_shape(shape, "task") if shape else "standard"
         # Same reason as the ticket above: this becomes a git ref, so a bad
         # name fails here rather than deep in worktree creation. A task-level
         # base is for the one-off -- a fix that must sit on a release branch
@@ -698,6 +702,10 @@ class LifecycleMixin:
                         #: one was chosen. Absent means the ladder decides at
                         #: launch; see `_resolve_effort`.
                         "effort": _validate_effort(effort, "task") if effort else None,
+                        #: How much ceremony this change gets -- review rounds,
+                        #: effort floor, evidence gate; see `SHAPE_POLICY`.
+                        "shape": shape,
+                        "shape_reason": _safe_text(shape_reason).strip() if shape_reason else "",
                         # Sticky: once any round is state-changing the task is
                         # a delivery candidate for good, however its last
                         # round was classified.

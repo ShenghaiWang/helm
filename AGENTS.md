@@ -124,12 +124,17 @@ second and applied by default to both, which turns an eleven-minute change
 into an hour: the evidence, the capture tooling question, the review round
 and the write-up all cost more than the work.
 
-So say the shape in the brief. For a small, visually-obvious, low-blast-radius
-change — an asset, a colour token, a string, a layout constant — ask for the
-change, the suite, and the result: no evidence captures, no review round, no
-artifact report. The commander looks at it and knows. Reserve the full
-protocol for changes whose correctness cannot be seen: concurrency, state
-machines, persistence, anything where a screenshot proves nothing.
+So say the shape on the task: `helm task create --shape small|standard|critical
+--shape-reason "..."`. Helm sizes the ceremony from it — review rounds (1, 2,
+3), the effort floor for author and reviewer (low, the ladder, high), and
+whether the full suite's exit must be recorded with `helm task evidence`
+before approval (critical only). For a small, visually-obvious,
+low-blast-radius change — an asset, a colour token, a string, a layout
+constant — ask for the change, the suite, and the result: no evidence
+captures, at most one review round, no artifact report. The commander looks
+at it and knows. Reserve critical for changes whose correctness cannot be
+seen: concurrency, state machines, persistence, auth, money, anything where
+a screenshot proves nothing.
 
 ## Mandatory delegation — the coordinator never does the work
 
@@ -252,7 +257,11 @@ a worker agent the coordinator spawns for that task.
   a resource somebody removed outside Helm. It resolves only for what cleanup
   actually shed, so a branch kept because it carries unmerged commits leaves
   the item open naming just that branch. A task is not finished until that
-  approved cleanup decision is resolved.
+  approved cleanup decision is resolved. Once it holds nothing, its record
+  leaves the live state document for `state/archive/tasks/<task>.json`;
+  `helm inspect`, `helm task cost` and `helm task outcome` still read it
+  there, and `helm state stats` / `helm state archive` show and move what
+  is eligible.
 - **Recording an outcome is not delivering it, so Helm routes it before
   anything closes.** A worker reports by running a Helm command inside its own
   pane, which means the confirmation prints onto the exact surface about to be

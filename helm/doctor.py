@@ -50,6 +50,7 @@ drifted from where it is enforced.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -60,7 +61,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import preferences as prefs
+from .errors import HelmError
 from . import runtimes
+from .coordinator.archive import ARCHIVABLE_WARN_COUNT, LIVE_DOCUMENT_WARN_BYTES
 from .core import (
     CHECKOUT_OPERATION_MARKERS,
     Coordinator,
@@ -717,6 +720,24 @@ class _Doctor:
                 f"Helm state is readable beyond its owner: {', '.join(exposed)}",
                 "chmod 700 the state directory and 600 the state file; state holds "
                 "task records, worker output and approval grants",
+            )
+            return
+        # The live document is read and rewritten by every command, so its
+        # size is what every command costs. Records nothing can change --
+        # cleaned-up, settled tasks -- belong in the archive, and a document
+        # carrying many of them is a root paying for its own history.
+        size = 0
+        with contextlib.suppress(OSError):
+            size = store.state_file.stat().st_size
+        archivable = 0
+        with contextlib.suppress(HelmError, OSError, ValueError):
+            archivable = len(self.coordinator.archivable_task_ids(data))
+        if size > LIVE_DOCUMENT_WARN_BYTES or archivable >= ARCHIVABLE_WARN_COUNT:
+            self.warn(
+                "root.state",
+                f"the live state document is {size / 1_000_000:.1f} MB with {archivable} "
+                "task record(s) that can no longer change",
+                "run helm state archive to move settled records into state/archive/",
             )
             return
         self.ok(

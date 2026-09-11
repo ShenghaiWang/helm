@@ -17,6 +17,7 @@ from typing import Any
 
 from . import watchdog as watchdog_module
 from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
+from .values import TASK_SHAPES
 from .core import (
     HEALTHY_WORKER_VERDICTS,
     EFFORT_LEVELS,
@@ -504,45 +505,7 @@ def _open_pull_request(
 
 def _sync_pull_request_status(coordinator: Coordinator, task_id: str) -> dict[str, Any]:
     """Read the task's PR with gh and record the observed delivery state."""
-    outcome = coordinator.task_outcome(task_id)
-    delivery = outcome.get("delivery") or {}
-    url = str(delivery.get("url") or "").strip()
-    if not url:
-        raise HelmError("task has no recorded PR URL; record it with helm task pr-status --state open --url ...")
-    if shutil.which("gh") is None:
-        raise HelmError("gh is not installed; record PR observations with helm task pr-status")
-    result = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "view",
-            url,
-            "--json",
-            "url,state,reviewDecision,mergeStateStatus,mergeCommit,comments",
-        ],
-        cwd=str(Path(coordinator.store.load()["projects"][outcome["project_id"]]["root"])),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise HelmError(result.stdout.strip() or "gh pr view failed")
-    payload = json.loads(result.stdout or "{}")
-    state = str(payload.get("state") or "OPEN").lower()
-    merge_commit = payload.get("mergeCommit") or {}
-    if isinstance(merge_commit, dict):
-        merge_commit = str(merge_commit.get("oid") or "")
-    comments = payload.get("comments") or []
-    return coordinator.record_pr_status(
-        task_id,
-        state="merged" if state == "merged" else "closed" if state == "closed" else "open",
-        url=str(payload.get("url") or url),
-        comments=len(comments) if isinstance(comments, list) else None,
-        checks=str(payload.get("mergeStateStatus") or ""),
-        review_decision=str(payload.get("reviewDecision") or ""),
-        merge_commit=str(merge_commit or ""),
-    )
+    return coordinator.sync_pull_request(task_id)
 
 
 
@@ -1062,6 +1025,37 @@ def _print_learning(proposal: dict[str, Any]) -> None:
     print(f"  rationale: {proposal['rationale']}")
 
 
+def _print_ledger(report: dict[str, Any]) -> None:
+    rows = report["rows"]
+    scope = f" for {report['project_id']}" if report.get("project_id") else ""
+    print(f"Ledger, last {report['days']:g} day(s){scope}: {len(rows)} worker task(s)")
+    if not rows:
+        return
+    print("| task | project | ticket | shape | status | to result | reviews | catches | asks | turns | out tokens | cost |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for row in rows:
+        cost = f"${row['cost_usd']:.2f}" if isinstance(row.get("cost_usd"), (int, float)) else ""
+        minutes = f"{row['minutes_to_result']:g}m" if isinstance(row.get("minutes_to_result"), (int, float)) else ""
+        print(
+            f"| {row['task_id']} | {row['project_id']} | {row.get('ticket') or ''} | {row['shape']} | "
+            f"{row['delivery']}{' (archived)' if row['archived'] else ''} | {minutes} | {row['review_rounds']} | "
+            f"{row['review_catches']} | {row['questions'] + row['blockers'] + row['approvals']} | {row['turns']} | "
+            f"{row['output_tokens']} | {cost} |"
+        )
+    totals = report["totals"]
+    median = f"{totals['median_minutes_to_result']:g}m" if totals.get("median_minutes_to_result") is not None else "n/a"
+    cost = (
+        f"${totals['cost_usd']:.2f} (known for {totals['cost_known_for']} of {totals['tasks']})"
+        if totals.get("cost_usd") is not None else "not reported"
+    )
+    print(
+        f"totals: {totals['delivered']} delivered, {totals['failed']} failed, median time to result {median}, "
+        f"{totals['review_rounds']} review round(s) with {totals['review_catches']} catch(es), "
+        f"{totals['questions']} question(s), {totals['approvals']} approval(s), "
+        f"{totals['output_tokens']} output tokens, cost {cost}"
+    )
+
+
 def _print_inspect(report: dict[str, Any]) -> None:
     task = report["task"]
     project = report["project"]
@@ -1071,6 +1065,11 @@ def _print_inspect(report: dict[str, Any]) -> None:
         )
     )
     print(f"  brief: {task['brief']}")
+    if task.get("shape"):
+        print(
+            f"  shape: {task['shape']}"
+            + (f" -- {task['shape_reason']}" if task.get("shape_reason") else "")
+        )
     print(f"  policy: {task['delivery_policy']}")
     print(f"  branch: {task['branch']}")
     print(f"  workspace: {task['workspace']}")
@@ -1279,6 +1278,15 @@ def _build_parser() -> argparse.ArgumentParser:
     add.add_argument("--init-git", action="store_true", help="initialize a non-Git root")
     add.add_argument("--confirm", action="store_true", help="confirm explicit non-Git initialization")
     project_commands.add_parser("list", help="list registered projects")
+    remove = project_commands.add_parser(
+        "remove",
+        help=(
+            "forget a project whose work is over: archive its remaining records "
+            "and drop it from the live state; refused while its directory is still "
+            "under projects/ or anything of it is running or undelivered"
+        ),
+    )
+    remove.add_argument("project_id")
 
     task = commands.add_parser("task", help="create, inspect, and deliver tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
@@ -1289,6 +1297,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="start a deliberate second line of work for a ticket that already holds a worktree here",
     )
     create.add_argument("--brief", required=True)
+    create.add_argument(
+        "--shape", choices=TASK_SHAPES,
+        help="how much ceremony the change gets: small (one review round at most, low effort, "
+             "no evidence captures), standard (default), or critical (three rounds, high effort, "
+             "full-suite evidence required before approval)",
+    )
+    create.add_argument("--shape-reason", default="", help="one line on why this shape; recorded on the task")
     create.add_argument("--delivery", choices=("local", "pr"))
     create.add_argument("--domain", help="explicit domain override for ambiguous tasks")
     create.add_argument("--no-domain", action="store_true")
@@ -1625,6 +1640,34 @@ def _build_parser() -> argparse.ArgumentParser:
     note_cmd.add_argument("--text", required=True)
     eval_commands.add_parser("report", help="every ticket, every arm, side by side")
 
+    ledger_cmd = commands.add_parser(
+        "ledger",
+        help="what each task cost and what came of it, per task, from Helm's own records",
+    )
+    ledger_cmd.add_argument("--days", type=float, default=7.0, help="window, in days (default 7)")
+    ledger_cmd.add_argument("--project", dest="project_id", help="one project only")
+    ledger_cmd.add_argument("--json", dest="as_json", action="store_true")
+
+    state_cmd = commands.add_parser(
+        "state",
+        help="measure the live state document, and archive the records nothing can change",
+    )
+    state_commands = state_cmd.add_subparsers(dest="state_command", required=True)
+    state_commands.add_parser("stats", help="size and counts of the live document and the archive")
+    state_archive = state_commands.add_parser(
+        "archive",
+        help=(
+            "move every cleaned-up, settled task -- with its workers, messages and "
+            "artifacts -- into state/archive/tasks/<id>.json"
+        ),
+    )
+    state_archive.add_argument("task_id", nargs="*", help="only these tasks; default: every eligible task")
+    state_archive.add_argument("--dry-run", action="store_true", help="say what would move and move nothing")
+    state_archive.add_argument(
+        "--reconcile", action="store_true",
+        help="probe a branch or worker directory the record still claims, once, and mark it removed when it is gone",
+    )
+
     agent = commands.add_parser("agent", help="list and check configured worker profiles")
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
     agent_commands.add_parser("list", help="list configured profiles without launching anything")
@@ -1770,11 +1813,30 @@ def _build_parser() -> argparse.ArgumentParser:
     watchdog_run.add_argument(
         "--once", action="store_true", help="check once and exit (what a scheduler calls)"
     )
+    for target_parser in (watchdog_run,):
+        target_parser.add_argument(
+            "--notify-command",
+            help="a shell command run on every notification, with HELM_TITLE and HELM_MESSAGE "
+                 "in its environment and the pending list on stdin -- a chat message, a phone",
+        )
+        target_parser.add_argument(
+            "--remind-after", type=float, default=watchdog_module.DEFAULT_REMIND_MINUTES,
+            help="minutes before a list that still stands unchanged is said again; 0 never",
+        )
     watchdog_install = watchdog_commands.add_parser(
         "install", help="generate and load this platform's scheduler entry"
     )
     watchdog_install.add_argument(
         "--interval", type=int, default=WATCHDOG_DEFAULT_INTERVAL
+    )
+    watchdog_install.add_argument(
+        "--notify-command", default="",
+        help="a shell command the scheduled watchdog runs on every notification (see run --notify-command); "
+             "keep secrets in that command's own configuration, not on this line",
+    )
+    watchdog_install.add_argument(
+        "--remind-after", type=float, default=watchdog_module.DEFAULT_REMIND_MINUTES,
+        help="minutes before a standing list is said again; 0 never",
     )
     watchdog_commands.add_parser("uninstall", help="remove the scheduler entry")
 
@@ -2093,7 +2155,10 @@ def _build_parser() -> argparse.ArgumentParser:
              "model.default otherwise intercepts an unset reviewer model")
     review.add_argument("--reviewer-effort", choices=EFFORT_LEVELS,
         help="reasoning effort for the reviewer; unset leaves the runtime's own default")
-    review.add_argument("--rounds", type=int, default=2, help="bounded disagreement rounds (default 2)")
+    review.add_argument(
+        "--rounds", type=int, default=None,
+        help="bounded disagreement rounds; default from the task's shape (small 1, standard 2, critical 3)",
+    )
     review.add_argument("--timeout", type=float, default=1800.0)
 
     inspect = commands.add_parser("inspect", help="alias for task inspect")
@@ -2811,6 +2876,9 @@ _ROOT_ONLY_COMMANDS = frozenset({
     ("prefs", "unset"),
     ("prefs", "migrate"),
     ("project", "add"),
+    ("project", "remove"),
+    # Archiving is maintenance of the commander's own records.
+    ("state", "archive"),
     ("task", "approve"),
     ("task", "merge"),
     ("task", "pr"),
@@ -3039,6 +3107,18 @@ def main(argv: list[str] | None = None) -> int:
                         args.project_id
                     ):
                         print("  space closed")
+                with contextlib.suppress(HelmError, OSError):
+                    archived = coordinator.archive_tasks(outcome["released"])["archived"] if outcome["released"] else []
+                    if archived:
+                        print(f"  {len(archived)} record(s) archived")
+            elif args.project_command == "remove":
+                removed = coordinator.remove_project(args.project_id)
+                print(
+                    f"Removed project {removed['project_id']} from the live state "
+                    f"({len(removed['archived_tasks'])} task record(s) archived)"
+                )
+                if removed.get("status_moved_to"):
+                    print(f"  status record moved to {removed['status_moved_to']}")
             elif args.project_command == "status":
                 _print_project_status(coordinator.project_status(args.project_id))
             elif args.project_command == "domain":
@@ -3090,6 +3170,8 @@ def main(argv: list[str] | None = None) -> int:
                     agent=args.agent,
                     model=args.model,
                     effort=args.effort,
+                    shape=args.shape,
+                    shape_reason=args.shape_reason,
                     ticket=args.ticket,
                     no_domain=args.no_domain,
                     read_only=args.read_only,
@@ -3277,6 +3359,12 @@ def main(argv: list[str] | None = None) -> int:
                         f"helm task cleanup {task['id']} --delete-branch"
                     )
                 _release_finished_space(coordinator, task)
+                # A cleaned task's record can no longer change, so it leaves
+                # the live document here, where the commander already decided
+                # the task was finished.
+                with contextlib.suppress(HelmError, OSError):
+                    if coordinator.archive_tasks([task["id"]])["archived"]:
+                        print(f"  record archived to state/archive/tasks/{task['id']}.json")
             return 0
 
         if args.command == "worker":
@@ -3803,15 +3891,50 @@ def main(argv: list[str] | None = None) -> int:
             # trusting, and no idea which Helm root it was installed for.
             root_path = Path(args.helm_root).resolve() if args.helm_root else Path.cwd()
             if args.watchdog_command == "run":
-                return watchdog_module.run(root_path, args.interval, once=args.once)
+                return watchdog_module.run(
+                    root_path, args.interval, once=args.once,
+                    notify_command=args.notify_command, remind_minutes=args.remind_after,
+                )
             if args.watchdog_command == "install":
-                return watchdog_module.install(root_path, args.interval)
+                return watchdog_module.install(
+                    root_path, args.interval,
+                    notify_command=args.notify_command, remind_minutes=args.remind_after,
+                )
             if args.watchdog_command == "restart":
                 return watchdog_module.restart()
             return watchdog_module.uninstall(root_path)
 
         if args.command == "eval":
             return _eval_command(coordinator, args)
+        if args.command == "ledger":
+            report = coordinator.ledger(days=args.days, project_id=args.project_id)
+            if args.as_json:
+                print(json.dumps(report, indent=2))
+                return 0
+            _print_ledger(report)
+            return 0
+        if args.command == "state":
+            if args.state_command == "stats":
+                stats = coordinator.state_stats()
+                print(f"{stats['state_file']}: {stats['bytes'] / 1_000_000:.1f} MB")
+                print(
+                    f"  projects={stats['projects']} tasks={stats['tasks']} workers={stats['workers']} "
+                    f"messages={stats['messages']} artifacts={stats['artifacts']}"
+                )
+                print("  tasks by status: " + ", ".join(f"{k} {v}" for k, v in stats["tasks_by_status"].items()))
+                print(
+                    f"  archivable now: {stats['archivable']}   archive: {stats['archive_files']} file(s), "
+                    f"{stats['archive_bytes'] / 1_000_000:.1f} MB"
+                )
+                return 0
+            result = coordinator.archive_tasks(
+                args.task_id or None, dry_run=args.dry_run, reconcile=args.reconcile
+            )
+            verb = "would archive" if result["dry_run"] else "archived"
+            print(f"{verb} {len(result['eligible'])} task record(s)")
+            if result["refused"]:
+                print(f"  not eligible: {', '.join(result['refused'][:8])}{' …' if len(result['refused']) > 8 else ''}")
+            return 0
 
         if args.command == "pending":
             # Deliberately narrow and deliberately silent. This is meant to run
@@ -4089,6 +4212,21 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "watch":
             report = coordinator.sweep_workers(silence_seconds=args.silence)
+            # A merged PR used to age as pr-open until somebody ran pr-sync
+            # by hand. Read the remote here, at most once per task per
+            # interval, and say what moved; a remote that cannot be reached
+            # is skipped quietly, because an offline laptop is not news.
+            with contextlib.suppress(HelmError, OSError):
+                synced = coordinator.sync_open_pull_requests()
+                if synced["checked"]:
+                    print(
+                        f"PR sync: {len(synced['checked'])} checked"
+                        + (f", merged: {', '.join(synced['merged'])}" if synced["merged"] else "")
+                        + (f", closed: {', '.join(synced['closed'])}" if synced["closed"] else "")
+                    )
+                    for task_id in synced["merged"]:
+                        with contextlib.suppress(HelmError, OSError):
+                            _release_finished_space(coordinator, coordinator.inspect_task(task_id)["task"])
             updates = coordinator.project_updates_for_watch()
             # A settled worker's pane is no longer evidence; leaving it open
             # makes the panel harder to read for no benefit.

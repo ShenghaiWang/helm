@@ -39,6 +39,7 @@ from ..values import (
     TASK_ROLES,
     WORKTREELESS_ROLES,
     _MAX_DOMAIN_DEPTH,
+    shape_policy,
     _ROLE_DIRECTORY,
     _SKILL_STOPWORDS,
     _safe_text,
@@ -517,6 +518,13 @@ class SkillsMixin:
                 f"task asks for {chosen} effort",
                 "task",
             )
+        # The shape of the change is the task's own statement about how hard
+        # this should be thought about, so it outranks a project pin or a
+        # root default -- a colour token on a security project is still a
+        # colour token -- and yields only to an effort named on the task.
+        shaped = shape_policy(task).get("effort")
+        if shaped:
+            return shaped, f"task shape {task.get('shape')} implies {shaped} effort", "shape"
         pinned = project.get("effort")
         if pinned:
             return (

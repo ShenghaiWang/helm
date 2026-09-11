@@ -117,9 +117,10 @@ for; never route around an exclusion by naming the runtime explicitly.
 
 Reasoning effort is a cost the commander pays and a quality difference nobody
 can see afterwards, so Helm states it or leaves it alone — it never invents
-one. It resolves most-specific-first: `--effort` on the task, the project's
-`"effort"` pin, `HELM_EFFORT`, then the root's `effort.default` preference;
-unset means the runtime's own default.
+one. It resolves most-specific-first: `--effort` on the task, then the floor
+the task's shape implies (`small` low, `critical` high, `standard` none), the
+project's `"effort"` pin, `HELM_EFFORT`, then the root's `effort.default`
+preference; unset means the runtime's own default.
 
 Effort is not a property runtimes share, so Helm records a mechanism per
 runtime rather than assuming a flag: Claude Code takes `--effort` (low,

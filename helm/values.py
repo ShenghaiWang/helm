@@ -117,6 +117,67 @@ def _validate_effort(effort: Any, source: str = "") -> str:
     return level
 
 
+#: The shape of a change decides how much ceremony it gets. The protocol is
+#: sized for a change whose correctness cannot be seen -- concurrency, state,
+#: persistence -- and applying all of it to a colour token turned eleven
+#: minutes of work into an hour. So a task says its shape, and Helm sizes
+#: the review rounds, the effort floor and the evidence gate from it.
+TASK_SHAPES: tuple[str, ...] = ("small", "standard", "critical")
+
+#: What each shape decides. `None` means "the ordinary ladder decides".
+SHAPE_POLICY: dict[str, dict[str, Any]] = {
+    "small": {
+        "review_rounds": 1,
+        "review_required": False,
+        "effort": "low",
+        "reviewer_effort": "low",
+        "evidence_required": False,
+        "means": (
+            "a small, visually obvious, low-blast-radius change: make it, run the "
+            "suite, report the result; no evidence captures, no artifact report, "
+            "and at most one review round"
+        ),
+    },
+    "standard": {
+        "review_rounds": 2,
+        "review_required": True,
+        "effort": None,
+        "reviewer_effort": None,
+        "evidence_required": False,
+        "means": "ordinary feature work: an independent review, up to two rounds",
+    },
+    "critical": {
+        "review_rounds": 3,
+        "review_required": True,
+        "effort": "high",
+        "reviewer_effort": "high",
+        "evidence_required": True,
+        "means": (
+            "a change whose correctness cannot be seen -- auth, money, data loss, "
+            "concurrency, persistence: high effort for author and reviewer, up to "
+            "three review rounds, and the full suite's exit recorded with "
+            "`helm task evidence` for the final tip before approval"
+        ),
+    },
+}
+
+
+def _validate_shape(shape: Any, source: str = "") -> str:
+    """Accept a task shape without letting it become a command."""
+    name = str(shape or "").strip().lower()
+    where = f" ({source})" if source else ""
+    if name not in TASK_SHAPES:
+        raise HelmError(
+            f"unknown task shape {shape!r}{where}: expected one of {', '.join(TASK_SHAPES)}"
+        )
+    return name
+
+
+def shape_policy(task: dict[str, Any]) -> dict[str, Any]:
+    """The policy for this task's shape; a record with none is standard."""
+    return SHAPE_POLICY[_validate_shape(task.get("shape") or "standard", "task record")]
+
+
 #: Ask for the runtime's own default model instead of naming one.
 #:
 #: The ladder is most-specific-first -- task, project pin, HELM_MODEL, root
@@ -266,8 +327,16 @@ WHAT YOU OWN
   decision, so the next agent does not need your conversation.
 
 THE COMMANDS THAT DO IT
-- `helm task create --project <project> --brief "<what and why>"` -- Helm
-  resolves the domain from the nature of the task; do not choose one by hand.
+- `helm task create --project <project> --brief "<what and why>" --shape
+  small|standard|critical --shape-reason "..."` -- Helm resolves the domain
+  from the nature of the task; do not choose one by hand. You do choose the
+  shape, and say why: small for a visually obvious, low-blast-radius change
+  (an asset, a string, a colour token, a layout constant -- one review round
+  at most, low effort, no evidence captures); critical for a change whose
+  correctness cannot be seen (auth, money, data loss, concurrency,
+  persistence -- three rounds, high effort, the full suite's exit recorded
+  with `helm task evidence` before approval); standard for the rest. Helm
+  sizes the review and the effort from it.
 - `helm worker launch <task-id>` -- one worker, one task, one worktree.
 - `helm watch`, then `helm worker answer <worker-id> --text "..."`.
 - `helm review <task-id>` -- Helm picks a reviewer that is not the author and

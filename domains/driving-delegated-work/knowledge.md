@@ -29,6 +29,31 @@ The exchange is worth it because it buys two things doing it yourself cannot:
 a second agent that did not write the change gets to judge it, and the driver
 keeps enough attention free to notice a worker that has stopped.
 
+## Say the shape of the change, and why
+
+A one-asset swap does not need screenshots in two appearances and a full
+review; a concurrency fix does. The protocol is sized for the second and,
+applied by default to both, turns an eleven-minute change into an hour. So
+every task is created with a shape and a one-line reason (`helm task create
+--shape small|standard|critical --shape-reason "..."`), and Helm sizes the
+ceremony from it: review rounds, the effort floor for author and reviewer,
+and whether the full suite's exit must be recorded before approval.
+
+- **small**: visually obvious and low blast radius -- an asset, a string, a
+  colour token, a layout constant. Ask for the change, the suite, and the
+  result. No evidence captures, no artifact report, at most one review round.
+- **standard**: ordinary feature work. An independent review, up to two
+  rounds.
+- **critical**: correctness cannot be seen -- auth, tokens, money, data loss,
+  concurrency, persistence, a migration, a lock. High effort on both sides,
+  up to three rounds, and `helm task evidence` for the final tip before
+  anyone approves it.
+
+The shape follows what the change touches, not how big the diff looks: a
+migration or a lock is critical however few lines it is, and a typo in
+billing copy is small however sensitive the directory. When in doubt, go up
+one.
+
 ## Two checks happen before the brief, not after
 
 Both are the driver's job precisely because the worker never sees the gap

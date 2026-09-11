@@ -36,6 +36,16 @@ from pathlib import Path
 
 LABEL = "com.helm.watchdog"
 DEFAULT_INTERVAL = 20
+#: A list that has stood unchanged this long is said again. A desktop banner
+#: is gone in seconds, and an approval that waited seven hours had been
+#: announced exactly once, at the moment nobody was looking. 0 disables it.
+DEFAULT_REMIND_MINUTES = 60
+#: A command the commander names to carry the notification somewhere a
+#: banner does not reach -- a chat message, a phone. Run with `sh -c`, the
+#: title and headline in HELM_TITLE and HELM_MESSAGE, and the whole pending
+#: list on stdin. Set by `install --notify-command`, which writes it into the
+#: scheduler entry as this environment variable.
+NOTIFY_ENV = "HELM_WATCHDOG_NOTIFY"
 
 
 def _fingerprint(text: str) -> str:
@@ -77,8 +87,22 @@ def _headline(text: str) -> str:
     return f"{first} {count}".strip() if count else first
 
 
-def _notify(title: str, message: str) -> bool:
-    """Best-effort desktop notification. Never fatal: the text also goes to stdout."""
+def _notify(title: str, message: str, *, text: str = "", command: str | None = None) -> bool:
+    """Best-effort notification: the desktop, plus the commander's own command
+    when one is configured. Never fatal: the text also goes to stdout."""
+    carried = False
+    hook = command if command is not None else os.environ.get(NOTIFY_ENV, "").strip()
+    if hook:
+        with _quiet():
+            done = subprocess.run(
+                ["sh", "-c", hook], input=text or message, text=True, timeout=60, check=False,
+                env={**os.environ, "HELM_TITLE": title, "HELM_MESSAGE": message},
+            )
+            carried = done.returncode == 0
+    return _desktop_notify(title, message) or carried
+
+
+def _desktop_notify(title: str, message: str) -> bool:
     if shutil.which("osascript"):
         # AppleScript string literals, not Python ones: `repr` produces single
         # quotes, which osascript rejects outright, and the pending headline
@@ -146,7 +170,29 @@ def pending_text(root: Path | None) -> str:
     return buffer.getvalue().strip()
 
 
-def run(root: Path | None, interval: int, once: bool = False) -> int:
+def sync_pull_requests(root: Path | None) -> dict[str, object]:
+    """Read every open PR that is due a look, and record what the forge says.
+
+    Bounded inside the coordinator to one read per task per interval, and
+    quiet about a remote it cannot reach, so calling it on every poll costs
+    nothing on an offline laptop and catches a merge within minutes on a
+    connected one.
+    """
+    from .core import Coordinator
+    from .state import StateStore
+
+    store = StateStore(root / "state", helm_root=root) if root else StateStore()
+    return Coordinator(store).sync_open_pull_requests()
+
+
+def run(
+    root: Path | None,
+    interval: int,
+    once: bool = False,
+    *,
+    notify_command: str | None = None,
+    remind_minutes: float = DEFAULT_REMIND_MINUTES,
+) -> int:
     """Check now, then every `interval` seconds until stopped.
 
     The interval is a POLL, not a report cadence: it decides how quickly
@@ -155,9 +201,19 @@ def run(root: Path | None, interval: int, once: bool = False) -> int:
     check reads state already on disk and prints nothing unless the set of
     waiting items changed -- so a short interval costs almost nothing and buys
     the difference between "surfaced" and "surfaced in time".
+
+    A list that changes is announced; a list that stands unchanged is said
+    again after `remind_minutes`, once per that interval, as a reminder
+    rather than as news.
     """
     state = Path(os.environ.get("TMPDIR", "/tmp")) / "helm-watchdog.last"
     while True:
+        try:
+            synced = sync_pull_requests(root)
+            for task_id in synced.get("merged", []):
+                print(f"helm watchdog: pull request merged for task {task_id}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - the sync is a courtesy, never the reason to die
+            print(f"helm watchdog: PR sync skipped: {exc}", file=sys.stderr, flush=True)
         try:
             text = pending_text(root)
         except Exception as exc:  # noqa: BLE001 - a watchdog that dies is worse
@@ -168,21 +224,42 @@ def run(root: Path | None, interval: int, once: bool = False) -> int:
                 state.write_text("", encoding="utf-8")
         else:
             current = _fingerprint(text)
-            previous = ""
+            previous, last_told = "", 0.0
             with _quiet():
-                previous = state.read_text(encoding="utf-8").strip()
-            if current != previous:
+                recorded = state.read_text(encoding="utf-8").split()
+                previous = recorded[0] if recorded else ""
+                last_told = float(recorded[1]) if len(recorded) > 1 else 0.0
+            changed = current != previous
+            standing = (
+                not changed and remind_minutes > 0
+                and time.time() - last_told >= remind_minutes * 60
+            )
+            if changed or standing:
                 with _quiet():
-                    state.write_text(current, encoding="utf-8")
-                _notify("Helm", _headline(text))
+                    state.write_text(f"{current} {time.time():.3f}", encoding="utf-8")
+                title = "Helm" if changed else "Helm, still waiting"
+                _notify(title, _headline(text), text=text, command=notify_command)
                 print(text, flush=True)
         if once:
             return 0
         time.sleep(max(5, interval))
 
 
-def _launchd_plist(root: Path, interval: int, log: Path) -> str:
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def _launchd_plist(
+    root: Path, interval: int, log: Path, *, notify_command: str = "", remind_minutes: float = DEFAULT_REMIND_MINUTES
+) -> str:
     executable = sys.executable
+    environment = (
+        f"  <key>EnvironmentVariables</key>\n  <dict>\n    <key>{NOTIFY_ENV}</key>"
+        f"<string>{_xml_escape(notify_command)}</string>\n  </dict>\n"
+        if notify_command else ""
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -195,8 +272,9 @@ def _launchd_plist(root: Path, interval: int, log: Path) -> str:
     <string>--root</string><string>{root}</string>
     <string>watchdog</string><string>run</string>
     <string>--interval</string><string>{interval}</string>
+    <string>--remind-after</string><string>{remind_minutes:g}</string>
   </array>
-  <key>WorkingDirectory</key><string>{root}</string>
+{environment}  <key>WorkingDirectory</key><string>{root}</string>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
@@ -206,15 +284,21 @@ def _launchd_plist(root: Path, interval: int, log: Path) -> str:
 """
 
 
-def _systemd_units(root: Path, interval: int) -> tuple[str, str]:
+def _systemd_units(
+    root: Path, interval: int, *, notify_command: str = "", remind_minutes: float = DEFAULT_REMIND_MINUTES
+) -> tuple[str, str]:
     executable = sys.executable
+    environment = (
+        f'Environment="{NOTIFY_ENV}={notify_command.replace(chr(34), chr(92) + chr(34))}"\n'
+        if notify_command else ""
+    )
     service = f"""[Unit]
 Description=Helm watchdog: surface what needs a human
 
 [Service]
 Type=simple
 WorkingDirectory={root}
-ExecStart={executable} -m helm --root {root} watchdog run --interval {interval}
+{environment}ExecStart={executable} -m helm --root {root} watchdog run --interval {interval} --remind-after {remind_minutes:g}
 Restart=always
 """
     timer = f"""[Unit]
@@ -279,14 +363,19 @@ def restart() -> int:
     return 1
 
 
-def install(root: Path, interval: int) -> int:
+def install(
+    root: Path, interval: int, *, notify_command: str = "", remind_minutes: float = DEFAULT_REMIND_MINUTES
+) -> int:
     """Generate and load the platform's own scheduler entry."""
     system = platform.system()
     if system == "Darwin":
         target = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
         log = root / "state" / "watchdog.log"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_launchd_plist(root, interval, log), encoding="utf-8")
+        target.write_text(
+            _launchd_plist(root, interval, log, notify_command=notify_command, remind_minutes=remind_minutes),
+            encoding="utf-8",
+        )
         with _quiet():
             subprocess.run(["launchctl", "unload", str(target)], check=False, timeout=20)
         result = subprocess.run(
@@ -294,7 +383,10 @@ def install(root: Path, interval: int) -> int:
         )
         print(f"Installed the Helm watchdog: {target}")
         print(f"  Polls every {interval}s against {root} and notifies within that,")
-        print("  staying silent unless something needs a human AND the list changed.")
+        print("  staying silent unless something needs a human AND the list changed,")
+        print(f"  then saying it again every {remind_minutes:g} minutes while it still waits.")
+        if notify_command:
+            print(f"  Each notification also runs your command: {notify_command}")
         if result.returncode != 0:
             print("  launchctl load reported a problem; run it by hand to see why.")
             return 1
@@ -302,7 +394,9 @@ def install(root: Path, interval: int) -> int:
     if system == "Linux":
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
-        service, _timer = _systemd_units(root, interval)
+        service, _timer = _systemd_units(
+            root, interval, notify_command=notify_command, remind_minutes=remind_minutes
+        )
         # A continuously-polling service needs no timer: a timer would restart
         # it on a cadence, which is the very latency this is removing.
         (unit_dir / "helm-watchdog.service").write_text(service, encoding="utf-8")

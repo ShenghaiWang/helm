@@ -96,8 +96,10 @@ helm task pr-status <task-id> --state merged --url https://example/pull/1
 replies can still arrive, so the project's single foreman stays responsible
 for monitoring it. PR delivery still requires the explicit protected push
 command; monitoring records observations and never approves or merges on its
-own. Nothing runs `pr-sync` automatically, so a merged PR ages as `pr-open`
-until somebody does.
+own. `helm watch` and the watchdog read every open PR on their own, at most
+once per task every ten minutes and quietly skipping a remote they cannot
+reach, so a merged PR is recorded as `pr-merged` within minutes and its
+cleanup decision raised; `helm task pr-sync` does the same read by hand.
 
 ## Delivering build outputs
 
@@ -146,6 +148,21 @@ cannot be mistaken for "the branch is already gone". A resource is held until
 Helm records letting go of it, and cleanup is the only thing that does —
 including for resources removed outside Helm, which it reconciles as removed
 on the way past.
+
+Once a task holds nothing, its record can no longer change, so `helm task
+cleanup` and `helm project release` move it — with its workers, messages and
+artifacts — out of the live state document into
+`state/archive/tasks/<task-id>.json`. Nothing is deleted: `helm inspect`,
+`helm task cost` and `helm task outcome` read the archive when a task is not
+live, and `helm reflect` counts archived evidence inside its window. The
+live document is read and rewritten by every command, so it stays fast only
+while it holds what can still change; `helm state stats` shows its size and
+what could move, `helm state archive` moves everything eligible (with
+`--reconcile` for records older than the cleanup that would have marked
+their branch or worker directory removed), and `helm doctor` warns when the
+document has grown past what it needs to carry. A project whose work is over
+is forgotten the same way: `helm project remove <id>` archives what it still
+holds and drops the record, once its directory has left `projects/`.
 
 Like the delivery decision it is derived rather than flagged: raised once
 however many times it is recomputed, never raised for a task that holds

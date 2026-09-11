@@ -239,7 +239,7 @@ class WorkersMixin:
         """
         data = self.store.load()
         if task_id not in data.get("tasks", {}):
-            raise HelmError(f"unknown task {task_id}")
+            return self._archived_task_usage(task_id, with_reviews=with_reviews)
         task_ids = [task_id]
         if with_reviews:
             task_ids.extend(
@@ -257,6 +257,28 @@ class WorkersMixin:
             entry["task_id"] = worker.get("task_id")
             entry["role"] = (data["tasks"].get(worker.get("task_id")) or {}).get("role")
         return {"task_id": task_id, "workers": entries, "total": costs.sum_usage(entries)}
+
+    def _archived_task_usage(self, task_id: str, *, with_reviews: bool) -> dict[str, Any]:
+        """`task_usage` for a task that has left the live document."""
+        record = self.archived_task(task_id)
+        if record is None:
+            raise HelmError(f"unknown task {task_id}")
+        records = [record]
+        if with_reviews:
+            for reviewer_id in record.get("reviewer_task_ids", []):
+                reviewer = self.archived_task(reviewer_id)
+                if reviewer is not None:
+                    records.append(reviewer)
+        workers = [
+            worker for entry in records for worker in entry.get("workers", {}).values()
+        ]
+        workers.sort(key=lambda worker: str(worker.get("started_at") or ""))
+        entries = [costs.worker_usage(worker) for worker in workers]
+        roles = {entry["task"]["id"]: entry["task"].get("role") for entry in records}
+        for entry, worker in zip(entries, workers):
+            entry["task_id"] = worker.get("task_id")
+            entry["role"] = roles.get(worker.get("task_id"))
+        return {"task_id": task_id, "workers": entries, "total": costs.sum_usage(entries), "archived": True}
 
     def nudge_worker(self, worker_id: str, text: str = "") -> dict[str, Any]:
         """Ask a silent worker for a status push and record that we asked.

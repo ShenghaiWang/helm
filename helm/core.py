@@ -138,6 +138,9 @@ from .authority import AUTHORITY_ENV, Authority
 from .processes import _process_parents, _scan_worker_pid
 from .coordinator.base import CoordinatorBase
 from .coordinator.agents import AgentsMixin
+from .coordinator.archive import ArchiveMixin
+from .coordinator.pull_requests import PullRequestsMixin
+from .coordinator.ledger import LedgerMixin
 from .coordinator.caller import CallerMixin
 from .coordinator.decisions import DecisionsMixin
 from .coordinator.lifecycle import LifecycleMixin
@@ -154,6 +157,9 @@ from .coordinator.status import StatusMixin
 
 
 class Coordinator(
+    ArchiveMixin,
+    PullRequestsMixin,
+    LedgerMixin,
     ProtectionMixin,
     LifecycleMixin,
     AgentsMixin,
@@ -1553,10 +1559,10 @@ class Coordinator(
         checkout, and its branch diffs against the base like any other.
         """
         data = self.store.load()
-        task = self._task(data, task_id)
-        project = self._project(data, task["project_id"])
+        task = self._task_anywhere(data, task_id)
+        project = data["projects"].get(task["project_id"]) or {"id": task["project_id"], "root": "", "color": ""}
         workspace = canonical(task["workspace"])
-        root = canonical(project["root"])
+        root = canonical(project["root"]) if project.get("root") else workspace
         outcome: dict[str, Any] = {
             "task_id": task_id,
             "project_id": project["id"],
@@ -1972,7 +1978,23 @@ class Coordinator(
 
     def inspect_task(self, task_id: str) -> dict[str, Any]:
         data = self.store.load()
-        task = self._task(data, task_id)
+        task = data["tasks"].get(task_id)
+        if task is None:
+            # Cleaned up and archived: the record is whole, in its own file.
+            record = self.archived_task(task_id)
+            if record is None:
+                raise HelmError(f"unknown task: {task_id}")
+            project = data["projects"].get(record["task"].get("project_id")) or {
+                "id": record["task"].get("project_id"), "archived": True,
+            }
+            return {
+                "task": record["task"],
+                "project": project,
+                "workers": list(record.get("workers", {}).values()),
+                "messages": record.get("messages", []),
+                "artifacts": record.get("artifacts", []),
+                "archived_at": record.get("archived_at"),
+            }
         return {
             "task": task,
             "project": self._project(data, task["project_id"]),

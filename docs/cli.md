@@ -94,11 +94,14 @@ helm pending [--changes]      # only what waits on a human; --changes prints wha
 helm ack <project>            # mark a project's owed reports as relayed
 helm ask record --reason authorization|ambiguity|escalation --text "..." [project]   # a question put to the commander, on the record
 helm ask show                 # what has been asked
-helm watchdog install [--interval SECONDS]   # the scheduled backstop outside a conversation; run|restart|uninstall
+helm watchdog install [--interval SECONDS] [--notify-command CMD] [--remind-after MINUTES]   # the scheduled backstop; run|restart|uninstall
 helm board [--open]           # one page showing what every agent produced
 helm tail <worker-id>         # a worker's decoded terminal output
 helm reflect [--hours N]      # recent evidence for a reflection on how Helm is working
 helm task cost <task-id>      # what a task's sessions consumed, from the runtimes' own transcripts
+helm ledger [--days N] [--project P] [--json]   # every worker task in the window: time to result, review rounds and catches, asks, tokens, cost
+helm state stats              # size of the live state document, counts, what could be archived
+helm state archive [--dry-run] [--reconcile] [TASK_ID ...]   # move settled records into state/archive/
 ```
 
 `helm pending --changes` in a twenty-second loop is what an agent harness
@@ -106,4 +109,11 @@ arms at session start: a quiet root generates no events, and the first gate,
 approval request, blocker or terminal report wakes the coordinator within
 seconds. The coordinator only exists inside a turn, so nothing reaches the
 commander while they are away; `helm watchdog` is the scheduled check that
-delivers outside the conversation.
+delivers outside the conversation. It posts a desktop notification when the
+pending list changes, says it again after `--remind-after` minutes (60 by
+default) while the same list still stands, and runs `--notify-command` on
+each — a shell command of the commander's own, with `HELM_TITLE` and
+`HELM_MESSAGE` in its environment and the whole list on stdin, which is how a
+notification reaches a chat channel or a phone rather than a banner that is
+gone in seconds. `helm watchdog restart` makes a running watchdog pick up
+new code.
