@@ -1380,6 +1380,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     for name in ("allocate", "inspect", "approve", "merge"):
         task_commands.add_parser(name).add_argument("task_id")
+    provenance_cmd = task_commands.add_parser(
+        "provenance",
+        help="print the provenance block a pull request body carries: task, agent, model, effort, reviews, suite",
+    )
+    provenance_cmd.add_argument("task_id")
+    provenance_cmd.add_argument("--json", dest="as_json", action="store_true")
     evidence_cmd = task_commands.add_parser(
         "evidence",
         help="record the full test-suite result for a task's current tip, as "
@@ -3481,6 +3487,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Allocated {task['id']} workspace={task['workspace']} branch={task['branch']}")
             elif args.task_command == "inspect":
                 _print_inspect(coordinator.inspect_task(args.task_id))
+            elif args.task_command == "provenance":
+                provenance = coordinator.task_provenance(args.task_id)
+                if args.as_json:
+                    print(json.dumps(provenance, indent=2))
+                else:
+                    print(coordinator.render_provenance(provenance), end="")
+                return 0
             elif args.task_command == "evidence":
                 detail = {}
                 if args.detail:
@@ -5150,6 +5163,13 @@ def main(argv: list[str] | None = None) -> int:
                     "waiting on the commander: helm gate decide "
                     f"{task['id']} --type {args.gate_type} --confirm|--skip"
                 )
+                shortfalls = ((task.get("gates") or {}).get(args.gate_type) or {}).get("shortfalls") or []
+                if shortfalls:
+                    print(
+                        "  The commander will see this proposal as thin: "
+                        + "; ".join(shortfalls)
+                        + ". Add a `Done means:` line and an `Out of scope:` line and propose again."
+                    )
             else:
                 task = coordinator.decide_gate(
                     args.task_id, args.gate_type,
@@ -5157,6 +5177,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 verb = "Skipped" if args.skip else "Confirmed"
                 print(f"{verb} the {args.gate_type} gate on task {task['id']}")
+                shortfalls = ((task.get("gates") or {}).get(args.gate_type) or {}).get("shortfalls") or []
+                if shortfalls and args.confirm:
+                    print(f"  (confirmed thin: {'; '.join(shortfalls)})")
                 # And TELL the foreman. A gate is the one thing a foreman is
                 # explicitly instructed to stop and wait for, and the decision
                 # was recorded where only a poll would find it -- so a

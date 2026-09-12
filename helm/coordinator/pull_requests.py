@@ -11,6 +11,7 @@ quiet about a remote it cannot reach: an offline laptop is not an event.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import shutil
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import HelmError, SafetyError
+from ..values import PROVENANCE_MARKER
 
 #: How often the automatic sync reads one task's PR. Ten minutes is well
 #: inside the time a merged PR used to sit unnoticed, and well outside the
@@ -41,7 +43,7 @@ class PullRequestsMixin:
         if shutil.which("gh") is None:
             raise HelmError("gh is not installed; record PR observations with helm task pr-status")
         result = subprocess.run(
-            ["gh", "pr", "view", url, "--json", "url,state,reviewDecision,mergeStateStatus,mergeCommit,comments"],
+            ["gh", "pr", "view", url, "--json", "url,state,reviewDecision,mergeStateStatus,mergeCommit,comments,body"],
             cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=60,
         )
         if result.returncode != 0:
@@ -69,6 +71,7 @@ class PullRequestsMixin:
         if isinstance(merge_commit, dict):
             merge_commit = str(merge_commit.get("oid") or "")
         comments = payload.get("comments") or []
+        self._note_provenance(task_id, project, str(payload.get("body") or ""))
         return self.record_pr_status(
             task_id,
             state="merged" if state == "merged" else "closed" if state == "closed" else "open",
@@ -78,6 +81,29 @@ class PullRequestsMixin:
             review_decision=str(payload.get("reviewDecision") or ""),
             merge_commit=str(merge_commit or ""),
         )
+
+    def _note_provenance(self, task_id: str, project: dict[str, Any], body: str) -> None:
+        """Record whether the PR body carries Helm's provenance block; say so once.
+
+        Helm writes nothing to the PR. A body without the block is noted on
+        the project's record the first time it is seen, with the command that
+        prints the block for the foreman to add.
+        """
+        present = PROVENANCE_MARKER in body
+        with self.store.locked() as data:
+            task = data.get("tasks", {}).get(task_id)
+            if task is None:
+                return
+            delivery = task.setdefault("delivery", {})
+            before = delivery.get("provenance")
+            delivery["provenance"] = "present" if present else "missing"
+        if not present and before != "missing":
+            with contextlib.suppress(HelmError, OSError):
+                self.record_situation(
+                    project["id"],
+                    f"PR for task {task_id} carries no provenance block; "
+                    f"helm task provenance {task_id} prints it for the PR body",
+                )
 
     def sync_open_pull_requests(
         self, *, min_interval_seconds: float = PR_SYNC_INTERVAL_SECONDS, now_epoch: float | None = None

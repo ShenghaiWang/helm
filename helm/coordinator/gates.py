@@ -14,7 +14,9 @@ import sys
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..values import GATE_TYPES, REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND, _safe_text, now
+from ..values import (
+    GATE_TYPES, REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND, _safe_text, now, requirement_shortfalls,
+)
 
 
 class GatesMixin:
@@ -235,6 +237,9 @@ class GatesMixin:
                 "confirmed_at": None,
                 "skipped": False,
                 "note": "",
+                # What the proposal leaves the commander unable to judge; said
+                # at the proposal, in the pending list and at the decision.
+                "shortfalls": requirement_shortfalls(text) if gate_type == "requirement" else [],
             }
             gates = dict(task.get("gates") or {})
             # A CONFIRMED PAIR THAT NOTHING HAS SPENT IS A LIVE COMMANDER
@@ -334,11 +339,13 @@ class GatesMixin:
         # `record_project_action_item` refuses rather than truncates -- so
         # building it unbounded made the decision silently vanish from
         # `open_action_items()` while the foreman was told it was waiting.
+        shortfalls = requirement_shortfalls(text) if gate_type == "requirement" else []
+        thin = f" [thin: {'; '.join(shortfalls)}]" if shortfalls else ""
         with contextlib.suppress(HelmError, OSError):
             self.record_project_action_item(
                 project_id,
                 self._situation_line(
-                    f"Decide the {gate_type} gate for foreman task {task_id}: ", text
+                    f"Decide the {gate_type} gate for foreman task {task_id}{thin}: ", text
                 ),
                 source="foreman",
                 task_id=task_id,

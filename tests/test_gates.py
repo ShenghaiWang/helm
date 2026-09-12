@@ -1129,3 +1129,60 @@ class ParallelGateSlotTests(HelmTestCase):
             self.coordinator._require_gates_confirmed(
                 data, project["id"], consume_for_task_id="t-second"
             )
+
+class ThinRequirementTests(HelmTestCase):
+    """A requirement nobody can check against is the defect that reaches review."""
+
+    def _foreman(self, name: str) -> tuple[dict, dict]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        return project, foreman_task
+
+    def test_a_proposal_without_done_or_scope_is_recorded_and_shown_as_thin(self) -> None:
+        project, foreman_task = self._foreman("thin")
+        task = self.coordinator.propose_gate(foreman_task["id"], "requirement", "goal: add gamification")
+        self.assertEqual(
+            task["gates"]["requirement"]["shortfalls"],
+            ["no 'Done means' line", "no 'Out of scope' line"],
+        )
+        items = [i for i in self.coordinator.open_action_items(project["id"]) if i.get("task_id") == foreman_task["id"]]
+        self.assertTrue(any("[thin: no 'Done means' line; no 'Out of scope' line]" in i["text"] for i in items), items)
+        # A complete proposal has no shortfall, whatever the wording.
+        task = self.coordinator.propose_gate(
+            foreman_task["id"], "requirement",
+            "Goal: points for lessons. Done means: a completed lesson shows points on the dashboard. "
+            "Out of scope: streaks and badges.",
+        )
+        self.assertEqual(task["gates"]["requirement"]["shortfalls"], [])
+        items = [i for i in self.coordinator.open_action_items(project["id"]) if i.get("task_id") == foreman_task["id"]]
+        self.assertFalse(any("[thin:" in i["text"] for i in items), items)
+        task = self.coordinator.propose_gate(
+            foreman_task["id"], "requirement", "Definition of done: it works. Non-goals: everything else.",
+        )
+        self.assertEqual(task["gates"]["requirement"]["shortfalls"], [])
+        # A solution proposal is not held to the requirement's sections.
+        self.coordinator.decide_gate(foreman_task["id"], "requirement", confirm=True, skip=False)
+        task = self.coordinator.propose_gate(foreman_task["id"], "solution", "approach: one line")
+        self.assertEqual(task["gates"]["solution"]["shortfalls"], [])
+
+    def test_the_cli_tells_the_foreman_and_marks_a_thin_confirmation(self) -> None:
+        project, foreman_task = self._foreman("thincli")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "gate", "propose", foreman_task["id"],
+                "--type", "requirement", "--text", "goal: ship it",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("The commander will see this proposal as thin", out.getvalue())
+        self.assertIn("Done means", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "gate", "decide", foreman_task["id"],
+                "--type", "requirement", "--confirm",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("(confirmed thin:", out.getvalue())
+

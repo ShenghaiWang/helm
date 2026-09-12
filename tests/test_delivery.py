@@ -539,6 +539,48 @@ class DeliveryTests(HelmTestCase):
         self.assertEqual(synced["delivery"]["checks"], "CLEAN")
         self.assertEqual(synced["delivery"]["review_decision"], "APPROVED")
         self.assertEqual(synced["delivery"]["merge_commit"], "def5678")
+        # A body without the provenance block is noted once, with the command.
+        self.assertEqual(synced["delivery"]["provenance"], "missing")
+        situation = " ".join(s["text"] for s in self.coordinator.project_status(project["id"])["situation"])
+        self.assertIn(f"helm task provenance {task['id']}", situation)
+
+    def test_a_pull_request_body_with_the_block_reads_as_present_and_the_block_says_who(self) -> None:
+        root = self.repo("provenance")
+        project = self.coordinator.register_project(
+            "Provenance", str(root), project_id="provenance", delivery_policy="pr"
+        )
+        task = self.coordinator.create_task(project["id"], "ship it", ticket="TCK-7", shape="critical")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""])
+        review = self.coordinator.create_task(
+            project["id"], "review", role="reviewer", reviews=task["id"], read_only=True
+        )
+        reviewer = self.coordinator.launch_worker(review["id"], [sys.executable, "-c", ""])
+        self.coordinator.record_worker_message(reviewer["id"], "result", "APPROVED: clean and tested")
+        self.coordinator.record_task_evidence(task["id"], tip="abc1234", command="make test", exit_code=0, cases=42)
+        block = self.coordinator.render_provenance(self.coordinator.task_provenance(task["id"]))
+        self.assertIn(f"Helm-Task: {task['id']} (TCK-7), shape critical", block)
+        self.assertIn("Reviewed: 1 independent round(s)", block)
+        self.assertIn("APPROVED: clean and tested", block)
+        self.assertIn("Suite: make test exited 0, 42 case(s) ran at abc1234", block)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["--state-dir", str(self.state.directory), "task", "provenance", task["id"]]), 0)
+        self.assertIn("<!-- helm provenance -->", out.getvalue())
+        self.coordinator.record_pr_status(task["id"], state="open", url="https://example.invalid/pull/9")
+        payload = {
+            "url": "https://example.invalid/pull/9", "state": "OPEN", "reviewDecision": "",
+            "mergeStateStatus": "CLEAN", "mergeCommit": None, "comments": [],
+            "body": "Fixes the thing.\n\n" + block,
+        }
+        with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"), \
+             mock.patch.object(
+                 cli.subprocess, "run",
+                 return_value=subprocess.CompletedProcess(["gh"], 0, stdout=json.dumps(payload), stderr=""),
+             ):
+            synced = cli._sync_pull_request_status(self.coordinator, task["id"])
+        self.assertEqual(synced["delivery"]["provenance"], "present")
+        situation = " ".join(s["text"] for s in self.coordinator.project_status(project["id"])["situation"])
+        self.assertNotIn("carries no provenance block", situation)
 
     def test_cleanup_still_refuses_a_dirty_workspace_it_could_now_force(self) -> None:
         root = self.repo("forcing")

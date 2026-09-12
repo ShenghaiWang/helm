@@ -63,6 +63,17 @@ commander, with its id and age, so it is looked at rather than forgotten;
 That command is root-only, like the approvals: an agent that could close a
 decision would have decided it.
 
+## The pull request carries its provenance
+
+`helm task provenance <task>` prints a short block for the PR body: which
+task and ticket, its shape, which agent and model wrote it at what effort,
+how many independent review rounds ran and what they said, and the suite
+evidence at the tip. The foreman pastes it; Helm writes nothing to the PR.
+When Helm syncs a PR it reads the body, records whether the block is there,
+and notes a missing one on the project's record once, naming the command.
+A later reader asking who wrote a change, how it was checked, or whether a
+model with a licence question touched it, answers from the PR itself.
+
 ## Local delivery
 
 For local delivery the final state is `merged`. An approved operator uses

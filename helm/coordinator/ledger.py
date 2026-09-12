@@ -17,7 +17,7 @@ import time
 from typing import Any
 
 from .. import archive, costs
-from ..values import DELIVERED_TASK_STATES
+from ..values import DELIVERED_TASK_STATES, PROVENANCE_MARKER
 
 
 def _epoch(stamp: Any) -> float | None:
@@ -167,6 +167,96 @@ class LedgerMixin:
             "archived": archived,
             **usage,
         }
+
+    def task_provenance(self, task_id: str) -> dict[str, Any]:
+        """Who and what produced a task's change, from Helm's own records.
+
+        The block a pull request body carries so a later reader -- a
+        reviewer, an auditor, someone asking about a licence -- can see
+        which agent and model wrote it, at what effort, how it was reviewed,
+        and what suite evidence the tip had, without opening Helm.
+        """
+        data = self.store.load()
+        task = self._task_anywhere(data, task_id)
+        workers = [w for w in data.get("workers", {}).values() if w.get("task_id") == task_id]
+        if not workers:
+            record = self.archived_task(task_id) or {}
+            workers = list((record.get("workers") or {}).values())
+        agents = sorted({str(w.get("agent_id") or w.get("agent") or "") for w in workers} - {""})
+        models = sorted({str(w.get("model") or task.get("model") or "") for w in workers} - {""})
+        reviewers = [
+            t for t in data.get("tasks", {}).values()
+            if t.get("role") == "reviewer" and t.get("reviews") == task_id
+        ]
+        reviewer_ids = {t["id"] for t in reviewers}
+        verdicts: list[str] = []
+        for message in data.get("messages", []):
+            if message.get("task_id") in reviewer_ids and message.get("kind") == "result":
+                first = str(message.get("text") or "").strip().splitlines()
+                verdicts.append((first[0] if first else "")[:60])
+        reviewer_models = sorted({
+            str(w.get("model") or "") for w in data.get("workers", {}).values()
+            if w.get("task_id") in reviewer_ids
+        } - {""})
+        suites = [
+            (message.get("payload") or {}).get("full_suite")
+            for message in data.get("messages", [])
+            if message.get("task_id") == task_id
+            and isinstance((message.get("payload") or {}).get("full_suite"), dict)
+        ]
+        evidence = suites[-1] if suites else None
+        return {
+            "task_id": task_id,
+            "project_id": task.get("project_id"),
+            "ticket": task.get("ticket"),
+            "shape": task.get("shape") or "standard",
+            "branch": task.get("branch"),
+            "agents": agents,
+            "models": models,
+            "effort": task.get("effort"),
+            "review_rounds": len(reviewers),
+            "verdicts": verdicts,
+            "reviewer_models": reviewer_models,
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def render_provenance(provenance: dict[str, Any]) -> str:
+        """The block itself, in the words a pull request body carries."""
+        lines = [
+            "<!-- helm provenance -->",
+            f"{PROVENANCE_MARKER} {provenance['task_id']}"
+            + (f" ({provenance['ticket']})" if provenance.get("ticket") else "")
+            + f", shape {provenance['shape']}",
+            "Written by: "
+            + (", ".join(provenance["agents"]) or "unrecorded agent")
+            + (f" on {', '.join(provenance['models'])}" if provenance["models"] else "")
+            + (f" at {provenance['effort']} effort" if provenance.get("effort") else ""),
+        ]
+        rounds = provenance["review_rounds"]
+        if rounds:
+            verdicts = "; ".join(v for v in provenance["verdicts"] if v) or "verdicts not recorded"
+            lines.append(
+                f"Reviewed: {rounds} independent round(s)"
+                + (f" on {', '.join(provenance['reviewer_models'])}" if provenance["reviewer_models"] else "")
+                + f" -- {verdicts}"
+            )
+        else:
+            lines.append("Reviewed: no independent review round recorded")
+        evidence = provenance.get("evidence")
+        if evidence:
+            ran = evidence.get("cases")
+            lines.append(
+                f"Suite: {evidence.get('command')} exited {evidence.get('exit')}"
+                + (f", {ran} case(s) ran" if ran is not None else ", case count not reported")
+                + f" at {str(evidence.get('tip') or '')[:10]}"
+            )
+        else:
+            lines.append("Suite: no run recorded")
+        if provenance.get("branch"):
+            lines.append(f"Branch: {provenance['branch']}")
+        lines.append("<!-- /helm provenance -->")
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _ledger_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:

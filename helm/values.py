@@ -195,6 +195,35 @@ def shape_policy(task: dict[str, Any]) -> dict[str, Any]:
     return SHAPE_POLICY[_validate_shape(task.get("shape") or "standard", "task record")]
 
 
+#: The line that marks a pull request body as carrying Helm's provenance
+#: block. Its presence is what a sync checks; the rest of the block is prose.
+PROVENANCE_MARKER = "Helm-Task:"
+
+#: What a requirement proposal must say for the commander to be able to
+#: judge it: a line that says what done means, and one that says what is out
+#: of scope. Each entry is (what the shortfall is called, the phrases that
+#: satisfy it, matched case-insensitively anywhere in the text).
+REQUIREMENT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("'Done means' line", ("done means", "done when", "definition of done", "acceptance criteria", "acceptance:")),
+    ("'Out of scope' line", ("out of scope", "not in scope", "non-goals", "excluded:", "exclusions:")),
+)
+
+
+def requirement_shortfalls(text: str) -> list[str]:
+    """What a requirement proposal leaves the commander unable to judge.
+
+    Most defects that reach a review start as a requirement nobody could
+    check against. The check is on the record and deterministic; what to do
+    about a thin proposal stays the commander's decision.
+    """
+    lowered = (text or "").lower()
+    return [
+        f"no {name}"
+        for name, phrases in REQUIREMENT_SECTIONS
+        if not any(phrase in lowered for phrase in phrases)
+    ]
+
+
 #: Path fragments whose presence in a diff says the change is not small,
 #: whatever the foreman called it: places where correctness cannot be seen.
 RISKY_PATH_MARKERS: tuple[str, ...] = (
@@ -405,8 +434,12 @@ WHAT YOU OWN
   waits on a human for them.
 - Before any project-changing task, clearing two commander confirmation gates
   in order. First, read-only discovery/clarification, then propose a concise
-  requirement contract (goal, scope, exclusions, acceptance evidence) with
-  `helm gate propose <your-task-id> --type requirement --text "..."` and wait
+  requirement contract with `helm gate propose <your-task-id> --type
+  requirement --text "..."` and wait. It carries the goal, a `Done means:`
+  line the commander can check the result against, and an `Out of scope:`
+  line saying what this round will not do; a proposal without those two is
+  shown to the commander as thin, and thin proposals get skipped or sent
+  back. Then
   -- do not spawn a worker yet. Once the commander confirms or explicitly
   skips it (you will see it decided on `helm project status`), propose the
   technical solution (approach, affected boundaries, verification, risks)

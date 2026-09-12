@@ -152,6 +152,13 @@ is driving.
 
 ## The requirement and solution gates
 
+A requirement proposal says what done means and what is out of scope, or
+the commander is told it does not: `helm gate propose` reports the shortfall
+to the foreman, the pending list marks the gate `[thin: …]`, and a decision
+that confirms it anyway says so. The check is on the record and
+deterministic; whether to confirm, skip or send it back stays the
+commander's call.
+
 Before a foreman may launch a state-changing worker, it clears two
 commander-decided gates on its own driving task, in order:
 
