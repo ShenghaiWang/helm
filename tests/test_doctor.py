@@ -8,6 +8,7 @@ reaches a credential. Each has its own case below.
 
 from __future__ import annotations
 
+import sys
 import contextlib
 import io
 import json
@@ -308,6 +309,7 @@ class ProjectChecksTests(DoctorTestCase):
                 "project.domains",
                 "project.skills",
                 "project.retained",
+                "project.evidence",
             ],
         )
         self.assertEqual(report.exit_code, 0)
@@ -358,6 +360,23 @@ class ProjectChecksTests(DoctorTestCase):
         )
         finding = self.finding(self.report(helm_root, "alpha"), "project.config")
         self.assertEqual(finding.severity, doctor.ERROR)
+
+    def test_recorded_suite_runs_that_ran_nothing_are_a_project_warning(self) -> None:
+        """A green exit from a suite that selected nothing is not evidence."""
+        helm_root, coordinator = self.sound_root()
+        self.add_project(helm_root, "alpha")
+        project = coordinator.discover_project(helm_root, "alpha")
+        self.assertEqual(self.finding(self.report(helm_root, "alpha"), "project.evidence").severity, doctor.OK)
+        task = coordinator.create_task(project["id"], "a change")
+        coordinator.launch_worker(task["id"], [sys.executable, "-c", ""])
+        coordinator.record_task_evidence(task["id"], tip="abc123", command="make test", exit_code=0)
+        finding = self.finding(self.report(helm_root, "alpha"), "project.evidence")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("say nothing about how many cases ran", finding.message)
+        coordinator.record_task_evidence(task["id"], tip="abc123", command="make test", exit_code=0, cases=0)
+        finding = self.finding(self.report(helm_root, "alpha"), "project.evidence")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("ran 0 cases", finding.message)
 
     def test_a_declared_domain_that_does_not_exist_is_an_error(self) -> None:
         helm_root, _ = self.sound_root()

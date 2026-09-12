@@ -90,3 +90,8 @@ gets its own worktree so two roles never share a checkout.
 
 A mixed graph is fine — an independent group and a dependent chain can run under
 different modes, with the reasoning stated per group.
+## Approved learning: lp-cd0b990ddf22
+<!-- helm-learning: {"approved_at":"2026-09-12T21:09:05Z","approved_by":"user","confidence":1.0,"created_at":"2026-09-12T21:09:05Z","domain_id":"work-decomposition","proposal_id":"lp-cd0b990ddf22"} -->
+- Fact: Slice vertically, and make the first slice a tracer bullet: a thin path through every layer the feature touches -- schema, service, API and a minimal visible surface -- so the whole flow gets feedback in the first task. Agents left to themselves slice horizontally (all schema, then all API, then all UI), which defers every integration surprise to the last phase. Split the rest into independently grabbable tasks with explicit blocking relationships, so what is unblocked can run in parallel.
+- Rationale: Borrowed from the tracer-bullet idea in The Pragmatic Programmer and its agent-era restatement; the commander agreed to teach it on 2026-09-13.
+<!-- /helm-learning: lp-cd0b990ddf22 -->

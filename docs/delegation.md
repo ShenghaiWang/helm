@@ -201,7 +201,16 @@ every change:
 | --- | --- | --- | --- |
 | `small` | at most 1, and not required | low, author and reviewer | no |
 | `standard` (default) | up to 2 | the ordinary ladder | no |
-| `critical` | up to 3 | high, author and reviewer | the full suite's exit recorded with `helm task evidence` for the final tip |
+| `critical` | up to 3 | high, author and reviewer | the full suite's exit and case count recorded with `helm task evidence --cases N` for the final tip |
+
+Evidence says what ran, not only how it exited. `helm task evidence <task>
+--tip <sha> --command '<suite>' --exit 0 --cases 128` (or `--suite unit=100
+--suite e2e=28`) records the count; a green run that ran zero cases is
+recorded as such and refused as evidence, because a filter that matches
+nothing still exits green. A root that wants every standard change approved
+on a counted run, as a critical one is, sets `helm prefs set
+evidence.standard require`; `helm doctor --project <id>` warns when a
+project's recorded runs ran nothing or never said how many cases ran.
 
 `helm review --rounds` and `--reviewer-effort` override the shape for one
 review; an effort named on the task outranks the shape's floor; the worker

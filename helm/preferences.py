@@ -84,6 +84,7 @@ KEY_EFFORT_RUNTIMES = "effort.runtimes"
 KEY_REVIEW_AGENT = "review.agent"
 KEY_CLEANUP_AFTER_MERGE = "cleanup.after_merge"
 KEY_EXECUTION_TURNS = "execution.turns"
+KEY_EVIDENCE_STANDARD = "evidence.standard"
 KEY_MODEL_PRICES = "model.prices"
 
 #: What `execution.turns` understands. "on" runs every worker this root
@@ -103,6 +104,10 @@ FREE_MODEL_VALUES = ("prefer", "off")
 #: residue holds nothing. "ask" keeps the shipped default: cleanup waits for
 #: the commander's explicit word.
 CLEANUP_AFTER_MERGE_VALUES = ("auto", "ask")
+
+#: `record` keeps the evidence gate for critical tasks only; `require` approves a
+#: standard task, too, only on a recorded and counted suite run.
+EVIDENCE_STANDARD_VALUES = ("record", "require")
 
 #: key -> (takes a list?, one-line description). Printed by `helm prefs keys`
 #: and quoted in every "unknown key" error, so this is the documentation.
@@ -164,6 +169,12 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         "run workers as non-interactive turns that share one agent session, so "
         "nothing is ever typed into a pane (values: on, off); default off keeps "
         "the interactive session; a project pins its own with \"execution\"",
+    ),
+    KEY_EVIDENCE_STANDARD: (
+        False,
+        "whether a standard-shaped task is approved only on a recorded, counted "
+        "suite run like a critical one (values: record, require); default record "
+        "keeps the gate for critical and records counts for the rest",
     ),
     KEY_MODEL_FREE: (
         False,
@@ -307,6 +318,10 @@ class Preferences:
     free_model: str | None = None
     cleanup_after_merge: str | None = None
     execution_turns: str | None = None
+    #: "require" approves a standard task only on a recorded, counted suite
+    #: run, as a critical one; "record" (the default) leaves that gate to
+    #: critical and only insists that recorded evidence says what ran.
+    evidence_standard: str | None = None
 
     def constraint_for(self, model: str | None) -> tuple[str, frozenset[str]] | None:
         """The family restriction that applies to a model, if any is enabled.
@@ -353,6 +368,8 @@ class Preferences:
             document["cleanup"] = {"after_merge": self.cleanup_after_merge}
         if self.execution_turns:
             document["execution"] = {"turns": self.execution_turns}
+        if self.evidence_standard:
+            document["evidence"] = {"standard": self.evidence_standard}
         if model:
             document["model"] = model
         if self.review_agent:
@@ -418,6 +435,8 @@ class Preferences:
             rows.append((KEY_CLEANUP_AFTER_MERGE, self.cleanup_after_merge))
         if self.execution_turns:
             rows.append((KEY_EXECUTION_TURNS, self.execution_turns))
+        if self.evidence_standard:
+            rows.append((KEY_EVIDENCE_STANDARD, self.evidence_standard))
         if self.review_agent:
             rows.append((KEY_REVIEW_AGENT, self.review_agent))
         if self.default_effort:
@@ -489,7 +508,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
             f"understands {', '.join(str(item) for item in SUPPORTED_VERSIONS)}"
         )
     _reject_unknown(
-        document, {"version", "agent", "model", "effort", "execution", "review", "cleanup"}, "", where
+        document, {"version", "agent", "model", "effort", "execution", "review", "cleanup", "evidence"}, "", where
     )
 
     agent = _object(document.get("agent"), "agent", where)
@@ -549,6 +568,19 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
             )
         execution_turns = value
 
+    evidence = _object(document.get("evidence"), "evidence", where)
+    _reject_unknown(evidence, {"standard"}, "evidence", where)
+    evidence_standard = None
+    if evidence.get("standard") is not None:
+        value = evidence["standard"]
+        if not isinstance(value, str) or value not in EVIDENCE_STANDARD_VALUES:
+            raise PreferencesError(
+                f"evidence.standard{where} must be one of "
+                + ", ".join(repr(v) for v in EVIDENCE_STANDARD_VALUES)
+                + f", not {value!r}"
+            )
+        evidence_standard = value
+
     model = _object(document.get("model"), "model", where)
     _reject_unknown(model, {"default", "runtimes", "free", "exclude", "prices"}, "model", where)
     default_model = (
@@ -607,6 +639,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         free_model=free_model,
         cleanup_after_merge=cleanup_after_merge,
         execution_turns=execution_turns,
+        evidence_standard=evidence_standard,
         default_effort=default_effort,
         effort_runtimes=effort_runtimes,
     )
@@ -931,6 +964,12 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
             execution_section.pop("turns", None)
         else:
             execution_section["turns"] = listed[0]
+    elif key == KEY_EVIDENCE_STANDARD:
+        evidence_section = document.setdefault("evidence", {})
+        if listed is None:
+            evidence_section.pop("standard", None)
+        else:
+            evidence_section["standard"] = listed[0]
     elif key == KEY_REVIEW_AGENT:
         if listed is None:
             review_section.pop("agent", None)
@@ -956,6 +995,8 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
         document.pop("effort")
     if not review_section:
         document.pop("review")
+    if "evidence" in document and not document["evidence"]:
+        document.pop("evidence")
     # Re-validate the whole document: the same path a hand-edited file takes,
     # so the CLI can never write something loading would then refuse.
     return _from_document(document, current.path)

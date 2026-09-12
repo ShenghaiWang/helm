@@ -682,6 +682,34 @@ class Coordinator(
                 )
 
 
+    @staticmethod
+    def _executed_cases(detail: dict[str, Any] | None) -> int | None:
+        """How many cases the per-suite detail says ran, or None if it is silent.
+
+        A value like "12/12" is passed-of-ran; a bare number is a count.
+        Anything else says nothing, and nothing is what gets recorded -- an
+        inferred count would be exactly the kind of evidence this exists to
+        refuse.
+        """
+        if not detail:
+            return None
+        total = 0
+        seen = False
+        for value in detail.values():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                total += max(0, value)
+                seen = True
+                continue
+            text = str(value or "").strip()
+            match = re.fullmatch(r"(\d+)\s*/\s*(\d+)", text) or re.fullmatch(r"(\d+)", text)
+            if match is None:
+                continue
+            total += int(match.group(match.lastindex))
+            seen = True
+        return total if seen else None
+
     def record_task_evidence(
         self,
         task_id: str,
@@ -690,6 +718,7 @@ class Coordinator(
         command: str,
         exit_code: int,
         detail: dict[str, Any] | None = None,
+        cases: int | None = None,
     ) -> dict[str, Any]:
         """Record a suite result as the evidence a reviewer actually reads.
 
@@ -707,10 +736,18 @@ class Coordinator(
             raise HelmError("evidence needs the tip its suite ran against")
         if not command:
             raise HelmError("evidence needs the command that produced it")
+        if cases is not None and (isinstance(cases, bool) or int(cases) < 0):
+            raise HelmError("evidence cases must be a count of zero or more")
+        executed = int(cases) if cases is not None else self._executed_cases(detail)
         report = {
             "tip": tip,
             "command": command,
             "exit": int(exit_code),
+            # How many cases actually ran. A green run that ran nothing is
+            # indistinguishable from one that ran everything by its exit
+            # status alone, so the count is the half of the evidence that
+            # says what the exit status is about.
+            "cases": executed,
             "recorded_at": now(),
         }
         if detail:
@@ -744,7 +781,10 @@ class Coordinator(
                     "task_id": task_id,
                     "project_id": task["project_id"],
                     "kind": "status",
-                    "text": f"full suite at {tip}: {command} exited {int(exit_code)}",
+                    "text": (
+                        f"full suite at {tip}: {command} exited {int(exit_code)}"
+                        + (f", {executed} case(s) ran" if executed is not None else ", case count not reported")
+                    ),
                     "payload": {"full_suite": report},
                     "created_at": now(),
                     "status": None,

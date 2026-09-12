@@ -1075,10 +1075,16 @@ class ProtectionMixin:
                     f"{'; '.join(check.get('findings') or [])[:300]}. Re-shape it before approving: "
                     f"helm task shape {task_id} critical --reason '...' (or standard, if the finding is wrong)"
                 )
-            if shape_policy(task).get("evidence_required"):
+            policy = shape_policy(task)
+            shape = _safe_text(task.get("shape") or "standard")
+            required = bool(policy.get("evidence_required")) or (
+                shape == "standard" and self.preferences().evidence_standard == "require"
+            )
+            if required:
                 # A critical change is approved on evidence, not on a
                 # reviewer's word: the full suite's exit, recorded against
-                # the exact revision being approved.
+                # the exact revision being approved -- and how many cases
+                # ran, because a suite that selected nothing exits green.
                 head = _git(workspace, "rev-parse", "HEAD").strip()
                 reports = [
                     (message.get("payload") or {}).get("full_suite")
@@ -1090,11 +1096,20 @@ class ProtectionMixin:
                     report for report in reports
                     if head.startswith(str(report.get("tip") or "\0")) or str(report.get("tip") or "").startswith(head)
                 ]
-                if not any(int(report.get("exit", 1) or 0) == 0 for report in green):
+                passed = [report for report in green if int(report.get("exit", 1) or 0) == 0]
+                if not passed:
                     raise SafetyError(
-                        f"task is shaped critical, so approval needs the full suite's exit recorded "
-                        f"for revision {head[:10]}: helm task evidence {task_id} --tip {head[:10]} "
-                        "--command '<suite command>' --exit 0"
+                        f"task is shaped {shape}, so approval needs the full suite's exit and case "
+                        f"count recorded for revision {head[:10]}: helm task evidence {task_id} "
+                        f"--tip {head[:10]} --command '<suite command>' --exit 0 --cases <n>"
+                    )
+                if policy.get("cases_required") and not any(
+                    isinstance(report.get("cases"), int) and report["cases"] > 0 for report in passed
+                ):
+                    raise SafetyError(
+                        f"task is shaped {shape}, and the green suite recorded for revision {head[:10]} "
+                        "does not say how many cases ran (or ran none). A green run proves nothing "
+                        "until you know what ran: re-record it with --cases <n> or --suite <name>=<count>"
                     )
             grant = None
             if grant_id is not None:

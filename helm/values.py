@@ -144,6 +144,7 @@ SHAPE_POLICY: dict[str, dict[str, Any]] = {
         "effort": "low",
         "reviewer_effort": "low",
         "evidence_required": False,
+        "cases_required": False,
         "means": (
             "a small, visually obvious, low-blast-radius change: make it, run the "
             "suite, report the result; no evidence captures, no artifact report, "
@@ -155,7 +156,10 @@ SHAPE_POLICY: dict[str, dict[str, Any]] = {
         "review_required": True,
         "effort": None,
         "reviewer_effort": None,
+        # Not required by default; a root that wants every standard change
+        # approved on a counted suite run sets `evidence.standard = require`.
         "evidence_required": False,
+        "cases_required": True,
         "means": "ordinary feature work: an independent review, up to two rounds",
     },
     "critical": {
@@ -164,11 +168,12 @@ SHAPE_POLICY: dict[str, dict[str, Any]] = {
         "effort": "high",
         "reviewer_effort": "high",
         "evidence_required": True,
+        "cases_required": True,
         "means": (
             "a change whose correctness cannot be seen -- auth, money, data loss, "
             "concurrency, persistence: high effort for author and reviewer, up to "
-            "three review rounds, and the full suite's exit recorded with "
-            "`helm task evidence` for the final tip before approval"
+            "three review rounds, and the full suite's exit and case count recorded "
+            "with `helm task evidence --cases N` for the final tip before approval"
         ),
     },
 }
@@ -411,7 +416,7 @@ THE COMMANDS THAT DO IT
   at most, low effort, no evidence captures); critical for a change whose
   correctness cannot be seen (auth, money, data loss, concurrency,
   persistence -- three rounds, high effort, the full suite's exit recorded
-  with `helm task evidence` before approval); standard for the rest. Helm
+  with `helm task evidence --cases N` before approval); standard for the rest. Helm
   sizes the review and the effort from it.
 - `helm worker launch <task-id>` -- one worker, one task, one worktree.
 - `helm watch`, then `helm worker answer <worker-id> --text "..."`.

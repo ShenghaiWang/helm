@@ -130,6 +130,7 @@ PROJECT_CHECKS = (
     "project.domains",
     "project.skills",
     "project.retained",
+    "project.evidence",
 )
 
 
@@ -1695,6 +1696,7 @@ class _Doctor:
         self._check_project_domains(settings)
         self._check_skills(project_id, project_root, settings)
         self._check_retained(project_id)
+        self._check_evidence(project_id)
 
     def _check_location(self, project_id: str, project_root: Path) -> bool:
         assert self.root is not None
@@ -2046,6 +2048,48 @@ class _Doctor:
             f"{len(available)} skill manifest(s) readable"
             + (f", {len(pinned)} pinned" if pinned else ""),
         )
+
+    def _check_evidence(self, project_id: str) -> None:
+        """Do this project's recorded suite runs say what ran?
+
+        A green exit from a suite that selected nothing is the failure the
+        case count exists to catch. Read from Helm's own records, so it costs
+        nothing and starts nothing.
+        """
+        if not self._state_ok or self.coordinator is None:
+            self._unchecked("project.evidence", "Helm state could not be read")
+            return
+        try:
+            data = self.coordinator.store.load()
+        except (HelmError, SafetyError, OSError, ValueError) as exc:
+            self._unchecked("project.evidence", f"state could not be read: {exc}")
+            return
+        reports = [
+            (message.get("payload") or {}).get("full_suite")
+            for message in data.get("messages", [])
+            if message.get("project_id") == project_id
+            and isinstance((message.get("payload") or {}).get("full_suite"), dict)
+        ]
+        if not reports:
+            self.ok("project.evidence", "no suite runs recorded yet")
+            return
+        silent = sum(1 for report in reports if report.get("cases") is None)
+        empty = sum(1 for report in reports if report.get("cases") == 0)
+        if empty:
+            self.warn(
+                "project.evidence",
+                f"{empty} of {len(reports)} recorded suite run(s) ran 0 cases -- a green exit that tested nothing",
+                "select the suite rather than a method-level filter, verify the count, and re-record with --cases",
+            )
+            return
+        if silent:
+            self.warn(
+                "project.evidence",
+                f"{silent} of {len(reports)} recorded suite run(s) say nothing about how many cases ran",
+                "record evidence with --cases <n> or --suite <name>=<count>, so a green exit means something",
+            )
+            return
+        self.ok("project.evidence", f"{len(reports)} recorded suite run(s) all say how many cases ran")
 
     def _check_retained(self, project_id: str) -> None:
         """What this project's tasks still hold, in one pass over the workers.

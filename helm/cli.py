@@ -1391,6 +1391,13 @@ def _build_parser() -> argparse.ArgumentParser:
     evidence_cmd.add_argument(
         "--detail", help="JSON object of per-package or per-runner counts"
     )
+    evidence_cmd.add_argument(
+        "--cases", type=int, help="how many test cases actually ran, in total"
+    )
+    evidence_cmd.add_argument(
+        "--suite", action="append", default=[], metavar="NAME=COUNT",
+        help="how many cases one suite ran; repeat per suite (the counts add up)",
+    )
     continue_cmd = task_commands.add_parser(
         "continue",
         help="run another round on a finished task, reusing its worktree and branch",
@@ -3476,17 +3483,35 @@ def main(argv: list[str] | None = None) -> int:
                     if not isinstance(parsed, dict):
                         raise HelmError("--detail must be a JSON object")
                     detail = parsed
+                for item in args.suite:
+                    name, sep, count = item.partition("=")
+                    if not sep or not name.strip() or not count.strip().isdigit():
+                        raise HelmError(f"--suite takes NAME=COUNT, not {item!r}")
+                    detail[name.strip()] = int(count)
                 recorded = coordinator.record_task_evidence(
                     args.task_id,
                     tip=args.tip,
                     command=args.suite_command,
                     exit_code=args.exit_code,
-                    detail=detail,
+                    detail=detail or None,
+                    cases=args.cases,
                 )
+                ran = recorded.get("cases")
                 print(
                     f"Recorded full-suite evidence for {args.task_id} at "
-                    f"{recorded['tip']} (exit {recorded['exit']})"
+                    f"{recorded['tip']} (exit {recorded['exit']}, "
+                    + (f"{ran} case(s) ran)" if ran is not None else "case count not reported)")
                 )
+                if ran == 0:
+                    print(
+                        "  0 cases ran: this is not evidence. A filter that matches nothing "
+                        "still exits green; select at suite level or verify the count, then re-record."
+                    )
+                elif ran is None:
+                    print(
+                        "  No case count: say what ran with --cases <n> or --suite <name>=<count>; "
+                        "a critical task is not approved without it."
+                    )
             elif args.task_command == "reopen":
                 task = coordinator.reopen_task(args.task_id, args.note)
                 print(

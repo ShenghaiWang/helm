@@ -92,13 +92,96 @@ class ShapeTests(HelmTestCase):
         self.coordinator.record_task_evidence(task["id"], tip=tip[:10], command="make test", exit_code=1)
         with self.assertRaisesRegex(SafetyError, "shaped critical"):
             self.coordinator.approve_task(task["id"], "still red")
-        self.coordinator.record_task_evidence(task["id"], tip=tip[:10], command="make test", exit_code=0)
+        self.coordinator.record_task_evidence(task["id"], tip=tip[:10], command="make test", exit_code=0, cases=12)
         approved = self.coordinator.approve_task(task["id"], "green on the tip")
         self.assertEqual(approved["status"], "approved")
         # A standard task never needed evidence to be approved.
         plain = self.coordinator.create_task(project["id"], "a feature")
         self.coordinator.launch_worker(plain["id"], [sys.executable, "-c", code])
         self.assertEqual(self.coordinator.approve_task(plain["id"], "ok")["status"], "approved")
+
+    def _worked(self, project: dict, brief: str, **kwargs) -> tuple[dict, str]:
+        task = self.coordinator.create_task(project["id"], brief, **kwargs)
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('change.txt').write_text('worker'); "
+            "subprocess.run(['git','add','change.txt'],check=True); "
+            "subprocess.run(['git','commit','-qm','worker change'],check=True)"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        tip = subprocess.run(
+            ["git", "-C", task["workspace"], "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        ).stdout.strip()
+        return task, tip[:10]
+
+    def test_a_green_run_that_ran_nothing_is_not_evidence(self) -> None:
+        """A filter that matches nothing exits green; the count is what says what ran."""
+        project = self._project("counted")
+        task, tip = self._worked(project, "change the token refresh", shape="critical")
+        zero = self.coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0, cases=0)
+        self.assertEqual(zero["cases"], 0)
+        with self.assertRaisesRegex(SafetyError, "how many cases ran"):
+            self.coordinator.approve_task(task["id"], "green")
+        silent = self.coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0)
+        self.assertIsNone(silent["cases"])
+        with self.assertRaisesRegex(SafetyError, "how many cases ran"):
+            self.coordinator.approve_task(task["id"], "green but silent")
+        # Per-suite detail counts as a count: passed-of-ran, or a bare number.
+        counted = self.coordinator.record_task_evidence(
+            task["id"], tip=tip, command="make test", exit_code=0,
+            detail={"packages/api": "12/12", "packages/web": 30, "note": "flaky one retried"},
+        )
+        self.assertEqual(counted["cases"], 42)
+        self.assertEqual(self.coordinator.approve_task(task["id"], "green, 42 ran")["status"], "approved")
+        messages = [m for m in self.state.load()["messages"] if m.get("task_id") == task["id"] and m.get("kind") == "status"]
+        self.assertTrue(any("42 case(s) ran" in m["text"] for m in messages))
+        self.assertTrue(any("case count not reported" in m["text"] for m in messages))
+        with self.assertRaisesRegex(HelmError, "zero or more"):
+            self.coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0, cases=-1)
+
+    def test_a_root_can_require_counted_evidence_for_standard_tasks(self) -> None:
+        project = self._project("strict")
+        task, tip = self._worked(project, "a feature")
+        self.write_preferences(evidence={"standard": "require"})
+        with self.assertRaisesRegex(SafetyError, "shaped standard"):
+            self.coordinator.approve_task(task["id"], "ok")
+        self.coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0, cases=0)
+        with self.assertRaisesRegex(SafetyError, "how many cases ran"):
+            self.coordinator.approve_task(task["id"], "ok")
+        self.coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0, cases=7)
+        self.assertEqual(self.coordinator.approve_task(task["id"], "ok")["status"], "approved")
+        # Small stays small: no evidence asked for even under the strict root.
+        little, _ = self._worked(project, "rename a label", shape="small")
+        self.assertEqual(self.coordinator.approve_task(little["id"], "ok")["status"], "approved")
+
+    def test_the_cli_records_counts_and_warns_on_a_run_that_ran_nothing(self) -> None:
+        project = self._project("clicount")
+        task, tip = self._worked(project, "a feature")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "task", "evidence", task["id"],
+                "--tip", tip, "--command", "make test", "--exit", "0", "--cases", "0",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("0 case(s) ran", out.getvalue())
+        self.assertIn("this is not evidence", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "task", "evidence", task["id"],
+                "--tip", tip, "--command", "make test", "--exit", "0", "--suite", "unit=100", "--suite", "e2e=28",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("128 case(s) ran", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "task", "evidence", task["id"],
+                "--tip", tip, "--command", "make test", "--exit", "0", "--suite", "unit",
+            ])
+        self.assertNotEqual(code, 0)
+        self.assertIn("NAME=COUNT", out.getvalue())
 
     def test_the_cli_takes_a_shape_and_inspect_shows_it(self) -> None:
         project = self._project("clishape")
