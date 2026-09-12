@@ -2807,6 +2807,19 @@ class HerdrAdapter:
         if note is None:
             with contextlib.suppress(HelmError, OSError):
                 note = self.coordinator.leave_inbox_note(worker_id, text)
+        turns_worker = (self.coordinator.store.load().get("workers", {}).get(worker_id) or {})
+        if turns_worker.get("execution_mode") == "turns":
+            # The message is the next turn's prompt. Nothing is typed; the
+            # runner starts the turn, and a runner that has died is restarted
+            # so the prompt is not left waiting on a process nobody watches.
+            self.coordinator.deliver_turn(worker_id, text)
+            if note is not None:
+                with contextlib.suppress(HelmError, OSError):
+                    self.coordinator.mark_inbox_read(worker_id, note)
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                self.ensure_turns_runner(worker_id)
+            self.last_wake_outcome = "turned"
+            return "turned"
         if not self.client.available():
             return ""
         send_text = getattr(self.client, "pane_send_text", None)
@@ -2866,6 +2879,67 @@ class HerdrAdapter:
         self.last_wake_outcome = "unconfirmed"
         return ""
 
+    def turns_runner_alive(self, worker_id: str) -> bool:
+        """Whether the turns runner behind a worker is a live process."""
+        data = self.coordinator.store.load()
+        worker = data.get("workers", {}).get(worker_id) or {}
+        pid = worker.get("pid")
+        if not pid:
+            with contextlib.suppress(OSError, ValueError):
+                pid = int((self.coordinator.turns_dir(worker_id) / "runner.pid").read_text().strip())
+        return bool(pid) and self.coordinator._pid_alive(pid)
+
+    def ensure_turns_runner(self, worker_id: str) -> bool:
+        """Start the turns runner again when it is gone; True when one is running after.
+
+        The runner reads its own state -- session id, the prompt it was on,
+        anything queued -- so a machine that slept or a process the OS
+        reclaimed costs a restart, not the task. It goes back into the
+        worker's own Herdr tab when that tab still exists, otherwise it runs
+        as a detached process.
+        """
+        data = self.coordinator.store.load()
+        worker = data.get("workers", {}).get(worker_id)
+        if worker is None or worker.get("status") != "running" or worker.get("execution_mode") != "turns":
+            return False
+        if self.turns_runner_alive(worker_id):
+            return True
+        command = list(worker.get("runner_command") or [])
+        if not command:
+            return False
+        layout = self._herdr_state(data)["workers"].get(worker_id)
+        if layout and self.client.available():
+            with contextlib.suppress(HerdrUnavailable, HerdrNotFound):
+                self.client.pane_run(layout["pane_id"], self._runner_command(worker))
+                self._note_restart(worker_id, "in its pane")
+                return True
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(worker.get("runner_pythonpath") or "")
+        subprocess.Popen(
+            [*command, "--detach"], cwd=worker.get("workspace") or None, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._note_restart(worker_id, "as a detached process")
+        return True
+
+    def _note_restart(self, worker_id: str, where: str) -> None:
+        with contextlib.suppress(HelmError, OSError):
+            with self.coordinator.store.locked() as data:
+                worker = data.get("workers", {}).get(worker_id)
+                if worker is None:
+                    return
+                worker["pid"] = None
+                worker.setdefault("turn_restarts", []).append({"at": now(), "where": where})
+                task = data.get("tasks", {}).get(worker.get("task_id"))
+                project = data.get("projects", {}).get(worker.get("project_id"))
+                if task is not None and project is not None:
+                    self.coordinator._message(
+                        data, project, task, worker, "status",
+                        f"turns runner restarted {where}; the session resumes where it stopped",
+                        {"turns": "restart"},
+                    )
+
     def interrupt_worker(self, worker_id: str) -> bool:
         """Send Escape into a worker's session, on purpose.
 
@@ -2901,6 +2975,12 @@ class HerdrAdapter:
         data = self.coordinator.store.load()
         worker = data.get("workers", {}).get(worker_id)
         if worker is None or worker.get("status") != "running":
+            return False
+        if worker.get("execution_mode") == "turns":
+            # A turns worker is reachable while its runner runs, and a runner
+            # that died is restarted here rather than reported as a wall.
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                return self.ensure_turns_runner(worker_id)
             return False
         if worker.get("execution") != "herdr":
             # No pane and no input channel Helm owns. Presentation cannot

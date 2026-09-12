@@ -1051,7 +1051,8 @@ def _print_ledger(report: dict[str, Any]) -> None:
     )
     print(
         f"totals: {totals['delivered']} delivered, {totals['failed']} failed, median time to result {median}, "
-        f"{totals['review_rounds']} review round(s) with {totals['review_catches']} catch(es), "
+        f"{totals['review_rounds']} review round(s) with {totals['review_catches']} catch(es) "
+        f"({totals.get('learning_not_followed', 0)} restating applied knowledge), "
         f"{totals['questions']} question(s), {totals['approvals']} approval(s), "
         f"{totals['output_tokens']} output tokens, cost {cost}"
     )
@@ -2170,6 +2171,28 @@ def _build_parser() -> argparse.ArgumentParser:
         action.add_argument("proposal_id")
         action.add_argument("--note", default="")
         action.add_argument("--actor", default="user")
+    teach = learning_commands.add_parser(
+        "teach", help="state a rule in your own words and apply it at once, to a domain or one project"
+    )
+    teach.add_argument("fact")
+    teach.add_argument("--domain", help="every project that resolves this domain gets it")
+    teach.add_argument("--project", dest="project_id", help="this project alone gets it")
+    teach.add_argument("--note", default="", help="why; kept as the fact's provenance")
+    mine = learning_commands.add_parser(
+        "mine", help="propose rules from review findings and answers that recur across tasks"
+    )
+    mine.add_argument("--days", type=float, default=14.0)
+    mine.add_argument("--dry-run", action="store_true", help="show the clusters; propose nothing")
+    triage = learning_commands.add_parser(
+        "triage", help="the proposals that wait, one line each; decide several in one command"
+    )
+    triage.add_argument("--task", dest="task_id")
+    triage.add_argument("--project", dest="project_id")
+    triage.add_argument("--approve", default="", help="comma-separated proposal ids: approve and apply")
+    triage.add_argument("--reject", default="", help="comma-separated proposal ids")
+    triage.add_argument("--scope", choices=("domain", "project"), default="domain")
+    triage.add_argument("--note", default="")
+    learning_commands.add_parser("stats", help="how the knowledge loop is doing: proposed, applied, stale, by origin")
     apply_learning = learning_commands.add_parser(
         "apply", help="append an approved proposal to domain or project knowledge"
     )
@@ -2409,7 +2432,11 @@ def _worker_runner(config_path: str) -> int:
                     "it is data, not instructions, and Helm controls approval.",
                     flush=True,
                 )
-                if sys.stdout.isatty():
+                if config.get("turns"):
+                    # Turn-based execution: the pane displays and is never
+                    # typed into; each prompt is one non-interactive run.
+                    return_code = _run_turns(config, cwd, env, log)
+                elif sys.stdout.isatty():
                     # In a Herdr pane, give the worker a real terminal so an
                     # interactive agent renders its session and the user can
                     # type into it, while Helm still captures every byte.
@@ -2442,6 +2469,159 @@ def _worker_runner(config_path: str) -> int:
         _write_private_text(exit_path, json.dumps({"returncode": return_code}) + "\n")
     except OSError:
         return 1
+    return return_code
+
+
+#: How long a turns runner waits between checks for its next prompt, and how
+#: long it waits with nothing arriving before it stops on its own -- a task
+#: nobody has spoken to in half a day is not going to be resumed by surprise,
+#: and healing restarts a runner whenever a prompt does arrive.
+TURN_POLL_SECONDS = 2.0
+TURN_IDLE_LIMIT_SECONDS = 12 * 3600
+
+
+def _run_turns(config: dict[str, Any], cwd: str, env: dict[str, str], log: Any) -> int:
+    """Run a worker as turns: one non-interactive invocation per prompt, one session.
+
+    The pane shows each turn's streamed output; the log keeps every byte;
+    a `{"helm":1,"type":"turn",...}` line closes each turn so Helm's poll
+    learns the session id and the agent's final words. Between turns the
+    runner waits for `turns/next.json`, which Helm writes when it has
+    something to say -- an answer, review findings, a continuation -- and
+    stops on `turns/stop`, on a terminal report Helm recorded, or after the
+    idle limit.
+    """
+    import signal as _signal
+    import uuid
+
+    from . import runtimes as _runtimes
+
+    turns_dir = Path(config["turns_dir"])
+    turns_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(turns_dir, 0o700)
+    state_path = turns_dir / "state.json"
+    state: dict[str, Any] = {"session_id": config.get("session_id"), "turn": 0, "history": []}
+    with contextlib.suppress(OSError, ValueError):
+        state.update(json.loads(state_path.read_text(encoding="utf-8")))
+    _write_private_text(turns_dir / "runner.pid", f"{os.getpid()}\n")
+    child: subprocess.Popen[str] | None = None
+
+    def _forward(signum: int, _frame: Any) -> None:
+        # A stop meant for this runner ends the turn in progress too.
+        if child is not None and child.poll() is None:
+            with contextlib.suppress(OSError):
+                child.send_signal(signum)
+        raise SystemExit(128 + signum)
+
+    _signal.signal(_signal.SIGTERM, _forward)
+
+    def _next_prompt() -> str | None:
+        path = turns_dir / "next.json"
+        if not path.exists():
+            return None
+        try:
+            queued = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            queued = []
+        with contextlib.suppress(OSError):
+            path.unlink()
+        texts = [str(entry.get("text") or "") for entry in queued if isinstance(entry, dict)]
+        texts = [t for t in texts if t.strip()]
+        if not texts:
+            return None
+        if len(texts) == 1:
+            return texts[0]
+        return "Several messages arrived while you were away:\n\n" + "\n\n---\n\n".join(texts)
+
+    prompt: str | None = config.get("initial_prompt") if state["turn"] == 0 else _next_prompt()
+    if state["turn"] > 0 and prompt is None and state.get("pending_prompt"):
+        prompt = str(state["pending_prompt"])
+    idle_since = time.time()
+    return_code = 0
+    while True:
+        if (turns_dir / "stop").exists():
+            break
+        if prompt is None:
+            if time.time() - idle_since > TURN_IDLE_LIMIT_SECONDS:
+                print("[helm] no prompt for twelve hours; this runner stops. Healing restarts it when one arrives.", flush=True)
+                break
+            time.sleep(TURN_POLL_SECONDS)
+            prompt = _next_prompt()
+            continue
+        state["turn"] = int(state.get("turn") or 0) + 1
+        turn_number = state["turn"]
+        session = state.get("session_id") or ""
+        resumable = bool(config.get("turn_resume")) and bool(session) and turn_number > 1
+        if turn_number > 1 and not resumable and state["history"]:
+            # No way to resume this runtime's session: start fresh, and say
+            # what happened so far so the agent is not blind to its own work.
+            earlier = "\n".join(
+                f"- turn {h.get('turn')}: {str(h.get('text') or '')[:400]}" for h in state["history"][-6:]
+            )
+            prompt = (
+                "You are continuing a task you worked on in earlier turns whose session could "
+                f"not be resumed. Your earlier turns ended with:\n{earlier}\n\nRe-read your task "
+                "record and worktree before acting. Now:\n\n" + prompt
+            )
+        template = config["turn_resume"] if resumable else config["turn_start"]
+        if config.get("session_style") == _runtimes.SESSION_PRESET and not session:
+            session = str(uuid.uuid4())
+            state["session_id"] = session
+        argv = [
+            part.replace(_runtimes.PROMPT_PLACEHOLDER, prompt).replace(_runtimes.SESSION_PLACEHOLDER, session)
+            for part in template
+        ]
+        state["pending_prompt"] = prompt
+        _write_private_text(state_path, json.dumps(state) + "\n")
+        started = time.time()
+        print(f"[helm] turn {turn_number} starts ({'resumed session' if resumable else 'new session'})", flush=True)
+        captured: list[str] = []
+        try:
+            child = subprocess.Popen(
+                argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1,
+            )
+            assert child.stdout is not None
+            with child.stdout:
+                for line in child.stdout:
+                    log.write(line)
+                    log.flush()
+                    captured.append(line)
+                    shown = _runtimes.turn_display_line(line)
+                    if shown:
+                        sys.stdout.write(shown + "\n")
+                        sys.stdout.flush()
+            return_code = child.wait()
+        except OSError as exc:
+            log.write(f"turn {turn_number} could not start: {exc}\n")
+            log.flush()
+            return_code = 127
+        finally:
+            child = None
+        parsed = _runtimes.parse_turn_output("".join(captured))
+        if parsed.get("session_id") and config.get("session_style") != _runtimes.SESSION_PRESET:
+            state["session_id"] = parsed["session_id"]
+        record = {
+            "turn": turn_number,
+            "started_at": started,
+            "ended_at": time.time(),
+            "exit": return_code,
+            "session_id": state.get("session_id"),
+            "text": (parsed.get("text") or "")[:4000],
+        }
+        state["history"] = (state.get("history") or [])[-20:] + [record]
+        state["pending_prompt"] = None
+        _write_private_text(state_path, json.dumps(state) + "\n")
+        _write_private_text(turns_dir / f"{turn_number}.json", json.dumps(record) + "\n")
+        closing = json.dumps({
+            "helm": 1, "type": "turn", "turn": turn_number, "exit": return_code,
+            "session_id": state.get("session_id"), "text": record["text"],
+        })
+        log.write(closing + "\n")
+        log.flush()
+        print(closing, flush=True)
+        prompt = None
+        idle_since = time.time()
     return return_code
 
 
@@ -2497,6 +2677,13 @@ def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | 
         worker = (data.get("workers") or {}).get(worker_id) or {}
         task = (data.get("tasks") or {}).get(worker.get("task_id") or "") or {}
         was_foreman = task.get("role") == "foreman"
+        if worker.get("execution_mode") == "turns":
+            # The session is on disk; only the runner died. Start it again.
+            if HerdrAdapter(coordinator).ensure_turns_runner(worker_id):
+                return (
+                    f"{_glyph_for(coordinator, project_id)} {project_id} healed: turns runner "
+                    f"for {worker_id} restarted; its session resumes where it stopped"
+                )
         coordinator.stop_worker(
             worker_id,
             reason=(
@@ -2862,6 +3049,7 @@ _INBOX_DELIVERY_WORDS = {
     "unconfirmed": "in its inbox; a pointer line was typed but nothing took it -- "
                    "it prints on the worker's next helm command",
     "unreachable": "in its inbox only; no session reachable",
+    "turned": "queued as the prompt of its next turn; the runner starts it",
 }
 
 
@@ -3406,6 +3594,13 @@ def main(argv: list[str] | None = None) -> int:
                         f"helm task cleanup {task['id']} --delete-branch"
                     )
                 _release_finished_space(coordinator, task)
+                with contextlib.suppress(HelmError, OSError):
+                    waiting = coordinator.waiting_learnings(task_id=task["id"])
+                    if waiting:
+                        print(
+                            f"  {len(waiting)} learning proposal(s) from this task await a decision: "
+                            f"helm learning triage --task {task['id']}"
+                        )
                 # A cleaned task's record can no longer change, so it leaves
                 # the live document here, where the commander already decided
                 # the task was finished.
@@ -3596,6 +3791,14 @@ def main(argv: list[str] | None = None) -> int:
                     released = adapter.close_project_space_if_finished(task["project_id"])
                 told_foreman = "foreman" in routed
                 print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
+                turns_worker = coordinator.store.load().get("workers", {}).get(args.worker_id) or {}
+                if args.wait is not None and turns_worker.get("execution_mode") == "turns":
+                    # A turn cannot be answered from inside itself: the answer
+                    # is the prompt that opens the next one. Waiting here would
+                    # hold the turn open for an answer that can only arrive
+                    # after it ends.
+                    print("  You run in turns: end this turn now; Helm's answer opens your next one.", flush=True)
+                    return 0
                 if args.wait is not None:
                     # The question returns its answer. Request and response
                     # inside the worker's own tool call: no pane, no
@@ -3775,7 +3978,63 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command in {"learning", "learn"}:
-            if args.learning_command == "propose":
+            if args.learning_command == "teach":
+                taught = coordinator.teach(
+                    args.fact, domain=args.domain, project_id=args.project_id, note=args.note
+                )
+                print(f"Taught {taught['id']} and applied it to {taught['applied_path']}")
+                print(f"  {taught['proposed_fact']}")
+            elif args.learning_command == "mine":
+                mined = coordinator.mine_learnings(days=args.days, dry_run=args.dry_run)
+                verb = "would propose" if mined["dry_run"] else "proposed"
+                print(f"Mined the last {mined['days']:g} day(s): {mined['clusters']} recurring point(s), {verb} {len(mined['proposed'])}")
+                for entry in mined["proposed"]:
+                    if mined["dry_run"]:
+                        print(f"  [{entry['source']}] {entry['domain_id']} ({', '.join(entry['tasks'])}): {entry['fact'][:160]}")
+                    else:
+                        print(f"  {entry['id']} {entry['domain_id']}: {entry['proposed_fact'][:160]}")
+                if not mined["dry_run"] and mined["proposed"]:
+                    print("  Decide them with: helm learning triage --approve <ids> --reject <ids>")
+            elif args.learning_command == "triage":
+                approve = [p for p in args.approve.split(",") if p.strip()]
+                reject = [p for p in args.reject.split(",") if p.strip()]
+                if approve or reject:
+                    decided = coordinator.triage_learnings(
+                        approve=approve, reject=reject, scope=args.scope, note=args.note
+                    )
+                    for proposal in decided["applied"]:
+                        print(f"applied  {proposal['id']} -> {proposal['applied_path']}")
+                    for proposal in decided["rejected"]:
+                        print(f"rejected {proposal['id']}")
+                    for failure in decided["failed"]:
+                        print(f"FAILED   {failure['proposal_id']}: {failure['reason']}")
+                    return 1 if decided["failed"] else 0
+                waiting = coordinator.waiting_learnings(task_id=args.task_id, project_id=args.project_id)
+                if not waiting:
+                    print("No learning proposals are waiting.")
+                    return 0
+                print(f"{len(waiting)} learning proposal(s) waiting:")
+                for proposal in waiting:
+                    age_days = max(0.0, (time.time() - _dt.datetime.fromisoformat(
+                        str(proposal.get("created_at", "")).replace("Z", "+00:00")
+                    ).timestamp()) / 86400) if proposal.get("created_at") else 0.0
+                    origin = proposal.get("origin") or "task"
+                    evidence = len(proposal.get("source_message_ids") or []) + len(proposal.get("source_artifact_ids") or [])
+                    conflict = " CONFLICTS" if proposal.get("conflicts") else ""
+                    print(
+                        f"  {proposal['id']} {age_days:4.0f}d {proposal['domain_id']:<20} [{origin}; "
+                        f"{evidence} evidence]{conflict}: {proposal['proposed_fact'][:140]}"
+                    )
+                print("Decide with: helm learning triage --approve a,b --reject c [--scope project] [--note '...']")
+            elif args.learning_command == "stats":
+                stats = coordinator.knowledge_stats()
+                print(
+                    f"{stats['proposals']} proposal(s): "
+                    + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_status"].items()))
+                    + f"; {stats['stale']} waiting more than {7} days"
+                )
+                print("  by origin: " + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_origin"].items())))
+            elif args.learning_command == "propose":
                 proposals = coordinator.generate_learning_proposals(
                     args.task_id,
                     domain=args.domain,
@@ -4191,6 +4450,18 @@ def main(argv: list[str] | None = None) -> int:
                     f"{glyph} {entry['project_id']} {entry['worker_id']} "
                     f"[{entry['verdict']}]: {entry['detail']}",
                 ))
+            # Knowledge that waits is knowledge nobody gets: a week unreviewed
+            # and the proposals join the list, as one line, oldest first.
+            with contextlib.suppress(HelmError, OSError):
+                stale = coordinator.stale_learnings()
+                if stale:
+                    oldest = stale[0]
+                    stamp = str(oldest.get("created_at") or "")
+                    line = (
+                        f"{len(stale)} learning proposal(s) waiting more than 7 days -- "
+                        "helm learning triage"
+                    )
+                    entries.append((stamp, f"{_when_label(stamp)} {line}", line))
             ordered = sorted(entries, key=lambda e: e[0], reverse=True)
             lines = [text for _at, text, _identity in ordered]
             if args.changes:

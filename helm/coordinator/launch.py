@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 from pathlib import Path
 from typing import Any, Sequence
@@ -33,6 +34,7 @@ from ..paths import (
 )
 from ..policy import CORE_SAFETY_RULES
 from ..values import (
+    RUNTIME_DEFAULT_MODEL,
     WORKTREELESS_ROLES,
     shape_policy,
     _TERMINAL_WORKER_TASK_STATES,
@@ -356,6 +358,7 @@ class LaunchMixin:
             # Helm when the process exits, so a long task must report through
             # this command as it goes.
             "reporting": self._reporting_contract(worker_id),
+            "execution": self._execution_contract(project, task),
         }
 
     #: How long a watch loop may go without calling in before Helm stops
@@ -428,6 +431,24 @@ class LaunchMixin:
 
     def worker_inbox_command(self, worker_id: str) -> list[str]:
         return self._worker_helm_command("inbox", worker_id)
+
+    def _execution_contract(self, project: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+        """How this worker's session runs, said plainly to the worker."""
+        mode = "turns" if self._execution_mode(project, "herdr") == "turns" else "session"
+        if mode != "turns":
+            return {"mode": "session"}
+        return {
+            "mode": "turns",
+            "rules": (
+                "You run in turns. Each turn is one run of your agent with one prompt; "
+                "it ends when you stop. Nothing is typed into your session between turns: "
+                "an answer to a question, review findings, a continuation or an authorization "
+                "arrives as the prompt that opens your next turn, with your full session "
+                "resumed. So: to ask, push a `question` (without --wait) and end your turn; "
+                "when a turn's work is done, push `status` (or `result` when the task is "
+                "done) and end your turn; never poll or sleep waiting for an answer."
+            ),
+        }
 
     def _reporting_contract(self, worker_id: str) -> dict[str, Any]:
         # A worker's environment is scrubbed and its cwd is the worktree, so
@@ -853,7 +874,53 @@ class LaunchMixin:
             self._worker_settings_file(worker_dir, worker_id, selected_agent["id"]),
         )
         _pretrust_workspace(task.get("agent_id"), workspace)
+        # Turn-based execution: the same agent, the same prompt, but run as
+        # non-interactive turns sharing one session, so nothing is ever typed
+        # into its pane. Decided per project, then per root; a runtime with no
+        # way to resume a session runs the interactive session as before.
+        mode = self._execution_mode(project, execution)
+        runtime_for_turns = runtimes.builtin_runtime(selected_agent["id"]) if mode == "turns" else None
+        turns_config: dict[str, Any] = {}
+        preset_session: str | None = None
+        if (
+            runtime_for_turns is not None
+            and runtime_for_turns.supports_turns()
+            and selected_agent.get("profile", {}).get("builtin") is True
+        ):
+            chosen_model = task.get("model") or self._resolve_model(project, task)[0]
+            if chosen_model == RUNTIME_DEFAULT_MODEL:
+                chosen_model = None
+
+            def _turn_argv(template: tuple[str, ...]) -> list[str]:
+                argv = list(template)
+                if chosen_model:
+                    argv = [argv[0], runtime_for_turns.model_flag, chosen_model, *argv[1:]]
+                argv = runtime_for_turns.with_effort(argv, task.get("effort"))
+                # No settings file: its SessionStart hook arms an inbox watch,
+                # which is the interactive session's way of being woken. A
+                # turn is woken by being started, so the hook has nothing to
+                # do and `--settings` is dropped with it.
+                return runtimes.apply_prompt(
+                    argv, runtimes.PROMPT_PLACEHOLDER, str(worker_dir), str(self.store.directory),
+                    str(project.get("git_common_dir") or ""), "",
+                    session=runtimes.SESSION_PLACEHOLDER,
+                )
+
+            if runtime_for_turns.session_style == runtimes.SESSION_PRESET:
+                preset_session = str(uuid.uuid4())
+            turns_config = {
+                "turns": True,
+                "turns_dir": str(worker_dir / "turns"),
+                "turn_start": _turn_argv(runtime_for_turns.turn_start),
+                "turn_resume": _turn_argv(runtime_for_turns.turn_resume) if runtime_for_turns.turn_resume else [],
+                "session_style": runtime_for_turns.session_style,
+                "session_id": preset_session,
+                "initial_prompt": self._worker_prompt(project, task, context_file),
+            }
+        elif mode == "turns":
+            mode = "session"
         runner_config = {
+            **turns_config,
             "command": command_args,
             "cwd": str(workspace),
             "project_root": project["root"],
@@ -915,6 +982,8 @@ class LaunchMixin:
             "agent_reason": selected_agent["reason"],
             "agent_profile": selected_agent.get("profile", {}).get("source"),
             "execution": execution,
+            "execution_mode": mode,
+            "agent_session_id": preset_session,
             "external": True,
             "status": "running",
             "pid": None,
@@ -941,6 +1010,17 @@ class LaunchMixin:
         data["workers"][worker_id] = worker
         task["status"] = "running"
         return worker, runner_command
+
+    def _execution_mode(self, project: dict[str, Any], execution: str) -> str:
+        """`turns` or `session`, most-specific-first: the project's own pin,
+        then the root's `execution.turns` preference. A custom external
+        command has no turn shape Helm knows, so it always runs as a session."""
+        if execution not in ("herdr", "process"):
+            return "session"
+        pinned = project.get("execution")
+        if pinned in ("turns", "session"):
+            return str(pinned)
+        return "turns" if self.preferences().execution_turns == "on" else "session"
 
     def _apply_launch_overrides(
         self,

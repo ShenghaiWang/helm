@@ -284,7 +284,9 @@ a worker agent the coordinator spawns for that task.
   `helm worker answer <worker-id> --text "..."`. The answer lands in the
   worker's inbox, which every `helm` command it runs prints first; the pane is
   only woken, never interrupted (`helm worker interrupt` is the deliberate
-  Escape). Answer in the worker's terms, decide rather than deferring, and let
+  Escape). Under `execution.turns` the answer is instead the prompt that
+  opens the worker's next turn of the same session, and nothing is typed at
+  all. Answer in the worker's terms, decide rather than deferring, and let
   it continue.
 - **A worker's confirmations are Helm's to answer, not the user's.** Workers are
   told to push every “should I proceed?”, “which approach?”, or “is this

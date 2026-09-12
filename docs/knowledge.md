@@ -133,6 +133,37 @@ instead of silently replacing knowledge. Applying appends an `Approved
 learning` block with its provenance to `knowledge.md` — only that file, never
 `guardrails.md` — and core safety rules always outrank learned material.
 
+## Helm learns from you, and from what recurs
+
+Task-born proposals are one source of knowledge. Two more matter as much:
+
+- **Your own rulings.** A rule you state is applied at once, in your words,
+  with you as its provenance — to every project of a domain or to one
+  project:
+
+  ```sh
+  helm learning teach "Run the full suite before reporting a result." --domain software-delivery
+  helm learning teach "Tests here need the dev database up." --project api --note "learned the hard way"
+  ```
+
+- **What recurs.** A review finding made on two different tasks, or an
+  answer the coordinator gave twice, is a rule nobody wrote down. `helm
+  learning mine [--days N]` clusters review findings and answers by their
+  content words across live and archived tasks, and proposes each recurring
+  point with the evidence messages attached; a single result's prose is not
+  mined. Run it weekly, or let the reflection prompt it.
+
+Nothing is applied without a decision, and the decision has a moment:
+`helm learning triage` lists what waits, one line each, and decides several
+in one command (`--approve a,b --reject c [--scope project]`); `helm task
+cleanup` names a task's waiting proposals; and `helm pending` counts
+proposals that have waited more than a week, so they are seen where
+everything else that needs you is seen. `helm learning stats` says how the
+loop is doing — proposed, applied, rejected, stale, by origin — and the
+ledger counts review findings that restate an applied fact as "knowledge
+not followed", which is the evidence that a learning was worth having and
+the brief that carried it was not read closely enough.
+
 ## Task-varying skills
 
 Domain knowledge is durable and shared. A great deal of what a worker needs is

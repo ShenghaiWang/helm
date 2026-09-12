@@ -173,6 +173,7 @@ class PreferenceSchemaTests(HelmTestCase):
                 "model.runtimes.<family>",
                 "review.agent",
                 "cleanup.after_merge",
+                "execution.turns",
                 "effort.default",
                 "effort.runtimes.<runtime>",
             },

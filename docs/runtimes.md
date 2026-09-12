@@ -145,6 +145,16 @@ correctness-critical code — auth, tokens, money, anything security-shaped —
 medium for ordinary feature work, low for mechanical rounds like rebases,
 evidence runs and doc edits. Say which level you chose and why.
 
+## Turns or a session
+
+`execution.turns` (`on`/`off`, default off) runs every worker this root
+starts as non-interactive turns that share one agent session, so nothing is
+typed into a pane; a project pins its own with `"execution": "turns"` or
+`"session"` in `.helm/project.json`, which outranks the preference either
+way. Claude Code, Codex and Cursor resume their sessions across turns; pi
+and opencode start a later turn fresh with a catch-up. See
+[worker-protocol.md](worker-protocol.md#turn-based-execution).
+
 ## Restricting a model family to certain runtimes
 
 Helm ships a **classifier**, not a policy. Given a model identifier it can

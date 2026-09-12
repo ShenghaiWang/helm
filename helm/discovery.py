@@ -127,6 +127,15 @@ def _discovery_settings(project_root: Path) -> dict[str, Any]:
     # resolves in the repository -- that check happens where the branch
     # is actually used, so a rename or a typo fails with the task it
     # would have affected, not silently at discovery time.
+    # A project may pin how its workers run: "turns" (non-interactive turns
+    # sharing one session; the pane displays, nothing types into it) or
+    # "session" (the interactive session). A pin is more specific than the
+    # root's execution.turns preference and outranks it either way.
+    if "execution" in settings:
+        mode = settings["execution"]
+        if mode not in ("turns", "session"):
+            raise HelmError(f'project settings execution must be "turns" or "session": {settings_file}')
+        result["execution"] = mode
     if "base_branch" in settings:
         result["base_branch"] = _validate_branch_name(
             settings["base_branch"], str(settings_file)

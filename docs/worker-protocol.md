@@ -104,6 +104,38 @@ job is to meet obstacles and escalate them, so the session stays live and an
 answer resumes it. A plain worker's blocker still ends its assignment, because
 a worker that cannot do the one thing it was made for needs a new task.
 
+## Turn-based execution
+
+Everything above still steers an agent by typing into its pane when it is
+idle, which is the fragile part: a paste that races its Enter, a dialog that
+takes the keystroke, a shell prompt that eats the launch line. A root can
+turn that channel off:
+
+```sh
+helm prefs set execution.turns on        # every worker this root starts
+# or, per project, in .helm/project.json: {"execution": "turns"}
+```
+
+In turns mode a worker is a sequence of **turns**: one non-interactive run
+of its agent per prompt, sharing one agent session (`claude --print
+--resume`, `codex exec resume`, `cursor-agent -p --resume`). The runner
+starts the first turn with the brief, streams the turn's output into the
+Herdr tab and the log, and closes it with one line Helm's poll reads: the
+session id and the agent's final words, recorded as a summary status. Then
+it waits. An answer, review findings, a continuation, a routed request, a
+gate decision or an authorization is the prompt that opens the next turn —
+`helm worker answer` reports `turned` — and nothing is ever typed. A worker
+is told this in its context: to ask, push a `question` and end the turn;
+when the work is done, push `result` and end.
+
+Liveness is a pid and an exit code. A runner the machine killed — sleep, an
+OOM — is started again by the next message or by the watchdog's healing,
+and resumes the same session where it stopped; the task does not fail.
+Stopping a worker ends the turn in progress. A runtime with no way to
+resume a session (pi, opencode) starts a later turn fresh with a catch-up
+of its earlier turns; a configured profile with its own command always runs
+the interactive session.
+
 ## Nobody watches the panes
 
 Delegation is only real if a human does not have to check each agent's UI, so

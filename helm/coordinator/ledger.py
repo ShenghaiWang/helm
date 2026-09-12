@@ -10,6 +10,7 @@ step in. This lays them out for a window, live and archived tasks alike.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import statistics
 import time
@@ -100,9 +101,16 @@ class LedgerMixin:
             round((first_result - created) / 60, 1) if created is not None and first_result is not None else None
         )
         kinds = [m.get("kind") for m in messages]
-        catches = sum(
-            1 for m in review_results if str(m.get("text") or "").lstrip().upper().startswith("CHANGES-REQUESTED")
-        )
+        catches = 0
+        not_followed = 0
+        for m in review_results:
+            text = str(m.get("text") or "")
+            if not text.lstrip().upper().startswith("CHANGES-REQUESTED"):
+                continue
+            catches += 1
+            with contextlib.suppress(Exception):
+                if self.learning_not_followed(text, task.get("domain")):
+                    not_followed += 1
         usage = {"turns": 0, "cost_usd": None, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
         try:
             total = self.task_usage(task["id"])["total"]
@@ -133,6 +141,7 @@ class LedgerMixin:
             # it said, and a reviewer can say more than one thing.
             "review_rounds": rounds,
             "review_catches": catches,
+            "learning_not_followed": not_followed,
             "questions": kinds.count("question"),
             "blockers": kinds.count("blocker"),
             "approvals": kinds.count("approval") + kinds.count("approval-needed"),
@@ -152,6 +161,7 @@ class LedgerMixin:
             "median_minutes_to_result": round(statistics.median(times), 1) if times else None,
             "review_rounds": sum(r["review_rounds"] for r in rows),
             "review_catches": sum(r["review_catches"] for r in rows),
+            "learning_not_followed": sum(r.get("learning_not_followed", 0) for r in rows),
             "questions": sum(r["questions"] for r in rows),
             "approvals": sum(r["approvals"] for r in rows),
             "output_tokens": sum(r["output_tokens"] for r in rows),

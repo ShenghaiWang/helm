@@ -83,6 +83,13 @@ KEY_EFFORT_DEFAULT = "effort.default"
 KEY_EFFORT_RUNTIMES = "effort.runtimes"
 KEY_REVIEW_AGENT = "review.agent"
 KEY_CLEANUP_AFTER_MERGE = "cleanup.after_merge"
+KEY_EXECUTION_TURNS = "execution.turns"
+
+#: What `execution.turns` understands. "on" runs every worker this root
+#: starts as a series of non-interactive turns that share one agent session
+#: -- the pane displays, and is never typed into. "off" keeps the interactive
+#: session Helm has always used.
+EXECUTION_TURNS_VALUES = ("on", "off")
 
 #: The whole vocabulary `model.free` understands. Deliberately enumerated:
 #: a narrow preference cannot be stretched into a standing order to downgrade
@@ -143,6 +150,12 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         "shed a merged task's worktree and branch immediately after a clean "
         "fast-forward merge (values: auto, ask); default ask keeps cleanup "
         "behind the commander's word",
+    ),
+    KEY_EXECUTION_TURNS: (
+        False,
+        "run workers as non-interactive turns that share one agent session, so "
+        "nothing is ever typed into a pane (values: on, off); default off keeps "
+        "the interactive session; a project pins its own with \"execution\"",
     ),
     KEY_MODEL_FREE: (
         False,
@@ -260,6 +273,7 @@ class Preferences:
     #: shipped default of no opinion. Never a model id and never an order.
     free_model: str | None = None
     cleanup_after_merge: str | None = None
+    execution_turns: str | None = None
 
     def constraint_for(self, model: str | None) -> tuple[str, frozenset[str]] | None:
         """The family restriction that applies to a model, if any is enabled.
@@ -299,6 +313,8 @@ class Preferences:
             model["free"] = self.free_model
         if self.cleanup_after_merge:
             document["cleanup"] = {"after_merge": self.cleanup_after_merge}
+        if self.execution_turns:
+            document["execution"] = {"turns": self.execution_turns}
         if model:
             document["model"] = model
         if self.review_agent:
@@ -337,6 +353,8 @@ class Preferences:
             rows.append((KEY_MODEL_FREE, self.free_model))
         if self.cleanup_after_merge:
             rows.append((KEY_CLEANUP_AFTER_MERGE, self.cleanup_after_merge))
+        if self.execution_turns:
+            rows.append((KEY_EXECUTION_TURNS, self.execution_turns))
         if self.review_agent:
             rows.append((KEY_REVIEW_AGENT, self.review_agent))
         if self.default_effort:
@@ -408,7 +426,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
             f"understands {', '.join(str(item) for item in SUPPORTED_VERSIONS)}"
         )
     _reject_unknown(
-        document, {"version", "agent", "model", "effort", "review", "cleanup"}, "", where
+        document, {"version", "agent", "model", "effort", "execution", "review", "cleanup"}, "", where
     )
 
     agent = _object(document.get("agent"), "agent", where)
@@ -454,6 +472,19 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
                 + f", not {value!r}"
             )
         cleanup_after_merge = value
+
+    execution = _object(document.get("execution"), "execution", where)
+    _reject_unknown(execution, {"turns"}, "execution", where)
+    execution_turns = None
+    if execution.get("turns") is not None:
+        value = execution["turns"]
+        if not isinstance(value, str) or value not in EXECUTION_TURNS_VALUES:
+            raise PreferencesError(
+                f"execution.turns{where} must be one of "
+                + ", ".join(repr(v) for v in EXECUTION_TURNS_VALUES)
+                + f", not {value!r}"
+            )
+        execution_turns = value
 
     model = _object(document.get("model"), "model", where)
     _reject_unknown(model, {"default", "runtimes", "free", "exclude"}, "model", where)
@@ -506,6 +537,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         model_runtimes=runtimes_by_family,
         free_model=free_model,
         cleanup_after_merge=cleanup_after_merge,
+        execution_turns=execution_turns,
         default_effort=default_effort,
         effort_runtimes=effort_runtimes,
     )
@@ -775,6 +807,12 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
             cleanup_section.pop("after_merge", None)
         else:
             cleanup_section["after_merge"] = listed[0]
+    elif key == KEY_EXECUTION_TURNS:
+        execution_section = document.setdefault("execution", {})
+        if listed is None:
+            execution_section.pop("turns", None)
+        else:
+            execution_section["turns"] = listed[0]
     elif key == KEY_REVIEW_AGENT:
         if listed is None:
             review_section.pop("agent", None)

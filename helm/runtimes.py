@@ -17,6 +17,7 @@ explicitly rather than by editing this file.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -45,6 +46,18 @@ GIT_COMMON_DIR_PLACEHOLDER = "{git_common_dir}"
 # A per-worker settings file for runtimes that take one; empty when the
 # launch wrote none, and the flag in front of it goes with it.
 WORKER_SETTINGS_PLACEHOLDER = "{worker_settings}"
+
+#: Slot for the agent session a turn resumes. Turn-based execution runs a
+#: worker as a series of non-interactive invocations that share one
+#: session, so the argv that starts the first turn and the argv that
+#: resumes a later one are recorded per runtime, like everything else here.
+SESSION_PLACEHOLDER = "{session}"
+
+#: How a runtime's session id becomes known: `preset` means Helm chooses it
+#: and passes it on the first turn (Claude Code takes --session-id), `reported`
+#: means the runtime prints it during the first turn and Helm reads it back.
+SESSION_PRESET = "preset"
+SESSION_REPORTED = "reported"
 
 
 #: How a runtime accepts an effort level. Not every one does, and the three
@@ -101,6 +114,16 @@ class AgentRuntime:
     #: runtimes that have one. Helm can send it into a live pane; a launch
     #: flag cannot help a session that is already going.
     effort_command: str = ""
+    #: Turn-based execution: argv for the first turn and for a resumed one,
+    #: both non-interactive with structured output. Empty means this runtime
+    #: has no way to resume a session, so a later turn starts fresh with a
+    #: catch-up brief instead.
+    turn_start: tuple[str, ...] = ()
+    turn_resume: tuple[str, ...] = ()
+    session_style: str = SESSION_REPORTED
+
+    def supports_turns(self) -> bool:
+        return bool(self.turn_start)
 
     def with_model(self, model: str | None, *, interactive: bool) -> list[str]:
         command = self.command(interactive=interactive)
@@ -207,6 +230,42 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
             "CLAUDE_CONFIG_DIR",
         ),
         detect_env=("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"),
+        # Turns: one --print invocation per turn, streaming JSON so the pane
+        # shows progress and Helm reads the final result; Helm chooses the
+        # session id up front and resumes it on every later turn.
+        turn_start=(
+            "claude",
+            "--add-dir",
+            WORKER_DIR_PLACEHOLDER,
+            "--settings",
+            WORKER_SETTINGS_PLACEHOLDER,
+            "--permission-mode",
+            "bypassPermissions",
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--session-id",
+            SESSION_PLACEHOLDER,
+            PROMPT_PLACEHOLDER,
+        ),
+        turn_resume=(
+            "claude",
+            "--add-dir",
+            WORKER_DIR_PLACEHOLDER,
+            "--settings",
+            WORKER_SETTINGS_PLACEHOLDER,
+            "--permission-mode",
+            "bypassPermissions",
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--resume",
+            SESSION_PLACEHOLDER,
+            PROMPT_PLACEHOLDER,
+        ),
+        session_style=SESSION_PRESET,
     ),
     AgentRuntime(
         id="codex",
@@ -271,6 +330,34 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
             "CODEX_HOME",
         ),
         detect_env=("CODEX_SANDBOX",),
+        # Turns: `codex exec --json` prints the thread id in its first events
+        # and `codex exec resume <id>` continues it.
+        turn_start=(
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "--add-dir",
+            STATE_DIR_PLACEHOLDER,
+            "--add-dir",
+            GIT_COMMON_DIR_PLACEHOLDER,
+            PROMPT_PLACEHOLDER,
+        ),
+        turn_resume=(
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "--add-dir",
+            STATE_DIR_PLACEHOLDER,
+            "--add-dir",
+            GIT_COMMON_DIR_PLACEHOLDER,
+            SESSION_PLACEHOLDER,
+            PROMPT_PLACEHOLDER,
+        ),
     ),
     AgentRuntime(
         id="pi",
@@ -347,6 +434,13 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
         # what `with_model` needs.
         interactive=("cursor-agent", "--force", PROMPT_PLACEHOLDER),
         noninteractive=("cursor-agent", "--force", "--print", PROMPT_PLACEHOLDER),
+        turn_start=(
+            "cursor-agent", "--force", "--print", "--output-format", "stream-json", PROMPT_PLACEHOLDER,
+        ),
+        turn_resume=(
+            "cursor-agent", "--force", "--print", "--output-format", "stream-json",
+            "--resume", SESSION_PLACEHOLDER, PROMPT_PLACEHOLDER,
+        ),
         # Auth is a login under HOME, which survives the worker scrub.
         # CURSOR_API_KEY is forwarded for roots that authenticate by
         # environment instead; CURSOR_API_ENDPOINT for a proxied install.
@@ -658,6 +752,7 @@ def apply_prompt(
     state_dir: str = "",
     git_common_dir: str = "",
     worker_settings: str = "",
+    session: str = "",
 ) -> list[str]:
     """Fill a launch command's placeholder slots.
 
@@ -673,6 +768,7 @@ def apply_prompt(
         STATE_DIR_PLACEHOLDER: state_dir,
         GIT_COMMON_DIR_PLACEHOLDER: git_common_dir,
         WORKER_SETTINGS_PLACEHOLDER: worker_settings,
+        SESSION_PLACEHOLDER: session,
     }
     out: list[str] = []
     for part in command:
@@ -685,7 +781,108 @@ def apply_prompt(
 
 
 #: Flags whose argument is a path placeholder: dropped with it when empty.
-_PATH_FLAGS = frozenset({"--add-dir", "--settings"})
+_PATH_FLAGS = frozenset({"--add-dir", "--settings", "--session-id", "--resume"})
+
+
+_SESSION_KEYS = ("session_id", "sessionId", "thread_id", "threadId", "chatId", "chat_id")
+
+
+def parse_turn_output(text: str) -> dict[str, Any]:
+    """What a turn's structured output says: the session id and the final message.
+
+    Runtimes stream one JSON object per line. Claude Code's `result` event
+    carries `session_id` and `result`; Codex's `thread.started` carries
+    `thread_id` and its last `agent_message` item the text; anything else is
+    read for the same keys. Lines that are not JSON are the agent's own
+    words, kept as the message when nothing structured said one.
+    """
+    session: str | None = None
+    final: str | None = None
+    prose: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            if line:
+                prose.append(line)
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            prose.append(line)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in _SESSION_KEYS:
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                session = value
+        kind = item.get("type")
+        if kind == "result" and isinstance(item.get("result"), str):
+            final = item["result"]
+        elif kind == "item.completed":
+            inner = item.get("item")
+            if isinstance(inner, dict) and inner.get("type") == "agent_message" and isinstance(inner.get("text"), str):
+                final = inner["text"]
+        elif kind == "assistant":
+            message = item.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                texts = [b.get("text") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                if texts:
+                    final = "\n".join(t for t in texts if isinstance(t, str))
+    if final is None and prose:
+        final = "\n".join(prose[-20:])
+    return {"session_id": session, "text": final or ""}
+
+
+def turn_display_line(raw: str) -> str | None:
+    """One readable line for the pane from one streamed JSON event, or None."""
+    line = raw.strip()
+    if not line.startswith("{"):
+        return raw.rstrip("\n") or None
+    try:
+        item = json.loads(line)
+    except ValueError:
+        return raw.rstrip("\n")
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type")
+    if kind == "assistant":
+        message = item.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"].strip())
+                elif block.get("type") == "tool_use":
+                    name = block.get("name") or "tool"
+                    hint = ""
+                    inputs = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    for key in ("command", "file_path", "pattern", "description"):
+                        if isinstance(inputs.get(key), str):
+                            hint = inputs[key][:100]
+                            break
+                    parts.append(f"▶ {name}{': ' + hint if hint else ''}")
+            return "\n".join(p for p in parts if p) or None
+        return None
+    if kind == "result":
+        cost = item.get("total_cost_usd")
+        turns = item.get("num_turns")
+        return (
+            "■ turn finished"
+            + (f", {turns} model turns" if isinstance(turns, int) else "")
+            + (f", ${cost:.2f}" if isinstance(cost, (int, float)) else "")
+        )
+    if kind == "item.completed":
+        inner = item.get("item")
+        if isinstance(inner, dict) and inner.get("type") == "agent_message" and isinstance(inner.get("text"), str):
+            return inner["text"].strip() or None
+        if isinstance(inner, dict) and inner.get("type") == "command_execution":
+            return f"▶ {str(inner.get('command') or '')[:100]}"
+    return None
 
 
 def wants_prompt(command: Sequence[str]) -> bool:

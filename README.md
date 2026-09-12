@@ -89,10 +89,13 @@ product that is a web app, a marketing site and a mobile app shares one
 domain rather than three drifting copies of the same instructions — the
 thing a single-agent setup cannot do, because there the knowledge sits in
 one repository's own instruction file and the next project starts blind. It
-grows as the work does: a finished task is evidence, Helm proposes a
-learning from it, and once a human approves it the fact is appended to the
-domain and attaches to every later task in any project that resolves it. A
-repository's own skills attach the same way. Nothing may approve its own
+grows as the work does, and it learns from you: a rule you state (`helm
+learning teach`) is applied at once with you as its provenance; a review
+finding or an answer that recurs across tasks is mined into a proposal with
+its evidence; a finished task's result is proposed too. Once a human decides
+— `helm learning triage`, one command for several — the fact is appended to
+the domain and attaches to every later task in any project that resolves it.
+A repository's own skills attach the same way. Nothing may approve its own
 knowledge.
 
 **Nobody has to watch the panes.** Every agent runs in a real terminal you
@@ -284,6 +287,7 @@ helm prefs show                        # effective values, env overrides, legacy
 helm prefs set agent.default claude
 helm prefs set agent.exclude codex omp
 helm prefs set effort.default medium
+helm prefs set execution.turns on        # workers run as resumed non-interactive turns; nothing is typed into a pane
 ```
 
 Every key is enumerated and every value validated, so the file cannot hold a
@@ -405,6 +409,7 @@ helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N]
 helm worker launch|round|poll|wait|message|report|answer|inbox|interrupt|action-start|reconcile|stop
 helm approval grant ACTION [--project P] [--note N] [--stale-days D] · list|check|revoke|release|repair
 helm authority init|status
+helm learning teach FACT (--domain D | --project P) [--note N] · mine [--days N] [--dry-run] · triage [--approve IDS] [--reject IDS] [--scope S] · stats
 helm learning propose|list|inspect|edit|approve|reject|apply
 helm project add|list|status|note|action|domain|release|remove
 helm state stats|archive [--dry-run] [--reconcile] [TASK_ID ...]

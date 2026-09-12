@@ -142,6 +142,7 @@ from .coordinator.archive import ArchiveMixin
 from .coordinator.pull_requests import PullRequestsMixin
 from .coordinator.ledger import LedgerMixin
 from .coordinator.adopt import AdoptMixin
+from .coordinator.knowledge import KnowledgeMixin
 from .coordinator.caller import CallerMixin
 from .coordinator.decisions import DecisionsMixin
 from .coordinator.lifecycle import LifecycleMixin
@@ -162,6 +163,7 @@ class Coordinator(
     PullRequestsMixin,
     LedgerMixin,
     AdoptMixin,
+    KnowledgeMixin,
     ProtectionMixin,
     LifecycleMixin,
     AgentsMixin,
@@ -786,6 +788,43 @@ class Coordinator(
             return message if when.timestamp() >= cutoff else None
         return None
 
+    def _record_turn(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        item: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """A turns runner closed one turn: keep the session and the last words.
+
+        The session id is what a later turn resumes, so it goes on the worker
+        record the moment it is known. The agent's final message of the turn
+        is recorded as a summary status when it pushed no report itself
+        during the turn, so a turn that ended with "I need X decided" in
+        prose still reaches the foreman and the commander.
+        """
+        session = item.get("session_id")
+        if isinstance(session, str) and session:
+            worker["agent_session_id"] = session
+        turn = item.get("turn")
+        turns = worker.setdefault("turns", [])
+        if isinstance(turn, int) and turn not in [t.get("turn") for t in turns if isinstance(t, dict)]:
+            turns.append({"turn": turn, "exit": item.get("exit"), "at": now()})
+        worker["turns"] = turns[-50:]
+        text = _safe_text(item.get("text") or "").strip()
+        if not text:
+            return None
+        # Same intake as a pushed status line, so the record, the routing to
+        # the project's pane and the foreman's wake all happen as they would
+        # for a report the agent had made itself.
+        return self._ingest_worker_event(
+            data, worker, "status",
+            f"turn {turn} ended: {text[:1500]}",
+            {"summary": True, "turn": turn, "exit": item.get("exit")},
+            None,
+        )
+
     def record_worker_message(
         self,
         worker_id: str,
@@ -879,6 +918,8 @@ class Coordinator(
         if not isinstance(item, dict) or item.get("helm") != 1:
             return None
         kind = item.get("type")
+        if kind == "turn":
+            return self._record_turn(data, project, task, worker, item)
         if kind not in self.WORKER_MESSAGE_KINDS or kind == "answer":
             return None
         text = _safe_text(item.get("text", item.get("message", "")))

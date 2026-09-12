@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..paths import _write_private_text
+from ..paths import _write_private_text, _private_dir
 from ..processes import _scan_worker_pid
 from ..values import _safe_text, new_id, now
 from .. import costs
@@ -89,6 +89,46 @@ class WorkersMixin:
 
     def _inbox_dir(self, worker_id: str) -> Path:
         return self.store.directory / "workers" / worker_id / self.INBOX_DIRNAME
+
+    def turns_dir(self, worker_id: str) -> Path:
+        return self.store.directory / "workers" / worker_id / "turns"
+
+    def deliver_turn(self, worker_id: str, text: str, *, kind: str = "note") -> Path:
+        """Queue the next turn's prompt for a turns worker. The runner picks it up.
+
+        The inbox note is left too, so the record of what was said is the
+        same whichever way the worker runs; the queue is what starts the
+        turn. Several messages arriving between turns are delivered
+        together, in order, as one prompt.
+        """
+        directory = self.turns_dir(worker_id)
+        _private_dir(directory.parent)
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = directory / "next.json"
+        queued: list[dict[str, Any]] = []
+        with contextlib.suppress(OSError, ValueError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                queued = loaded
+        queued.append({"text": _safe_text(text), "kind": kind, "at": now()})
+        _write_private_text(path, json.dumps(queued) + "\n")
+        return path
+
+    def stop_turns(self, worker_id: str) -> None:
+        """Tell a turns runner to exit once its current turn ends."""
+        directory = self.turns_dir(worker_id)
+        with contextlib.suppress(OSError):
+            directory.mkdir(parents=True, exist_ok=True)
+            _write_private_text(directory / "stop", now() + "\n")
+
+    def turn_state(self, worker_id: str) -> dict[str, Any]:
+        path = self.turns_dir(worker_id) / "state.json"
+        with contextlib.suppress(OSError, ValueError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        return {}
 
     def leave_inbox_note(
         self, worker_id: str, text: str, *, note_id: str | None = None
@@ -395,6 +435,8 @@ class WorkersMixin:
             worker["signalled"] = signalled
             return worker
         detail = _safe_text(reason).strip() or "stopped by the coordinator"
+        if worker.get("execution_mode") == "turns":
+            self.stop_turns(worker_id)
         # A provider-launched worker never had its pid recorded, so this used
         # to signal nothing and "stopped" meant only that the record changed --
         # the agent kept running, invisible, and had to be killed by hand. Look

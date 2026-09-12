@@ -283,7 +283,7 @@ class LifecycleMixin:
                 wanted: dict[str, Any] = {}
                 for key in (
                     "delivery_policy", "color", "domains", "agent",
-                    "model", "foreman", "review", "base_branch",
+                    "model", "foreman", "review", "base_branch", "execution",
                 ):
                     if key in settings:
                         wanted[key] = settings[key]
