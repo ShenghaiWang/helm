@@ -54,3 +54,26 @@ class LedgerTests(HelmTestCase):
         self.assertIn(f"| {first['id']} | ledgered | T-1 | small |", text)
         self.assertIn("totals:", text)
         self.assertEqual(json.loads(text[text.index("{"):])["totals"]["tasks"], 2)
+
+    def test_a_merged_task_reads_as_delivered_even_from_a_record_that_never_advanced(self) -> None:
+        root = self.repo("delivered")
+        project = self.coordinator.register_project("Delivered", str(root), project_id="delivered")
+        task = self.coordinator.create_task(project["id"], "ship it")
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('shipped.txt').write_text('w'); subprocess.run(['git','add','shipped.txt'],check=True); "
+            "subprocess.run(['git','commit','-qm','w'],check=True)"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        self.coordinator.approve_task(task["id"], "reviewed")
+        merged = self.coordinator.merge_task(task["id"])
+        self.assertEqual(merged["delivery"]["state"], "merged")
+        report = self.coordinator.ledger(days=1, project_id="delivered")
+        self.assertEqual(report["rows"][0]["delivery"], "merged")
+        self.assertEqual(report["totals"]["delivered"], 1)
+        # A record from before the merge path advanced its delivery state.
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["delivery"]["state"] = "worktree"
+        report = self.coordinator.ledger(days=1, project_id="delivered")
+        self.assertEqual(report["rows"][0]["delivery"], "merged")
+        self.assertEqual(report["totals"]["delivered"], 1)

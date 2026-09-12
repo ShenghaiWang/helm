@@ -1439,6 +1439,13 @@ class ProtectionMixin:
             _git(root, "merge", "--ff-only", task["branch"])
             task["status"] = "merged"
             task["merged_at"] = now()
+            # The delivery record is what the ledger and the outcome read;
+            # left at "worktree" it reported a merged task as undelivered.
+            delivery = task.setdefault(
+                "delivery", {"policy": task.get("delivery_policy"), "state": "worktree", "events": []}
+            )
+            delivery["state"] = "merged"
+            delivery.setdefault("events", []).append({"at": task["merged_at"], "event": "merged"})
             self._message(data, project, task, None, "merged", "Approved local fast-forward merge completed", {})
             self.resolve_delivery_decisions(
                 project["id"], reason="merged", data=data

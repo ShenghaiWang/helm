@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 from .. import archive, costs
+from ..values import DELIVERED_TASK_STATES
 
 
 def _epoch(stamp: Any) -> float | None:
@@ -71,7 +72,10 @@ class LedgerMixin:
                 record["task"], record.get("messages", []), review_results,
                 rounds=len(reviewer_ids), archived=True,
             ))
-        rows.sort(key=lambda row: row["created_at"] or "")
+        # Creation time first; on a tie an archived row precedes a live one,
+        # because a task that has been cleaned up and archived is the older
+        # of the two, and the id last so the order is the same on every read.
+        rows.sort(key=lambda row: (row["created_at"] or "", 0 if row.get("archived") else 1, row["task_id"]))
         return {"days": days, "project_id": project_id, "rows": rows, "totals": self._ledger_totals(rows)}
 
     @staticmethod
@@ -141,7 +145,14 @@ class LedgerMixin:
             "effort": task.get("effort"),
             "created_at": task.get("created_at"),
             "status": task.get("status"),
-            "delivery": delivery.get("state") or task.get("status"),
+            # A task's status is the authority once it is delivered: a record
+            # written before the merge path advanced its delivery state still
+            # says "worktree", and that must never outrank "merged".
+            "delivery": (
+                task.get("status")
+                if task.get("status") in DELIVERED_TASK_STATES
+                else delivery.get("state") or task.get("status")
+            ),
             "minutes_to_result": minutes_to_result,
             "rounds": len(task.get("rounds") or []) + 1,
             # One reviewer task is one round; its result messages are what
