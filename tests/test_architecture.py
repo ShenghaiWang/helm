@@ -29,6 +29,7 @@ LAYERED = (
     "discovery.py",
     "launching.py",
     "policy.py",
+    "learned.py",
     "coordinator/base.py",
     "coordinator/archive.py",
     "coordinator/pull_requests.py",

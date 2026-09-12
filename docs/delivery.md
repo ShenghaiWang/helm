@@ -56,6 +56,13 @@ failure decision at all: neither owns a worktree, so none of retry, continue
 or cleanup applies — the review loop re-runs a failed round, and the next
 command that starts work appoints a driver.
 
+A free-text follow-up on live work is still never closed by Helm. What
+`helm state tidy` does with one older than a fortnight is show it to the
+commander, with its id and age, so it is looked at rather than forgotten;
+`helm project resolve <project> <item> --note "..."` closes it on their word.
+That command is root-only, like the approvals: an agent that could close a
+decision would have decided it.
+
 ## Local delivery
 
 For local delivery the final state is `merged`. An approved operator uses

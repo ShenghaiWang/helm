@@ -95,3 +95,20 @@ task, and is confirmed before it is built, not shown afterwards.
 
 The test is not how many lines it touches. It is whether anyone other than you
 would have to change how they work. If yes, ask first.
+
+### Check a design against every member, not the common case
+
+When a design proposes a generic helper over a set of members, enumerate the
+member types mechanically before shipping it. The cheap parse of every
+declaration is what turns "a reviewer found one exception" into "there is
+exactly one", and a helper validated against the common case compiles for the
+ninety-five and fails at the ninety-sixth.
+
+### A lazily initialised global captures its scope
+
+Before recommending a lazily initialised global in place of an explicitly
+seeded one, ask what the initialiser **captures**, not only what it computes.
+A dependency or store resolved during construction is frozen for the object's
+life, so moving construction to first access silently moves that binding to
+whatever scope happens to touch it first — a test host, a background task, a
+preview — and the difference is invisible until it is not.

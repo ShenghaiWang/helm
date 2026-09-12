@@ -21,10 +21,25 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
+import datetime as _dt
+
 from ..errors import HelmError
-from ..values import now
+from ..values import FOLLOW_UP_ACTION_KIND, now
 
 ARCHIVED_REASON = "task archived"
+#: A free-text follow-up older than this is listed for the commander's eye.
+#: Never closed by Helm: only a human knows whether a caveat was dealt with.
+STALE_FOLLOW_UP_DAYS = 14
+
+
+def _age_days(stamp: Any) -> int | None:
+    try:
+        recorded = _dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if recorded.tzinfo is None:
+        recorded = recorded.replace(tzinfo=_dt.timezone.utc)
+    return max(0, (_dt.datetime.now(_dt.timezone.utc) - recorded).days)
 
 
 class TidyMixin:
@@ -42,6 +57,7 @@ class TidyMixin:
             raise HelmError(f"unknown project: {project_id}")
         projects = [project_id] if project_id else sorted(data.get("projects", {}))
         resolved: list[dict[str, Any]] = []
+        for_your_eye: list[dict[str, Any]] = []
         kept = 0
         for pid in projects:
             if not dry_run:
@@ -60,6 +76,19 @@ class TidyMixin:
                 task_id = item.get("task_id")
                 if not task_id or task_id in live_tasks:
                     kept += 1
+                    age = _age_days(item.get("at"))
+                    if (
+                        item.get("kind", FOLLOW_UP_ACTION_KIND) == FOLLOW_UP_ACTION_KIND
+                        and age is not None
+                        and age >= STALE_FOLLOW_UP_DAYS
+                    ):
+                        for_your_eye.append({
+                            "project_id": pid,
+                            "id": item.get("id"),
+                            "task_id": task_id,
+                            "age_days": age,
+                            "text": str(item.get("text") or "")[:110],
+                        })
                     continue
                 resolved.append({
                     "project_id": pid,
@@ -84,4 +113,5 @@ class TidyMixin:
                             item["status"] = "resolved"
                             item["resolved_at"] = now()
                             item["resolved_reason"] = ARCHIVED_REASON
-        return {"resolved": resolved, "kept": kept, "dry_run": dry_run}
+        for_your_eye.sort(key=lambda entry: -entry["age_days"])
+        return {"resolved": resolved, "kept": kept, "for_your_eye": for_your_eye, "dry_run": dry_run}

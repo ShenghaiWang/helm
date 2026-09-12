@@ -101,10 +101,6 @@ have it, so a foreman reads this before calling `helm task create` /
   from that immutable commit -- a branch name is a moving pointer; the SHA is
   what makes the worktree reproducible.
 
-## Approved learning: fresh configured base
-- Fact: Before a new worktree-backed task is created, resolve the project's *configured* default/base branch (never a hardcoded or inferred name; a repository default is only inferred once, at registration, and only falls back to the checked-out branch when the project has no remote at all -- a remote with an ambiguous or undiscoverable default is reported, never guessed past). When that branch has an upstream -- configured, or the one unambiguous same-named branch on a remote when none was configured -- fetch it and verify the fetch *succeeded*, resolving the fetched value from a location nothing else can overwrite rather than a shared one; a successful fetch that moves nothing is still a fresh, verified base, and only a failed fetch (unreachable remote, non-zero exit) blocks. After a successful fetch, a local branch that is ahead of or diverged from its upstream also blocks, so unmerged local commits are never mixed into a task baseline; equal-or-behind uses the fetched upstream tip. Never switch, reset, rebase, merge, or force-update the project's own checkout to get there -- resolve refs directly, and block on an uncommitted change to a tracked file or an unresolved merge/rebase/cherry-pick there too (an untracked file does not block). A genuinely local-only project (no remote at all) uses its local tip and records explicitly that no remote exists. Record the exact verified base commit SHA, whether a fetch actually ran, and against what upstream, then cut the task branch/worktree from that immutable commit -- never from the project's current HEAD, which can move between a task's creation and its allocation.
-- Rationale: A hardcoded or inferred branch name breaks on any project not named `main`; falling back to the checkout once a remote exists silently blesses whatever feature branch happens to be checked out as the project's base; treating "the fetch didn't change anything" as failure would block on the single most common outcome of asking a remote for its current state; and silently repairing a dirty, ahead, or diverged checkout risks discarding or misattributing work nobody asked to touch. Pinning to a verified commit, resolved before allocation and immune to the project's checkout moving afterward, is what makes a task worktree provably isolated and reproducible instead of merely convenient.
-
 ## Catching up to a moved base: merge it in, do not rebase by default
 
 Helm's local delivery lands a task with `git merge --ff-only` (see
@@ -139,3 +135,32 @@ a clean rebase both produce a tree no suite has run against, so the suite runs
 at the new tip regardless. Neither approach saves that, and it is where the
 wall-clock actually goes — so do not choose between them on speed grounds
 alone.
+
+## Cut every task from a verified base
+
+Before a worktree-backed task is created, resolve the project's *configured*
+default branch — never a hardcoded or inferred name. A repository default is
+inferred once, at registration, and falls back to the checked-out branch only
+when the project has no remote at all; a remote whose default is ambiguous or
+undiscoverable is reported, never guessed past.
+
+When that branch has an upstream — configured, or the one unambiguous branch
+of the same name on a remote when none was configured — fetch it and verify
+the fetch **succeeded**, reading the fetched value from a location nothing
+else can overwrite rather than a shared one. A successful fetch that moves
+nothing is still a fresh, verified base; only a failed fetch (unreachable
+remote, non-zero exit) blocks. After a successful fetch, a local branch that
+is ahead of or diverged from its upstream also blocks, so unmerged local
+commits are never mixed into a task baseline; equal-or-behind uses the fetched
+upstream tip.
+
+Never switch, reset, rebase, merge, or force-update the project's own checkout
+to get there: resolve refs directly, and block on an uncommitted change to a
+tracked file or an unresolved merge, rebase or cherry-pick in that checkout
+(an untracked file does not block). A genuinely local-only project uses its
+local tip and records explicitly that no remote exists.
+
+Record the exact verified base commit, whether a fetch actually ran, and
+against which upstream; then cut the task branch and worktree from that
+immutable commit — never from the project's current HEAD, which can move
+between a task's creation and its allocation.

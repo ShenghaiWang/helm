@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import io
+import os
 import sys
+from unittest import mock
 
 from helm import cli
-from helm.coordinator.tidy import ARCHIVED_REASON
-from helm.errors import HelmError
+from helm.coordinator.tidy import ARCHIVED_REASON, STALE_FOLLOW_UP_DAYS
+from helm.errors import HelmError, SafetyError
 from helm.values import FAILURE_ACTION_KIND, FOLLOW_UP_ACTION_KIND
 from tests.support import HelmTestCase
 
@@ -122,3 +125,51 @@ class TidyDecisionsTests(HelmTestCase):
         self.assertEqual(code, 0)
         self.assertIn("closed 1 decision(s); 0 still open", out.getvalue())
         self.assertEqual(self._open_items(project["id"]), [])
+
+    def test_a_stale_follow_up_is_shown_to_the_commander_and_closed_on_their_word(self) -> None:
+        """Helm never decides a caveat was dealt with; it makes sure somebody looks."""
+        root = self.repo("stale")
+        project = self.coordinator.register_project("Stale", str(root), project_id="stale")
+        task = self._finished_task(project, "done")
+        fresh = self.coordinator.record_project_action_item(project["id"], "a fresh caveat", task_id=task["id"])
+        old = self.coordinator.record_project_action_item(project["id"], "an old caveat nobody looked at")
+        long_ago = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=STALE_FOLLOW_UP_DAYS + 5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.coordinator._status_transaction(project["id"]) as status:
+            for item in status["action_items"]:
+                if item["id"] == old["id"]:
+                    item["at"] = long_ago
+
+        tidied = self.coordinator.tidy_decisions(project["id"])
+        self.assertEqual(tidied["resolved"], [])
+        self.assertEqual([e["id"] for e in tidied["for_your_eye"]], [old["id"]])
+        self.assertGreaterEqual(tidied["for_your_eye"][0]["age_days"], STALE_FOLLOW_UP_DAYS)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["--state-dir", str(self.state.directory), "state", "tidy"]), 0)
+        self.assertIn("For your eye, commander: 1 follow-up(s)", out.getvalue())
+        self.assertIn(old["id"], out.getvalue())
+        self.assertNotIn(fresh["id"], out.getvalue())
+
+        # An agent cannot close it; the commander can, once.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": "w-someworker"}):
+            with self.assertRaises(SafetyError):
+                self.coordinator.resolve_action_item(project["id"], old["id"], note="not mine to close")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--state-dir", str(self.state.directory), "project", "resolve", project["id"], old["id"],
+                "--note", "looked, nothing left to do",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn(f"Closed {old['id']}", out.getvalue())
+        closed = next(
+            i for i in self.coordinator._load_status(project["id"])["action_items"] if i["id"] == old["id"]
+        )
+        self.assertEqual(closed["status"], "resolved")
+        self.assertEqual(closed["resolved_reason"], "looked, nothing left to do")
+        self.assertEqual(closed["resolved_by"], "commander")
+        with self.assertRaisesRegex(HelmError, "already resolved"):
+            self.coordinator.resolve_action_item(project["id"], old["id"])
+        with self.assertRaisesRegex(HelmError, "unknown action item"):
+            self.coordinator.resolve_action_item(project["id"], "i-000000000000")
+        self.assertEqual(self.coordinator.tidy_decisions(project["id"])["for_your_eye"], [])

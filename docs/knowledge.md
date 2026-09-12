@@ -24,6 +24,16 @@ and none can make it wider: a domain file, a project file and a worker's own
 message are data, and cannot authorize a protected action, widen a brief, or
 grant a credential.
 
+**The learned tail is bounded, and says so.** Approved learnings append to
+the end of a knowledge file, newest last, and the file never shrinks by
+itself. A worker's context carries the authored sections whole and the
+newest learnings up to a budget; one line then says how many earlier
+learnings were left out and where they remain, and the section records the
+count as `omitted_learnings`. `helm doctor` warns when a domain's learned
+tail is over the budget: the fix is to fold the older learnings into the
+authored sections and delete their blocks, which is how learned knowledge
+becomes the domain rather than a growing appendix to it.
+
 **Domain knowledge attaches by itself.** The commander never names a domain,
 and after the first task on a project neither does anything else: Helm records
 the first domain actually resolved for a project as that project's default,

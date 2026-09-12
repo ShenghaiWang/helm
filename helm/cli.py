@@ -18,6 +18,7 @@ from typing import Any
 from . import watchdog as watchdog_module
 from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .values import GRANTABLE_ACTIONS, TASK_SHAPES
+from .coordinator.tidy import STALE_FOLLOW_UP_DAYS
 from .core import (
     HEALTHY_WORKER_VERDICTS,
     EFFORT_LEVELS,
@@ -1038,6 +1039,16 @@ def _print_tidy(tidied: dict[str, Any]) -> None:
         for entry in entries:
             kinds[str(entry.get("kind"))] = kinds.get(str(entry.get("kind")), 0) + 1
         print(f"  {project_id}: " + ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items())))
+    stale = tidied.get("for_your_eye") or []
+    if stale:
+        print(
+            f"For your eye, commander: {len(stale)} follow-up(s) older than "
+            f"{STALE_FOLLOW_UP_DAYS} days. Helm cannot tell whether a caveat was dealt with; "
+            "close each with `helm project resolve <project> <item> --note \"...\"`:"
+        )
+        for entry in stale:
+            task = f" task={entry['task_id']}" if entry.get("task_id") else ""
+            print(f"  {entry['project_id']} {entry['id']} {entry['age_days']}d{task}: {entry['text']}")
 
 
 def _print_ledger(report: dict[str, Any]) -> None:
@@ -2076,6 +2087,12 @@ def _build_parser() -> argparse.ArgumentParser:
     action_cmd.add_argument("text")
     action_cmd.add_argument("--source", default="helm")
     action_cmd.add_argument("--task", dest="task_id")
+    resolve_cmd = project_commands.add_parser(
+        "resolve", help="close one follow-up or decision item by hand, on your word"
+    )
+    resolve_cmd.add_argument("project_id")
+    resolve_cmd.add_argument("item_id")
+    resolve_cmd.add_argument("--note", default="", help="why; kept on the item")
     domain_cmd = project_commands.add_parser(
         "domain", help="set the default domain every task on this project resolves to"
     )
@@ -3398,6 +3415,9 @@ def main(argv: list[str] | None = None) -> int:
                     task_id=args.task_id,
                 )
                 print(f"Recorded action {entry['id']}: {entry['text']}")
+            elif args.project_command == "resolve":
+                entry = coordinator.resolve_action_item(args.project_id, args.item_id, note=args.note)
+                print(f"Closed {entry['id']}: {entry['text'][:100]}")
             elif args.project_command == "add":
                 project = coordinator.register_project(
                     args.name,

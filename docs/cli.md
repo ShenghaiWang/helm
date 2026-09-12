@@ -119,7 +119,8 @@ helm task cost <task-id>      # what a task's sessions consumed, from the runtim
 helm ledger [--days N] [--project P] [--json]   # every worker task in the window: time to result, review rounds and catches, asks, tokens, cost
 helm state stats              # size of the live state document, counts, what could be archived
 helm state archive [--dry-run] [--reconcile] [TASK_ID ...]   # move settled records into state/archive/
-helm state tidy [--project P] [--dry-run]   # close the decisions and follow-ups nothing can act on any more
+helm state tidy [--project P] [--dry-run]   # close the decisions and follow-ups nothing can act on; list stale follow-ups for your eye
+helm project resolve <project-id> <item-id> [--note "..."]   # close one follow-up or decision by hand, on your word
 ```
 
 `helm pending --changes` in a twenty-second loop is what an agent harness

@@ -128,6 +128,33 @@ class DecisionsMixin:
                     closed.append(dict(item))
         return closed
 
+    def resolve_action_item(
+        self, project_id: str, item_id: str, *, note: str = ""
+    ) -> dict[str, Any]:
+        """Close one commander-visible item by hand, on the commander's word.
+
+        Helm closes the gates it raised for itself when their task moves on;
+        a free-text follow-up is somebody's judgement about later, and only a
+        human knows whether it was dealt with. So this is root-only, like the
+        approvals: an agent that could close a decision has decided it.
+        """
+        self.authority("closing a follow-up")
+        marker = _safe_text(item_id).strip()
+        if not marker:
+            raise HelmError("an action item id is required")
+        with self._status_transaction(project_id) as status:
+            for item in status["action_items"]:
+                if item.get("id") != marker:
+                    continue
+                if item.get("status", "open") != "open":
+                    raise HelmError(f"{marker} is already {item.get('status')}")
+                item["status"] = "resolved"
+                item["resolved_at"] = now()
+                item["resolved_by"] = "commander"
+                item["resolved_reason"] = _safe_text(note).strip()[:120] or "closed by the commander"
+                return dict(item)
+        raise HelmError(f"unknown action item {marker} on {project_id}")
+
     def record_commander_ask(
         self,
         reason: str,

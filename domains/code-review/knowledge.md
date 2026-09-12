@@ -63,6 +63,20 @@ the diff and check both directions: does the change do what the spec says,
 and does the spec still describe what the change does. A spec that is wrong
 is a finding like any other, reported rather than quietly worked around.
 
+**When the reviewer cannot check out the branch**, it reads at the ref —
+the diff from the base to the branch tip, and each file at the branch's own
+revision — and states that provenance in the verdict. A reviewer whose
+worktree sits on another commit and reads files from disk reviews different
+bytes than it reports on, and nobody can tell from the verdict.
+
+**A change with nothing to compile is reviewed against the code it
+describes.** A design document, a plan or a README produces no artefact, so
+do not require a build and do not record "nothing was compiled" as a caveat:
+there was nothing to compile, and the caveat implies a gap that does not
+exist. Verify such a change by reading every claim it makes about the code
+against the code as it stands, and name the base commit the claims were
+checked against.
+
 ## Full-suite evidence belongs to the author, once
 
 The author runs the full unit suite once it believes the change is done, at
@@ -106,9 +120,31 @@ until someone acts on it.
 
 A finding is worth reporting only if it is specific enough to act on: what is
 wrong, where, and what would go wrong because of it.
-## Approved learning: document-only review
-- Fact: When the change under review produces no compilable artifact — a design document, a plan, a README — do not require a build, and do not record 'nothing was compiled' as a caveat on the verdict. There was nothing to compile, so the caveat implies a gap that does not exist. Verify such a change by reading every claim it makes about the code against the code as it stands, and state the base commit those claims were checked against.
-- Rationale: For document-only changes, the relevant verification is whether the document's claims match the repository. A build caveat adds noise when no buildable artifact exists.
+
+**A deliberate forward seam must be loud.** When a diff ships a placeholder a
+later round replaces, check that it has its own error type, its own test, and
+a comment saying it is temporary and which round deletes it. A quiet
+placeholder is a finding, because to every reader after the author it is
+indistinguishable from a wrong contract.
+
+**Comments explain purpose, and the ticket lives in the branch name.** The
+single test for a comment is whether the purpose of the code is unclear from
+the code itself — a non-obvious constraint, an external contract, a deliberate
+deviation — and then one short sentence. Do not narrate what a line does,
+restate the diff, argue the change is correct, or leave review-round
+commentary in the source. A tracker id belongs in the branch name and the
+change description, which a human reads once; a code comment is permanent and
+its reader may have no access to that tracker, so it names the file, symbol
+or value involved instead. Enforce it by verification, not memory: before
+asking for a push, grep the lines the branch adds for a tracker-id pattern and
+quote the result in the round's evidence, where empty output is the pass. The
+grep is a prompt to judge, not a verdict — advisory ids, hash names and
+encodings match it and stay — and it covers only the lines your own branch
+adds, because reformatting a repository's existing comments turns a scoped
+change into a repo-wide diff. Expect the surrounding code to argue for the
+convention, and do not take its side: a repository that already carries ticket
+ids in dozens of files makes them read as house style, which is exactly how the
+rule gets broken in good faith.
 
 ## Report suspicions too — labelled as suspicions
 
@@ -140,6 +176,13 @@ The reviewer's half of the same bargain: when a finding smells like a class,
 say so — "this pattern likely repeats at X and Y" belongs in the verdict,
 even unverified. Naming the class is worth more than proving the instance.
 
+A repaired defect stays repaired only if the fix targets the class. Sweep for
+every member of it, report the full result — including "none besides this
+one" — and leave a test that scans for the class and fails. Prove that test by
+planting a violation, and where the original defect is recoverable, plant
+*that* one, so the guard has been seen refusing the real historical failure
+rather than a synthetic stand-in.
+
 ## Slice for one reviewable pass, not for one feature
 
 A milestone sized to a feature carries five to seven independent findings, and
@@ -147,8 +190,3 @@ each round can only close what the last one exposed. Size the increment to what
 one reviewer can hold at once — a single mechanism with its tests, not a screen
 with its whole supporting stack. Two increments reviewed once each beat one
 increment reviewed five times, and the arithmetic is not close.
-## Approved learning: lp-8dcc0467ac8b
-<!-- helm-learning: {"approved_at":"2026-09-12T02:16:51Z","approved_by":"user","confidence":0.85,"created_at":"2026-08-16T11:24:20Z","domain_id":"code-review","proposal_id":"lp-8dcc0467ac8b"} -->
-- Fact: When a diff ships a deliberate forward seam -- a placeholder a later round replaces -- check that it is LOUD: its own error type, its own test, and a comment saying it is temporary and which round deletes it. A quiet placeholder is a finding, because it is indistinguishable from a wrong contract to every reader after the author.
-- Rationale: Round 6a of a service layer deferred SSE to 6b, so POST /notes returned 501 NOTES_STREAM_NOT_IMPLEMENTED. That is not the route's specified contract, and shipped quietly it would read as the real behaviour to anyone reading the code, the tests or the API afterwards. It was made loud instead -- its own problem type, its own named test, and a comment naming the round that removes it -- so the deferral stayed visible and the deletion is a diff a reviewer can see rather than a rewrite that silently absorbs it. The reviewer independently confirmed the seam was loud rather than assuming it, and the deletion was written into the next round's contract as debt at the moment the seam was created, not left to be remembered.
-<!-- /helm-learning: lp-8dcc0467ac8b -->

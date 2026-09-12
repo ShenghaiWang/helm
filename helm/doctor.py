@@ -61,6 +61,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import preferences as prefs
+from .learned import split_learned
+from .values import LEARNED_KNOWLEDGE_BUDGET_BYTES
 from .errors import HelmError
 from . import runtimes
 from .coordinator.archive import ARCHIVABLE_WARN_COUNT, LIVE_DOCUMENT_WARN_BYTES
@@ -922,6 +924,7 @@ class _Doctor:
             return
         broken: list[str] = []
         thin: list[str] = []
+        heavy: list[str] = []
         names: list[str] = []
         for entry in entries:
             if _is_symlink(entry):
@@ -947,8 +950,20 @@ class _Doctor:
                 broken.append(f"{entry.name} ({exc})")
                 self._unusable_domains.add(entry.name)
                 continue
-            if not (domain_root / entry.name / "knowledge.md").is_file():
+            knowledge_file = domain_root / entry.name / "knowledge.md"
+            if not knowledge_file.is_file():
                 thin.append(entry.name)
+                continue
+            try:
+                authored, blocks = split_learned(knowledge_file.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            learned = sum(len(block) for block in blocks)
+            if learned > LEARNED_KNOWLEDGE_BUDGET_BYTES:
+                heavy.append(
+                    f"{entry.name} ({len(blocks)} learnings, {learned / 1000:.0f} KB learned "
+                    f"against {len(authored) / 1000:.0f} KB authored)"
+                )
         if broken:
             self.error(
                 "root.domains",
@@ -963,6 +978,16 @@ class _Doctor:
                 f"{len(thin)} domain(s) have no knowledge.md: {', '.join(thin[:5])}",
                 "add domains/<id>/knowledge.md, or remove the empty directory",
             )
+            return
+        if heavy:
+            self.warn(
+                "root.domains",
+                f"{len(heavy)} domain(s) carry more learned knowledge than a worker's context "
+                f"takes ({LEARNED_KNOWLEDGE_BUDGET_BYTES} bytes): {'; '.join(heavy[:3])}",
+                "fold the older approved learnings into the authored sections of that "
+                "knowledge.md and delete their blocks; until then workers see only the newest",
+            )
+            return
             return
         self.ok("root.domains", f"{len(names)} domain(s) load cleanly")
 

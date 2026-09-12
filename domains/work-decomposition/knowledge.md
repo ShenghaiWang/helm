@@ -32,6 +32,23 @@ Cross-check the ticket against the project's own guidance (solution docs,
 silently preferring one source. Write a requirements summary and publish it to
 the tracker so other teams reuse it instead of re-deriving it.
 
+**Read the report's date against the code's history.** A bug report older
+than the last rework of the code it names may already be fixed, and the fix
+may have landed under an unrelated change that never linked back. Check
+before implementing; the cheapest fix is the one that already shipped.
+
+**A reporter's suggested remedy is evidence of intent, not the requirement.**
+Build to the observed symptom. If the suggested mechanism would not produce
+the result the reporter wants, say so in the summary and record why, rather
+than shipping the mechanism and calling the symptom addressed.
+
+**A spike measures blast radius by applying the change, not by reasoning
+about it.** Asked whether a proposed one-line change is viable, make the
+change on a scratch branch and let the compiler or the test suite enumerate
+the fallout. A type made non-optional invalidates every optional chain and
+every fallback at every call site, and a reader estimating that from the
+declaration alone will be wrong by an order of magnitude.
+
 ## Size the work before decomposing it
 
 **Estimate the total diff first.** Under roughly 500 changed lines, do not break

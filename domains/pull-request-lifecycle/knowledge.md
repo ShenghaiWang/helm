@@ -114,6 +114,17 @@ weakened control, and the two look identical in the diff. Safety-critical
 switches deserve the safe value or the original failure, and the difference is a
 decision to raise, not a rule to apply.
 
+## Posting a review with inline comments
+
+Inline review comments anchor only to lines that appear in the diff. Build an
+anchor map first: fetch the change's files, parse each patch for the lines a
+comment can attach to on the new side, and check every finding's cited line
+against it. A finding that cites unchanged context is relocated to the nearest
+commentable line in the same file and opens with a line naming the real
+location — never dropped, and never landed on code it does not discuss. Post
+the whole review as one atomic submission, so a reader sees a verdict with its
+findings rather than a trickle of comments with no conclusion.
+
 ## Keeping it mergeable
 
 **The base moves under an open change.** Check whether it still merges rather

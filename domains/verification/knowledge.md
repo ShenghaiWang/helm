@@ -110,6 +110,12 @@ break the production code the test is supposed to guard, confirm the test goes
 red, restore it, and report both. A test that cannot fail is worse than no
 test, because it retires the doubt that would otherwise have found the bug.
 
+**A regression test is watched red before it is trusted green.** Run it on
+the parent commit, per test and in isolation, and watch it fail there while
+its unaffected counterpart stays green. A test never seen to fail proves
+nothing, and one that fails on everything discriminates nothing; a candidate
+that cannot be made red on the parent is withdrawn, not shipped as coverage.
+
 ## Verify the artefact, not the process that made it
 
 Four defects in one day survived thorough verification because every check
@@ -139,6 +145,17 @@ The rule generalises: when a change produces something a person will hold —
 a document, a screen, a message, an exported file — at least one check must
 inspect that thing, in the form they will receive it.
 
+**A build that succeeded has not run.** A green build says the code compiles;
+it says nothing about launch order, wiring, or whether a lazily constructed
+object ever bound its dependencies. Pin a green build by installing and
+launching the artefact and exercising the path in question, and pin a green
+run by the case count and the named suites, never by the build's exit status.
+
+**Verify a UI fix in the real running app**, not in a harness that mocks the
+surrounding surface. A harness that renders the changed element over a mocked
+version of its neighbour encodes the very assumption under test, and will
+confirm any fix.
+
 ## A screenshot of the wrong state beats a log of the crash
 
 A list crash took three attempts and three wrong diagnoses. Each attempt had a
@@ -166,6 +183,29 @@ innocent.
 And test the do-nothing path. Three attempts here wrote tests that drove the
 deletion directly; not one of them went through the button the user actually
 taps, which is where the defect lived.
+
+## Tests that involve a second process
+
+A test that pins a cross-process guarantee must control the second process's
+**load order**, not merely its existence. A child spawned after the parent's
+write learns the answer from its own startup read, and passes against an
+implementation with no cross-process story at all. Make the child load,
+signal that it is ready, and wait; have the parent act in between; then prove
+the ordering matters by deleting the cross-process code and watching that
+case, and only that case, go red.
+
+Tooling that kills processes matches the executable path or a recorded pid,
+never a substring that can also appear in another agent's arguments. On a
+machine running several agents, a pattern like the name of a tool is also the
+name of somebody else's tool.
+
+## When a fix deletes the witness
+
+When a change makes a failure mode unrepresentable, check whether it also
+makes the **assertion** that guarded it unrepresentable. Deleting a crash
+class can delete the only test that proved the mitigation was still
+installed. Name that as a regression to be replaced, not as a tidy-up to be
+waved through.
 
 ## "Additive" is not a synonym for "safe" in a persistent store
 

@@ -203,6 +203,11 @@ RISKY_PATH_MARKERS: tuple[str, ...] = (
 SMALL_SHAPE_MAX_LINES = 200
 SPLIT_ADVICE_LINES = 1500
 
+#: How much of a knowledge file's learned tail -- the approved learnings
+#: appended after the authored sections -- a worker's context carries. The
+#: newest fit; earlier ones are counted and named, not silently dropped.
+LEARNED_KNOWLEDGE_BUDGET_BYTES = 6000
+
 
 def shape_check(task: dict[str, Any], numstat: str) -> dict[str, Any]:
     """Compare a task's declared shape with what its diff touches.

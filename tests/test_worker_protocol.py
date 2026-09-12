@@ -660,13 +660,8 @@ class WorkerProtocolTests(HelmTestCase):
         self.assertIn("the reviewer must not be the author", text)
         # The fresh-base gate reaches the foreman before it allocates a task.
         self.assertIn("The base must be fresh and verified before a worktree is cut", text)
-        self.assertIn(
-            "resolve the project's *configured* default/base branch "
-            "(never a hardcoded or inferred name; a repository default is "
-            "only inferred once, at registration, and only falls back to "
-            "the checked-out branch when the project has no remote at all",
-            text,
-        )
+        self.assertIn("Before a worktree-backed task is created, resolve the project's *configured*", text)
+        self.assertIn("never from the project's current HEAD, which can move", text)
 
     def test_a_foreman_that_is_down_outranks_any_stalled_worker(self) -> None:
         root = self.repo("driverdown")
