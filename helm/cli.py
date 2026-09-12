@@ -1060,8 +1060,11 @@ def _print_ledger(report: dict[str, Any]) -> None:
     totals = report["totals"]
     median = f"{totals['median_minutes_to_result']:g}m" if totals.get("median_minutes_to_result") is not None else "n/a"
     cost = (
-        f"${totals['cost_usd']:.2f} (known for {totals['cost_known_for']} of {totals['tasks']})"
-        if totals.get("cost_usd") is not None else "not reported"
+        f"${totals['cost_usd']:.2f} (known for {totals['cost_known_for']} of {totals['tasks']}"
+        + (f", {totals['priced_for']} priced from model.prices" if totals.get("priced_for") else "")
+        + ")"
+        if totals.get("cost_usd") is not None
+        else "not known (set model.prices.<model> to price transcripts)"
     )
     print(
         f"totals: {totals['delivered']} delivered, {totals['failed']} failed, median time to result {median}, "
@@ -3555,14 +3558,22 @@ def main(argv: list[str] | None = None) -> int:
                         f"cache_read={entry['cache_read_input_tokens']} "
                         f"cache_write={entry['cache_creation_input_tokens']}"
                         + (f" models={','.join(entry['models'])}" if entry["models"] else "")
-                        + (f" cost=${dollars:.2f}" if isinstance(dollars, (int, float)) else "")
+                        + (
+                            f" cost=${dollars:.2f} ({entry.get('cost_source') or 'reported'})"
+                            if isinstance(dollars, (int, float)) else ""
+                        )
                     )
                 total = usage["total"]
+                unpriced = total.get("unpriced_models") or []
                 print(
                     f"  total: {total['turns']} turns, in={total['input_tokens']} "
                     f"out={total['output_tokens']} cache_read={total['cache_read_input_tokens']} "
                     f"cache_write={total['cache_creation_input_tokens']}"
-                    + (f", cost=${total['cost_usd']:.2f}" if total["cost_known"] else ", cost: not reported")
+                    + (f", cost=${total['cost_usd']:.2f}" if total["cost_known"] else ", cost: not known")
+                    + (
+                        f"; unpriced: {', '.join(unpriced)} (set model.prices.<model>)"
+                        if unpriced else ""
+                    )
                 )
                 return 0
             elif args.task_command == "outcome":

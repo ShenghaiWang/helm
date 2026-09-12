@@ -84,6 +84,7 @@ KEY_EFFORT_RUNTIMES = "effort.runtimes"
 KEY_REVIEW_AGENT = "review.agent"
 KEY_CLEANUP_AFTER_MERGE = "cleanup.after_merge"
 KEY_EXECUTION_TURNS = "execution.turns"
+KEY_MODEL_PRICES = "model.prices"
 
 #: What `execution.turns` understands. "on" runs every worker this root
 #: starts as a series of non-interactive turns that share one agent session
@@ -138,6 +139,12 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         True,
         "restrict a model family to named runtimes; families: "
         + ", ".join(runtimes.model_family_ids()),
+    ),
+    f"{KEY_MODEL_PRICES}.<model>": (
+        False,
+        "what one model costs, in USD per million tokens: in=<n>,out=<n>"
+        "[,cache_read=<n>][,cache_write=<n>]; the ledger and `task cost` price "
+        "a transcript with it, and a model with no price stays in tokens only",
     ),
     KEY_REVIEW_AGENT: (
         False,
@@ -207,12 +214,25 @@ def split_effort_runtimes_key(key: str) -> str | None:
     return runtime_id
 
 
+def split_model_prices_key(key: str) -> str | None:
+    """Return the model id a `model.prices.<model>` key names, or None."""
+    prefix = f"{KEY_MODEL_PRICES}."
+    if not key.startswith(prefix):
+        return None
+    try:
+        return runtimes.validate_model_id(key[len(prefix):])
+    except ValueError as exc:
+        raise PreferencesError(f"{key}: {exc}") from exc
+
+
 def takes_list(key: str) -> bool:
     if key in SUPPORTED_KEYS:
         return SUPPORTED_KEYS[key][0]
     if split_model_runtimes_key(key) is not None:
         return True
     if split_effort_runtimes_key(key) is not None:
+        return False
+    if split_model_prices_key(key) is not None:
         return False
     raise _unknown_key(key)
 
@@ -268,6 +288,10 @@ class Preferences:
     #: here still yields a same-agent review, labelled as the weak check it is.
     review_agent: str | None = None
     model_runtimes: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: USD per million tokens by model id -- in, out, cache_read, cache_write.
+    #: A dated catalogue fact, so it lives here and never in tracked code. A
+    #: model with no entry is reported in tokens only, never guessed at.
+    model_prices: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     #: `prefer` asks the dispatcher to prefer an explicitly-free model it has
     #: judged competent; `off` records the opposite, explicitly; None is the
     #: shipped default of no opinion. Never a model id and never an order.
@@ -311,6 +335,11 @@ class Preferences:
             model["exclude"] = sorted(self.excluded_models)
         if self.free_model:
             model["free"] = self.free_model
+        if self.model_prices:
+            model["prices"] = {
+                model_id: _price_spec(rates)
+                for model_id, rates in sorted(self.model_prices.items())
+            }
         if self.cleanup_after_merge:
             document["cleanup"] = {"after_merge": self.cleanup_after_merge}
         if self.execution_turns:
@@ -332,6 +361,23 @@ class Preferences:
             document["effort"] = effort
         return document
 
+    def price_for(self, model_id: str | None) -> Mapping[str, float] | None:
+        """The rates for a model id: an exact entry, else the longest prefix.
+
+        Transcripts name dated ids and a root prices a family, so
+        `model.prices.some-model-5` covers `some-model-5-20260101`. Nothing is
+        ever guessed across families: no entry means no price.
+        """
+        if not model_id or not self.model_prices:
+            return None
+        exact = self.model_prices.get(model_id)
+        if exact is not None:
+            return exact
+        candidates = [key for key in self.model_prices if model_id.startswith(key)]
+        if not candidates:
+            return None
+        return self.model_prices[max(candidates, key=len)]
+
     def entries(self) -> list[tuple[str, str]]:
         """Every set preference as (key, printable value), for `prefs show`.
 
@@ -349,6 +395,8 @@ class Preferences:
             rows.append((KEY_MODEL_DEFAULT, self.default_model))
         for family, allowed in sorted(self.model_runtimes.items()):
             rows.append((f"{KEY_MODEL_RUNTIMES}.{family}", ", ".join(sorted(allowed))))
+        for model_id, rates in sorted(self.model_prices.items()):
+            rows.append((f"{KEY_MODEL_PRICES}.{model_id}", _price_spec(rates)))
         if self.free_model:
             rows.append((KEY_MODEL_FREE, self.free_model))
         if self.cleanup_after_merge:
@@ -487,7 +535,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         execution_turns = value
 
     model = _object(document.get("model"), "model", where)
-    _reject_unknown(model, {"default", "runtimes", "free", "exclude"}, "model", where)
+    _reject_unknown(model, {"default", "runtimes", "free", "exclude", "prices"}, "model", where)
     default_model = (
         _model_id(model["default"], "model.default", where)
         if model.get("default") is not None
@@ -517,6 +565,10 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
                 "than restricting it. Remove the key instead."
             )
         runtimes_by_family[family] = names
+    prices_by_model: dict[str, dict[str, float]] = {}
+    for model_id, spec in _object(model.get("prices"), "model.prices", where).items():
+        name = f"model.prices.{model_id}"
+        prices_by_model[_model_id(model_id, name, where)] = _parse_price(spec, name, where)
 
     excluded_models = frozenset(
         # Validated as model ids, exactly like `model.default`. An exclusion
@@ -535,6 +587,7 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
         excluded_models=excluded_models,
         review_agent=review_agent,
         model_runtimes=runtimes_by_family,
+        model_prices=prices_by_model,
         free_model=free_model,
         cleanup_after_merge=cleanup_after_merge,
         execution_turns=execution_turns,
@@ -593,6 +646,44 @@ def _agent_id(value: Any, name: str, where: str) -> str:
 _SAFE_ARGUMENT = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+PRICE_FIELDS = ("in", "out", "cache_read", "cache_write")
+#: USD per million tokens above this is a typo, not a price.
+PRICE_CEILING = 100_000.0
+
+
+def _parse_price(value: Any, name: str, where: str) -> dict[str, float]:
+    """`in=<n>,out=<n>[,cache_read=<n>][,cache_write=<n>]` into rates."""
+    if not isinstance(value, str) or not value.strip():
+        raise PreferencesError(
+            f"{name}{where} must be a string like in=1,out=5,cache_read=0.1,cache_write=1.25"
+        )
+    rates: dict[str, float] = {}
+    for part in value.split(","):
+        field_name, sep, amount = part.strip().partition("=")
+        if not sep or field_name not in PRICE_FIELDS:
+            raise PreferencesError(
+                f"{name}{where}: {part.strip()!r} is not one of "
+                + ", ".join(f"{item}=<usd per million tokens>" for item in PRICE_FIELDS)
+            )
+        if field_name in rates:
+            raise PreferencesError(f"{name}{where}: {field_name} given twice")
+        try:
+            number = float(amount)
+        except ValueError:
+            raise PreferencesError(f"{name}{where}: {field_name} must be a number, not {amount!r}") from None
+        if not (0 <= number <= PRICE_CEILING) or number != number:
+            raise PreferencesError(f"{name}{where}: {field_name} must be between 0 and {PRICE_CEILING:g}")
+        rates[field_name] = number
+    for required in ("in", "out"):
+        if required not in rates:
+            raise PreferencesError(f"{name}{where} must give {required}=<usd per million tokens>")
+    return rates
+
+
+def _price_spec(rates: Mapping[str, float]) -> str:
+    return ",".join(f"{field_name}={rates[field_name]:g}" for field_name in PRICE_FIELDS if field_name in rates)
 
 
 def _effort_spec(mechanism: str, argument: str, levels) -> str:
@@ -766,8 +857,19 @@ def apply(current: Preferences, key: str, values: Iterable[str] | None) -> Prefe
         else:
             effort_section.pop("runtimes", None)
 
+    priced_model = split_model_prices_key(key)
     family = split_model_runtimes_key(key)
-    if family is not None:
+    if priced_model is not None:
+        prices = dict(model.get("prices", {}))
+        if listed is None:
+            prices.pop(priced_model, None)
+        else:
+            prices[priced_model] = listed[0]
+        if prices:
+            model["prices"] = prices
+        else:
+            model.pop("prices", None)
+    elif family is not None:
         if listed is None:
             families.pop(family, None)
         else:

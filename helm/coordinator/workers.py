@@ -344,7 +344,19 @@ class WorkersMixin:
         for entry, worker in zip(entries, workers):
             entry["task_id"] = worker.get("task_id")
             entry["role"] = (data["tasks"].get(worker.get("task_id")) or {}).get("role")
+        self._price_usage_entries(entries)
         return {"task_id": task_id, "workers": entries, "total": costs.sum_usage(entries)}
+
+    def _price_usage_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Fill in dollars from `model.prices` where the runtime reported none."""
+        price_for = self.preferences().price_for
+        for entry in entries:
+            if isinstance(entry.get("cost_usd"), (int, float)):
+                continue
+            priced = costs.price_usage(entry.get("by_model") or {}, price_for)
+            entry["cost_usd"] = priced["cost_usd"]
+            entry["cost_source"] = "priced" if priced["cost_usd"] is not None else None
+            entry["unpriced_models"] = priced["unpriced"]
 
     def _archived_task_usage(self, task_id: str, *, with_reviews: bool) -> dict[str, Any]:
         """`task_usage` for a task that has left the live document."""
@@ -366,6 +378,7 @@ class WorkersMixin:
         for entry, worker in zip(entries, workers):
             entry["task_id"] = worker.get("task_id")
             entry["role"] = roles.get(worker.get("task_id"))
+        self._price_usage_entries(entries)
         return {"task_id": task_id, "workers": entries, "total": costs.sum_usage(entries), "archived": True}
 
     def nudge_worker(self, worker_id: str, text: str = "") -> dict[str, Any]:

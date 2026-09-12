@@ -171,6 +171,7 @@ class PreferenceSchemaTests(HelmTestCase):
                 "model.exclude",
                 "model.free",
                 "model.runtimes.<family>",
+                "model.prices.<model>",
                 "review.agent",
                 "cleanup.after_merge",
                 "execution.turns",

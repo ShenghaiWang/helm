@@ -135,4 +135,5 @@ class TaskUsageTests(HelmTestCase):
                 code = cli.main(["--state-dir", str(self.state.directory), "task", "cost", task["id"]])
             self.assertEqual(code, 0)
             self.assertIn("total:", out.getvalue())
-            self.assertIn("cost: not reported", out.getvalue())
+            self.assertIn("cost: not known", out.getvalue())
+            self.assertIn("unpriced: claude-x (set model.prices.<model>)", out.getvalue())

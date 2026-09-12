@@ -111,12 +111,19 @@ class LedgerMixin:
             with contextlib.suppress(Exception):
                 if self.learning_not_followed(text, task.get("domain")):
                     not_followed += 1
-        usage = {"turns": 0, "cost_usd": None, "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
+        usage = {
+            "turns": 0, "cost_usd": None, "cost_source": None, "input_tokens": 0,
+            "output_tokens": 0, "cache_read_input_tokens": 0,
+        }
         try:
             total = self.task_usage(task["id"])["total"]
             usage = {
                 "turns": total.get("turns", 0),
                 "cost_usd": total.get("cost_usd") if total.get("cost_known") else None,
+                "cost_source": (
+                    None if not total.get("cost_known")
+                    else "priced" if total.get("priced") else "reported"
+                ),
                 "input_tokens": total.get("input_tokens", 0),
                 "output_tokens": total.get("output_tokens", 0),
                 "cache_read_input_tokens": total.get("cache_read_input_tokens", 0),
@@ -168,4 +175,5 @@ class LedgerMixin:
             "cache_read_input_tokens": sum(r["cache_read_input_tokens"] for r in rows),
             "cost_usd": round(sum(costs_known), 2) if costs_known else None,
             "cost_known_for": len(costs_known),
+            "priced_for": sum(1 for r in rows if r.get("cost_source") == "priced"),
         }

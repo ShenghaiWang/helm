@@ -7,9 +7,12 @@ runtime's own record, so it is the evidence, not an estimate. Other runtimes
 keep no such record Helm knows how to read, and a worker on one of them
 reports no usage rather than a guess.
 
-Tokens only. A price is a dated catalogue fact and does not belong in tracked
-code; a run that carried its own ``total_cost_usd`` (Claude Code's print mode
-reports one) is recorded as such and summed separately.
+Tokens first. A price is a dated catalogue fact and does not belong in tracked
+code, so dollars come from two places only: a run that carried its own
+``total_cost_usd`` (Claude Code's print mode reports one) is recorded as such,
+and otherwise the root's own ``model.prices`` preference prices the tokens per
+model. A model with no price, or cache tokens with no cache rate, leaves the
+figure blank rather than guessed.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ def transcript_usage(path: Path) -> dict[str, Any]:
         "path": str(path),
         "turns": 0,
         "models": [],
+        "by_model": {},
         "session_id": None,
         "first_at": None,
         "last_at": None,
@@ -82,12 +86,15 @@ def transcript_usage(path: Path) -> dict[str, Any]:
                 if not isinstance(usage, dict):
                     continue
                 totals["turns"] += 1
+                model = message.get("model") if isinstance(message, dict) else None
+                model = model if isinstance(model, str) and model else ""
+                bucket = totals["by_model"].setdefault(model, {field: 0 for field in USAGE_FIELDS})
                 for field in USAGE_FIELDS:
                     value = usage.get(field)
                     if isinstance(value, (int, float)):
                         totals[field] += int(value)
-                model = message.get("model") if isinstance(message, dict) else None
-                if isinstance(model, str) and model:
+                        bucket[field] += int(value)
+                if model:
                     models.add(model)
                 stamp = _parse_stamp(record.get("timestamp"))
                 if stamp is not None:
@@ -148,6 +155,8 @@ def worker_usage(worker: dict[str, Any]) -> dict[str, Any]:
         "turns": 0,
         "models": [],
         "cost_usd": worker.get("cost_usd"),
+        "cost_source": "reported" if isinstance(worker.get("cost_usd"), (int, float)) else None,
+        "by_model": {},
         "metered": False,
     }
     for field in USAGE_FIELDS:
@@ -162,10 +171,55 @@ def worker_usage(worker: dict[str, Any]) -> dict[str, Any]:
         result["turns"] += usage["turns"]
         for field in USAGE_FIELDS:
             result[field] += usage[field]
+        _merge_by_model(result["by_model"], usage.get("by_model", {}))
         models.update(usage["models"])
     result["models"] = sorted(models)
     result["metered"] = bool(paths)
     return result
+
+
+def _merge_by_model(into: dict[str, dict[str, int]], more: dict[str, dict[str, int]]) -> None:
+    for model, tokens in more.items():
+        bucket = into.setdefault(model, {field: 0 for field in USAGE_FIELDS})
+        for field in USAGE_FIELDS:
+            bucket[field] += int(tokens.get(field) or 0)
+
+
+def price_usage(by_model: dict[str, dict[str, int]], price_for) -> dict[str, Any]:
+    """Dollars for tokens, per model, from the root's own price list.
+
+    Honest about its gaps: the figure is given only when every model that
+    spent tokens has a price, and every kind of token it spent has a rate.
+    A partial sum would read as the whole cost of the task.
+    """
+    total = 0.0
+    priced: list[str] = []
+    unpriced: list[str] = []
+    for model, tokens in sorted(by_model.items()):
+        spent = {field: int(tokens.get(field) or 0) for field in USAGE_FIELDS}
+        if not any(spent.values()):
+            continue
+        rates = price_for(model) if model else None
+        if rates is None:
+            unpriced.append(model or "unknown model")
+            continue
+        needed = {
+            "input_tokens": "in",
+            "output_tokens": "out",
+            "cache_read_input_tokens": "cache_read",
+            "cache_creation_input_tokens": "cache_write",
+        }
+        missing = [name for field, name in needed.items() if spent[field] and name not in rates]
+        if missing:
+            unpriced.append(f"{model} (no {', '.join(missing)} rate)")
+            continue
+        total += sum(spent[field] * rates.get(name, 0.0) / 1_000_000 for field, name in needed.items())
+        priced.append(model)
+    return {
+        "cost_usd": round(total, 4) if priced and not unpriced else None,
+        "priced": priced,
+        "unpriced": unpriced,
+    }
 
 
 def sum_usage(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -173,15 +227,25 @@ def sum_usage(entries: list[dict[str, Any]]) -> dict[str, Any]:
     total["turns"] = 0
     total["cost_usd"] = 0.0
     total["cost_known"] = False
+    total["by_model"] = {}
+    total["priced"] = 0
+    total["unpriced_models"] = []
     models: set[str] = set()
+    unpriced: set[str] = set()
     for entry in entries:
         for field in USAGE_FIELDS:
             total[field] += int(entry.get(field) or 0)
         total["turns"] += int(entry.get("turns") or 0)
+        _merge_by_model(total["by_model"], entry.get("by_model", {}))
         cost = entry.get("cost_usd")
         if isinstance(cost, (int, float)):
             total["cost_usd"] += float(cost)
             total["cost_known"] = True
+            if entry.get("cost_source") == "priced":
+                total["priced"] += 1
+        unpriced.update(entry.get("unpriced_models") or [])
         models.update(entry.get("models") or [])
     total["models"] = sorted(models)
+    total["unpriced_models"] = sorted(unpriced)
+    total["cost_usd"] = round(total["cost_usd"], 4)
     return total

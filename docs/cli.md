@@ -115,7 +115,7 @@ helm watchdog install [--interval SECONDS] [--notify-command CMD] [--remind-afte
 helm board [--open]           # one page showing what every agent produced
 helm tail <worker-id>         # a worker's decoded terminal output
 helm reflect [--hours N]      # recent evidence for a reflection on how Helm is working
-helm task cost <task-id>      # what a task's sessions consumed, from the runtimes' own transcripts
+helm task cost <task-id>      # what a task's sessions consumed, from the runtimes' own transcripts; priced by model.prices when set
 helm ledger [--days N] [--project P] [--json]   # every worker task in the window: time to result, review rounds and catches, asks, tokens, cost
 helm state stats              # size of the live state document, counts, what could be archived
 helm state archive [--dry-run] [--reconcile] [TASK_ID ...]   # move settled records into state/archive/
