@@ -43,6 +43,28 @@ def _learning_polarity_and_core(value: str) -> tuple[int, set[str]]:
     return (-1 if negative else 1), {word for word in words if word not in stop}
 
 
+_REPORT_PREFIXES = (
+    "approved", "approve", "changes-requested", "pass", "fail", "verdict", "done", "delivered",
+    "review complete", "re-review", "pr #", "row ", "merged", "pushed", "completed", "fixed",
+)
+
+
+def _reads_as_report(text: str) -> bool:
+    """A verdict, a delivery note or an evidence summary is not a fact.
+
+    A fact says what to do next time. A report says what happened this
+    time: it opens with a verdict word, cites a PR, a URL, a path or an exit
+    code, or is a paragraph rather than a sentence.
+    """
+    stripped = " ".join(text.split())
+    lowered = stripped.lower().lstrip("#*- ")
+    if any(lowered.startswith(prefix) for prefix in _REPORT_PREFIXES):
+        return True
+    if re.search(r"https?://|/users/|state/|\bexit \d|\bpr #\d|\btip [0-9a-f]{7}|\b[0-9a-f]{40}\b", lowered):
+        return True
+    return len(stripped) > 400
+
+
 def _learning_facts_conflict(left: str, right: str) -> bool:
     """Find obvious opposing rules while avoiding broad semantic guesses."""
     if _learning_fact_key(left) == _learning_fact_key(right):
@@ -53,6 +75,28 @@ def _learning_facts_conflict(left: str, right: str) -> bool:
         return False
     overlap = len(left_core & right_core)
     return overlap >= 1 and overlap / max(len(left_core), len(right_core)) > 0.5
+
+
+#: Helm's own generated identifiers, by prefix, and what to call one in prose.
+_IDENTIFIER_WORDS = {
+    "t": "a task", "w": "a worker", "m": "a message", "i": "an item",
+    "s": "a status entry", "a": "an artifact", "g": "a grant",
+}
+_HELM_IDENTIFIER = re.compile(r"\b([twmisag])-[0-9a-f]{8,}\b")
+#: A tracker ticket such as ABC-123: one root's history, not knowledge.
+_TICKET = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b")
+
+
+def scrub_identifiers(text: str) -> str:
+    """Replace one root's identifiers with the kind of thing they named.
+
+    A learning is worth keeping because it generalises; the ids in its
+    rationale are the evidence, and the evidence stays in state. Written into
+    a tracked domain file they would make Helm's shipped knowledge carry a
+    managed root's task, message and ticket history.
+    """
+    scrubbed = _HELM_IDENTIFIER.sub(lambda m: _IDENTIFIER_WORDS.get(m.group(1), "an item"), text or "")
+    return _TICKET.sub("a ticket", scrubbed)
 
 
 class LearningMixin:
@@ -443,6 +487,13 @@ class LearningMixin:
         candidates: list[str] = []
         if fact is not None:
             candidates = [fact]
+        elif task.get("role") == "reviewer":
+            # A reviewer's result is a verdict about one change, never a
+            # fact about the domain. Forty-four of the first fifty-seven
+            # proposals on one root were verdicts.
+            raise HelmError(
+                f"task {task_id} is a review; its verdict is not a learning. Provide --fact for a rule it revealed"
+            )
         else:
             generic = {
                 _learning_fact_key("worker completed; explicit approval is still required before merge"),
@@ -460,14 +511,14 @@ class LearningMixin:
             )
             # Keep extraction bounded and deterministic. Review information is
             # retained in provenance/rationale rather than turned into a rule.
-            candidates = list(dict.fromkeys(candidates))[:10]
+            candidates = [c for c in dict.fromkeys(candidates) if not _reads_as_report(c)][:10]
         if not candidates:
             raise HelmError(
                 f"task {task_id} has no concise result or artifact description; provide --fact"
             )
         if rationale is None:
             review = "review outcome recorded" if task.get("approval") else "worker result recorded"
-            rationale = f"Candidate extracted from task {task_id}: {review}."
+            rationale = f"Candidate extracted from the task's result: {review}."
         return [
             self.create_learning_proposal(
                 task_id,
@@ -544,7 +595,7 @@ class LearningMixin:
             if self._learning_core_override(rationale_text):
                 raise SafetyError("learning cannot weaken or override Helm core safety rules")
             confidence_value = proposal["confidence"] if confidence is None else self._learning_confidence(confidence)
-            project = self._project(data, proposal["project_id"])
+            project = self._learning_project(data, proposal)
             proposal["proposed_fact"] = fact
             proposal["fact"] = fact
             proposal["rationale"] = rationale_text
@@ -573,7 +624,7 @@ class LearningMixin:
             approved_by = self._learning_actor_allowed(proposal, actor, "learning approval")
             if proposal.get("status") != "proposed":
                 raise SafetyError(f"learning proposal is already {proposal.get('status')}")
-            project = self._project(data, proposal["project_id"])
+            project = self._learning_project(data, proposal)
             conflicts = self._learning_domain_conflicts_locked(
                 data, project, proposal["domain_id"], proposal["proposed_fact"],
                 exclude_proposal_id=proposal_id,
@@ -619,12 +670,17 @@ class LearningMixin:
 
     @staticmethod
     def _learning_block(proposal: dict[str, Any]) -> str:
+        """The block written into a knowledge file: the fact, and nothing real.
+
+        A domain file is tracked product content, so the task, message and
+        artifact ids that evidence a proposal stay on the proposal record in
+        state, and the fact and rationale are scrubbed of any identifier that
+        would name one root's work. Only the proposal id rides along, because
+        it is what ties the block back to its provenance.
+        """
         provenance = {
             "proposal_id": proposal["id"],
             "domain_id": proposal["domain_id"],
-            "source_task_id": proposal["source_task_id"],
-            "source_artifact_ids": proposal.get("source_artifact_ids", []),
-            "source_message_ids": proposal.get("source_message_ids", []),
             "confidence": proposal.get("confidence"),
             "created_at": proposal["created_at"],
             "approved_at": proposal.get("approval", {}).get("approved_at"),
@@ -634,8 +690,8 @@ class LearningMixin:
         return (
             f"\n\n## Approved learning: {proposal['id']}\n"
             f"<!-- helm-learning: {metadata} -->\n"
-            f"- Fact: {proposal['proposed_fact']}\n"
-            f"- Rationale: {proposal['rationale']}\n"
+            f"- Fact: {scrub_identifiers(proposal['proposed_fact'])}\n"
+            f"- Rationale: {scrub_identifiers(proposal['rationale'])}\n"
             f"<!-- /helm-learning: {proposal['id']} -->\n"
         )
 
@@ -667,7 +723,39 @@ class LearningMixin:
                 os.close(fd)
             raise
 
+    def _learning_project(self, data: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
+        """The proposal's project, live or forgotten.
+
+        A proposal outlives its project: the project can be removed once its
+        work is over, and its learnings are exactly what should survive it.
+        A forgotten project's record is read from the archive; failing that,
+        a stand-in carries the id and the root's own directory, which is all
+        a domain-scoped apply needs.
+        """
+        project_id = proposal.get("project_id")
+        live = data.get("projects", {}).get(project_id or "")
+        if live is not None:
+            return live
+        from .. import archive as _archive
+
+        path = _archive.project_file(self.store.directory, project_id or "")
+        with contextlib.suppress(OSError, ValueError):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(record, dict) and isinstance(record.get("project"), dict):
+                return {**record["project"], "forgotten": True}
+        configured = self.store.configured_root()
+        return {
+            "id": project_id or "forgotten",
+            "root": str(configured or self.store.directory.parent),
+            "forgotten": True,
+        }
+
     def _learning_project_file(self, project: dict[str, Any], *, create: bool = False) -> Path:
+        if project.get("forgotten"):
+            raise HelmError(
+                f"project {project.get('id')} has been removed; apply this learning to its domain, "
+                "not to a project file nothing reads"
+            )
         """The project's own knowledge file, the one nothing ever wrote.
 
         The composed context has always had a slot for per-project knowledge
@@ -710,7 +798,7 @@ class LearningMixin:
                 raise SafetyError("applying learning requires explicit proposal approval")
             if scope not in {"domain", "project"}:
                 raise HelmError("learning scope must be 'domain' or 'project'")
-            project = self._project(data, proposal["project_id"])
+            project = self._learning_project(data, proposal)
             if scope == "project":
                 # Facts true of this project and no other belong here rather
                 # than in a domain, where they would be taught to every

@@ -783,7 +783,7 @@ def _print_project_status(status: dict[str, Any]) -> None:
 def _print_approval_grants(coordinator: Coordinator, *, include_revoked: bool = False) -> None:
     grants = coordinator.list_approval_grants(include_revoked=include_revoked)
     if not grants:
-        print("No standing approvals; every protected action stops for a human.")
+        print("No standing approvals; every protected action waits for your word, commander.")
         return
     for grant in grants:
         state = "revoked" if grant.get("revoked_at") else "live"
@@ -1024,6 +1024,20 @@ def _print_learning(proposal: dict[str, Any]) -> None:
         print(f"  conflicts: {_json(proposal['conflicts'])}")
     print(f"  source task: {proposal['source_task_id']}")
     print(f"  rationale: {proposal['rationale']}")
+
+
+def _print_tidy(tidied: dict[str, Any]) -> None:
+    verb = "would close" if tidied.get("dry_run") else "closed"
+    resolved = tidied["resolved"]
+    print(f"{verb} {len(resolved)} decision(s); {tidied['kept']} still open")
+    by_project: dict[str, list[dict[str, Any]]] = {}
+    for entry in resolved:
+        by_project.setdefault(entry["project_id"], []).append(entry)
+    for project_id, entries in sorted(by_project.items()):
+        kinds: dict[str, int] = {}
+        for entry in entries:
+            kinds[str(entry.get("kind"))] = kinds.get(str(entry.get("kind")), 0) + 1
+        print(f"  {project_id}: " + ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items())))
 
 
 def _print_ledger(report: dict[str, Any]) -> None:
@@ -1697,6 +1711,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--reconcile", action="store_true",
         help="probe a branch or worker directory the record still claims, once, and mark it removed when it is gone",
     )
+    state_tidy = state_commands.add_parser(
+        "tidy",
+        help=(
+            "close the decisions and follow-ups nothing can act on: gates whose task "
+            "was delivered, cleaned up or retried, and any item whose task has been archived"
+        ),
+    )
+    state_tidy.add_argument("--project", dest="project_id", help="one project only")
+    state_tidy.add_argument("--dry-run", action="store_true", help="say what would close and change nothing")
 
     agent = commands.add_parser("agent", help="list and check configured worker profiles")
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
@@ -1830,7 +1853,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "watchdog",
         help=(
             "the backstop when the reporting chain does not fire: check "
-            "outside a conversation and notify when something needs a human"
+            "outside a conversation and notify when something needs the commander's attention"
         ),
     )
     watchdog_commands = watchdog.add_subparsers(dest="watchdog_command", required=True)
@@ -4267,6 +4290,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"{stats['archive_bytes'] / 1_000_000:.1f} MB"
                 )
                 return 0
+            if args.state_command == "tidy":
+                tidied = coordinator.tidy_decisions(args.project_id, dry_run=args.dry_run)
+                _print_tidy(tidied)
+                return 0
             result = coordinator.archive_tasks(
                 args.task_id or None, dry_run=args.dry_run, reconcile=args.reconcile
             )
@@ -4274,6 +4301,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{verb} {len(result['eligible'])} task record(s)")
             if result["refused"]:
                 print(f"  not eligible: {', '.join(result['refused'][:8])}{' …' if len(result['refused']) > 8 else ''}")
+            if result["archived"]:
+                # An archived task takes its record with it; an item still
+                # pointing at it has nothing left to decide.
+                _print_tidy(coordinator.tidy_decisions())
             return 0
 
         if args.command == "pending":
@@ -4340,7 +4371,7 @@ def main(argv: list[str] | None = None) -> int:
                 if update.get("kind") != "situation":
                     continue
                 # OWED reports only. This command is read unattended and its
-                # whole value is that it changes when something needs a human;
+                # whole value is that it changes when something needs the commander;
                 # a routine progress line has nothing that ever clears it, so
                 # including one makes the list permanently non-empty and every
                 # future change look like the same old news.
@@ -4509,7 +4540,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if not entries:
                 return 0
-            print(f"HELM NEEDS A HUMAN ({len(lines)}):")
+            print(f"Commander, for your attention ({len(lines)}):")
             for line in lines:
                 print(f"  {line}")
             print("  (helm status for detail; helm ack <project> once relayed)")
@@ -4590,6 +4621,13 @@ def main(argv: list[str] | None = None) -> int:
                     coordinator.archive_tasks([entry["task_id"] for entry in swept["cleaned"]])
                 for entry in swept["skipped"]:
                     print(f"  cleanup of {entry['task_id']} refused: {entry['reason']}")
+            # Decisions about tasks that have moved on or left the live
+            # document close here, so the list `watch` prints is only what a
+            # human can still act on.
+            with contextlib.suppress(HelmError, OSError):
+                tidied = coordinator.tidy_decisions()
+                if tidied["resolved"]:
+                    print(f"Closed {len(tidied['resolved'])} decision(s) nothing can act on")
             updates = coordinator.project_updates_for_watch()
             # A settled worker's pane is no longer evidence; leaving it open
             # makes the panel harder to read for no benefit.

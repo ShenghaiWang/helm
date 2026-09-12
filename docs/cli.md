@@ -119,6 +119,7 @@ helm task cost <task-id>      # what a task's sessions consumed, from the runtim
 helm ledger [--days N] [--project P] [--json]   # every worker task in the window: time to result, review rounds and catches, asks, tokens, cost
 helm state stats              # size of the live state document, counts, what could be archived
 helm state archive [--dry-run] [--reconcile] [TASK_ID ...]   # move settled records into state/archive/
+helm state tidy [--project P] [--dry-run]   # close the decisions and follow-ups nothing can act on any more
 ```
 
 `helm pending --changes` in a twenty-second loop is what an agent harness
@@ -132,7 +133,8 @@ default) while the same list still stands, and runs `--notify-command` on
 each — a shell command of the commander's own, with `HELM_TITLE` and
 `HELM_MESSAGE` in its environment and the whole list on stdin, which is how a
 notification reaches a chat channel or a phone rather than a banner that is
-gone in seconds. It also heals: a worker that reads as provably dead on two
+gone in seconds. Once a day it runs `helm learning mine` so recurring
+findings become proposals on their own. It also heals: a worker that reads as provably dead on two
 checks a minute apart — its process gone with no exit record, or the pane
 gone and the worker silent past the threshold, never a worker still in its
 startup grace — is stopped so its task can be reopened or retried, a dead

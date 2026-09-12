@@ -1795,6 +1795,17 @@ class HerdrAdapter:
                     # stays. A worker that reported nothing terminal has no
                     # outcome to route and is not held back by this.
                     continue
+            # A turns runner is still inside the turn that made the report;
+            # closing the pane would kill it before its turn record is
+            # written. Let it finish, then close -- and when this very
+            # command is that turn (a worker's own report), only ask it to
+            # stop: the runner exits once the turn ends, and the next pass
+            # finds a settled runner and closes the pane.
+            with contextlib.suppress(HelmError, OSError):
+                if self.coordinator.inside_own_turn(worker):
+                    self.coordinator.stop_turns(worker_id)
+                    continue
+                self.coordinator._let_turns_finish(worker)
             try:
                 self.client.tab_close(tab_id)
                 closed.append(worker_id)

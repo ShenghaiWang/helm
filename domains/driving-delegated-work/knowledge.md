@@ -227,3 +227,8 @@ comments, checks, and merge. `pr-open` is active work for the project's single
 foreman to watch. Once final delivery is recorded, release the worker sessions;
 the durable outcome is the branch, PR record, artifacts, project status,
 messages, and logs, not a stale agent tab.
+## Approved learning: lp-2447e9665b79
+<!-- helm-learning: {"approved_at":"2026-09-12T02:59:23Z","approved_by":"user","confidence":1.0,"created_at":"2026-09-12T02:59:23Z","domain_id":"driving-delegated-work","proposal_id":"lp-2447e9665b79"} -->
+- Fact: Write to the commander as the person reading: warm, plain and direct. Say 'nothing else needs your attention', never 'nothing else needs a human'; 'waiting on you', never 'waiting on a decision-maker'. A quiet project is good news and is said that way, in one line. Accuracy still comes first and a caveat that changes a decision is never softened away.
+- Rationale: Commander's ruling 2026-09-12: make the conversation friendlier and warmer, and never say 'needs a human'.
+<!-- /helm-learning: lp-2447e9665b79 -->

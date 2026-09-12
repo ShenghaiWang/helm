@@ -1422,7 +1422,11 @@ class ProtectionMixin:
             if not self._workspace_clean(workspace):
                 raise SafetyError("refusing merge: worker workspace is dirty or unresolved")
             root = canonical(project["root"])
-            if _git(root, "status", "--porcelain", check=False):
+            # Helm's own project-local directory sits untracked in the base
+            # checkout by design -- `.helm/project.json` is where a project
+            # pins its agent or opts into turns -- so it is not dirtiness. It
+            # refused every local merge on a project that had one.
+            if _git(root, "status", "--porcelain", "--", ":!.helm", check=False):
                 raise SafetyError("refusing merge: project main worktree is dirty")
             branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
             if branch != task["base_branch"]:

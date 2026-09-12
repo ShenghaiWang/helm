@@ -45,6 +45,17 @@ been taken: the task reaching `merged` or `pr-merged`, being continued with
 `helm project action` is never auto-closed — Helm knows when a delivery
 decision was taken and cannot know whether somebody's caveat was dealt with.
 
+The one exception is a task that has left the live document. `helm state
+archive` takes a settled task's whole record with it, and an item still
+pointing at that task — a delivery gate, a failure decision, or a free-text
+follow-up — has nothing left to decide. `helm state tidy` closes those as
+"task archived", after re-running the derived gates so a delivery decided
+elsewhere or a failure since retried closes too; `helm watch` and `helm state
+archive` run the same pass. A failed foreman or reviewer never raises a
+failure decision at all: neither owns a worktree, so none of retry, continue
+or cleanup applies — the review loop re-runs a failed round, and the next
+command that starts work appoints a driver.
+
 ## Local delivery
 
 For local delivery the final state is `merged`. An approved operator uses

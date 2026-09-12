@@ -1664,3 +1664,26 @@ class HelmsOwnOutputDoesNotBlockCleanupTests(HelmTestCase):
         """`.helm-output/` is not `.helm-out/`, and prefix matching would take it."""
         workspace = self._repo_with(".helm-outside/notes.md")
         self.assertFalse(self.coordinator._workspace_clean(workspace))
+
+
+class AProjectsOwnHelmDirectoryIsNotDirtinessTests(HelmTestCase):
+    """`.helm/project.json` sits untracked in the base checkout by design.
+
+    It is where a project pins its agent or opts into turns, so every project
+    that used it had an untracked directory in its main worktree -- and the
+    merge check refused every local merge on such a project as "dirty".
+    """
+
+    def test_a_local_merge_proceeds_past_the_helm_directory_but_not_past_other_untracked_files(self) -> None:
+        root, project, task = self._completed_task_awaiting_approval("dothelm")
+        (root / ".helm").mkdir()
+        (root / ".helm" / "project.json").write_text('{"execution": "turns"}\n', encoding="utf-8")
+        self.coordinator.approve_task(task["id"], "reviewed")
+        (root / "stray.txt").write_text("left behind\n", encoding="utf-8")
+        with self.assertRaisesRegex(SafetyError, "main worktree is dirty"):
+            self.coordinator.merge_task(task["id"])
+        (root / "stray.txt").unlink()
+        merged = self.coordinator.merge_task(task["id"])
+        self.assertEqual(merged["status"], "merged")
+        self.assertTrue((root / "change.txt").exists())
+        self.assertTrue((root / ".helm" / "project.json").exists())

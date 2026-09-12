@@ -572,6 +572,15 @@ class DecisionsMixin:
             state = task.get("status")
             if state != "failed":
                 continue
+            # A failed foreman or reviewer is not the commander's decision. The
+            # item offers retry, continue or cleanup, and none of those applies
+            # to a role that owns no worktree: a failed review round is re-run
+            # by the loop that started it, and a project without a driver gets
+            # one appointed by the next command that starts work. On this root
+            # they were 63 of the 69 open failure items -- most of the backlog
+            # was about tasks nothing could be done with.
+            if task.get("role") in WORKTREELESS_ROLES:
+                continue
             # A failed task whose workspace has been released is settled, even
             # though it is still `failed`. The item offers three ways out --
             # retry, continue, clean up -- and releasing the worktree removes

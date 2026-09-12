@@ -37,7 +37,7 @@ next thing you hear is the result, or the one decision only you can make.
 **It remembers, so you do not have to.** Every task's state — what is
 running, what is waiting on you, what was decided and when — lives in Helm's
 records, not in your head or a chat window. `helm pending` prints only what
-needs a human, stamped with the clock time and how long it has waited, and
+needs the commander, stamped with the clock time and how long it has waited, and
 is silent on a quiet root; `helm status` shows the whole board. Come back
 after a day away, or start a fresh session, and the context is there. A
 coordinator that has read only a project's status record can take it over

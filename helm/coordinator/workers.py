@@ -19,7 +19,7 @@ from typing import Any
 
 from ..errors import HelmError, SafetyError
 from ..paths import _write_private_text, _private_dir
-from ..processes import _scan_worker_pid
+from ..processes import _process_parents, _scan_worker_pid
 from ..values import _safe_text, new_id, now
 from .. import costs
 
@@ -121,6 +121,54 @@ class WorkersMixin:
         with contextlib.suppress(OSError):
             directory.mkdir(parents=True, exist_ok=True)
             _write_private_text(directory / "stop", now() + "\n")
+
+    #: How long a turns runner gets to close the turn in progress once told to
+    #: stop, before it is signalled. The agent's last words and the turn record
+    #: are worth a short wait; the first trial killed both runners mid-turn
+    #: the instant they had reported, and lost every turn record.
+    TURN_STOP_GRACE_SECONDS = 30.0
+
+    def _runner_pid(self, worker: dict[str, Any]) -> int | None:
+        pid = worker.get("pid")
+        if not pid:
+            with contextlib.suppress(OSError, ValueError):
+                pid = int((self.turns_dir(worker["id"]) / "runner.pid").read_text().strip())
+                worker["pid"] = pid
+        return pid or None
+
+    def inside_own_turn(self, worker: dict[str, Any]) -> bool:
+        """Is this command running inside the turn of the runner it is about?
+
+        A worker reports by running a Helm command in its own session, so the
+        command that completes a task is a descendant of that task's runner.
+        Every agent Helm starts inherits its worker id in the environment, and
+        the runner's pid sits in this process's ancestry; either says so.
+        """
+        if worker.get("execution_mode") != "turns":
+            return False
+        if os.environ.get("HELM_WORKER_ID", "").strip() == worker.get("id"):
+            return True
+        pid = self._runner_pid(worker)
+        return bool(pid) and pid in _process_parents(os.getpid())
+
+    def _let_turns_finish(self, worker: dict[str, Any]) -> None:
+        """Ask a turns runner to stop after its current turn, and wait for it.
+
+        Not from inside that turn. A foreman's own `report result` releases
+        its tab, and waiting here for the runner to exit is waiting for the
+        turn this command is part of: the wait ran out its whole grace and the
+        pane closed on a turn still writing its record. From inside, the stop
+        is left for the runner to find between turns and the call returns.
+        """
+        if worker.get("execution_mode") != "turns":
+            return
+        self.stop_turns(worker["id"])
+        if self.inside_own_turn(worker):
+            return
+        pid = self._runner_pid(worker)
+        deadline = time.monotonic() + self.TURN_STOP_GRACE_SECONDS
+        while pid and self._pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.2)
 
     def turn_state(self, worker_id: str) -> dict[str, Any]:
         path = self.turns_dir(worker_id) / "state.json"
@@ -421,6 +469,7 @@ class WorkersMixin:
         # is demonstrably gone, so this never papers over a live session.
         if worker.get("status") != "running":
             signalled = False
+            self._let_turns_finish(worker)
             if self._pid_alive(worker.get("pid")):
                 # A settled worker whose session is still open: it pushed its
                 # result and kept its pane. A stop is the request to end that
@@ -435,8 +484,7 @@ class WorkersMixin:
             worker["signalled"] = signalled
             return worker
         detail = _safe_text(reason).strip() or "stopped by the coordinator"
-        if worker.get("execution_mode") == "turns":
-            self.stop_turns(worker_id)
+        self._let_turns_finish(worker)
         # A provider-launched worker never had its pid recorded, so this used
         # to signal nothing and "stopped" meant only that the record changed --
         # the agent kept running, invisible, and had to be killed by hand. Look
@@ -445,6 +493,18 @@ class WorkersMixin:
             with contextlib.suppress(HelmError, SafetyError, OSError):
                 self.adopt_worker_pid(worker_id)
             worker = self.store.load().get("workers", {}).get(worker_id, worker)
+        if worker.get("execution_mode") == "turns":
+            # The runner was asked to stop after its turn and given time to.
+            # If it did, its own exit record is the truth: settle from it
+            # rather than overwriting it with a "lost" verdict.
+            exit_file = Path(worker.get("exit_file") or "")
+            if exit_file.is_file() and not self._pid_alive(worker.get("pid")):
+                with contextlib.suppress(OSError, ValueError):
+                    recorded = json.loads(exit_file.read_text(encoding="utf-8"))
+                    if isinstance(recorded, dict) and not recorded.get("stopped"):
+                        settled = self.poll_worker(worker_id)
+                        settled["signalled"] = False
+                        return settled
         signalled = self._terminate_process(worker.get("pid"), grace=grace)
         # Record the exit here, which is what `_session_still_live` reads
         # before `helm task cleanup` will touch a worktree. Its docstring

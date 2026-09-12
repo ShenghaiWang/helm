@@ -139,3 +139,61 @@ class TurnsTests(HelmTestCase):
         self.assertEqual(self.coordinator._execution_mode(project, "herdr"), "turns")
         self.assertEqual(self.coordinator._execution_mode({**project, "execution": "session"}, "herdr"), "session")
         self.assertEqual(self.coordinator._execution_mode(project, "external"), "session")
+
+    def test_a_stop_lets_the_turn_in_progress_finish_and_keeps_its_record(self) -> None:
+        self.write_preferences(execution={"turns": "on"})
+        root = self.repo("graceful")
+        project = self.coordinator.register_project("Graceful", str(root), project_id="graceful")
+        task = self.coordinator.create_task(project["id"], "do the thing", agent="claude")
+        bin_dir = self._fake_claude()
+        # A turn that takes a moment: long enough to be mid-turn when stopped.
+        script = bin_dir / "claude"
+        script.write_text(script.read_text().replace("prompt = args[-1]\n", "import time; time.sleep(2)\nprompt = args[-1]\n"))
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        with mock.patch.dict(os.environ, env):
+            worker = self.coordinator.launch_worker(task["id"], None, wait=False, agent="claude")
+            turns_dir = Path(worker["config_file"]).parent / "turns"
+            self._wait_for(turns_dir / "runner.pid")
+            self.assertFalse((turns_dir / "1.json").exists())
+            self.coordinator.stop_worker(worker["id"], "done with it")
+        self.assertTrue((turns_dir / "1.json").exists(), "the turn in progress was allowed to end")
+        record = json.loads(Path(worker["exit_file"]).read_text())
+        self.assertEqual(record.get("returncode"), 0, record)
+        self.assertNotEqual(self.state.load()["workers"][worker["id"]]["status"], "running")
+
+    def test_a_report_from_inside_the_turn_leaves_its_own_runner_to_finish(self) -> None:
+        """A worker's own report is part of the turn a stop would wait for.
+
+        The foreman's `report result` released its own tab: it waited the
+        whole grace on its own runner, then closed the pane on a turn still
+        writing its record. From inside the turn, a stop is only left for the
+        runner to find between turns.
+        """
+        self.write_preferences(execution={"turns": "on"})
+        root = self.repo("selfreport")
+        project = self.coordinator.register_project("SelfReport", str(root), project_id="selfreport")
+        task = self.coordinator.create_task(project["id"], "do the thing", agent="claude")
+        bin_dir = self._fake_claude()
+        script = bin_dir / "claude"
+        script.write_text(script.read_text().replace("prompt = args[-1]\n", "import time; time.sleep(2)\nprompt = args[-1]\n"))
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        with mock.patch.dict(os.environ, env):
+            worker = self.coordinator.launch_worker(task["id"], None, wait=False, agent="claude")
+            turns_dir = Path(worker["config_file"]).parent / "turns"
+            self._wait_for(turns_dir / "runner.pid")
+            pid = int((turns_dir / "runner.pid").read_text().strip())
+            self.assertFalse(self.coordinator.inside_own_turn(worker))
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+                self.assertTrue(self.coordinator.inside_own_turn(worker))
+                started = time.monotonic()
+                self.coordinator._let_turns_finish(worker)
+                self.assertLess(time.monotonic() - started, 1.0, "waited on the turn this command is part of")
+            self.assertTrue((turns_dir / "stop").exists())
+            self.assertTrue(self.coordinator._pid_alive(pid), "the runner was left to finish its turn")
+            # Left alone, the runner ends the turn, keeps its record, and exits.
+            self._wait_for(turns_dir / "1.json")
+            self._wait_for(Path(worker["exit_file"]))
+            record = json.loads(Path(worker["exit_file"]).read_text())
+            self.assertEqual(record.get("returncode"), 0, record)
+            self.coordinator.poll_worker(worker["id"])
+            self.assertNotEqual(self.state.load()["workers"][worker["id"]]["status"], "running")

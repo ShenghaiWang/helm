@@ -817,11 +817,11 @@ class CliStatusTests(HelmTestCase):
         """
         from helm import watchdog
 
-        first = "HELM NEEDS A HUMAN (2):\n  a w-1 [quiet]: no message for 30s"
-        later = "HELM NEEDS A HUMAN (2):\n  a w-1 [quiet]: no message for 9000s"
+        first = "Commander, for your attention (2):\n  a w-1 [quiet]: no message for 30s"
+        later = "Commander, for your attention (2):\n  a w-1 [quiet]: no message for 9000s"
         self.assertEqual(watchdog._fingerprint(first), watchdog._fingerprint(later))
 
-        changed = "HELM NEEDS A HUMAN (3):\n  a w-1 [quiet]: no message for 30s\n  b GATE"
+        changed = "Commander, for your attention (3):\n  a w-1 [quiet]: no message for 30s\n  b GATE"
         self.assertNotEqual(watchdog._fingerprint(first), watchdog._fingerprint(changed))
 
     def test_the_watchdog_says_so_rather_than_pretending_on_an_unknown_platform(
@@ -1313,7 +1313,7 @@ class WatchdogHeadlineTests(HelmTestCase):
 
     The watchdog delivered correctly for its whole life and informed nobody.
     Its notification body was `text.splitlines()[0]`, which is always the
-    header -- "HELM NEEDS A HUMAN (4):". Every banner Helm ever sent carried a
+    header -- "Commander, for your attention (4):". Every banner Helm ever sent carried a
     number and no subject: no project, no verb, nothing to distinguish one from
     the next. A reader learns within a day that opening one tells them nothing,
     and stops looking, which is worse than no delivery at all -- the log shows
@@ -1324,7 +1324,7 @@ class WatchdogHeadlineTests(HelmTestCase):
         from helm.watchdog import _headline
 
         text = (
-            "HELM NEEDS A HUMAN (2):\n"
+            "Commander, for your attention (2):\n"
             "  09-10 06:56  22s scribe-fe-v2: PR #21656 OPEN against desktop/release-2.11.0\n"
             "  09-10 06:50   6m scribe-fe-v2: Approval request: push\n"
             "  (helm status for detail; helm ack <project> once relayed)"
@@ -1332,7 +1332,7 @@ class WatchdogHeadlineTests(HelmTestCase):
         headline = _headline(text)
         self.assertIn("PR #21656", headline, "the banner must name what happened")
         self.assertNotIn(
-            "NEEDS A HUMAN", headline, "the header is a count, not information"
+            "for your attention", headline, "the header is a count, not information"
         )
         self.assertIn("(2)", headline, "but it should still say how many are waiting")
 
@@ -1340,8 +1340,8 @@ class WatchdogHeadlineTests(HelmTestCase):
         """The trailing hint line is not an item and must never be the subject."""
         from helm.watchdog import _headline
 
-        text = "HELM NEEDS A HUMAN (1):\n  (helm status for detail; helm ack <project>)"
-        self.assertEqual(_headline(text), "HELM NEEDS A HUMAN (1):")
+        text = "Commander, for your attention (1):\n  (helm status for detail; helm ack <project>)"
+        self.assertEqual(_headline(text), "Commander, for your attention (1):")
 
     def test_empty_text_still_produces_something_sayable(self) -> None:
         from helm.watchdog import _headline

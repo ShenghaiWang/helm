@@ -26,7 +26,7 @@ class WatchdogTests(HelmTestCase):
 
     def test_a_standing_list_is_said_again_after_the_reminder_interval(self) -> None:
         told: list[tuple[str, str]] = []
-        text = "HELM NEEDS A HUMAN (1):\n  09-11 10:56   5m 🟦 media — approval-needed push"
+        text = "Commander, for your attention (1):\n  09-11 10:56   5m 🟦 media — approval-needed push"
 
         def notify(title, message, **kwargs):
             told.append((title, message))

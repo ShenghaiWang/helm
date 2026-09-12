@@ -131,7 +131,10 @@ when the work is done, push `result` and end.
 Liveness is a pid and an exit code. A runner the machine killed — sleep, an
 OOM — is started again by the next message or by the watchdog's healing,
 and resumes the same session where it stopped; the task does not fail.
-Stopping a worker ends the turn in progress. A runtime with no way to
+Stopping a worker lets the turn in progress end, then exits the runner.
+A worker's own terminal report is part of such a turn, so the release it
+triggers only asks the runner to stop: the runner exits once that turn is
+written, and the next pass closes the pane. A runtime with no way to
 resume a session (pi, opencode) starts a later turn fresh with a catch-up
 of its earlier turns; a configured profile with its own command always runs
 the interactive session.

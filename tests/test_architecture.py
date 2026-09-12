@@ -35,6 +35,7 @@ LAYERED = (
     "coordinator/ledger.py",
     "coordinator/adopt.py",
     "coordinator/knowledge.py",
+    "coordinator/tidy.py",
     "coordinator/status.py",
     "coordinator/skills.py",
     "coordinator/gates.py",

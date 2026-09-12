@@ -335,7 +335,10 @@ class DomainsSkillsTests(HelmTestCase):
         knowledge = (domain / "knowledge.md").read_text()
         self.assertIn("Use captions on artifacts", knowledge)
         self.assertIn(proposal["id"], knowledge)
-        self.assertIn(task["id"], knowledge)
+        # The evidence stays on the record; a tracked domain file names no
+        # task of the root that learned from it.
+        self.assertNotIn(task["id"], knowledge)
+        self.assertEqual(applied["source_task_id"], task["id"])
         future = coordinator.create_task(project["id"], "Prepare another artifact")
         future_worker = coordinator.launch_worker(future["id"], [sys.executable, "-c", ""])
         context = json.loads(Path(future_worker["context_file"]).read_text())

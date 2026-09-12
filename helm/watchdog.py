@@ -6,7 +6,7 @@ and the coordinator that would relay any of it only exists inside a
 conversation turn, so nothing reaches the commander while they are away.
 
 This runs outside all of that. It reconciles worker state, and when something
-genuinely needs a human it says so through a channel that reaches one.
+genuinely needs the commander it says so through a channel that reaches them.
 
 Two properties it must keep, because both are how notifiers die:
 
@@ -33,6 +33,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 LABEL = "com.helm.watchdog"
 DEFAULT_INTERVAL = 20
@@ -65,7 +66,7 @@ def _headline(text: str) -> str:
     """The first line that says something, not the line that counts things.
 
     This used to be `text.splitlines()[0]`, which is always the header --
-    "HELM NEEDS A HUMAN (4):". Every notification Helm has ever sent said a
+    "Commander, for your attention (4):". Every notification Helm has ever sent said a
     number and nothing else: no project, no subject, no verb. Two of them in a
     row are indistinguishable, so a reader learns within a day that opening one
     tells them nothing, and stops looking. The chain then delivers perfectly
@@ -78,7 +79,7 @@ def _headline(text: str) -> str:
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
-        return "something needs a human"
+        return "something needs your attention, commander"
     header = lines[0]
     items = [
         line
@@ -191,6 +192,9 @@ def sync_pull_requests(root: Path | None) -> dict[str, object]:
     store = StateStore(root / "state", helm_root=root) if root else StateStore()
     coordinator = Coordinator(store)
     synced = coordinator.sync_open_pull_requests()
+    # Once a day, mine what recurred into proposals, so the knowledge loop
+    # feeds itself and the proposals reach `pending` on their own.
+    synced["mined"] = _mine_daily(coordinator, root)
     # The same pass sheds what a standing cleanup grant covers, and archives
     # the records that then hold nothing -- housekeeping nobody has to run.
     swept = coordinator.sweep_residue_under_grants()
@@ -263,6 +267,26 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
                     f"foreman; appointed {appointed['worker']['id']}"
                 )
     return reports
+
+
+MINE_EVERY_SECONDS = 24 * 3600
+
+
+def _mine_daily(coordinator: Any, root: Path | None) -> int:
+    """Run `helm learning mine` once a day from the watchdog; the count proposed."""
+    stamp = Path(os.environ.get("TMPDIR", "/tmp")) / "helm-watchdog.mined"
+    last = 0.0
+    with _quiet():
+        last = float(stamp.read_text(encoding="utf-8").strip() or 0)
+    if time.time() - last < MINE_EVERY_SECONDS:
+        return 0
+    with _quiet():
+        stamp.write_text(f"{time.time():.0f}", encoding="utf-8")
+    try:
+        mined = coordinator.mine_learnings(days=14)
+    except Exception:  # noqa: BLE001 - a courtesy, never the reason to die
+        return 0
+    return len(mined.get("proposed") or [])
 
 
 def run(
@@ -385,7 +409,7 @@ def _systemd_units(
         if notify_command else ""
     )
     service = f"""[Unit]
-Description=Helm watchdog: surface what needs a human
+Description=Helm watchdog: surface what needs the commander's attention
 
 [Service]
 Type=simple
@@ -478,7 +502,7 @@ def install(
         )
         print(f"Installed the Helm watchdog: {target}")
         print(f"  Polls every {interval}s against {root} and notifies within that,")
-        print("  staying silent unless something needs a human AND the list changed,")
+        print("  staying silent unless something needs the commander AND the list changed,")
         print(f"  then saying it again every {remind_minutes:g} minutes while it still waits.")
         if notify_command:
             print(f"  Each notification also runs your command: {notify_command}")

@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "//": "Prints nothing when nothing needs a human, so a quiet root stays quiet.",
+            "//": "Prints nothing when nothing needs the commander's attention, so a quiet root stays quiet.",
             "command": "python3 -m helm pending 2>/dev/null || true",
             "timeout": 20
           }

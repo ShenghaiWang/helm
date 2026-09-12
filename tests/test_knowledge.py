@@ -125,3 +125,56 @@ class KnowledgeTests(HelmTestCase):
         self.assertIn("waiting more than 7 days", text)
         self.assertIn(f"applied  {waiting[0]['id']}", text)
         self.assertEqual([p for p in coordinator.waiting_learnings() if str(p.get("origin", "")).startswith("mined")], [])
+
+    def test_auto_proposals_skip_reviewers_and_reports_and_a_proposal_outlives_its_project(self) -> None:
+        helm_root, coordinator, project = self._rooted("filtered")
+        # A worker whose result reads as a fact is proposed; a report is not.
+        task = coordinator.create_task(project["id"], "fix the thing")
+        worker = coordinator.launch_worker(task["id"], [sys.executable, "-c", ""])
+        proposals = coordinator.generate_learning_proposals(
+            task["id"], fact="A retry loop must cap its attempts and say so in the log."
+        )
+        self.assertEqual(len(proposals), 1)
+        report_task = coordinator.create_task(project["id"], "ship it")
+        report_worker = coordinator.launch_worker(report_task["id"], [sys.executable, "-c", ""])
+        with coordinator.store.locked() as data:
+            data["messages"].append({
+                "id": "m-report", "project_id": project["id"], "task_id": report_task["id"],
+                "worker_id": report_worker["id"], "kind": "result", "status": None,
+                "text": "TCK-1 delivered: PR #12 opened (https://example.test/pull/12), tests exit 0.",
+                "payload": {}, "created_at": "2026-09-12T00:00:00Z",
+            })
+        with self.assertRaisesRegex(HelmError, "no concise result"):
+            coordinator.generate_learning_proposals(report_task["id"])
+        review = coordinator.create_task(project["id"], "review", role="reviewer", reviews=task["id"], read_only=True)
+        reviewer = coordinator.launch_worker(review["id"], [sys.executable, "-c", ""])
+        coordinator.record_worker_message(reviewer["id"], "result", "APPROVED — nothing to change.")
+        with self.assertRaisesRegex(HelmError, "its verdict is not a learning"):
+            coordinator.generate_learning_proposals(review["id"])
+        # The project is forgotten; its learning can still be applied to the domain.
+        coordinator.cleanup_task(task["id"], delete_branch=True)
+        coordinator.cleanup_task(report_task["id"], delete_branch=True)
+        coordinator.cleanup_task(review["id"])
+        shutil.rmtree(helm_root / "projects" / project["id"])
+        coordinator.remove_project(project["id"])
+        decided = coordinator.triage_learnings(approve=[proposals[0]["id"]], note="still true")
+        self.assertEqual([p["id"] for p in decided["applied"]], [proposals[0]["id"]], decided)
+        self.assertIn("retry loop", (helm_root / "domains" / "software-delivery" / "knowledge.md").read_text())
+
+    def test_an_applied_learning_carries_no_identifier_from_the_root_that_learned_it(self) -> None:
+        """A domain file is tracked product content; the evidence stays in state."""
+        helm_root, coordinator, _ = self._rooted("scrubbed")
+        taught = coordinator.teach(
+            "On t-0123456789ab the reviewer m-fedcba987654 caught what ABC-12 missed: check the seam.",
+            domain="software-delivery",
+            note="seen on w-abcdef012345 during ABC-12",
+        )
+        knowledge = (helm_root / "domains" / "software-delivery" / "knowledge.md").read_text()
+        for identifier in ("t-0123456789ab", "m-fedcba987654", "w-abcdef012345", "ABC-12", "source_message_ids", "source_task_id"):
+            self.assertNotIn(identifier, knowledge, identifier)
+        self.assertIn("On a task the reviewer a message caught what a ticket missed", knowledge)
+        self.assertIn(taught["id"], knowledge, "the proposal id is the one tie back to provenance")
+        # The record in state keeps the words the commander actually used.
+        stored = next(p for p in coordinator.store.load()["learning_proposals"] if p["id"] == taught["id"])
+        self.assertIn("t-0123456789ab", stored["proposed_fact"])
+        self.assertIn("ABC-12", stored["rationale"])

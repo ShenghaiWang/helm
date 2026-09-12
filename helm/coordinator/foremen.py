@@ -61,7 +61,7 @@ class ForemenMixin:
         A foreman that escalates ends `blocked`, and that record is permanent
         evidence of what happened -- rightly. But appointing its replacement
         IS the answer to the escalation, so continuing to present it as
-        needing a human turns the attention list into a list of things
+        needing the commander turns the attention list into a list of things
         already dealt with. Seven such entries on one project trained the
         reader to skim past the two that were real.
         """

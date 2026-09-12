@@ -147,3 +147,8 @@ each round can only close what the last one exposed. Size the increment to what
 one reviewer can hold at once — a single mechanism with its tests, not a screen
 with its whole supporting stack. Two increments reviewed once each beat one
 increment reviewed five times, and the arithmetic is not close.
+## Approved learning: lp-8dcc0467ac8b
+<!-- helm-learning: {"approved_at":"2026-09-12T02:16:51Z","approved_by":"user","confidence":0.85,"created_at":"2026-08-16T11:24:20Z","domain_id":"code-review","proposal_id":"lp-8dcc0467ac8b"} -->
+- Fact: When a diff ships a deliberate forward seam -- a placeholder a later round replaces -- check that it is LOUD: its own error type, its own test, and a comment saying it is temporary and which round deletes it. A quiet placeholder is a finding, because it is indistinguishable from a wrong contract to every reader after the author.
+- Rationale: Round 6a of a service layer deferred SSE to 6b, so POST /notes returned 501 NOTES_STREAM_NOT_IMPLEMENTED. That is not the route's specified contract, and shipped quietly it would read as the real behaviour to anyone reading the code, the tests or the API afterwards. It was made loud instead -- its own problem type, its own named test, and a comment naming the round that removes it -- so the deferral stayed visible and the deletion is a diff a reviewer can see rather than a rewrite that silently absorbs it. The reviewer independently confirmed the seam was loud rather than assuming it, and the deletion was written into the next round's contract as debt at the moment the seam was created, not left to be remembered.
+<!-- /helm-learning: lp-8dcc0467ac8b -->

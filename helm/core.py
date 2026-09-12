@@ -143,6 +143,7 @@ from .coordinator.pull_requests import PullRequestsMixin
 from .coordinator.ledger import LedgerMixin
 from .coordinator.adopt import AdoptMixin
 from .coordinator.knowledge import KnowledgeMixin
+from .coordinator.tidy import TidyMixin
 from .coordinator.caller import CallerMixin
 from .coordinator.decisions import DecisionsMixin
 from .coordinator.lifecycle import LifecycleMixin
@@ -164,6 +165,7 @@ class Coordinator(
     LedgerMixin,
     AdoptMixin,
     KnowledgeMixin,
+    TidyMixin,
     ProtectionMixin,
     LifecycleMixin,
     AgentsMixin,
