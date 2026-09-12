@@ -206,6 +206,7 @@ helm prefs set model.runtimes.claude claude
 helm prefs set model.free prefer         # cost evidence rides into the worker's context
 helm prefs set effort.default medium
 helm prefs set model.prices.some-model-5 in=1,out=5,cache_read=0.1,cache_write=1.25   # USD per million tokens
+helm prefs set model.prices.* in=1,out=5,cache_read=0.1,cache_write=1.25              # the flat rate for every other model
 helm prefs unset agent.exclude
 helm prefs migrate                       # legacy state.config exclusions into the file
 ```

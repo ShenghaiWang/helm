@@ -199,7 +199,7 @@ def price_usage(by_model: dict[str, dict[str, int]], price_for) -> dict[str, Any
         spent = {field: int(tokens.get(field) or 0) for field in USAGE_FIELDS}
         if not any(spent.values()):
             continue
-        rates = price_for(model) if model else None
+        rates = price_for(model)
         if rates is None:
             unpriced.append(model or "unknown model")
             continue

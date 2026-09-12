@@ -42,6 +42,17 @@ class ModelPricePreferenceTests(HelmTestCase):
         self.assertEqual(loaded.price_for("some-model-5-mini-20260101")["in"], 0.2)
         self.assertIsNone(loaded.price_for("other-model-9"))
         self.assertIsNone(loaded.price_for(None))
+        # A flat rate covers every model not priced by name, a nameless turn
+        # included; a name still wins over it.
+        flat = self._load({"version": 1, "model": {"prices": {
+            "*": "in=2,out=2,cache_read=2,cache_write=2",
+            "some-model-5": "in=1,out=5",
+        }}})
+        self.assertEqual(flat.price_for("other-model-9")["out"], 2.0)
+        self.assertEqual(flat.price_for("")["in"], 2.0)
+        self.assertEqual(flat.price_for("some-model-5-20260101")["out"], 5.0)
+        self.assertEqual(flat.document()["model"]["prices"]["*"], "in=2,out=2,cache_read=2,cache_write=2")
+        self.assertIn(("model.prices.*", "in=2,out=2,cache_read=2,cache_write=2"), flat.entries())
         document = loaded.document()
         self.assertEqual(document["model"]["prices"]["some-model-5-mini"], "in=0.2,out=1")
         self.assertIn(("model.prices.some-model-5", "in=1,out=5,cache_read=0.1,cache_write=1.25"), loaded.entries())
@@ -71,6 +82,10 @@ class ModelPricePreferenceTests(HelmTestCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(_cli(helm_root, "prefs", "unset", "model.prices.some-model-5")[0], 0)
         self.assertEqual(preferences.load(helm_root / "preferences.json").model_prices, {})
+        code, output = _cli(helm_root, "prefs", "set", "model.prices.*", "in=3,out=3,cache_read=3,cache_write=3")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(preferences.load(helm_root / "preferences.json").price_for("anything-at-all")["in"], 3.0)
+        self.assertEqual(_cli(helm_root, "prefs", "unset", "model.prices.*")[0], 0)
 
 
 class PriceUsageTests(HelmTestCase):

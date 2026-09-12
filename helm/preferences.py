@@ -144,7 +144,8 @@ SUPPORTED_KEYS: dict[str, tuple[bool, str]] = {
         False,
         "what one model costs, in USD per million tokens: in=<n>,out=<n>"
         "[,cache_read=<n>][,cache_write=<n>]; the ledger and `task cost` price "
-        "a transcript with it, and a model with no price stays in tokens only",
+        "a transcript with it, and a model with no price stays in tokens only; "
+        "`model.prices.*` is the flat rate for every model not priced by name",
     ),
     KEY_REVIEW_AGENT: (
         False,
@@ -214,13 +215,21 @@ def split_effort_runtimes_key(key: str) -> str | None:
     return runtime_id
 
 
+#: The one price key that is not a model id: the flat rate for every model
+#: the root has not priced by name.
+ANY_MODEL_PRICE = "*"
+
+
 def split_model_prices_key(key: str) -> str | None:
     """Return the model id a `model.prices.<model>` key names, or None."""
     prefix = f"{KEY_MODEL_PRICES}."
     if not key.startswith(prefix):
         return None
+    tail = key[len(prefix):]
+    if tail == ANY_MODEL_PRICE:
+        return tail
     try:
-        return runtimes.validate_model_id(key[len(prefix):])
+        return runtimes.validate_model_id(tail)
     except ValueError as exc:
         raise PreferencesError(f"{key}: {exc}") from exc
 
@@ -368,15 +377,21 @@ class Preferences:
         `model.prices.some-model-5` covers `some-model-5-20260101`. Nothing is
         ever guessed across families: no entry means no price.
         """
-        if not model_id or not self.model_prices:
+        if not self.model_prices:
             return None
-        exact = self.model_prices.get(model_id)
-        if exact is not None:
-            return exact
-        candidates = [key for key in self.model_prices if model_id.startswith(key)]
-        if not candidates:
-            return None
-        return self.model_prices[max(candidates, key=len)]
+        if model_id:
+            exact = self.model_prices.get(model_id)
+            if exact is not None:
+                return exact
+            candidates = [
+                key for key in self.model_prices
+                if key != ANY_MODEL_PRICE and model_id.startswith(key)
+            ]
+            if candidates:
+                return self.model_prices[max(candidates, key=len)]
+        # The flat rate covers every model not priced by name -- including a
+        # transcript turn that carries no model name at all.
+        return self.model_prices.get(ANY_MODEL_PRICE)
 
     def entries(self) -> list[tuple[str, str]]:
         """Every set preference as (key, printable value), for `prefs show`.
@@ -568,7 +583,8 @@ def _from_document(document: Any, path: Path | None) -> Preferences:
     prices_by_model: dict[str, dict[str, float]] = {}
     for model_id, spec in _object(model.get("prices"), "model.prices", where).items():
         name = f"model.prices.{model_id}"
-        prices_by_model[_model_id(model_id, name, where)] = _parse_price(spec, name, where)
+        priced_id = model_id if model_id == ANY_MODEL_PRICE else _model_id(model_id, name, where)
+        prices_by_model[priced_id] = _parse_price(spec, name, where)
 
     excluded_models = frozenset(
         # Validated as model ids, exactly like `model.default`. An exclusion
