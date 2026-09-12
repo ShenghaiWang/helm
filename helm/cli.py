@@ -19,6 +19,7 @@ from . import watchdog as watchdog_module
 from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .values import GRANTABLE_ACTIONS, TASK_SHAPES
 from .coordinator.tidy import STALE_FOLLOW_UP_DAYS
+from .learned import bound_learned_knowledge
 from .core import (
     HEALTHY_WORKER_VERDICTS,
     EFFORT_LEVELS,
@@ -1027,6 +1028,9 @@ def _print_learning(proposal: dict[str, Any]) -> None:
     print(f"  rationale: {proposal['rationale']}")
 
 
+_SAFE_DOMAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
 def _print_tidy(tidied: dict[str, Any]) -> None:
     verb = "would close" if tidied.get("dry_run") else "closed"
     resolved = tidied["resolved"]
@@ -1057,8 +1061,8 @@ def _print_ledger(report: dict[str, Any]) -> None:
     print(f"Ledger, last {report['days']:g} day(s){scope}: {len(rows)} worker task(s)")
     if not rows:
         return
-    print("| task | project | ticket | shape | status | to result | reviews | catches | asks | turns | out tokens | cost |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| task | project | ticket | shape | status | to result | reviews | catches | asks | turns | ctx KB | out tokens | cost |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for row in rows:
         cost = f"${row['cost_usd']:.2f}" if isinstance(row.get("cost_usd"), (int, float)) else ""
         minutes = f"{row['minutes_to_result']:g}m" if isinstance(row.get("minutes_to_result"), (int, float)) else ""
@@ -1066,6 +1070,7 @@ def _print_ledger(report: dict[str, Any]) -> None:
             f"| {row['task_id']} | {row['project_id']} | {row.get('ticket') or ''} | {row['shape']} | "
             f"{row['delivery']}{' (archived)' if row['archived'] else ''} | {minutes} | {row['review_rounds']} | "
             f"{row['review_catches']} | {row['questions'] + row['blockers'] + row['approvals']} | {row['turns']} | "
+            f"{row['context_kb'] if row.get('context_kb') is not None else ''} | "
             f"{row['output_tokens']} | {cost} |"
         )
     totals = report["totals"]
@@ -1104,6 +1109,12 @@ def _print_inspect(report: dict[str, Any]) -> None:
         for finding in check.get("findings") or []:
             print(f"    shape check: {finding}")
     print(f"  policy: {task['delivery_policy']}")
+    if task.get("context_bytes"):
+        indexed = task.get("context_indexed") or []
+        print(
+            f"  context: {task['context_bytes'] / 1000:.0f} KB handed to the worker"
+            + (f"; indexed rather than in full: {', '.join(indexed)}" if indexed else "")
+        )
     print(f"  branch: {task['branch']}")
     print(f"  workspace: {task['workspace']}")
     # What this task will actually be RUN as. Absent from inspect until a
@@ -1853,6 +1864,12 @@ def _build_parser() -> argparse.ArgumentParser:
     domain_cmd.add_subparsers(dest="domain_command", required=True).add_parser(
         "list", help="show every domain and the work it applies to"
     )
+
+    guide_cmd = commands.add_parser(
+        "guide",
+        help="print one domain's knowledge and guardrails in full -- what a worker's context indexed",
+    )
+    guide_cmd.add_argument("domain_id")
 
     skills_cmd = commands.add_parser(
         "skills", help="show a project's task-varying skills and what is wrong with any"
@@ -4245,6 +4262,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ! {problem.get('id') or '(root)'}: {problem['problem']}")
             return 1 if problems else 0
 
+        if args.command == "guide":
+            # The id is checked before it touches a path: a domain is a
+            # directory name under domains/, never a path of its own.
+            if not _SAFE_DOMAIN_ID.fullmatch(args.domain_id):
+                raise HelmError(f"unknown domain: {args.domain_id}")
+            projects = coordinator.list_projects()
+            domain_root = coordinator._domain_root(projects[0] if projects else {"root": "."})
+            domain_dir = (domain_root / args.domain_id) if domain_root else None
+            if domain_dir is None or not domain_dir.is_dir():
+                raise HelmError(f"unknown domain: {args.domain_id}")
+            knowledge = domain_dir / "knowledge.md"
+            guardrails = domain_dir / "guardrails.md"
+            if knowledge.is_file():
+                text, omitted = bound_learned_knowledge(knowledge.read_text(encoding="utf-8", errors="replace"), str(knowledge))
+                print(text.rstrip("\n"))
+            else:
+                print(f"(no knowledge.md for {args.domain_id})")
+            if guardrails.is_file():
+                print("\n--- guardrails ---\n")
+                print(guardrails.read_text(encoding="utf-8", errors="replace").rstrip("\n"))
+            return 0
         if args.command == "domain":
             projects = coordinator.list_projects()
             catalogue = coordinator.domain_catalogue(projects[0] if projects else {"root": "."})

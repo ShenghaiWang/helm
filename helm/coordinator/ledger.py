@@ -145,6 +145,7 @@ class LedgerMixin:
             "effort": task.get("effort"),
             "created_at": task.get("created_at"),
             "status": task.get("status"),
+            "context_kb": round((task.get("context_bytes") or 0) / 1000, 1) if task.get("context_bytes") else None,
             # A task's status is the authority once it is delivered: a record
             # written before the merge path advanced its delivery state still
             # says "worktree", and that must never outrank "merged".

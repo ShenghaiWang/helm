@@ -34,6 +34,20 @@ tail is over the budget: the fix is to fold the older learnings into the
 authored sections and delete their blocks, which is how learned knowledge
 becomes the domain rather than a growing appendix to it.
 
+**A worker pulls; a reviewer is pushed.** The selected domain and every
+guardrails file are handed over whole. Inherited base domains are budgeted:
+the smallest are handed over in full until the budget is spent, and the rest
+arrive as an index -- what the domain is for, every heading, and the exact
+`helm guide <domain>` command that prints it in full -- so a worker knows
+the topic is covered and reads it before acting on it. A reviewer is the
+exception: the standards a change is checked against (code review,
+verification, definition of done, change sizing, implementation notes) are
+pushed to it in full whatever the budget, and a domain whose rubric every
+role must read declares `always_in_full: true` in its own frontmatter, which
+takes it out of the budget for everyone. `helm inspect` shows how much was
+handed over and which bases were indexed, and the ledger carries it as a
+column, so the size of an assignment is a number rather than a feeling.
+
 **Domain knowledge attaches by itself.** The commander never names a domain,
 and after the first task on a project neither does anything else: Helm records
 the first domain actually resolved for a project as that project's default,

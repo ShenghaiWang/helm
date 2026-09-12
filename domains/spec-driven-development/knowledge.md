@@ -9,6 +9,7 @@ not_for:
   - narrow, well-understood, low-risk mechanical changes
   - choosing, installing, or scaffolding a spec framework
 selectable: false
+always_in_full: true
 ---
 # Spec-driven development
 

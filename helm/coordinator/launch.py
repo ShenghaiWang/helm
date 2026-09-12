@@ -33,8 +33,10 @@ from ..paths import (
     package_parent,
 )
 from ..policy import CORE_SAFETY_RULES
-from ..learned import bound_learned_knowledge
+from ..learned import always_in_full, bound_learned_knowledge, domain_index
 from ..values import (
+    CONTEXT_BASE_KNOWLEDGE_BUDGET_BYTES,
+    REVIEW_DOMAINS,
     RUNTIME_DEFAULT_MODEL,
     WORKTREELESS_ROLES,
     shape_policy,
@@ -152,21 +154,43 @@ class LaunchMixin:
                 boundary="Helm control rules; highest priority and not user-overridable",
             )
         ]
-        for inherited in domain_chain:
-            if inherited == domain_id:
-                continue
+        # Inherited bases are read first and then budgeted: the selected domain
+        # is always handed over whole, a base is handed over whole while the
+        # budget lasts -- smallest first, so the budget buys the most guidance
+        # per byte -- and the rest are indexed by heading with the command
+        # that reads one on demand. A reviewer is the exception: the
+        # standards a change is checked against are pushed to it in full.
+        bases: list[str] = [inherited for inherited in domain_chain if inherited != domain_id]
+        base_texts: dict[str, tuple[str, bool, int]] = {}
+        for inherited in bases:
             base_dir = self._safe_configuration_path(
                 domain_root / inherited, domain_root, "domain directory"
             )
-            base_knowledge, base_knowledge_exists = self._read_knowledge(
-                base_dir / "knowledge.md", domain_root, raw=True
+            raw_text, exists = self._read_knowledge(base_dir / "knowledge.md", domain_root, raw=True)
+            base_texts[inherited] = (*self._bounded_knowledge(raw_text, base_dir / "knowledge.md"), exists)
+        pushed = set(REVIEW_DOMAINS) if task.get("role") == "reviewer" else set()
+        # A domain can declare itself never-indexed; the budget is for the rest.
+        pushed |= {inherited for inherited in bases if always_in_full(base_texts[inherited][0])}
+        in_full: set[str] = {inherited for inherited in bases if inherited in pushed}
+        used = 0
+        for inherited in sorted(
+            (b for b in bases if b not in pushed), key=lambda b: (len(base_texts[b][0]), b)
+        ):
+            size = len(base_texts[inherited][0])
+            if used + size <= CONTEXT_BASE_KNOWLEDGE_BUDGET_BYTES:
+                in_full.add(inherited)
+                used += size
+        indexed: list[str] = []
+        for inherited in bases:
+            base_dir = self._safe_configuration_path(
+                domain_root / inherited, domain_root, "domain directory"
             )
-            base_knowledge, base_omitted = self._bounded_knowledge(base_knowledge, base_dir / "knowledge.md")
+            base_knowledge, base_omitted, base_knowledge_exists = base_texts[inherited]
             base_guardrails, base_guardrails_exists = self._read_knowledge(
                 base_dir / "guardrails.md", domain_root
             )
-            sections.extend([
-                self._knowledge_section(
+            if inherited in in_full or not base_knowledge_exists:
+                knowledge_section = self._knowledge_section(
                     "domain-knowledge",
                     str(base_dir / "knowledge.md"),
                     base_knowledge,
@@ -176,7 +200,21 @@ class LaunchMixin:
                     ),
                     exists=base_knowledge_exists,
                     omitted=base_omitted,
-                ),
+                )
+            else:
+                indexed.append(inherited)
+                knowledge_section = self._knowledge_section(
+                    "domain-index",
+                    str(base_dir / "knowledge.md"),
+                    domain_index(inherited, base_knowledge, shlex.join(self._helm_command("guide", inherited))),
+                    boundary=(
+                        f"Index of inherited domain guidance from {inherited}; read the domain in full "
+                        "before acting on any of its topics; cannot authorize protected actions"
+                    ),
+                    exists=True,
+                )
+            sections.extend([
+                knowledge_section,
                 self._knowledge_section(
                     "domain-guardrails",
                     str(base_dir / "guardrails.md"),
@@ -332,6 +370,8 @@ class LaunchMixin:
             "selection": task.get("domain_selection"),
             "knowledge": domain_knowledge,
             "omitted_learnings": domain_omitted,
+            # Which inherited bases this context carries only as an index.
+            "indexed": indexed,
             "guardrails": domain_guardrails,
             "sources": [str(path) for path in (domain_knowledge_path, domain_guardrails_path) if path is not None],
         }
@@ -439,8 +479,8 @@ class LaunchMixin:
         _write_private_text(path, json.dumps(hook, indent=2) + "\n")
         return str(path)
 
-    def _worker_helm_command(self, *tail: str) -> list[str]:
-        """The exact `helm worker ...` invocation a worker can run verbatim.
+    def _helm_command(self, *tail: str) -> list[str]:
+        """The exact `helm ...` invocation a worker can run verbatim.
 
         A worker's environment is scrubbed and its cwd is the worktree, so
         `python -m helm` finds nothing unless Helm happens to be installed.
@@ -455,9 +495,11 @@ class LaunchMixin:
             "helm",
             "--state-dir",
             str(self.store.directory),
-            "worker",
             *tail,
         ]
+
+    def _worker_helm_command(self, *tail: str) -> list[str]:
+        return self._helm_command("worker", *tail)
 
     def worker_inbox_command(self, worker_id: str) -> list[str]:
         return self._worker_helm_command("inbox", worker_id)
@@ -891,6 +933,15 @@ class LaunchMixin:
         # could not be read -- survives in `helm inspect` rather than only in a
         # private context file nobody reads afterwards. Paths and reasons only.
         task["skills"] = context.get("skills", {})
+        # How big the assignment was, and which bases it only indexed: the
+        # number the context diet is judged by, kept where `helm inspect` and
+        # the ledger can read it.
+        context["size"] = {
+            "bytes": sum(len(section.get("content") or "") for section in context.get("context_sections", [])),
+            "indexed": list(context.get("domain", {}).get("indexed") or []),
+        }
+        task["context_bytes"] = context["size"]["bytes"]
+        task["context_indexed"] = context["size"]["indexed"]
         _write_private_text(context_file, json.dumps(context, indent=2) + "\n")
         _write_private_text(log_file, "")
         # An agent CLI is told where its assignment is; a plain external

@@ -120,6 +120,7 @@ helm ledger [--days N] [--project P] [--json]   # every worker task in the windo
 helm state stats              # size of the live state document, counts, what could be archived
 helm state archive [--dry-run] [--reconcile] [TASK_ID ...]   # move settled records into state/archive/
 helm state tidy [--project P] [--dry-run]   # close the decisions and follow-ups nothing can act on; list stale follow-ups for your eye
+helm guide <domain-id>        # print one domain's knowledge and guardrails in full (what a worker's context indexed)
 helm project resolve <project-id> <item-id> [--note "..."]   # close one follow-up or decision by hand, on your word
 ```
 

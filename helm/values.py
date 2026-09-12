@@ -213,6 +213,21 @@ SPLIT_ADVICE_LINES = 1500
 #: newest fit; earlier ones are counted and named, not silently dropped.
 LEARNED_KNOWLEDGE_BUDGET_BYTES = 6000
 
+#: How much inherited base-domain knowledge a composed context carries in
+#: full. The smallest bases go first, so the budget buys the most guidance per
+#: byte; the rest are indexed by heading, with the command that reads one on
+#: demand. The selected domain and every guardrails file are never cut: a
+#: rule that is not read is not a rule, and the most specific guidance is the
+#: one the task was resolved to.
+CONTEXT_BASE_KNOWLEDGE_BUDGET_BYTES = 30_000
+
+#: Domains a reviewer is handed in full whatever the budget: the standards a
+#: change is checked against are pushed to the reviewer, while an author pulls
+#: them on demand. An author working from an index still sees every heading.
+REVIEW_DOMAINS = frozenset({
+    "code-review", "verification", "definition-of-done", "change-sizing", "implementation-notes",
+})
+
 
 def shape_check(task: dict[str, Any], numstat: str) -> dict[str, Any]:
     """Compare a task's declared shape with what its diff touches.
