@@ -39,9 +39,12 @@ class CliStatusTests(HelmTestCase):
         root = self.repo("asking")
         project = self.coordinator.register_project("Ask", str(root), project_id="asking")
         task = self.coordinator.create_task(project["id"], "ask and wait")
+        # Alive for the whole test, or a busy runner sees the exit before the
+        # question and every verdict reads "finished".
         worker = self.coordinator.launch_worker(
-            task["id"], [sys.executable, "-c", ""], wait=False
+            task["id"], [sys.executable, "-c", "import time; time.sleep(300)"], wait=False
         )
+        self.addCleanup(lambda: os.kill(int(worker["pid"]), 15) if worker.get("pid") else None)
         self.coordinator.record_worker_message(worker["id"], "status", "working")
         # Reporting normally, so every other signal says healthy. Asking is
         # what makes it blocked, and that has to be visible on its own.

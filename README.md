@@ -406,6 +406,16 @@ profiles, `HELM_WORKER_COMMAND`) and the adapter conventions in
 [docs/agent-adapters.md](docs/agent-adapters.md) are advanced inputs, not
 prerequisites. See [docs/cli.md](docs/cli.md).
 
+## Running the tests
+
+```sh
+python3 -m unittest discover -s tests        # the whole suite, serially (what CI runs)
+python3 tools/run_tests.py                   # the same suite sharded across processes, about four times faster
+```
+
+Tests that need real agent runtimes on `PATH` skip and say which; the suite
+also runs under an empty home and a bare `PATH`.
+
 ## Documentation map
 
 | Read | For |

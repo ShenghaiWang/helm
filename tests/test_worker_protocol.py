@@ -28,6 +28,17 @@ from helm.herdr import HerdrAdapter
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS, wait_for_exit
 
 
+def _terminate(pid) -> None:
+    """End a test's long-lived worker process; a gone process is fine."""
+    import signal
+    if not pid:
+        return
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
 class WorkerProtocolTests(HelmTestCase):
     def _runner_config(self, name: str) -> Path:
         root = self.repo(name)
@@ -779,8 +790,9 @@ class WorkerProtocolTests(HelmTestCase):
         project = self.coordinator.register_project("Break", str(root), project_id="breaking")
         task = self.coordinator.create_task(project["id"], "break midway")
         worker = self.coordinator.launch_worker(
-            task["id"], [sys.executable, "-c", ""], wait=False
+            task["id"], [sys.executable, "-c", "import time; time.sleep(300)"], wait=False
         )
+        self.addCleanup(_terminate, worker.get("pid"))
         self.coordinator.record_worker_message(worker["id"], "status", "working")
         Path(worker["log_file"]).write_text(
             "doing the work\nAPI Error: Connection closed mid-response\n", encoding="utf-8"
@@ -1115,9 +1127,13 @@ class LiveButSilentWorkerTests(HelmTestCase):
             name.title(), str(root), project_id=name
         )
         task = self.coordinator.create_task(project["id"], "think for a while")
+        # A process that stays alive for the whole test. One that exits at once
+        # races the health check: on a busy runner the exit is observed first
+        # and every verdict below reads "finished" instead of what it tests.
         worker = self.coordinator.launch_worker(
-            task["id"], [sys.executable, "-c", ""], wait=False
+            task["id"], [sys.executable, "-c", "import time; time.sleep(300)"], wait=False
         )
+        self.addCleanup(_terminate, worker.get("pid"))
         # A Herdr worker has no pid here, which is precisely why output was the
         # only signal and a long model call read as a stall.
         data = self.coordinator.store.load()

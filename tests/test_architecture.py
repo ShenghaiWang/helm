@@ -204,6 +204,12 @@ class EveryGlobalAFunctionReachesForExistsTests(unittest.TestCase):
             for function in functions:
                 if function.__module__ != name:
                     continue
+                if not function.__code__.co_filename.endswith(".py"):
+                    # Generated code -- a dataclass's __repr__ or __eq__ is
+                    # compiled from a string -- resolves its globals through
+                    # the dataclasses module on Python before 3.13, and looks
+                    # up names this module was never meant to have.
+                    continue
                 for code in code_objects(function.__code__):
                     for instruction in dis.get_instructions(code):
                         if instruction.opname != "LOAD_GLOBAL":
