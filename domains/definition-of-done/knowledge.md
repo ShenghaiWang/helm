@@ -13,7 +13,9 @@ Small by design: compose it with `{"extends": ["definition-of-done"]}`.
 ## Definition of done
 
 Change open for review, verification evidence attached, implementation notes
-linked, every traceability item verified, the human-signal label applied, all
-review comments resolved (automated and human), and CI green.
+linked, every traceability item verified, whatever label or checklist the
+repository's own process requires applied, all review comments resolved
+(automated and human), and CI green. For local delivery, read "CI green" as
+the project's declared checks green at the tip.
 
 ---

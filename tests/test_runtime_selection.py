@@ -21,7 +21,7 @@ from helm.core import (
     worker_environment,
 )
 
-from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS
+from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS, needs_runtimes
 
 
 class RuntimeSelectionTests(HelmTestCase):
@@ -1145,6 +1145,7 @@ class EffortByModelSwapTests(HelmTestCase):
         self.assertIn("big", replaced)
         self.assertNotIn("small", replaced)
 
+    @needs_runtimes(1, "pi")
     def test_a_pinned_model_and_a_swap_effort_refuse_rather_than_override(self) -> None:
         """Satisfying the effort would mean running a model the commander did
         not choose. Both were stated; Helm surfaces the conflict instead of

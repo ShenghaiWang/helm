@@ -1671,7 +1671,7 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate = commands.add_parser(
         "eval",
         help=(
-            "replay closed tickets on the single-agent, firstmate and helm arms and "
+            "replay closed tickets on the single-agent, delegated and helm arms and "
             "score them against what shipped"
         ),
     )
@@ -1691,10 +1691,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run_cmd = eval_commands.add_parser("run", help="start one ticket on one arm")
     run_cmd.add_argument("ticket")
     run_cmd.add_argument("--arm", required=True, choices=evaluation_module.ARMS)
-    run_cmd.add_argument("--model", help="model for the single or firstmate arm's agent")
+    run_cmd.add_argument("--model", help="model for the single or delegated arm's agent")
     run_cmd.add_argument(
         "--effort", choices=EFFORT_LEVELS,
-        help="effort for the single or firstmate arm's agent; overrides the corpus setting",
+        help="effort for the single or delegated arm's agent; overrides the corpus setting",
     )
     run_cmd.add_argument(
         "--restart", action="store_true",
@@ -2991,7 +2991,7 @@ def _prefs_command(
             # change behaviour for an older Helm still reading this root, and
             # the two sources are unioned anyway, so keeping it is a no-op the
             # operator can undo when they are ready.
-            written = preferences.save(
+            written = coordinator.write_preferences(
                 preferences.apply(current, preferences.KEY_AGENT_EXCLUDE, merged)
             )
         except preferences.PreferencesError as exc:
@@ -3004,7 +3004,7 @@ def _prefs_command(
     values = args.value if args.prefs_command == "set" else None
     try:
         updated = preferences.apply(current, key, values)
-        written = preferences.save(updated)
+        written = coordinator.write_preferences(updated)
     except preferences.PreferencesError as exc:
         raise HelmError(str(exc)) from exc
     shown = dict(updated.entries()).get(key, "(unset)")
@@ -3058,12 +3058,12 @@ def _eval_command(coordinator: Coordinator, args: argparse.Namespace) -> int:
                 args.ticket, model=args.model, restart=args.restart, effort=args.effort
             )
             print(f"Started {args.ticket} on single: pid={record['pid']} worktree={record['worktree']}")
-        elif args.arm == "firstmate":
-            record = runner.start_firstmate(
+        elif args.arm == "delegated":
+            record = runner.start_delegated(
                 args.ticket, adapter=HerdrAdapter(coordinator), model=args.model,
                 restart=args.restart, effort=args.effort,
             )
-            print(f"Started {args.ticket} on firstmate: task={record['task_ids'][0]}")
+            print(f"Started {args.ticket} on delegated: task={record['task_ids'][0]}")
         else:
             def route(project_id: str, text: str) -> None:
                 code = main(["--state-dir", str(coordinator.store.directory), "route", project_id, text])

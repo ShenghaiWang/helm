@@ -2,10 +2,30 @@
 # is local content and must stay out of this repository.
 /projects/*
 !/projects/.gitkeep
-# Domain knowledge is Helm repository content and is committed, so it travels
-# with the repo and is shared through GitHub rather than living only on one
-# machine. Nothing under /domains/ is ignored: keep private or company-specific
-# knowledge in a project's own .helm/knowledge.md, which is not tracked.
+# Domain knowledge: the shared packs below ship with the repository and travel
+# with it; any other domain under /domains/ is this root's own -- private or
+# company-specific -- and stays local. To ship a new pack, add it here.
+/domains/*
+!/domains/.gitkeep
+!/domains/agent-autonomy/
+!/domains/agent-messaging/
+!/domains/architecture/
+!/domains/branch-isolation/
+!/domains/change-sizing/
+!/domains/code-review/
+!/domains/definition-of-done/
+!/domains/driving-delegated-work/
+!/domains/implementation-notes/
+!/domains/model-selection/
+!/domains/progress-reporting/
+!/domains/pull-request-lifecycle/
+!/domains/software-delivery/
+!/domains/spec-driven-development/
+!/domains/verification/
+!/domains/work-decomposition/
+# A configured agent profile is this machine's own (commands, credential
+# passthrough) and never enters the repository.
+/agents.json
 /agents/*
 !/agents/.gitkeep
 /state/*

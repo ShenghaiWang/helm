@@ -315,3 +315,24 @@ class HelmTestCase(unittest.TestCase):
         return self._flat(
             json.dumps(coordinator._context(project, task, f"w-{task['id']}"))
         )
+
+#: The executables Helm's built-in launch definitions look for. A test that
+#: exercises real runtime resolution needs some of them on PATH; on a machine
+#: without them it skips and says so, rather than failing on the machine.
+BUILTIN_EXECUTABLES = ("claude", "codex", "pi", "opencode", "cursor-agent", "omp")
+
+
+def installed_runtimes() -> set[str]:
+    return {name for name in BUILTIN_EXECUTABLES if shutil.which(name)}
+
+
+def needs_runtimes(count: int = 1, *names: str):
+    """Skip unless `count` built-in runtimes -- and every named one -- are on PATH."""
+    have = installed_runtimes()
+    missing = [name for name in names if name not in have]
+    reason = ""
+    if missing:
+        reason = f"needs {', '.join(missing)} on PATH"
+    elif len(have) < count:
+        reason = f"needs {count} installed agent runtime(s) on PATH, found {len(have)}"
+    return unittest.skipIf(bool(reason), reason)

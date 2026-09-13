@@ -361,6 +361,15 @@ class StateStore:
             os.chmod(temporary, 0o600)
             os.replace(temporary, self.state_file)
             os.chmod(self.state_file, 0o600)
+            # The file's bytes were fsynced above; the rename lives in the
+            # directory, and a power loss before the directory reaches disk
+            # can revert it to the previous document.
+            with contextlib.suppress(OSError):
+                dir_fd = os.open(self.directory, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary)

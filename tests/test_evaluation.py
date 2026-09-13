@@ -175,7 +175,7 @@ class RunnerTests(HelmTestCase):
         corpus = evaluation.load_corpus()
         corpus["settings"] = {
             "repo": str(repo),
-            "projects": {"firstmate": name, "helm": name},
+            "projects": {"delegated": name, "helm": name},
             "judge": {"agent": "cursor", "model": None},
             "checks": ["test -f fix.txt", "false", "git diff --quiet {base} {tip} -- nothing-changed-here"],
             "effort": "medium",
@@ -214,12 +214,12 @@ class RunnerTests(HelmTestCase):
         # Collecting again changes nothing.
         self.assertEqual(runner.collect("T-1", "single")["status"], "completed")
 
-    def test_firstmate_is_one_launched_worker_and_counts_what_the_human_decided(self) -> None:
+    def test_delegated_is_one_launched_worker_and_counts_what_the_human_decided(self) -> None:
         evaluation, runner, repo, project = self._setup("mate")
         herdr = FakeHerdr()
         adapter = HerdrAdapter(self.coordinator, herdr)
         with mock.patch.dict(os.environ, {"PATH": f"{self._fake_bin()}{os.pathsep}{os.environ['PATH']}"}):
-            record = runner.start_firstmate("T-1", adapter=adapter)
+            record = runner.start_delegated("T-1", adapter=adapter)
         task_id = record["task_ids"][0]
         task = self.state.load()["tasks"][task_id]
         # The worker knows the ticket by its alias, never its real id.
@@ -230,7 +230,7 @@ class RunnerTests(HelmTestCase):
         # Every arm thinks as hard as the others: the effort is stated.
         self.assertEqual(task["effort"], "medium")
         self.assertTrue(herdr.runs, "no worker was launched")
-        self.assertIsNone(runner.collect("T-1", "firstmate")["ended_at"])  # still running
+        self.assertIsNone(runner.collect("T-1", "delegated")["ended_at"])  # still running
         # The commander was asked one thing; that is the intervention counted.
         self.coordinator.record_commander_ask("ambiguity", "which file?", project_id=project["id"])
         worker = next(w for w in self.state.load()["workers"].values() if w["task_id"] == task_id)
@@ -239,7 +239,7 @@ class RunnerTests(HelmTestCase):
         subprocess.run(["git", "-C", str(workspace), "add", "."], check=True)
         subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "candidate"], check=True)
         self.coordinator.record_worker_message(worker["id"], "result", "done")
-        collected = runner.collect("T-1", "firstmate")
+        collected = runner.collect("T-1", "delegated")
         self.assertEqual(collected["status"], "completed")
         self.assertIsNotNone(collected["tip"])
         self.assertEqual(collected["metrics"]["interventions"]["ambiguity"], 1)
@@ -534,11 +534,11 @@ class RunnerTests(HelmTestCase):
         herdr = FakeHerdr()
         adapter = HerdrAdapter(self.coordinator, herdr)
         with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
-            record = runner.start_firstmate("T-1", adapter=adapter)
+            record = runner.start_delegated("T-1", adapter=adapter)
         task_id = record["task_ids"][0]
         worker = next(w for w in self.state.load()["workers"].values() if w["task_id"] == task_id)
         self.assertEqual(worker["status"], "running")
-        collected = runner.collect("T-1", "firstmate", adapter=adapter)
+        collected = runner.collect("T-1", "delegated", adapter=adapter)
         self.assertEqual(collected["status"], "timed-out")
         self.assertIsNone(collected["tip"])
         self.assertNotEqual(self.state.load()["workers"][worker["id"]]["status"], "running")

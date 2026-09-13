@@ -48,6 +48,7 @@ class AdoptMixin:
         The description is written to `.helm/project.json` only when there
         is none; an existing file is the owner's, and is read instead.
         """
+        self.authority("adopting a project")
         source_path = canonical(source)
         if not source_path.is_dir():
             raise HelmError(f"not a directory: {source}")

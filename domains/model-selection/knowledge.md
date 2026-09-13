@@ -163,8 +163,8 @@ at best. Read the machine:
 - `opencode models [provider]` prints its own, which is far wider — a gateway
   credential reaches many vendors at once, so this is where to look for a model
   no other runtime here can start.
-- Claude capabilities are queryable from the Models API; the `claude-api` skill
-  is authoritative for that surface and outranks anything recalled.
+- A vendor's own models endpoint or CLI listing is authoritative for its ids;
+  nothing recalled from memory outranks what the machine can enumerate.
 - The catalogue reflects **credentials actually present**, not what a vendor
   sells. A provider with no key does not appear — pi's own default provider can
   be one of them, so "the default" is not proof of availability.

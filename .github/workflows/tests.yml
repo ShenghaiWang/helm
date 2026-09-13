@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Identify git for the tests that commit
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+      - name: Run the suite
+        env:
+          HELM_CI: "1"
+        run: python -m unittest discover -s tests -v

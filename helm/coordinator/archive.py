@@ -110,6 +110,9 @@ class ArchiveMixin:
         document, under the state lock; a write that fails leaves the live
         document exactly as it was.
         """
+        if not dry_run:
+            # Archiving is maintenance of the commander's own records.
+            self.authority("archiving settled task records")
         with self.store.locked() as data:
             # A dry run reports and writes nothing, reconciliation included:
             # it works on a copy so the lock has nothing to save.
@@ -182,6 +185,7 @@ class ArchiveMixin:
     # ---------- projects ----------
 
     def remove_project(self, project_id: str) -> dict[str, Any]:
+        self.authority("removing a project")
         """Forget a project whose work is over, archiving what it still holds.
 
         Refused while its directory is still a direct child of `projects/`

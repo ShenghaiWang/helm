@@ -7,7 +7,7 @@ the real fix started from and scores each against what shipped:
 
 - **single**: one `claude -p` session in a worktree, handed the ticket, no
   Helm;
-- **firstmate**: delegation without the protocol — one launched worker in an
+- **delegated**: delegation without the protocol — one launched worker in an
   isolated worktree with the brief and knowledge, no foreman, no gates, no
   independent review (a project with `"foreman": false`);
 - **helm**: the whole protocol, routed to a foreman.
@@ -15,7 +15,7 @@ the real fix started from and scores each against what shipped:
 ```sh
 helm eval add T-12 --base <sha> --merge <sha> --brief-file t12.md --title "..."
 helm eval settings settings.json   # projects per arm, the single arm's repo, judge, checks, cap
-helm eval run T-12 --arm single    # or firstmate, or helm; one arm at a time
+helm eval run T-12 --arm single    # or delegated, or helm; one arm at a time
 helm eval status                   # collects runs whose sessions have finished
 helm eval checks T-12 --arm helm   # the corpus check commands, in the candidate's checkout
 helm eval judge T-12 --arm helm    # a read-only judge on an independent model

@@ -74,6 +74,11 @@ class LifecycleMixin:
         label: str | None = None,
         discovered: bool = False,
     ) -> dict[str, Any]:
+        if not discovered:
+            # An explicit `project add` is the commander's decision about what
+            # this root manages; discovery of a checkout already under
+            # projects/ is a read of the root's own layout and stays open.
+            self.authority("registering a project")
         name = _safe_text(label if label is not None else name).strip()
         if not name:
             raise HelmError("project name is required")
@@ -947,8 +952,10 @@ class LifecycleMixin:
         brief a read-only task to "implement X and commit it" and the worker
         would simply do it. Removing the write bit from the whole tree makes
         authoring new content -- writing, editing, or deleting a tracked file
-        in the worktree -- impossible at the OS level rather than trusting a
-        worker to respect a flag it was merely told about.
+        in the worktree -- fail fast for an agent that respects the boundary,
+        rather than an instruction it might forget. It is not isolation: the
+        files stay owned by the same user and one `chmod` undoes it (see
+        docs/security.md). It replaced trusting a
 
         This does not by itself make the branch unable to gain a commit: the
         index and object store for a linked worktree live under the project's

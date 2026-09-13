@@ -120,6 +120,11 @@ class CallerMixin:
         credential it could leak. The file exists so a human can export it into
         their own shell; the value never crosses this process's output.
         """
+        # Gated like everything it protects: an agent that could write the
+        # root's capability hash would be issuing its own authority. The first
+        # configuration on a root passes on the session-role check; every later
+        # one requires the capability already in force.
+        self.authority("configuring the root's authority capability")
         secret = str(secret or "")
         if len(secret) < 32:
             raise SafetyError("an authority capability must be at least 32 characters")
@@ -130,13 +135,29 @@ class CallerMixin:
         _write_private_text(path, secret + "\n")
         return path
 
+    def write_preferences(self, updated: Any) -> Path:
+        """Write the root's preferences, on the root's authority.
+
+        A preference is the commander's own cost and safety policy for this
+        machine; an agent that could write one could lift the exclusion that
+        stops it starting an expensive runtime. So the write obtains the same
+        authority a merge does, here in core, not only in CLI dispatch.
+        """
+        self.authority("writing a preference")
+        from .. import preferences as _prefs
+        return _prefs.save(updated)
+
     def authority(self, action: str, project_id: str | None = None) -> Authority:
         """Build the capability a protected core operation requires, or refuse.
 
-        This is the boundary. It is here, in core, rather than in CLI dispatch,
-        because an agent that can import `Coordinator` bypasses dispatch
-        entirely -- and the actions on the other side of this line cannot be
-        undone by deleting a branch.
+        This is the boundary against a cooperating agent: one that follows
+        the protocol but reasons badly or is prompt-injected. It is here, in
+        core, rather than in CLI dispatch, because an agent that can import
+        `Coordinator` bypasses dispatch entirely -- and the actions on the
+        other side of this line cannot be undone by deleting a branch. It is
+        not isolation: every agent runs as Helm's own user, so an agent that
+        sets out to defeat it can edit the store or shed its ancestry. What
+        that means in practice is written down in docs/security.md.
         """
         action = _safe_text(action).strip() or "this action"
         identity = self.caller_identity()

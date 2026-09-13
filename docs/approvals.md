@@ -178,3 +178,15 @@ acceptable approaches — is Helm's to answer. Passing those upward defeats
 delegation; guessing on the first list is unsafe. A decision the commander
 must make is asked directly, in its own reply, with a recommendation and what
 happens either way — not listed in a status report and left to age.
+
+## What a release actually gates
+
+For an action Helm performs itself, the gate is the action: a local merge
+happens inside `merge_task`, under the lock, after the snapshot is
+re-verified. For an action the **worker** performs after authorization, such
+as a push, a publish or an external delete, `helm worker action-start` is the
+last thing Helm sees. It re-checks the snapshot, spends the single-use
+authorization and returns; the worker then acts on its own, and what it
+reports afterwards is recorded as outcome data. Helm does not watch the
+action happen. The full statement of what the boundary defends against is in
+[security.md](security.md).

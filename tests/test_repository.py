@@ -141,16 +141,24 @@ class RepositoryTests(HelmTestCase):
                 0,
                 name,
             )
-        # Domain knowledge is repository content: it is committed so it travels
-        # with the repo instead of living on one machine. Private material
-        # belongs in a project's own .helm/knowledge.md, which is not tracked.
-        for shared in ("domains/anything/knowledge.md", "domains/code-review/knowledge.md"):
+        # The shipped domain packs are repository content and travel with it;
+        # any other domain under domains/ is this root's own -- private or
+        # company-specific -- and stays local, exactly as the docs promise.
+        for shared in ("domains/code-review/knowledge.md", "domains/.gitkeep"):
             self.assertNotEqual(
                 subprocess.run(
                     ["git", "check-ignore", "--no-index", "--quiet", shared], check=False
                 ).returncode,
                 0,
                 shared,
+            )
+        for private in ("domains/anything/knowledge.md", "domains/on-device-llm/knowledge.md", "agents.json"):
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "check-ignore", "--no-index", "--quiet", private], check=False
+                ).returncode,
+                0,
+                private,
             )
 
     def test_a_private_file_is_never_observable_half_written(self) -> None:
@@ -300,7 +308,7 @@ class RepositoryTests(HelmTestCase):
         quickstart = readme.split("## Helm root layout", 1)[0]
 
         self.assertIn("start any supported agent", native)
-        self.assertIn("does not require Python", native)
+        self.assertIn("no Helm installation step", native)
         self.assertNotIn("HELM_WORKER_COMMAND", quickstart)
         self.assertNotIn("agents.json", quickstart)
         self.assertNotIn("helm run", quickstart)

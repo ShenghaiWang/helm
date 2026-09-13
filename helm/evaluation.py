@@ -36,7 +36,7 @@ from .errors import HelmError
 from .launching import worker_environment
 from .paths import _write_private_text
 
-ARMS = ("single", "firstmate", "helm")
+ARMS = ("single", "delegated", "helm")
 
 #: How a judge scores a candidate against the shipped change.
 JUDGE_SCORES = {
@@ -495,7 +495,7 @@ def single_agent_brief(ticket: dict[str, Any]) -> str:
     )
 
 
-def firstmate_brief(ticket: dict[str, Any]) -> str:
+def delegated_brief(ticket: dict[str, Any]) -> str:
     """What the launched worker is told: the ticket, under the replay rule."""
     return (
         f"Implement ticket {ticket['alias']}"
@@ -521,7 +521,7 @@ class Runner:
     """Start, collect, judge and score runs, against the coordinator's records.
 
     Settings live in the corpus file, because they are facts about this
-    root: which registered projects host the firstmate and helm arms, the
+    root: which registered projects host the delegated and helm arms, the
     repository the single agent works in, the judge's runtime and model, and
     the check commands. Nothing here names a project of its own.
     """
@@ -913,24 +913,24 @@ class Runner:
                     reasons.append(f"the session transcript names {what}")
         return list(dict.fromkeys(reasons))
 
-    # ---------- firstmate: delegation without the protocol ----------
+    # ---------- delegated: delegation without the protocol ----------
 
-    def start_firstmate(
+    def start_delegated(
         self, ticket: str, *, adapter: Any, model: str | None = None, restart: bool = False,
         effort: str | None = None,
     ) -> dict[str, Any]:
         entry = self.evaluation.ticket(ticket)
-        project_id = self._setting("projects", "firstmate")
+        project_id = self._setting("projects", "delegated")
         if not project_id:
-            raise HelmError("settings.projects.firstmate names no registered project")
-        branch = self.prepare_base(ticket, "firstmate")
+            raise HelmError("settings.projects.delegated names no registered project")
+        branch = self.prepare_base(ticket, "delegated")
         task = self.coordinator.create_task(
             project_id,
-            firstmate_brief(entry),
+            delegated_brief(entry),
             ticket=entry["alias"],
             base=branch,
             agent="claude",
-            model=model or self._setting("firstmate", "model") or None,
+            model=model or self._setting("delegated", "model") or None,
             effort=effort or self._setting("effort") or None,
             delivery_policy="local",
             # A measured run is a deliberate fresh line of work, whatever an
@@ -938,7 +938,7 @@ class Runner:
             new=True,
         )
         record = self.evaluation.new_run(
-            ticket, "firstmate", status="running", task_ids=[task["id"]], project_id=project_id,
+            ticket, "delegated", status="running", task_ids=[task["id"]], project_id=project_id,
             restart=restart,
         )
         adapter.launch_task(task["id"], None, wait=False, agent="claude")

@@ -47,7 +47,7 @@ starts inherits it. Keep the two in step.
 - `helm init` is an initialization tool only. Do not make it part of a normal
   conversational request, and do not use it to repair or overwrite a project.
 - One task means one project and one task worktree. Never modify another
-  project, the Helm state, firstmate files, or a user-owned worktree. The
+  project, the Helm state, a foreman's files, or a user-owned worktree. The
   delegated worker uses the assigned task worktree (an isolated worktree), or a
   unique one created under Helm state when the harness has not supplied one;
   never edit a project root as a shortcut.
@@ -584,7 +584,7 @@ cost. The `model-selection` domain carries the detail.
 Two bounds that do not bend: an agent is available only when its **executable is
 on `PATH`** — Herdr integrating an agent means Herdr can recognize or control it
 once running, not that Helm has a safe launch recipe, and Helm ships launch
-definitions for five built-ins — and an agent the root **excludes** is excluded
+definitions for six built-ins — and an agent the root **excludes** is excluded
 whatever its fit, because that is the commander's cost decision made in advance
 and recorded in the root's own `agent.exclude` preference, not a question
 fitness reasoning may reopen. A newly installed Herdr integration

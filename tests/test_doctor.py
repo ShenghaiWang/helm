@@ -21,7 +21,7 @@ from unittest import mock
 from helm import cli, doctor, preferences, runtimes
 from helm.core import Coordinator, HelmError, SafetyError, StateStore, canonical
 
-from tests.support import SHIPPED_DOMAINS, HelmTestCase
+from tests.support import SHIPPED_DOMAINS, HelmTestCase, needs_runtimes
 
 
 class DoctorTestCase(HelmTestCase):
@@ -213,6 +213,21 @@ class RootChecksTests(DoctorTestCase):
         report = self.report(helm_root)
         self.assertEqual(self.finding(report, "root.domains").severity, doctor.WARNING)
         self.assertEqual(report.exit_code, 0)
+
+    def test_a_root_without_a_watchdog_entry_gets_a_warning_not_a_crash(self) -> None:
+        """Every machine that never ran `helm watchdog install` takes this branch.
+
+        It called a method that did not exist, so `helm doctor` and `helm
+        adopt` died with an AttributeError on any fresh clone, and this whole
+        module errored anywhere the developer's own watchdog was not installed.
+        """
+        helm_root, _ = self.sound_root("nowatchdog")
+        with mock.patch.dict(os.environ, {"HOME": str(Path(self.temp.name) / "empty-home")}):
+            (Path(self.temp.name) / "empty-home").mkdir(exist_ok=True)
+            finding = self.finding(self.report(helm_root), "root.watchdog")
+        self.assertEqual(finding.severity, doctor.WARNING)
+        self.assertIn("no watchdog scheduler entry", finding.message)
+        self.assertIn("helm watchdog install", finding.remediation)
 
     def test_the_shipped_domain_pack_loads_cleanly(self) -> None:
         """Guards the repository's own domains, not a fixture's."""
@@ -1783,6 +1798,7 @@ class ThirdReviewRegressionTests(DoctorTestCase):
 
         self.assertEqual(self.finding(report, "root.runtimes").severity, doctor.ERROR)
 
+    @needs_runtimes(1)
     def test_no_resolvable_default_runtime_is_a_warning_not_silence(self) -> None:
         helm_root, _ = self.sound_root()
         with mock.patch.dict(os.environ, {"HELM_AGENT": ""}), mock.patch.object(

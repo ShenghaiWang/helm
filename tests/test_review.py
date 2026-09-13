@@ -22,7 +22,7 @@ from helm.core import (
 from helm import runtimes
 from helm.herdr import HerdrAdapter
 
-from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS
+from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS, needs_runtimes
 
 
 class ReviewTests(HelmTestCase):
@@ -1056,6 +1056,7 @@ class ReviewTests(HelmTestCase):
         with self.assertRaisesRegex(HelmError, r"holds no commits over"):
             adapter.run_review_cycle(task["id"])
 
+    @needs_runtimes(2)
     def test_a_review_is_pinned_to_the_commit_the_work_was_built_on(self) -> None:
         """The base branch moves; the tree the author measured does not.
 
@@ -1593,6 +1594,7 @@ class TheRootCanNameItsReviewerTests(HelmTestCase):
     def _prefer(self, runtime: str) -> None:
         self.write_preferences(review={"agent": runtime})
 
+    @needs_runtimes(2)
     def test_the_preferred_runtime_is_chosen_over_the_automatic_search(self) -> None:
         self._prefer("cursor")
 
@@ -1602,6 +1604,7 @@ class TheRootCanNameItsReviewerTests(HelmTestCase):
         self.assertIn("review.agent", choice["reason"])
         self.assertEqual(choice["independence"], "different-runtime")
 
+    @needs_runtimes(2)
     def test_it_never_makes_the_author_review_itself(self) -> None:
         """The one case a convenience must lose."""
         self._prefer("cursor")

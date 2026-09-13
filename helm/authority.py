@@ -25,6 +25,11 @@ class Authority:
     `mode` records which boundary actually held, because an audit that cannot
     distinguish a capability-backed decision from a session-role one is telling
     the reader less than it appears to.
+
+    What this proves is bounded by the threat model in docs/security.md: the
+    caller was not identifiable as an agent, and the capability, when one is
+    configured, was presented. Agents share Helm's user; this is a check on
+    a cooperating agent's judgement, not an operating-system boundary.
     """
 
     __slots__ = ("mode", "actor")

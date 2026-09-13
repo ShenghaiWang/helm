@@ -537,7 +537,7 @@ class _Doctor:
         if present:
             self._check_watchdog_freshness(entry)
         else:
-            self.warning(
+            self.warn(
                 "root.watchdog",
                 "no watchdog scheduler entry: nothing reaches a human while no "
                 "session is open",

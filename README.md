@@ -4,28 +4,104 @@
 and verification stay explicitly governed.**
 
 Helm is a local-first coordination protocol for running many software
-projects through agent CLIs at once — Claude Code, Codex, Cursor, pi,
-opencode — with one person deciding only what genuinely needs a person. It is
-the repository itself plus an optional `helm` command: no remote service, no
-autonomous merge, push, or publish.
+projects through agent CLIs at once, with one person deciding only what
+genuinely needs a person. It is the repository itself plus an optional
+`helm` command: no remote service, no autonomous merge, push or publish.
+Two things it does that a single agent in one repository cannot: a human
+confirms what a change is for and how it will be built *before* any
+state-changing work launches, and every task is briefed from shared domain
+knowledge that is composed per task and learns across projects.
 
-The question Helm exists to answer is how autonomous agents can be given
-substantial responsibility without anyone losing hold of four things. Each
-one is a boundary you can point at in the code, not a property claimed in
+## Quickstart
+
+You need Python 3.10 or newer, git, and at least one agent CLI on your
+`PATH`. Helm ships launch definitions for six: [Claude Code](https://claude.com/claude-code),
+[Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com),
+[pi](https://pi.dev), [opencode](https://opencode.ai) and omp. Optional:
+the [GitHub CLI](https://cli.github.com) for pull-request delivery, and the
+Herdr terminal for one pane per agent (without it, agents run as plain
+processes; see [docs/herdr.md](docs/herdr.md)).
+
+```sh
+git clone https://github.com/ShenghaiWang/helm.git && cd helm
+python3 -m helm doctor                      # is this root sound? changes nothing
+git clone <your repository> projects/api    # each project is its own git checkout
+python3 -m helm adopt projects/api --domain software-delivery
+```
+
+Then start your agent CLI with this directory as its working root. It reads
+`AGENTS.md`, and from there your words are the interface:
+
+```text
+you:   work on the next ticket for api: add rate limiting to the login route
+agent: routes it to api's foreman; the foreman proposes a requirement gate
+you:   helm gate decide <foreman-task> --type requirement --confirm
+       ... the solution gate the same way ...
+agent: a worker is launched in its own worktree; a reviewer on another model
+       reads the change; you are asked only for the delivery decision
+you:   helm task merge <task>                # or a pull request, or another round
+```
+
+`helm pending` prints what waits on you and nothing else; `helm status`
+shows the whole board; `helm ledger` shows what each task cost and caught.
+
+## How it works
+
+```text
+commander   → the human; owns approval and anything irreversible
+coordinator → picks the project, composes context, holds the approval gate
+foreman     → one per project; turns goals into tasks, drives and answers workers
+worker      → one per task; works only in its own worktree, reports by protocol
+reviewer    → independent agent on a different model; cross-checks every change
+```
+
+One request travels like this:
+
+1. **Route.** `helm route <project> "..."` hands the commander's words to that
+   project's foreman and returns at once; a project without a foreman gets
+   one appointed first.
+2. **Gate.** The foreman proposes a requirement contract and then a technical
+   solution; only the root confirms each, and one confirmed pair authorizes
+   exactly one state-changing task.
+3. **Cut a worktree.** The task's worktree and branch are cut from a fresh,
+   verified base — never from whatever the checkout happens to sit on.
+4. **Brief and launch.** One worker, one runtime, model and effort chosen for
+   the task, one context document holding exactly one project's knowledge.
+   The task's shape — small, standard or critical — sizes the review rounds,
+   the effort floor and the evidence gate, so a colour token and a migration
+   do not get the same ceremony.
+5. **Drive.** The worker pushes `status`, `question`, `result`, `blocker`
+   and `approval-needed` messages; questions are answered into its inbox; a
+   protected action pauses the task until the root releases it.
+6. **Review.** An independent reviewer on a different model reads the change;
+   rounds go back to the same author session until both agree.
+7. **Decide delivery.** When no driver is left, Helm records a delivery
+   decision for the commander: local merge, pull request, another round, or
+   cleanup — and then a cleanup decision, because delivery is not
+   finalization.
+
+Every step above is a section of the [documentation map](#documentation-map).
+
+## What Helm holds onto
+
+Four things stay governed however much responsibility the agents carry.
+Each is a boundary you can point at in the code, not a property claimed in
 prose:
 
-- **Authority** is held, not asserted. Every protected operation — merge,
-  push, publish, delete, a standing approval — begins by obtaining an
-  authority only the root can hold, and an approval binds to the exact
-  revision, index, tree and artifacts it was granted for.
-- **Knowledge** is composed per task and bounded: core safety rules, one
+- **Authority.** It is held, not asserted: every protected operation, from a
+  merge to a standing approval, begins by obtaining an authority only the
+  root can hold, and an approval binds to the exact revision, index, tree and
+  artifacts it was granted for. What that boundary does and does not defend
+  against is written down in [docs/security.md](docs/security.md).
+- **Knowledge.** It is composed per task and bounded: core safety rules, one
   resolved domain, one project's own files, in that order, each layer able to
   make a choice more specific and none able to make it wider.
-- **Context** is one project per worker, with no exceptions: its own
-  worktree, branch, agent and context document.
-- **Verification** is structural: a state-changing task cannot start until a
-  requirement gate and a solution gate have been decided by the root, and an
-  independent review is chosen to run on a different model than the author's.
+- **Context.** One project per worker, with no exceptions: its own worktree,
+  branch, agent and context document.
+- **Verification.** It is structural: a state-changing task cannot start
+  until a requirement gate and a solution gate have been decided by the
+  root, and an independent review runs on a different model than the
+  author's.
 
 ## Why Helm
 
@@ -112,43 +188,6 @@ record, per task.
 runtimes, and a plain process fallback when the Herdr terminal is not there.
 Local-first: the repository itself plus an optional command, no service.
 
-## How it works
-
-```text
-commander   → the human; owns approval and anything irreversible
-coordinator → picks the project, composes context, holds the approval gate
-foreman     → one per project; turns goals into tasks, drives and answers workers
-worker      → one per task; works only in its own worktree, reports by protocol
-reviewer    → independent agent on a different model; cross-checks every change
-```
-
-One request travels like this:
-
-1. **Route.** `helm route <project> "..."` hands the commander's words to that
-   project's foreman and returns at once; a project without a foreman gets
-   one appointed first.
-2. **Gate.** The foreman proposes a requirement contract and then a technical
-   solution; only the root confirms each, and one confirmed pair authorizes
-   exactly one state-changing task.
-3. **Cut a worktree.** The task's worktree and branch are cut from a fresh,
-   verified base — never from whatever the checkout happens to sit on.
-4. **Brief and launch.** One worker, one runtime, model and effort chosen for
-   the task, one context document holding exactly one project's knowledge.
-   The task's shape — small, standard or critical — sizes the review rounds,
-   the effort floor and the evidence gate, so a colour token and a migration
-   do not get the same ceremony.
-5. **Drive.** The worker pushes `status`, `question`, `result`, `blocker`
-   and `approval-needed` messages; questions are answered into its inbox; a
-   protected action pauses the task until the root releases it.
-6. **Review.** An independent reviewer on a different model reads the change;
-   rounds go back to the same author session until both agree.
-7. **Decide delivery.** When no driver is left, Helm records a delivery
-   decision for the commander: local merge, pull request, another round, or
-   cleanup — and then a cleanup decision, because delivery is not
-   finalization.
-
-Every step above is a section of the [documentation map](#documentation-map).
-
 ## Start here: repository-native agent workflow
 
 A normal checkout is already a usable Helm root. Enter the repository and
@@ -160,8 +199,9 @@ cd /path/to/helm
 # start your supported agent with this directory as its working root
 ```
 
-The native path does not require Python, a Helm installation, `helm init`, or
-any worker configuration. The agent then:
+The native path needs Python 3.10 or newer and git on the machine, and
+nothing else: no Helm installation step, no `helm init`, no worker
+configuration. The agent runs Helm's own commands from the checkout. It then:
 
 1. reads `AGENTS.md` and inspects the existing root; a conversation is never
    turned into initialization or project registration;
@@ -374,6 +414,7 @@ prerequisites. See [docs/cli.md](docs/cli.md).
 | [docs/worker-protocol.md](docs/worker-protocol.md) | worker messages, the inbox and answers, confirmations, `watch`, `stop` |
 | [docs/worker-lifecycle.md](docs/worker-lifecycle.md) | the state machine that reconciles a worker's messages with what the OS observed |
 | [docs/approvals.md](docs/approvals.md) | the authority boundary, standing grants, a paused task and its release, repair |
+| [docs/security.md](docs/security.md) | the threat model: what the boundary defends against, and what it does not |
 | [docs/delivery.md](docs/delivery.md) | the delivery decision, local and PR delivery, build outputs, the cleanup gate |
 | [docs/worktrees.md](docs/worktrees.md) | the fresh verified base, naming the base branch, one ticket one worktree |
 | [docs/knowledge.md](docs/knowledge.md) | bounded domain context, domain chains, learning proposals, skills, when a change needs a spec |
@@ -396,24 +437,25 @@ Herdr ownership.
 helm init [ROOT]
 helm adopt PATH [--id ID] [--label L] [--delivery local|pr] [--domain D]... [--base-branch B] [--no-foreman] [--no-review] [--agent A] [--model M] [--effort E]
 helm doctor [--project PROJECT_ID] [--json] [--probe-runtimes]
-helm status [--project PROJECT_ID] · pending [--changes] · ack PROJECT · ask record|show
+helm status [--project PROJECT_ID] · pending [--changes] [--heal] · ack PROJECT · ask record|show
 helm watch [--silence SECONDS] [--nudge] · watchdog install|run [--notify-command CMD] [--remind-after MIN] [--no-heal] · restart|uninstall
 helm route PROJECT TEXT [--agent A] [--model M] [--no-herdr]
 helm foreman PROJECT [--agent A] [--command CMD] [--no-herdr]
 helm gate propose|decide FOREMAN_TASK --type requirement|solution
-helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async]
-helm task create --project P --brief TEXT [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--base B] [--new]
+helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async|--wait]
+helm task create --project P --brief TEXT [--read-only] [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--blocked-by TASK_ID]... [--base B] [--new]
 helm task shape TASK_ID small|standard|critical [--reason TEXT]
-helm task allocate|inspect|continue|reopen|evidence|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|cleanup
-helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N]
+helm task evidence TASK_ID --tip SHA --command CMD --exit N [--cases N] [--suite NAME=COUNT]... [--check NAME]
+helm task allocate|inspect|continue|reopen|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|provenance|cleanup [--delete-branch]
+helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N] [--reviewer-effort E]
 helm worker launch|round|poll|wait|message|report|answer|inbox|interrupt|action-start|reconcile|stop
 helm approval grant ACTION [--project P] [--note N] [--stale-days D] · list|check|revoke|release|repair
 helm authority init|status
 helm learning teach FACT (--domain D | --project P) [--note N] · mine [--days N] [--dry-run] · triage [--approve IDS] [--reject IDS] [--scope S] · stats
 helm learning propose|list|inspect|edit|approve|reject|apply
-helm project add|list|status|note|action|domain|release|remove
-helm state stats|archive [--dry-run] [--reconcile] [TASK_ID ...]
-helm domain list · skills PROJECT [--agent A] [--brief TEXT]
+helm project add|list|status|note|action|resolve|domain|release|remove
+helm state stats|archive [--dry-run] [--reconcile] [TASK_ID ...] · tidy [--project P] [--dry-run]
+helm domain list · guide DOMAIN_ID · skills PROJECT [--agent A] [--brief TEXT]
 helm agent list|check|models · prefs path|show|keys|set|unset|migrate
 helm herdr launch|poll|wait|relabel|cleanup|cleanup-project|cleanup-coordinator
 helm eval add|list|settings|run|status|checks|judge|sanitize|note|report
