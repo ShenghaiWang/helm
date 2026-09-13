@@ -84,7 +84,15 @@ A worker cannot miss a note:
   memory files from the working directory up to the filesystem root, and a
   workspace sits under the Helm root, so without the exclusion every worker
   and foreman opened with the root's own coordinator manual ahead of its
-  assignment. The project's own file, inside the workspace, still loads. A
+  assignment. The project's own file, inside the workspace, still loads.
+  The same file turns Claude Code's auto memory off (`autoMemoryEnabled`):
+  that memory directory is keyed to the enclosing git repository, so a
+  foreman inside the Helm root would otherwise read the commander's own
+  notes about this root, and a worker would read and write the notes of
+  whoever runs sessions in that project's repository.
+  Under `execution.turns` each turn is started with a settings file that
+  carries the exclusions alone: a turn is woken by being started, so it
+  needs no hook. A
   runtime that reads `AGENTS.md` from the enclosing repository root has no
   such exclusion, so a foreman on one of those, whose workspace lies inside
   this repository, may still see the manual; a worker in its own worktree

@@ -472,7 +472,13 @@ class LaunchMixin:
         )
 
     def _worker_settings_file(
-        self, worker_dir: Path, worker_id: str, agent_id: str, workspace: str | os.PathLike[str] | None = None
+        self,
+        worker_dir: Path,
+        worker_id: str,
+        agent_id: str,
+        workspace: str | os.PathLike[str] | None = None,
+        *,
+        watch_hook: bool = True,
     ) -> str:
         """A settings file for runtimes that take one; "" for the rest.
 
@@ -480,7 +486,9 @@ class LaunchMixin:
         into the session, exactly as this repository's own hook arms the root's
         watch. The watch is what turns the inbox from "read on your next helm
         command" into "woken within 20s, idle or busy", with nothing typed
-        into the pane.
+        into the pane. A turn is woken by being started, so the turns runner
+        asks for the file without the hook (`watch_hook=False`) and gets the
+        exclusion list alone, in a file of its own.
 
         And an exclusion list. Claude Code loads every CLAUDE.md from the
         working directory up to the filesystem root, and a worker's workspace
@@ -490,11 +498,27 @@ class LaunchMixin:
         the work -- ahead of the assignment Helm composed for it. Every memory
         file above the workspace is excluded by path; the project's own, inside
         the workspace, still loads.
+
+        Auto memory is off in both files. Claude Code keys its memory directory
+        to the enclosing git repository, so a foreman inside the Helm root would
+        read the commander's own notes about this root, and a worker would read,
+        and write into, the notes of whoever runs sessions in that project's
+        repository -- a channel between the commander's sessions and Helm's
+        agents that nothing composed.
         """
         if agent_id != "claude":
             return ""
+        excludes = _memory_files_above(workspace) if workspace else []
+        if not watch_hook:
+            path = worker_dir / "claude-turn-settings.json"
+            _write_private_text(
+                path,
+                json.dumps({"claudeMdExcludes": excludes, "autoMemoryEnabled": False}, indent=2) + "\n",
+            )
+            return str(path)
         hook: dict[str, Any] = {
-            "claudeMdExcludes": _memory_files_above(workspace) if workspace else [],
+            "claudeMdExcludes": excludes,
+            "autoMemoryEnabled": False,
             "hooks": {
                 "SessionStart": [
                     {
@@ -1045,18 +1069,23 @@ class LaunchMixin:
             if chosen_model == RUNTIME_DEFAULT_MODEL:
                 chosen_model = None
 
+            # A turn is woken by being started, so the inbox-watch hook has
+            # nothing to do here -- but the settings file also keeps the
+            # coordinator's own CLAUDE.md out of the session, and that applies
+            # to every turn. Dropping `--settings` altogether here is how every
+            # turns-mode worker and foreman came to open with the manual.
+            turn_settings = self._worker_settings_file(
+                worker_dir, worker_id, selected_agent["id"], workspace, watch_hook=False
+            )
+
             def _turn_argv(template: tuple[str, ...]) -> list[str]:
                 argv = list(template)
                 if chosen_model:
                     argv = [argv[0], runtime_for_turns.model_flag, chosen_model, *argv[1:]]
                 argv = runtime_for_turns.with_effort(argv, task.get("effort"))
-                # No settings file: its SessionStart hook arms an inbox watch,
-                # which is the interactive session's way of being woken. A
-                # turn is woken by being started, so the hook has nothing to
-                # do and `--settings` is dropped with it.
                 return runtimes.apply_prompt(
                     argv, runtimes.PROMPT_PLACEHOLDER, str(worker_dir), str(self.store.directory),
-                    str(project.get("git_common_dir") or ""), "",
+                    str(project.get("git_common_dir") or ""), turn_settings,
                     session=runtimes.SESSION_PLACEHOLDER,
                 )
 

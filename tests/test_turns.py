@@ -62,6 +62,16 @@ class TurnsTests(HelmTestCase):
             self.assertTrue(config["turns"])
             self.assertIn("--session-id", config["turn_start"])
             self.assertIn("--resume", config["turn_resume"])
+            # Every turn carries the settings file that keeps the memory files
+            # above the workspace out of the session; without it each turn
+            # opened with the Helm root's own instructions. The inbox-watch
+            # hook stays out, because a turn is woken by being started.
+            for template in (config["turn_start"], config["turn_resume"]):
+                self.assertIn("--settings", template)
+                turn_settings = json.loads(Path(template[template.index("--settings") + 1]).read_text())
+                self.assertTrue(turn_settings["claudeMdExcludes"])
+                self.assertIs(turn_settings["autoMemoryEnabled"], False)
+                self.assertNotIn("hooks", turn_settings)
             context = json.loads(Path(worker["context_file"]).read_text())
             self.assertEqual(context["execution"]["mode"], "turns")
             self.assertIn("end your turn", context["execution"]["rules"])

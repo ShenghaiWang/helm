@@ -1954,6 +1954,9 @@ class ClaudeWorkersWatchTheirInboxTests(HelmTestCase):
         self.assertIn(str(self.state.directory / ".claude" / "CLAUDE.md"), excluded)
         self.assertIn("/CLAUDE.md", excluded)
         self.assertNotIn(str(workspace / "CLAUDE.md"), excluded)
+        # And no auto memory: the memory directory is keyed to the enclosing
+        # git repository, which for a foreman is the Helm root itself.
+        self.assertIs(settings["autoMemoryEnabled"], False)
         for entry in excluded:
             directory = Path(entry).parent
             if directory.name == ".claude":
