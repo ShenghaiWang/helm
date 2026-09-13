@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -3328,6 +3329,2098 @@ def _name_root_tab(coordinator: Coordinator) -> None:
             integrations = locked.setdefault("integrations", {})
             integrations.setdefault("herdr", {})["root_tab"] = tab_id
 
+class _Context:
+    """What `main` opened before dispatch: the coordinator, its store and the root."""
+
+    __slots__ = ("coordinator", "store", "helm_root")
+
+    def __init__(self, coordinator: Coordinator, store: StateStore, helm_root: Path | None) -> None:
+        self.coordinator = coordinator
+        self.store = store
+        self.helm_root = helm_root
+
+
+def _cmd_init(ctx: _Context, args: argparse.Namespace) -> int | None:
+    store, helm_root = ctx.store, ctx.helm_root
+    initialized = store.initialize_root(helm_root or args.init_root)
+    print(f"Initialized Helm root {initialized}")
+    print(f"  projects={initialized / 'projects'}")
+    print(f"  state={initialized / 'state'}")
+    return 0
+
+
+def _cmd_run(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator, helm_root = ctx.coordinator, ctx.helm_root
+    if helm_root is None:
+        raise HelmError("a Helm root is required; run helm init first")
+    brief = _task_brief(args.brief)
+    if not brief:
+        raise HelmError(
+            "No task supplied. Provide a brief or run helm run "
+            f"{args.project_id} interactively to start a conversation."
+        )
+    project = coordinator.discover_project(helm_root, args.project_id)
+    task = coordinator.create_task(
+        project["id"], brief, delivery_policy=args.delivery, domain=args.domain,
+        agent=args.agent, model=args.model, effort=args.effort,
+        ticket=args.ticket,
+        no_domain=args.no_domain,
+    )
+    if args.herdr:
+        worker = HerdrAdapter(coordinator).launch_task(
+            task["id"], args.worker_command_text, wait=not args.asynchronous
+        )
+        mode = (
+            "herdr"
+            if worker.get("execution") == "herdr"
+            else "process fallback (Herdr unavailable)"
+        )
+    else:
+        worker = coordinator.launch_worker(
+            task["id"], args.worker_command_text, wait=not args.asynchronous
+        )
+        mode = "process (--no-herdr)"
+    _ensure_foreman(coordinator, project["id"], herdr=args.herdr)
+    print(
+        f"Ran {_project_label(project)} task={task['id']} "
+        f"worker={worker['id']} [{worker['status']}] mode={mode} "
+        f"domain={task.get('domain') or 'none'} "
+        f"agent={worker.get('agent_id', 'default')} reason={worker.get('agent_reason', '')}"
+    )
+    return 0
+
+
+def _cmd_project(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator, helm_root = ctx.coordinator, ctx.helm_root
+    if args.project_command == "release":
+        outcome = coordinator.release_project(args.project_id)
+        print(
+            f"Released {len(outcome['released'])} task(s) in {outcome['project_id']}"
+        )
+        for entry in outcome["kept"]:
+            print(f"  kept {entry['task_id']}: {entry['reason']}")
+        with contextlib.suppress(HelmError, OSError):
+            if HerdrAdapter(coordinator).close_project_space_if_finished(
+                args.project_id
+            ):
+                print("  space closed")
+        with contextlib.suppress(HelmError, OSError):
+            archived = coordinator.archive_tasks(outcome["released"])["archived"] if outcome["released"] else []
+            if archived:
+                print(f"  {len(archived)} record(s) archived")
+    elif args.project_command == "remove":
+        removed = coordinator.remove_project(args.project_id)
+        print(
+            f"Removed project {removed['project_id']} from the live state "
+            f"({len(removed['archived_tasks'])} task record(s) archived)"
+        )
+        if removed.get("status_moved_to"):
+            print(f"  status record moved to {removed['status_moved_to']}")
+    elif args.project_command == "status":
+        _print_project_status(coordinator.project_status(args.project_id))
+    elif args.project_command == "domain":
+        project = coordinator.set_project_domains(args.project_id, args.domains)
+        configured = project.get("domains") or []
+        print(
+            f"{_glyph_for(coordinator, args.project_id)} {args.project_id} "
+            + (
+                f"defaults to domain {', '.join(configured)}"
+                if configured
+                else "has no default domain; tasks need --domain"
+            )
+        )
+    elif args.project_command == "note":
+        entry = coordinator.record_situation(
+            args.project_id, args.text, supersedes=args.supersedes
+        )
+        print(f"Recorded {entry['id']}: {entry['text']}")
+    elif args.project_command == "action":
+        entry = coordinator.record_project_action_item(
+            args.project_id,
+            args.text,
+            source=args.source,
+            task_id=args.task_id,
+        )
+        print(f"Recorded action {entry['id']}: {entry['text']}")
+    elif args.project_command == "resolve":
+        entry = coordinator.resolve_action_item(args.project_id, args.item_id, note=args.note)
+        print(f"Closed {entry['id']}: {entry['text'][:100]}")
+    elif args.project_command == "add":
+        project = coordinator.register_project(
+            args.name,
+            args.root,
+            project_id=args.project_id,
+            delivery_policy=args.delivery,
+            init_git=args.init_git,
+            confirm=args.confirm,
+        )
+        print(f"Registered {_project_label(project)}  root={project['root']}  delivery={project['delivery_policy']}")
+    else:
+        _discover_if_configured(coordinator, helm_root)
+        _print_projects(coordinator.list_projects())
+    return 0
+
+
+def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.task_command == "create":
+        task = coordinator.create_task(
+            args.project_id,
+            args.brief,
+            delivery_policy=args.delivery,
+            domain=args.domain,
+            agent=args.agent,
+            model=args.model,
+            effort=args.effort,
+            shape=args.shape,
+            shape_reason=args.shape_reason,
+            blocked_by=args.blocked_by,
+            ticket=args.ticket,
+            no_domain=args.no_domain,
+            read_only=args.read_only,
+            base=args.base,
+            new=args.new,
+        )
+        print(f"Created task {task['id']} [{task['status']}] project={task['project_id']} policy={task['delivery_policy']}")
+    elif args.task_command == "allocate":
+        task = coordinator.allocate_task(args.task_id)
+        print(f"Allocated {task['id']} workspace={task['workspace']} branch={task['branch']}")
+    elif args.task_command == "inspect":
+        _print_inspect(coordinator.inspect_task(args.task_id))
+    elif args.task_command == "provenance":
+        provenance = coordinator.task_provenance(args.task_id)
+        if args.as_json:
+            print(json.dumps(provenance, indent=2))
+        else:
+            print(coordinator.render_provenance(provenance), end="")
+        return 0
+    elif args.task_command == "evidence":
+        detail = {}
+        if args.detail:
+            # A bad --detail used to surface as a raw json.loads
+            # message ("Expecting value: line 1 column 1"), which
+            # names neither the flag nor what it wanted. The most
+            # likely mistake is prose, because the surrounding report
+            # is prose.
+            try:
+                parsed = json.loads(args.detail)
+            except json.JSONDecodeError as error:
+                raise HelmError(
+                    f"--detail must be a JSON object of per-package counts, "
+                    f'e.g. \'{{"packages/foo": "12/12"}}\' -- could not parse '
+                    f"it ({error.msg} at position {error.pos})"
+                ) from error
+            if not isinstance(parsed, dict):
+                raise HelmError("--detail must be a JSON object")
+            detail = parsed
+        for item in args.suite:
+            name, sep, count = item.partition("=")
+            if not sep or not name.strip() or not count.strip().isdigit():
+                raise HelmError(f"--suite takes NAME=COUNT, not {item!r}")
+            detail[name.strip()] = int(count)
+        recorded = coordinator.record_task_evidence(
+            args.task_id,
+            tip=args.tip,
+            command=args.suite_command,
+            exit_code=args.exit_code,
+            detail=detail or None,
+            cases=args.cases,
+            check=args.check_name,
+        )
+        ran = recorded.get("cases")
+        print(
+            f"Recorded full-suite evidence for {args.task_id} at "
+            f"{recorded['tip']} (exit {recorded['exit']}, "
+            + (f"{ran} case(s) ran)" if ran is not None else "case count not reported)")
+        )
+        if ran == 0:
+            print(
+                "  0 cases ran: this is not evidence. A filter that matches nothing "
+                "still exits green; select at suite level or verify the count, then re-record."
+            )
+        elif ran is None:
+            print(
+                "  No case count: say what ran with --cases <n> or --suite <name>=<count>; "
+                "a critical task is not approved without it."
+            )
+    elif args.task_command == "reopen":
+        task = coordinator.reopen_task(args.task_id, args.note)
+        print(
+            f"Reopened task {task['id']} from {task['reopened_from']}; "
+            f"it is now {task['status']} and can take another round"
+        )
+        print(
+            "  Continue it with helm task continue "
+            f"{task['id']} --brief \"...\" --read-only|--state-changing"
+        )
+    elif args.task_command == "approve":
+        task = coordinator.approve_task(
+            args.task_id, args.note, grant_id=args.grant_id
+        )
+        under = task["approval"].get("grant_id")
+        authority = f" under standing grant {under}" if under else ""
+        print(
+            f"Approved task {task['id']}{authority}; "
+            "merge remains an explicit separate command"
+        )
+    elif args.task_command == "pr":
+        pushed = coordinator.publish_task_branch(
+            args.task_id,
+            remote=args.remote,
+            grant_id=args.grant_id,
+            confirm=args.confirm,
+        )
+        print(
+            f"Pushed {pushed['branch']} -> {pushed['remote']} "
+            f"(authorized by {pushed['authorized_by']})"
+        )
+        if not args.no_open:
+            _open_pull_request(coordinator, args.task_id, pushed)
+            with contextlib.suppress(HelmError, OSError):
+                task = coordinator.inspect_task(args.task_id)["task"]
+                if task.get("status") in {"pr-open", "pr-merged"}:
+                    _release_finished_space(coordinator, task)
+    elif args.task_command == "pr-status":
+        task = coordinator.record_pr_status(
+            args.task_id,
+            state=args.state,
+            url=args.url,
+            comments=args.comments,
+            checks=args.checks,
+            review_decision=args.review_decision,
+            merge_commit=args.merge_commit,
+        )
+        delivery = task.get("delivery") or {}
+        print(
+            f"Recorded PR {args.state} for task {task['id']} "
+            f"[{task['status']}]"
+            + (f" {delivery.get('url')}" if delivery.get("url") else "")
+        )
+        if task["status"] == "pr-merged":
+            _release_finished_space(coordinator, task)
+    elif args.task_command == "pr-sync":
+        task = _sync_pull_request_status(coordinator, args.task_id)
+        delivery = task.get("delivery") or {}
+        print(
+            f"Synced PR for task {task['id']} [{task['status']}]"
+            + (f" {delivery.get('url')}" if delivery.get("url") else "")
+        )
+        if task["status"] == "pr-merged":
+            _release_finished_space(coordinator, task)
+    elif args.task_command == "shape":
+        reshaped = coordinator.reshape_task(args.task_id, args.shape, reason=args.reason)
+        history = reshaped.get("shape_history") or [{}]
+        print(
+            f"Task {reshaped['id']} is now shaped {reshaped['shape']}"
+            f" (was {history[-1].get('from')})"
+            + (f": {args.reason}" if args.reason else "")
+        )
+    elif args.task_command == "cost":
+        usage = coordinator.task_usage(args.task_id, with_reviews=not args.no_reviews)
+        if args.as_json:
+            print(json.dumps(usage, indent=2))
+            return 0
+        print(f"Usage for task {args.task_id}:")
+        for entry in usage["workers"]:
+            where = (
+                f"{len(entry['transcripts'])} transcript(s), {entry['turns']} turns"
+                if entry["metered"] else "no transcript Helm can read"
+            )
+            dollars = entry.get("cost_usd")
+            print(
+                f"  {entry['worker_id']} [{entry.get('role') or 'worker'} on "
+                f"{entry['agent']}] {where}: in={entry['input_tokens']} "
+                f"out={entry['output_tokens']} "
+                f"cache_read={entry['cache_read_input_tokens']} "
+                f"cache_write={entry['cache_creation_input_tokens']}"
+                + (f" models={','.join(entry['models'])}" if entry["models"] else "")
+                + (
+                    f" cost=${dollars:.2f} ({entry.get('cost_source') or 'reported'})"
+                    if isinstance(dollars, (int, float)) else ""
+                )
+            )
+        total = usage["total"]
+        unpriced = total.get("unpriced_models") or []
+        print(
+            f"  total: {total['turns']} turns, in={total['input_tokens']} "
+            f"out={total['output_tokens']} cache_read={total['cache_read_input_tokens']} "
+            f"cache_write={total['cache_creation_input_tokens']}"
+            + (
+                f", peak context {_peak_cell(total.get('peak_context'))}"
+                if total.get("peak_context") else ""
+            )
+            + (f", cost=${total['cost_usd']:.2f}" if total["cost_known"] else ", cost: not known")
+            + (
+                f"; unpriced: {', '.join(unpriced)} (set model.prices.<model>)"
+                if unpriced else ""
+            )
+        )
+        return 0
+    elif args.task_command == "outcome":
+        _print_outcome(coordinator.task_outcome(args.task_id))
+    elif args.task_command == "deliver":
+        _print_delivery(coordinator.deliver_task_artifacts(args.task_id, force=args.force))
+    elif args.task_command == "merge":
+        task = coordinator.merge_task(args.task_id)
+        print(f"Merged task {task['id']} with local fast-forward")
+        # A merge moves tracked files only. Without this the rendered
+        # video -- the actual product -- stays in the worktree and dies
+        # with it. Auto-cleanup delivers first, so this is usually a
+        # no-op reporting "identical"; it still runs for the roots that
+        # do not auto-clean.
+        try:
+            delivered = task.get("delivered_artifacts")
+            _print_delivery(
+                delivered
+                if delivered is not None
+                else coordinator.deliver_task_artifacts(args.task_id)
+            )
+        except (HelmError, OSError) as error:
+            # Never silent. A swallowed failure here is how a finished
+            # render was lost with every record saying the merge went
+            # fine.
+            print(
+                f"  WARNING: build outputs were NOT delivered: {error}",
+                file=sys.stderr,
+            )
+        _release_finished_space(coordinator, task)
+    elif args.task_command == "continue":
+        task = coordinator.continue_task(
+            args.task_id, args.brief, read_only=args.read_only
+        )
+        print(
+            f"Task {task['id']} reopened for round {len(task.get('rounds', [])) + 1} "
+            f"in {task['workspace']}"
+        )
+        print(f"  branch {task.get('branch') or '(none)'} — launch a worker to run it")
+    elif args.task_command == "cleanup":
+        task = coordinator.cleanup_task(
+            args.task_id, delete_branch=args.delete_branch
+        )
+        print(f"Cleaned task {task['id']} workspace (dirty/unresolved work is always refused)")
+        if not task.get("branch"):
+            pass  # a foreman drives rather than edits and owns no branch
+        elif task.get("branch_removed"):
+            print(f"  branch {task['branch']} deleted")
+        else:
+            print(
+                f"  branch {task['branch']} kept; discard it with "
+                f"helm task cleanup {task['id']} --delete-branch"
+            )
+        _release_finished_space(coordinator, task)
+        with contextlib.suppress(HelmError, OSError):
+            waiting = coordinator.waiting_learnings(task_id=task["id"])
+            if waiting:
+                print(
+                    f"  {len(waiting)} learning proposal(s) from this task await a decision: "
+                    f"helm learning triage --task {task['id']}"
+                )
+        # A cleaned task's record can no longer change, so it leaves
+        # the live document here, where the commander already decided
+        # the task was finished.
+        with contextlib.suppress(HelmError, OSError):
+            if coordinator.archive_tasks([task["id"]])["archived"]:
+                print(f"  record archived to state/archive/tasks/{task['id']}.json")
+    return 0
+
+
+def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.worker_command == "launch":
+        # Herdr by default, like `helm run`. A worker started off to
+        # the side has nowhere to be looked at, which matters most for
+        # the agents a foreman spawns: it launches through this
+        # command, so every one of them used to land invisible while
+        # the foreman itself sat in a tab. The adapter falls back to
+        # the process launcher when Herdr is unavailable, so this
+        # changes where a worker is shown, never whether it runs.
+        launcher = (
+            HerdrAdapter(coordinator).launch_task
+            if args.herdr
+            else coordinator.launch_worker
+        )
+        worker = launcher(
+            args.task_id,
+            args.worker_command_text,
+            wait=not args.asynchronous,
+            domain=args.domain,
+            agent=args.agent,
+        )
+        _ensure_foreman(coordinator, worker["project_id"], herdr=args.herdr)
+        print(
+            f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
+            f"pid={worker.get('pid')} agent={worker.get('agent_id', 'default')} "
+            f"reason={worker.get('agent_reason', '')}"
+        )
+    elif args.worker_command == "round":
+        adapter = HerdrAdapter(coordinator)
+        data = coordinator.store.load()
+        # The resident is the task's most recent worker whose pane
+        # still exists. Its RECORD is usually settled -- a terminal
+        # result settles the worker while the interactive session
+        # stays open -- so liveness here means the pane, not the
+        # status field.
+        candidates = sorted(
+            (
+                w for w in data.get("workers", {}).values()
+                if w.get("task_id") == args.task_id
+            ),
+            key=lambda w: (w.get("started_at") or "", w.get("id") or ""),
+        )
+        resident = None
+        if candidates and not args.fresh:
+            latest = candidates[-1]
+            layout = (
+                data.get("integrations", {}).get("herdr", {})
+                .get("workers", {}).get(latest["id"])
+            )
+            if layout is not None:
+                resident = latest
+        if resident is not None:
+            task = coordinator.continue_task(
+                args.task_id, args.brief,
+                read_only=args.read_only,
+                effort=args.effort,
+                reuse_worker=(
+                    resident["id"]
+                    if resident.get("status") == "running" else None
+                ),
+            )
+            round_no = len(task.get("rounds", [])) + 1
+            try:
+                delivered = adapter.answer_worker(
+                resident["id"],
+                f"ROUND {round_no} for your task {args.task_id} "
+                f"({'read-only' if args.read_only else 'state-changing'}). "
+                "Same worktree, same branch, same reporting protocol; finish "
+                f"with one result. BRIEF: {args.brief}",
+                )
+            except HerdrUnavailable:
+                # A vanished pane mid-delivery is the same fact as a
+                # refused delivery: the resident cannot take the
+                # round. Raw provider errors used to escape here and
+                # strand the task in its just-continued state.
+                delivered = False
+            if delivered:
+                print(
+                    f"Round {round_no} delivered into live worker "
+                    f"{resident['id']} on {args.task_id}"
+                )
+                return 0
+            # The session looked alive but the round never landed in it.
+            # A resident nobody can reach is a dead driver: stand it
+            # down and fall through to a fresh launch, saying so.
+            coordinator.stop_worker(
+                resident["id"],
+                reason="round delivery failed; replacing the resident session",
+            )
+            # Stopping a still-"running" resident fails its task, but
+            # this round was just opened on it: the failure belongs to
+            # the dead session, not the round. Restore the round's own
+            # state so the fresh launch below is not refused.
+            with coordinator.store.locked() as data:
+                stopped_task = data["tasks"][args.task_id]
+                if stopped_task.get("status") == "failed":
+                    stopped_task["status"] = "allocated"
+            print(
+                f"Live session {resident['id']} did not accept the round; "
+                "stopped it and launching a fresh worker"
+            )
+        else:
+            coordinator.continue_task(
+                args.task_id, args.brief, read_only=args.read_only,
+                effort=args.effort,
+            )
+        try:
+            worker = adapter.launch_task(args.task_id, None, wait=False)
+        except BaseException:
+            # The round was opened but its worker never launched.
+            # Left as-is the task sits in "allocated", which no later
+            # round may continue from -- so put back the settled
+            # status the round found it in.
+            with coordinator.store.locked() as failed_data:
+                stranded = failed_data["tasks"][args.task_id]
+                if stranded.get("status") == "allocated":
+                    stranded["status"] = "completed"
+            raise
+        print(
+            f"Round launched with fresh worker {worker['id']} on {args.task_id}"
+        )
+    elif args.worker_command == "poll":
+        worker = coordinator.poll_worker(args.worker_id)
+        print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
+    elif args.worker_command == "wait":
+        worker = coordinator.wait_worker(args.worker_id)
+        print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
+    elif args.worker_command in {"message", "report"}:
+        payload: dict[str, Any] = {}
+        if args.payload:
+            parsed = json.loads(args.payload)
+            if not isinstance(parsed, dict):
+                raise HelmError("--payload must be a JSON object")
+            payload.update(parsed)
+        if args.path:
+            payload["path"] = args.path
+        if args.action:
+            payload["action"] = args.action
+        if args.subject:
+            payload["subject"] = args.subject
+        if args.type == "approval-needed" and not args.action:
+            # Refused at the edge as well as in core, so the worker gets
+            # the usable form rather than a validation error.
+            raise HelmError(
+                "--type approval-needed needs --action naming exactly what "
+                "you would do: push, publish, delete, or external"
+            )
+        if args.wait is not None and args.type != "question":
+            raise HelmError(
+                "--wait goes with --type question: only a question has an "
+                "answer to wait for"
+            )
+        task = coordinator.record_worker_message(
+            args.worker_id,
+            args.type,
+            args.text,
+            payload=payload,
+            requested_status=args.status,
+        )
+        # Push the update onward to the project's pane now.  Presentation
+        # must never decide whether the report itself was recorded.
+        released = False
+        released_tabs: list[str] = []
+        routed: list[str] = []
+        with contextlib.suppress(HelmError, OSError):
+            adapter = HerdrAdapter(coordinator)
+            adapter.route_worker_messages(args.worker_id)
+            # Before anything closes. This command runs inside the
+            # worker's own pane, so its output is printed onto the
+            # surface the next two calls are about to remove; the
+            # outcome and the decision it leaves have to reach the
+            # driver, the project's own pane, and the durable record
+            # first. A live foreman is one of those channels, not a
+            # precondition -- a project without a driver is exactly the
+            # case that needed telling.
+            if args.type in Coordinator.TERMINAL_REPORT_KINDS:
+                routed = adapter.notify_coordinator(args.worker_id)["channels"]
+            released_tabs = adapter.release_finished_tabs()
+            # A reported, clean finish releases the project's space.
+            released = adapter.close_project_space_if_finished(task["project_id"])
+        told_foreman = "foreman" in routed
+        print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
+        turns_worker = coordinator.store.load().get("workers", {}).get(args.worker_id) or {}
+        if args.wait is not None and turns_worker.get("execution_mode") == "turns":
+            # A turn cannot be answered from inside itself: the answer
+            # is the prompt that opens the next one. Waiting here would
+            # hold the turn open for an answer that can only arrive
+            # after it ends.
+            print("  You run in turns: end this turn now; Helm's answer opens your next one.", flush=True)
+            return 0
+        if args.wait is not None:
+            # The question returns its answer. Request and response
+            # inside the worker's own tool call: no pane, no
+            # keystrokes, no UI state to guess, on every runtime.
+            print(f"  Waiting up to {args.wait:g}s for Helm's answer...", flush=True)
+            notes = coordinator.wait_inbox(args.worker_id, args.wait)
+            if notes:
+                print(_format_inbox(args.worker_id, notes), end="")
+                return 0
+            print(
+                f"  No answer within {args.wait:g}s. Keep waiting with: helm worker "
+                f"inbox {args.worker_id} --wait {args.wait:g} (run it in the background "
+                "if your harness can wake you when a command exits), and keep working "
+                "on anything the answer does not block."
+            )
+            return 3
+        if args.type == "approval-needed":
+            hold = coordinator.task_hold(task) or {}
+            print(
+                "  The task is paused, not finished; this session stays open. "
+                "A human authorizes it with: helm approval release "
+                f"{task['id']} --action {hold.get('action') or '<action>'} --confirm"
+            )
+            print(
+                "  When told it is approved, run helm worker action-start "
+                f"{args.worker_id} immediately before acting; it checks the "
+                "approval against this exact state and spends it once."
+            )
+        if told_foreman:
+            print("  Told the project's foreman; it is theirs to act on")
+        if routed:
+            print(f"  Routed the final outcome to: {', '.join(routed)}")
+        if released_tabs:
+            print(f"  Closed {len(released_tabs)} finished worker tab(s)")
+        if released:
+            print(f"Closed the Herdr space for project {task['project_id']}")
+        # Say it here too. The gate is recorded either way, but the
+        # coordinator reading this line is the one who can act on it
+        # now rather than at the next `helm status`.
+        if args.type in Coordinator.TERMINAL_REPORT_KINDS:
+            for item in coordinator.open_action_items(task["project_id"]):
+                if item.get("kind") != DELIVERY_DECISION_KIND:
+                    continue
+                scope = f"task {item['task_id']}" if item.get("task_id") else "project"
+                print(f"  Commander decision pending on {scope}: {item['text']}")
+    elif args.worker_command == "reconcile":
+        result = coordinator.reconcile_worker(args.worker_id, args.evidence)
+        print(
+            f"Reconciled {result['worker']} ({result['was']} -> running); "
+            f"task {result['task']} follows"
+        )
+    elif args.worker_command == "stop":
+        # Through the adapter, because a Herdr worker's pane is what
+        # is actually running it; core settles the record either way.
+        stopped = HerdrAdapter(coordinator).stop_worker(
+            args.worker_id, args.reason
+        )
+        where = []
+        if stopped.get("signalled"):
+            where.append("process signalled")
+        if stopped.get("tab_closed"):
+            where.append("pane closed")
+        print(
+            f"Stopped worker {stopped['id']} [{stopped['status']}] "
+            f"task={stopped['task_id']}"
+            + (f" ({', '.join(where)})" if where else "")
+        )
+        print(
+            "  Its log and worktree are kept as evidence; remove them with "
+            f"helm task cleanup {stopped['task_id']}"
+        )
+        with contextlib.suppress(HelmError, OSError):
+            if HerdrAdapter(coordinator).close_project_space_if_finished(
+                stopped["project_id"]
+            ):
+                print(f"Closed the Herdr space for project {stopped['project_id']}")
+    elif args.worker_command == "action-start":
+        started = coordinator.start_authorized_action(args.worker_id)
+        print(
+            f"Authorized: {started['action']} for task {started['task_id']} "
+            f"[{started['status']}]"
+        )
+        if started.get("note"):
+            print(f"  Commander's note: {started['note']}")
+        print(
+            "  This authorization is now spent. Act, then report the outcome "
+            "with --type result and any receipt in --payload."
+        )
+        with contextlib.suppress(HelmError, OSError):
+            HerdrAdapter(coordinator).route_worker_messages(args.worker_id)
+    elif args.worker_command == "inbox":
+        identity = coordinator.caller_identity()
+        worker_id = args.worker_id or identity["worker_id"]
+        if not worker_id:
+            raise HelmError("name the worker whose inbox to read")
+        if identity["role"] != "root" and worker_id != identity["worker_id"]:
+            # A message to one worker is that worker's context and
+            # nobody else's -- the same wall as every other read.
+            print(
+                f"helm: a worker reads only its own inbox; you are "
+                f"{identity['worker_id']} (by {identity['evidence']})",
+                file=sys.stderr,
+            )
+            return 2
+        if args.wait is not None:
+            notes = coordinator.wait_inbox(worker_id, args.wait)
+        elif args.peek:
+            notes = coordinator.inbox_notes(worker_id)
+        else:
+            notes = coordinator.read_inbox(worker_id, watch=args.changes)
+        if notes:
+            print(_format_inbox(worker_id, notes), end="")
+        elif args.wait is not None:
+            print(
+                f"No message for {worker_id} within {args.wait:g}s; "
+                "run this again to keep waiting."
+            )
+            return 3
+        elif not args.changes:
+            print(f"No unread messages for {worker_id}.")
+        return 0
+    elif args.worker_command == "interrupt":
+        coordinator.require_same_project(args.worker_id, "worker interrupt")
+        sent = False
+        with contextlib.suppress(HelmError, OSError):
+            sent = HerdrAdapter(coordinator).interrupt_worker(args.worker_id)
+        print(
+            f"Interrupted worker {args.worker_id}"
+            if sent else f"Could not reach worker {args.worker_id}'s session to interrupt it"
+        )
+        return 0 if sent else 1
+    elif args.worker_command == "answer":
+        # One worker, one driver. Two answers inside two minutes is a
+        # root and a foreman both replying to the same question, and the
+        # second lands while the agent is already acting on the first --
+        # interleaving with its own redraw and reading as an interrupt.
+        # Refuse rather than deliver, because two answers that disagree
+        # race and the later one wins silently.
+        # One project, one worker. An agent addressing a worker in
+        # another project is a context leak the receiver cannot undo,
+        # and --force must not buy past it -- it exists for a
+        # deliberate follow-up to your OWN worker, not for a boundary.
+        coordinator.require_same_project(args.worker_id, "worker answer")
+        racing = None if args.force else coordinator.recent_answer(args.worker_id)
+        if racing is not None:
+            print(
+                f"Refusing: worker {args.worker_id} was already answered at "
+                f"{racing.get('created_at')}, which is inside Helm's "
+                f"{int(Coordinator.ANSWER_RACE_SECONDS)}s window."
+            )
+            print(
+                "  That is what two drivers answering one worker looks like. "
+                "Decide who is driving this task and let them answer; ask the "
+                "other for status instead."
+            )
+            print(f"  Deliberate follow-up? Resend with --force.")
+            print(f"  Already sent: {(racing.get('text') or '')[:160]}")
+            return 1
+        # Record first: the answer is part of the task's audit trail
+        # whether or not a presentation surface can deliver it.
+        task = coordinator.record_worker_message(args.worker_id, "answer", args.text)
+        # The inbox note IS the delivery; the pane is only a wake. Its
+        # id is the recorded message's id, so the two are one record.
+        recorded = coordinator.recent_answer(args.worker_id) or {}
+        note = coordinator.leave_inbox_note(
+            args.worker_id, args.text, note_id=recorded.get("id")
+        )
+        outcome = "unreachable"
+        with contextlib.suppress(HelmError, OSError):
+            adapter = HerdrAdapter(coordinator)
+            adapter.answer_worker(args.worker_id, args.text, note=note)
+            outcome = adapter.last_wake_outcome
+        print(
+            f"Answered worker {args.worker_id} for task {task['id']} "
+            f"[{_INBOX_DELIVERY_WORDS.get(outcome, _INBOX_DELIVERY_WORDS['unreachable'])}]"
+        )
+    return 0
+
+
+def _cmd_learning(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.learning_command == "teach":
+        taught = coordinator.teach(
+            args.fact, domain=args.domain, project_id=args.project_id, note=args.note
+        )
+        print(f"Taught {taught['id']} and applied it to {taught['applied_path']}")
+        print(f"  {taught['proposed_fact']}")
+    elif args.learning_command == "mine":
+        mined = coordinator.mine_learnings(days=args.days, dry_run=args.dry_run)
+        verb = "would propose" if mined["dry_run"] else "proposed"
+        print(f"Mined the last {mined['days']:g} day(s): {mined['clusters']} recurring point(s), {verb} {len(mined['proposed'])}")
+        for entry in mined["proposed"]:
+            if mined["dry_run"]:
+                print(f"  [{entry['source']}] {entry['domain_id']} ({', '.join(entry['tasks'])}): {entry['fact'][:160]}")
+            else:
+                print(f"  {entry['id']} {entry['domain_id']}: {entry['proposed_fact'][:160]}")
+        if not mined["dry_run"] and mined["proposed"]:
+            print("  Decide them with: helm learning triage --approve <ids> --reject <ids>")
+    elif args.learning_command == "triage":
+        approve = [p for p in args.approve.split(",") if p.strip()]
+        reject = [p for p in args.reject.split(",") if p.strip()]
+        if approve or reject:
+            decided = coordinator.triage_learnings(
+                approve=approve, reject=reject, scope=args.scope, note=args.note
+            )
+            for proposal in decided["applied"]:
+                print(f"applied  {proposal['id']} -> {proposal['applied_path']}")
+            for proposal in decided["rejected"]:
+                print(f"rejected {proposal['id']}")
+            for failure in decided["failed"]:
+                print(f"FAILED   {failure['proposal_id']}: {failure['reason']}")
+            return 1 if decided["failed"] else 0
+        waiting = coordinator.waiting_learnings(task_id=args.task_id, project_id=args.project_id)
+        if not waiting:
+            print("No learning proposals are waiting.")
+            return 0
+        print(f"{len(waiting)} learning proposal(s) waiting:")
+        for proposal in waiting:
+            age_days = max(0.0, (time.time() - _dt.datetime.fromisoformat(
+                str(proposal.get("created_at", "")).replace("Z", "+00:00")
+            ).timestamp()) / 86400) if proposal.get("created_at") else 0.0
+            origin = proposal.get("origin") or "task"
+            evidence = len(proposal.get("source_message_ids") or []) + len(proposal.get("source_artifact_ids") or [])
+            conflict = " CONFLICTS" if proposal.get("conflicts") else ""
+            print(
+                f"  {proposal['id']} {age_days:4.0f}d {proposal['domain_id']:<20} [{origin}; "
+                f"{evidence} evidence]{conflict}: {proposal['proposed_fact'][:140]}"
+            )
+        print("Decide with: helm learning triage --approve a,b --reject c [--scope project] [--note '...']")
+    elif args.learning_command == "stats":
+        stats = coordinator.knowledge_stats()
+        print(
+            f"{stats['proposals']} proposal(s): "
+            + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_status"].items()))
+            + f"; {stats['stale']} waiting more than {7} days"
+        )
+        print("  by origin: " + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_origin"].items())))
+    elif args.learning_command == "propose":
+        proposals = coordinator.generate_learning_proposals(
+            args.task_id,
+            domain=args.domain,
+            fact=args.fact,
+            rationale=args.rationale,
+            confidence=args.confidence,
+            artifact_ids=args.artifact_ids,
+            message_ids=args.message_ids,
+        )
+        for proposal in proposals:
+            _print_learning(proposal)
+    elif args.learning_command == "list":
+        proposals = coordinator.list_learning_proposals(
+            domain=args.domain, status=args.status, task_id=args.task_id
+        )
+        if not proposals:
+            print("No learning proposals.")
+        for proposal in proposals:
+            _print_learning(proposal)
+    elif args.learning_command == "inspect":
+        print(_json(coordinator.inspect_learning_proposal(args.proposal_id)))
+    elif args.learning_command == "edit":
+        proposal = coordinator.edit_learning_proposal(
+            args.proposal_id,
+            proposed_fact=args.fact,
+            rationale=args.rationale,
+            confidence=args.confidence,
+        )
+        _print_learning(proposal)
+    elif args.learning_command == "approve":
+        proposal = coordinator.approve_learning_proposal(
+            args.proposal_id, args.note, actor=args.actor
+        )
+        _print_learning(proposal)
+    elif args.learning_command == "reject":
+        proposal = coordinator.reject_learning_proposal(
+            args.proposal_id, args.note, actor=args.actor
+        )
+        _print_learning(proposal)
+    elif args.learning_command == "apply":
+        proposal = coordinator.apply_learning_proposal(
+            args.proposal_id, actor=args.actor, scope=args.scope
+        )
+        _print_learning(proposal)
+    return 0
+
+
+def _cmd_agent(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.agent_command == "models":
+        _print_agent_models(coordinator, as_json=args.agent_models_json)
+    else:
+        _print_agents(coordinator, check=args.agent_command == "check")
+        if args.agent_command == "check" and getattr(args, "probe", False):
+            _print_probe(coordinator)
+    return 0
+
+
+def _cmd_prefs(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator, helm_root = ctx.coordinator, ctx.helm_root
+    return _prefs_command(coordinator, helm_root, args)
+
+
+def _cmd_herdr(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    adapter = HerdrAdapter(coordinator)
+    if args.herdr_command == "launch":
+        worker = adapter.launch_task(
+            args.task_id,
+            args.worker_command_text,
+            wait=not args.asynchronous,
+            domain=args.domain,
+            agent=args.agent,
+        )
+        mode = "herdr" if worker.get("execution") == "herdr" else "terminal fallback"
+        _ensure_foreman(coordinator, worker["project_id"])
+        print(
+            f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
+            f"pid={worker.get('pid')} mode={mode} "
+            f"agent={worker.get('agent_id', 'default')} reason={worker.get('agent_reason', '')}"
+        )
+    elif args.herdr_command == "poll":
+        worker = adapter.poll_worker(args.task_id)
+        print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
+    elif args.herdr_command == "wait":
+        worker = adapter.wait_worker(args.task_id, timeout=args.timeout)
+        print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
+    elif args.herdr_command == "cleanup":
+        print(f"Cleaned Herdr worker resources: {adapter.cleanup_task(args.task_id)}")
+    elif args.herdr_command == "cleanup-project":
+        print(f"Cleaned Herdr project resources: {adapter.cleanup_project(args.project_id)}")
+    elif args.herdr_command == "cleanup-coordinator":
+        print(f"Cleaned Herdr coordinator resources: {adapter.cleanup_coordinator()}")
+    elif args.herdr_command == "relabel":
+        for entry in adapter.relabel():
+            if entry.get("error"):
+                print(f"  {entry['kind']} {entry['id']}: {entry['error']}")
+            else:
+                print(f"  renamed {entry['kind']} -> {entry['label']}")
+    return 0
+
+
+def _cmd_status(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator, helm_root = ctx.coordinator, ctx.helm_root
+    _discover_if_configured(coordinator, helm_root)
+    _print_status(coordinator, args.project_id)
+    return 0
+
+
+def _cmd_skills(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    project = coordinator.get_project(args.project_id)
+    if args.brief is not None:
+        selection = coordinator.select_skills(
+            project, {"id": "-", "brief": args.brief}, args.agent
+        )
+        print(selection["reason"])
+        for skill in selection["selected"]:
+            print(f"  {skill['id']}  {skill['path']}")
+            print(f"    because: {skill['reason']}")
+            print(f"    delivery: {skill['delivery']}")
+        for entry in selection["skipped"]:
+            print(f"  - {entry['id']}: {entry['reason']}")
+        problems = selection["problems"]
+    else:
+        found = coordinator.discover_skills(project, args.agent)
+        print(f"Roots read: {', '.join(found['roots'])}")
+        if not found["skills"]:
+            print("No readable skills in this project.")
+        for skill in found["skills"]:
+            print(f"  {skill['id']}  {skill['path']}")
+            print(f"    {skill['description'][:200]}")
+            if skill["duplicate_of"]:
+                print(f"    also present at {skill['duplicate_of']}")
+        problems = found["problems"]
+    for problem in problems:
+        # Reported rather than skipped in silence: a skill that cannot
+        # be read is the case most likely to matter.
+        print(f"  ! {problem.get('id') or '(root)'}: {problem['problem']}")
+    return 1 if problems else 0
+
+
+def _cmd_guide(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    # The id is checked before it touches a path: a domain is a
+    # directory name under domains/, never a path of its own.
+    if not _SAFE_DOMAIN_ID.fullmatch(args.domain_id):
+        raise HelmError(f"unknown domain: {args.domain_id}")
+    projects = coordinator.list_projects()
+    domain_root = coordinator._domain_root(projects[0] if projects else {"root": "."})
+    domain_dir = (domain_root / args.domain_id) if domain_root else None
+    if domain_dir is None or not domain_dir.is_dir():
+        raise HelmError(f"unknown domain: {args.domain_id}")
+    knowledge = domain_dir / "knowledge.md"
+    guardrails = domain_dir / "guardrails.md"
+    if knowledge.is_file():
+        text, omitted = bound_learned_knowledge(knowledge.read_text(encoding="utf-8", errors="replace"), str(knowledge))
+        print(text.rstrip("\n"))
+    else:
+        print(f"(no knowledge.md for {args.domain_id})")
+    if guardrails.is_file():
+        print("\n--- guardrails ---\n")
+        print(guardrails.read_text(encoding="utf-8", errors="replace").rstrip("\n"))
+    return 0
+
+
+def _cmd_domain(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    projects = coordinator.list_projects()
+    catalogue = coordinator.domain_catalogue(projects[0] if projects else {"root": "."})
+    if not catalogue:
+        print("No domains found.")
+        return 0
+    print("Choose by what the task IS, not by words in its brief.")
+    print("Pick a selectable domain, or none. Then pass --domain to helm run.\n")
+    for entry in catalogue:
+        if not entry["selectable"]:
+            continue
+        print(f"  {entry['id']}")
+        print(f"    is for:  {entry['applies_to'] or '(undeclared)'}")
+        for line in entry["use_when"]:
+            print(f"    use when: {line}")
+        for line in entry["not_for"]:
+            print(f"    NOT for:  {line}")
+        if entry["extends"]:
+            print(f"    composes: {', '.join(entry['extends'])}")
+        print()
+    blocks = [e["id"] for e in catalogue if not e["selectable"]]
+    if blocks:
+        print(f"Building blocks (reached only via extends): {', '.join(blocks)}")
+    return 0
+
+
+def _cmd_watchdog(ctx: _Context, args: argparse.Namespace) -> int | None:
+    # Root resolved here so a scheduler entry carries an absolute path:
+    # a launchd agent or systemd timer has no shell, no cwd worth
+    # trusting, and no idea which Helm root it was installed for.
+    root_path = Path(args.helm_root).resolve() if args.helm_root else Path.cwd()
+    if args.watchdog_command == "run":
+        return watchdog_module.run(
+            root_path, args.interval, once=args.once,
+            notify_command=args.notify_command, remind_minutes=args.remind_after,
+            heal=not args.no_heal,
+        )
+    if args.watchdog_command == "install":
+        return watchdog_module.install(
+            root_path, args.interval,
+            notify_command=args.notify_command, remind_minutes=args.remind_after,
+            heal=not args.no_heal,
+        )
+    if args.watchdog_command == "restart":
+        return watchdog_module.restart()
+    return watchdog_module.uninstall(root_path)
+
+
+def _cmd_eval(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    return _eval_command(coordinator, args)
+
+
+def _cmd_adopt(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator, helm_root = ctx.coordinator, ctx.helm_root
+    if helm_root is None:
+        raise HelmError("adopt needs a Helm root; run it from one, or pass --root")
+    adopted = coordinator.adopt_project(
+        args.path, helm_root=helm_root, project_id=args.project_id, label=args.label,
+        delivery_policy=args.delivery, domains=args.domains, base_branch=args.base_branch,
+        foreman=not args.no_foreman, review=not args.no_review,
+        agent=args.agent, model=args.model, effort=args.effort,
+    )
+    project = adopted["project"]
+    print(f"Adopted {project['id']} at {adopted['root']}")
+    if adopted["cloned_from"]:
+        print(f"  cloned from {adopted['cloned_from']}; the original was not touched")
+    if adopted["settings_written"] is not None:
+        print(f"  wrote {adopted['settings_file']}:")
+        for key, value in adopted["settings_written"].items():
+            print(f"    {key}: {value}")
+    else:
+        print(f"  kept the existing {adopted['settings_file']}")
+    print(f"  base branch: {project.get('base_branch')}   delivery: {project.get('delivery_policy')}")
+    print(f"  foreman: {'no' if project.get('foreman') is False else 'appointed on the first request'}"
+          f"   review: {'no' if project.get('review') is False else 'independent, on a different model'}")
+    report = doctor_module.run(coordinator, helm_root, project["id"])
+    for line in doctor_module.render_text(report):
+        print(line)
+    print(f"Next: helm route {project['id']} \"<what you want done, in your own words>\"")
+    # The project is adopted either way; the exit code says whether
+    # its own preflight found something that would stop the first
+    # task. Root-level warnings are printed above and are not this
+    # project's fault.
+    broken = [f for f in report.findings if f.scope == "project" and f.severity == doctor_module.ERROR]
+    return 1 if broken else 0
+
+
+def _cmd_ledger(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    report = coordinator.ledger(days=args.days, project_id=args.project_id)
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+        return 0
+    _print_ledger(report)
+    return 0
+
+
+def _cmd_state(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.state_command == "stats":
+        stats = coordinator.state_stats()
+        print(f"{stats['state_file']}: {stats['bytes'] / 1_000_000:.1f} MB")
+        print(
+            f"  projects={stats['projects']} tasks={stats['tasks']} workers={stats['workers']} "
+            f"messages={stats['messages']} artifacts={stats['artifacts']}"
+        )
+        print("  tasks by status: " + ", ".join(f"{k} {v}" for k, v in stats["tasks_by_status"].items()))
+        print(
+            f"  archivable now: {stats['archivable']}   archive: {stats['archive_files']} file(s), "
+            f"{stats['archive_bytes'] / 1_000_000:.1f} MB"
+        )
+        return 0
+    if args.state_command == "tidy":
+        tidied = coordinator.tidy_decisions(args.project_id, dry_run=args.dry_run)
+        _print_tidy(tidied)
+        return 0
+    result = coordinator.archive_tasks(
+        args.task_id or None, dry_run=args.dry_run, reconcile=args.reconcile
+    )
+    verb = "would archive" if result["dry_run"] else "archived"
+    print(f"{verb} {len(result['eligible'])} task record(s)")
+    if result["refused"]:
+        print(f"  not eligible: {', '.join(result['refused'][:8])}{' …' if len(result['refused']) > 8 else ''}")
+    if result["archived"]:
+        # An archived task takes its record with it; an item still
+        # pointing at it has nothing left to decide.
+        _print_tidy(coordinator.tidy_decisions())
+    return 0
+
+
+def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    # Deliberately narrow and deliberately silent. This is meant to run
+    # on every turn, so anything it prints when nothing is wrong is
+    # noise that trains the reader to skip it -- the same failure as an
+    # attention list full of healthy workers. It prints four things: an
+    # agent that asked a human and got no answer, a gate holding work
+    # still, an outcome nobody has relayed yet, and a worker that has
+    # stopped producing. Everything else waits to be asked for.
+    # RECONCILE FIRST, because reporting is a push and a push can be
+    # missed: a worker killed by the OS never reports anything, and its
+    # record sat as `running` until a human happened to run `helm
+    # watch`. Polling every worker whose process is gone settles those
+    # here, so this check reflects what is TRUE rather than what was
+    # reported -- and a task that died silently becomes a failure
+    # decision on its own, without anybody noticing first.
+    #
+    # Cheap by construction: `poll_worker` on an already-settled worker
+    # is a no-op, and the loop only touches workers still marked
+    # running.
+    with contextlib.suppress(HelmError, OSError):
+        for entry in list(coordinator.store.load().get("workers", {}).values()):
+            if entry.get("status") != "running":
+                continue
+            with contextlib.suppress(HelmError, OSError):
+                coordinator.poll_worker(entry["id"])
+
+    # (recency, text): a gate raised two minutes ago must not sit
+    # under a blocker from yesterday. The list is read top-down and the
+    # top is the only part reliably read, so ordering by age is the
+    # difference between surfacing something and burying it. Items with
+    # no timestamp sort oldest -- they are the long-standing ones.
+    # (recency, display, identity). The identity is the UNtruncated
+    # text: --changes compares on it, and comparing truncated lines
+    # lets a widening number look like a new item. Every append must
+    # carry all three -- a 2-tuple here crashes the whole command,
+    # which is the one command that must never fail silently.
+    entries: list[tuple[str, str, str]] = []
+    for item in coordinator.open_escalations(None):
+        glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
+        first = next(
+            (line.strip() for line in item["text"].splitlines() if line.strip()), ""
+        )
+        stamp = str(item.get("at") or item.get("created_at") or "")
+        entries.append((
+            stamp,
+            f"{_when_label(stamp)} {glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
+            f"{glyph} {item['kind']} {item['worker_id']}: {first}",
+        ))
+    for item in coordinator.open_action_items(None):
+        if item.get("kind") not in BLOCKING_GATE_KINDS:
+            continue
+        stamp = str(item.get("at") or "")
+        entries.append((
+            stamp,
+            f"{_when_label(stamp)} {item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}",
+            f"{item['glyph']} {item['project_id']} GATE waiting: {item['text']}",
+        ))
+    # Owed but unrelayed outcomes. `mark_seen=False` matters: this runs
+    # unattended, and a check that consumed what it reported would be
+    # the exact hole this command exists to close.
+    for update in coordinator.project_updates_for_watch(None, mark_seen=False):
+        if update.get("kind") != "situation":
+            continue
+        # OWED reports only. This command is read unattended and its
+        # whole value is that it changes when something needs the commander;
+        # a routine progress line has nothing that ever clears it, so
+        # including one makes the list permanently non-empty and every
+        # future change look like the same old news.
+        if not update.get("owed"):
+            continue
+        # Wider than the rest on purpose. A terminal report's payload is
+        # usually at the END of the line -- a video id, a URL, a commit
+        # -- so a 100-character cut removes exactly the part worth
+        # reading and leaves something that looks like nothing was said.
+        stamp = str(update.get("at") or "")
+        entries.append((
+            stamp,
+            f"{_when_label(stamp)} {update['glyph']} {update['project_id']}: {update['text'][:220]}",
+            f"{update['glyph']} {update['project_id']}: {update['text']}",
+        ))
+    # A request that reached a foreman and was never acted on. This is
+    # derived, not marked: `pending_foreman_requests` asks whether the
+    # foreman has spoken at all since the request arrived, so it cannot
+    # drift and needs nothing written. It already existed and was
+    # already correct -- but it was only ever read by `project status`,
+    # which nobody runs on a turn, so an unacted instruction sat in the
+    # record where no reader would meet it. Twice in one day a project
+    # went quiet with its driver idle on a delivered message, and both
+    # times the commander noticed before Helm did. Delivery is not
+    # action, and this is the line that says so.
+    # One snapshot for the whole sweep. Every helper below used to
+    # reach the store itself -- `pending_foreman_requests` once per
+    # project, the `foreman_for` inside it again, and `_glyph_for`
+    # once per *request* -- so a root with a dozen projects re-parsed
+    # tens of megabytes dozens of times to build a few lines of text.
+    # Nothing here writes, so one read is all the sweep is entitled to.
+    snapshot = coordinator.store.load()
+    glyphs = {
+        project["id"]: project_glyph(project.get("color", ""))
+        for project in snapshot.get("projects", {}).values()
+    }
+    for project in coordinator.list_projects(data=snapshot):
+        for request in coordinator.pending_foreman_requests(
+            project["id"], data=snapshot
+        ):
+            glyph = glyphs.get(project["id"], "")
+            first = next(
+                (line.strip() for line in request["text"].splitlines() if line.strip()),
+                "",
+            )
+            stamp = str(request.get("at") or "")
+            entries.append((
+                stamp,
+                f"{_when_label(stamp)} {glyph} {project['id']} foreman has not acted on: {first[:100]}",
+                f"{glyph} {project['id']} foreman has not acted on: {first}",
+            ))
+    # An answer nobody has read is the stall this whole channel was
+    # built to make visible: the note is a fact, its age is a fact,
+    # and a worker that has not run one helm command in that long is
+    # not acting on anything.
+    for entry in list(snapshot.get("workers", {}).values()):
+        if entry.get("status") != "running":
+            continue
+        age = coordinator.oldest_unread_inbox_age(entry["id"])
+        if age is None or age < INBOX_UNREAD_STALL_SECONDS:
+            continue
+        glyph = glyphs.get(entry.get("project_id"), "")
+        waited = f"{int(age) // 60}m" if age >= 60 else f"{int(age)}s"
+        stamp = _dt.datetime.fromtimestamp(
+            time.time() - age, _dt.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (
+            f"{glyph} {entry.get('project_id')}: message to {entry['id']} unread "
+            f"for {waited} -- it has run no helm command since; check its session"
+        )
+        entries.append((stamp, f"{_when_label(stamp)} {line}", line))
+    for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
+        if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
+            continue
+        # --heal acts only on the one verdict that is EVIDENCE rather
+        # than inference: the process is gone. A stalled worker may be
+        # thinking and an erroring one may recover; killing either on
+        # a heuristic is how a healthy reviewer dies. Seven silent
+        # foreman deaths in one day, each waiting on a human to
+        # notice, are why the dead ones stop waiting.
+        if getattr(args, "heal", False) and entry["verdict"] == "died":
+            healed = _heal_dead_worker(coordinator, entry)
+            if healed:
+                entries.append((
+                    _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    healed[:220],
+                    healed,
+                ))
+                continue
+        glyph = _glyph_for(coordinator, entry["project_id"])
+        idle = max(
+            entry.get("output_idle_seconds") or 0.0,
+            entry.get("reported_idle_seconds") or 0.0,
+        )
+        # A health verdict carries no timestamp, but it does carry its
+        # own idleness -- so date it from that and it sorts among the
+        # timestamped items correctly instead of falling to the bottom
+        # as a block. Without this the list only claimed to be
+        # newest-first.
+        dated = (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=idle)
+        ).isoformat().replace("+00:00", "Z")
+        entries.append((
+            dated,
+            f"{_when_label(seconds=idle)} {glyph} {entry['project_id']} "
+            f"{entry['worker_id']} [{entry['verdict']}]: {entry['detail'][:80]}",
+            f"{glyph} {entry['project_id']} {entry['worker_id']} "
+            f"[{entry['verdict']}]: {entry['detail']}",
+        ))
+    # Knowledge that waits is knowledge nobody gets: a week unreviewed
+    # and the proposals join the list, as one line, oldest first.
+    with contextlib.suppress(HelmError, OSError):
+        stale = coordinator.stale_learnings()
+        if stale:
+            oldest = stale[0]
+            stamp = str(oldest.get("created_at") or "")
+            line = (
+                f"{len(stale)} learning proposal(s) waiting more than 7 days -- "
+                "helm learning triage"
+            )
+            entries.append((stamp, f"{_when_label(stamp)} {line}", line))
+    ordered = sorted(entries, key=lambda e: e[0], reverse=True)
+    lines = [text for _at, text, _identity in ordered]
+    if args.changes:
+        # Only what is NEW since the last --changes call. An unattended
+        # watch that re-prints the whole list every poll buries the one
+        # new line under things already read, and trains its reader to
+        # skip it -- the same failure the list itself was built to fix.
+        #
+        # Compared with digits stripped, because a line carries elapsed
+        # time ("quiet for 7481s") that differs on every poll: without
+        # that, every health line reads as new, forever.
+        #
+        # The identity is built from the FULL text, never the truncated
+        # display line. Truncating first reintroduces the bug by the
+        # back door: when a counter grows from 994s to 1016s the line
+        # gets one character longer, the cut lands one character
+        # earlier, and the stripped tails differ -- so an unchanged
+        # item announces itself again purely because a number got wider.
+        #
+        # Only ELAPSED TIMES are normalised, not every digit. Stripping
+        # all of them also dissolved the worker id, whose digits are
+        # most of what distinguishes one from another: two ids differing
+        # only in where their digits sit reduced to the SAME key, so the
+        # second worker's news was SUPPRESSED once the first had been
+        # reported. That error runs the dangerous way -- a repeat is
+        # noise, but a swallowed item is the silence this command exists
+        # to prevent.
+        def _key(text: str) -> str:
+            return re.sub(r"\d+s\b", "Ns", text)
+
+        seen_file = coordinator.store.directory / "pending-seen.json"
+        previous: set[str] = set()
+        with contextlib.suppress(OSError, ValueError):
+            previous = set(json.loads(seen_file.read_text()))
+        current = {_key(identity) for _at, _text, identity in ordered}
+        fresh = [
+            text
+            for _at, text, identity in ordered
+            if _key(identity) not in previous
+        ]
+        with contextlib.suppress(OSError):
+            seen_file.write_text(json.dumps(sorted(current)))
+        for line in fresh:
+            print(line.strip())
+        return 0
+    if not entries:
+        return 0
+    print(f"Commander, for your attention ({len(lines)}):")
+    for line in lines:
+        print(f"  {line}")
+    print("  (helm status for detail; helm ack <project> once relayed)")
+    return 0
+
+
+def _cmd_ask(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.ask_command == "record":
+        message = coordinator.record_commander_ask(
+            args.reason,
+            args.text,
+            project_id=args.project_id,
+            task_id=args.task_id,
+        )
+        scope = args.project_id or "no single project"
+        print(f"Recorded a {args.reason} ask ({scope}) as {message['id']}")
+        return 0
+    counts = coordinator.commander_asks(args.project_id)
+    print("Asked of the commander:")
+    for reason, total in counts["recorded"].items():
+        print(f"  {reason:<14} {total}")
+    print(f"  {'recorded total':<14} {counts['recorded_total']}")
+    print("Already proven by the record, needing nobody's honesty:")
+    for name, total in counts["derived"].items():
+        print(f"  {name:<20} {total}")
+    if counts["recorded_total"] < counts["derived_total"]:
+        # Said out loud rather than left for the reader to notice. A
+        # rate computed from an under-recorded numerator is wrong in
+        # the direction that flatters Helm, which is the direction
+        # nobody checks.
+        print(
+            "\nRecorded asks are below what the record already proves, so "
+            "the coordinator is not marking every ask. Treat any rate "
+            "computed from the recorded figure as a lower bound."
+        )
+    return 0
+
+
+def _cmd_ack(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    done = coordinator.acknowledge_updates(
+        args.project_id, args.entry_ids or None
+    )
+    if not done:
+        print("No owed reports were waiting to be acknowledged.")
+        return 0
+    print(f"Acknowledged {len(done)} report(s) as relayed:")
+    for entry in done:
+        first = next(
+            (line.strip() for line in entry["text"].splitlines() if line.strip()),
+            "",
+        )
+        print(f"  {entry['id']} {first[:96]}")
+    return 0
+
+
+def _cmd_watch(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    report = coordinator.sweep_workers(silence_seconds=args.silence)
+    # A merged PR used to age as pr-open until somebody ran pr-sync
+    # by hand. Read the remote here, at most once per task per
+    # interval, and say what moved; a remote that cannot be reached
+    # is skipped quietly, because an offline laptop is not news.
+    with contextlib.suppress(HelmError, OSError):
+        synced = coordinator.sync_open_pull_requests()
+        if synced["checked"]:
+            print(
+                f"PR sync: {len(synced['checked'])} checked"
+                + (f", merged: {', '.join(synced['merged'])}" if synced["merged"] else "")
+                + (f", closed: {', '.join(synced['closed'])}" if synced["closed"] else "")
+            )
+            for task_id in synced["merged"]:
+                with contextlib.suppress(HelmError, OSError):
+                    _release_finished_space(coordinator, coordinator.inspect_task(task_id)["task"])
+    # Residue a standing cleanup grant covers is shed here, and the
+    # records that then hold nothing leave the live document.
+    with contextlib.suppress(HelmError, OSError):
+        swept = coordinator.sweep_residue_under_grants()
+        if swept["cleaned"]:
+            print(f"Cleanup under standing grant: {len(swept['cleaned'])} task(s)")
+            for entry in swept["cleaned"]:
+                print(f"  {entry['task_id']}: {entry['reason']} (grant {entry['grant_id']})")
+            coordinator.archive_tasks([entry["task_id"] for entry in swept["cleaned"]])
+        for entry in swept["skipped"]:
+            print(f"  cleanup of {entry['task_id']} refused: {entry['reason']}")
+    # Decisions about tasks that have moved on or left the live
+    # document close here, so the list `watch` prints is only what a
+    # human can still act on.
+    with contextlib.suppress(HelmError, OSError):
+        tidied = coordinator.tidy_decisions()
+        if tidied["resolved"]:
+            print(f"Closed {len(tidied['resolved'])} decision(s) nothing can act on")
+    updates = coordinator.project_updates_for_watch()
+    # A settled worker's pane is no longer evidence; leaving it open
+    # makes the panel harder to read for no benefit.
+    with contextlib.suppress(HelmError, OSError):
+        adapter = HerdrAdapter(coordinator)
+        released = adapter.release_finished_tabs()
+        if released:
+            print(f"Closed {len(released)} finished worker tab(s)")
+        for project_id in adapter.close_finished_project_spaces():
+            print(f"Closed the Herdr space for project {project_id}")
+    if updates:
+        print("Project updates:")
+        for update in updates:
+            glyph = f"{update['glyph']} " if update.get("glyph") else ""
+            print(
+                f"  {glyph}{update['project_id']}: "
+                f"{str(update.get('text', ''))[:220]}"
+            )
+    if not report:
+        print("No running workers.")
+        return 0
+    attention = 0
+    for entry in report:
+        # `driving` belongs here: a foreman waiting on a worker it
+        # launched is doing its job, not failing. Left out, it fell to
+        # the foreman branch below and every healthy driver was stamped
+        # "nothing is driving it" -- so the one row that was fine read
+        # exactly like the two that were genuinely down, and the whole
+        # signal stopped being worth reading.
+        healthy = entry["verdict"] in HEALTHY_WORKER_VERDICTS
+        if healthy:
+            mark = ""
+        elif entry.get("role") == "foreman":
+            # The foreman is what would have noticed the others. When
+            # it is down, nothing is driving the project at all, and
+            # that outranks any single stalled worker on the list.
+            mark = "  <-- URGENT: this project's foreman is down; nothing is driving it"
+        else:
+            mark = "  <-- attention"
+        if mark:
+            attention += 1
+        role = f"{entry['agent_id']}" + (
+            " (foreman)" if entry.get("role") == "foreman" else ""
+        )
+        print(
+            f"{_glyph_for(coordinator, entry['project_id'])} {entry['worker_id']} "
+            f"[{entry['verdict']}] project={entry['project_id']} "
+            f"task={entry['task_id']} agent={role}: {entry['detail']}{mark}"
+        )
+        if args.nudge and entry["verdict"] in {"stalled", "quiet"} and not entry["nudged_at"]:
+            nudge = coordinator.nudge_worker(entry["worker_id"])
+            with contextlib.suppress(HelmError, OSError):
+                HerdrAdapter(coordinator).answer_worker(
+                    entry["worker_id"], nudge["text"]
+                )
+            print(f"  nudged {entry['worker_id']} for a status push")
+    # A non-zero exit lets a scheduled check page a human without
+    # anyone reading the output.
+    return 1 if attention else 0
+
+
+def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    # Root Helm's whole job for one input: identify the project,
+    # make sure its one foreman is live, hand the request off, and
+    # come straight back -- never wait for that foreman to act on
+    # it. Ensuring the foreman only ever spawns (wait=False); the
+    # handoff itself is a pane send-text plus Enter, not a call that
+    # blocks on the foreman's own work. Neither step waits on what
+    # the foreman does with the request, so this command never
+    # becomes the thing that makes one busy project's input hold up
+    # another project's -- independent of how long either step
+    # itself happens to take.
+    #
+    # Truthful, not optimistic: the project's own decision to decline
+    # a foreman is reported as exactly that, not folded into the
+    # generic "could not start one" path used for an actual failure.
+    coordinator.get_project(args.project_id)  # truthful "unknown project" first
+    # Routing is the moment root touches this project, so it is the
+    # moment to say what the project said while nobody was reading.
+    # Printed before the hand-off: a request routed on top of an
+    # unread "investigation complete" is usually the wrong request.
+    _print_new_project_updates(
+        coordinator,
+        args.project_id,
+        heading="Before routing -- new from this project since you last looked:",
+        # Same filter as `status`, for a sharper reason: what a router
+        # needs is what the project SAID, and a standing delivery
+        # decision is neither new nor answerable here. Unfiltered, a
+        # dozen identical decision lines pushed the foreman's actual
+        # report off the top of the very output meant to prevent
+        # routing on top of it -- observed, not hypothesised.
+        skip_decisions=True,
+    )
+    if not coordinator.project_wants_foreman(args.project_id):
+        raise HelmError(
+            f'{args.project_id} has declined a foreman ("foreman": false in its '
+            "own record or .helm/project.json); there is nothing for route to hand "
+            "this request to. Appoint one explicitly with helm foreman "
+            f"{args.project_id} first if you want to route to it anyway."
+        )
+    existing = coordinator.foreman_for(args.project_id)
+    started = None
+    if existing is None:
+        started = _ensure_foreman(
+            coordinator, args.project_id, herdr=args.herdr,
+            command=args.worker_command_text, agent=args.agent,
+            model=args.model,
+            # The request goes into the brief this appointment composes,
+            # so a foreman started by this very call comes up already
+            # holding it rather than hoping to read it afterwards.
+            request=args.text,
+        )
+        foreman = coordinator.foreman_for(args.project_id)
+    else:
+        foreman = existing
+    if foreman is None:
+        raise HelmError(
+            f"{args.project_id} has no live foreman to route to; appointing one "
+            "failed -- see the message above for why"
+        )
+    # Record first, always, while the worker is still whatever it
+    # currently is: the request is part of the project's durable
+    # record whether or not a presentation surface can deliver it,
+    # the same guarantee `helm worker answer` gives a worker's
+    # reply. This is safe to do before checking reachability
+    # because `record_worker_message` no longer touches this
+    # worker's `last_reported_at` for an `answer` push -- that field
+    # is the worker's own liveness signal, and an outbound message
+    # Helm is delivering is not evidence the worker is alive, let
+    # alone that it received it. Recording after the reachability
+    # check would instead let `session_reachable`'s own
+    # reconciliation of a dead Herdr pane (it settles the worker to
+    # "failed" -- the strongest evidence available that the session
+    # is over) run first and leave no running worker left to record
+    # onto, silently dropping the request while still saying
+    # "recorded". Recording first closes that gap: the request
+    # survives in the durable record regardless of what
+    # reachability turns out to be.
+    task = coordinator.record_worker_message(foreman["id"], "answer", args.text)
+    # Reachability is checked after recording, and is unaffected by
+    # having just recorded: `session_reachable` asks whether there
+    # is a live Herdr pane, with a provider that confirms it, for
+    # this worker right now -- not whether it has spoken recently.
+    # It is correct for a plain-process foreman too (no `helm herdr`
+    # input channel to send into at all) and for a foreman mid-task
+    # or quietly idle (both reachable, neither is what this checks).
+    # A foreman appointed by this very call is a separate case,
+    # handled below via `started is not None` -- its process was
+    # just spawned and cannot have a ready pane yet regardless of
+    # what `session_reachable` would say.
+    reachable = started is None and HerdrAdapter(coordinator).session_reachable(
+        foreman["id"]
+    )
+    if started is not None:
+        # A foreman appointed this call cannot have a ready pane yet
+        # -- the agent process was just spawned and has not had time
+        # to start reading, let alone attach a shell it can accept
+        # text into. Sending into it now is a race that would either
+        # be silently swallowed by a not-yet-listening pane or wedge
+        # ahead of the agent's own startup output; either way a
+        # "delivered" claim here would be false. The record above is
+        # what makes the request survive regardless: the foreman's
+        # own brief-time status read (`foreman_brief`,
+        # `helm project status`) surfaces it once it comes up.
+        print(
+            f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
+            f"newly appointed foreman {foreman['id']} task={task['id']} "
+            "[recorded, and written into the brief this appointment composed; the "
+            "foreman is still starting and comes up holding the request, "
+            "not a live pane send]"
+        )
+        return 0
+    if not reachable:
+        # A live worker record with nothing that can actually
+        # receive text: a plain-process foreman with no Herdr pane
+        # at all, or a Herdr pane the provider says is gone or was
+        # closed by hand. Neither is "unhealthy" in the sense
+        # `worker_health` reports (a busy or quietly idle foreman
+        # is not that), so this checks reachability directly rather
+        # than reusing that verdict. Never claim a delivery that
+        # could not have happened; one foreman per project is
+        # preserved -- this does not stop or replace it, only says
+        # how to if that is wanted.
+        print(
+            f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
+            f"foreman {foreman['id']} task={task['id']} "
+            "[recorded only; its foreman has no reachable session to send into -- "
+            "either a plain process with no input channel, or its Herdr pane is gone. "
+            f"Replace it with: helm worker stop {foreman['id']} --reason \"...\" "
+            f"&& helm foreman {args.project_id}]"
+        )
+        return 0
+    delivered = False
+    with contextlib.suppress(HelmError, OSError):
+        delivered = HerdrAdapter(coordinator).answer_worker(foreman["id"], args.text)
+    print(
+        f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
+        f"foreman {foreman['id']} task={task['id']} "
+        f"[{'delivered' if delivered else 'recorded only; the send itself failed'}]"
+    )
+    return 0
+
+
+def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    existing = coordinator.foreman_for(args.project_id)
+    if existing is not None:
+        # One project, one foreman: a second driver is worse than none.
+        # But "already has one" must never become a dead end -- a
+        # foreman whose pane was closed by hand still reads as running,
+        # and without a way out that project could never be given
+        # another driver. So say how to replace it.
+        health = {
+            entry["worker_id"]: entry for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator))
+        }.get(existing["id"], {})
+        verdict = health.get("verdict", "unknown")
+        print(
+            f"{_glyph_for(coordinator, args.project_id)} {args.project_id} already has "
+            f"a foreman: {existing['id']} [{verdict}] task={existing['task_id']}"
+        )
+        if verdict not in {"healthy", "starting", "reported"}:
+            print(
+                f"  It is not driving anything. Replace it with: "
+                f"helm worker stop {existing['id']} --reason \"...\" "
+                f"&& helm foreman {args.project_id}"
+            )
+        return 0
+    task = coordinator.create_foreman_task(
+        args.project_id, agent=args.agent, model=args.model, effort=args.effort
+    )
+    if args.herdr:
+        worker = HerdrAdapter(coordinator).launch_task(
+            task["id"], args.worker_command_text, wait=False
+        )
+        mode = (
+            "herdr"
+            if worker.get("execution") == "herdr"
+            else "process fallback (Herdr unavailable)"
+        )
+    else:
+        worker = coordinator.launch_worker(
+            task["id"], args.worker_command_text, wait=False
+        )
+        mode = "process (--no-herdr)"
+    print(
+        f"{_glyph_for(coordinator, args.project_id)} {args.project_id} foreman "
+        f"{worker['id']} [{worker['status']}] task={task['id']} mode={mode} "
+        f"agent={worker.get('agent_id', 'default')}"
+    )
+    if not coordinator.project_wants_foreman(args.project_id):
+        # Started by hand for a project that has not declared one:
+        # say so, because nothing will reappoint it after it exits.
+        print(
+            '  This project does not declare a foreman. Add "foreman": true to its '
+            ".helm/project.json to have Helm appoint one itself."
+        )
+    # Say what it cannot do, every time. A driver that looks like a
+    # coordinator is the one mistake this command can cause.
+    print(
+        "  It drives this project's loops. It cannot approve, merge, push, "
+        "publish, delete, or grant a standing approval -- those stay here."
+    )
+    return 0
+
+
+def _cmd_board(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator, store = ctx.coordinator, ctx.store
+    projects = coordinator.board()
+    destination = Path(args.out) if args.out else store.directory / "board.html"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        _board_html(projects, __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")),
+        encoding="utf-8",
+    )
+    shown = sum(len(p["tasks"]) for p in projects)
+    print(f"Board written: {destination}  ({shown} task(s) across {len(projects)} project(s))")
+    if args.open_it:
+        subprocess.run(["open", str(destination)], check=False)
+    return 0
+
+
+def _cmd_reflect(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    print(_json(coordinator.reflection_evidence(args.hours)))
+    return 0
+
+
+def _cmd_tail(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    for line in coordinator.worker_output(args.worker_id, args.lines):
+        print(line)
+    return 0
+
+
+def _cmd_approval(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.approval_command == "grant":
+        granted = coordinator.grant_approval(
+            args.action, project_id=args.project_id, note=args.note, stale_days=args.stale_days,
+        )
+        scope = granted["project_id"] or "all projects"
+        print(f"Granted {granted['id']}: {granted['action']} for {scope}")
+        # A standing approval is the one place a later action happens
+        # without anyone being asked, so say plainly what changed.
+        print(
+            f"  Helm may now {granted['action']} for {scope} without asking again. "
+            f"Withdraw it with: helm approval revoke {granted['id']}"
+        )
+    elif args.approval_command == "revoke":
+        revoked = coordinator.revoke_approval_grant(args.grant_id, args.note)
+        print(f"Revoked {revoked['id']}: {revoked['action']} for {revoked['project_id'] or 'all projects'}")
+    elif args.approval_command == "release":
+        task = coordinator.release_task_hold(
+            args.task_id,
+            action=args.action,
+            note=args.note,
+            grant_id=args.grant_id,
+            confirm=args.confirm,
+        )
+        hold = task.get("hold") or {}
+        authorization = hold.get("authorization") or {}
+        snapshot = authorization.get("snapshot") or hold.get("snapshot") or {}
+        worker_id = hold.get("worker_id", "")
+        message = args.text or (
+            f"Approved: {args.action}. The commander authorized exactly this"
+            + (f" ({args.note})" if args.note else "")
+            + ". Run `helm worker action-start "
+            f"{worker_id}` immediately before you act -- it checks the approval "
+            "against the state that was approved and spends it once -- then do "
+            "it and report the outcome with --type result."
+        )
+        # Delivery is its own fact. The decision is already recorded and
+        # the task stays paused until the session itself acknowledges by
+        # spending the ticket, so a failed delivery is a retry rather
+        # than an authorization nobody received.
+        delivered = False
+        with contextlib.suppress(HelmError, OSError):
+            adapter = HerdrAdapter(coordinator)
+            if adapter.session_reachable(worker_id):
+                delivered = adapter.answer_worker(worker_id, message)
+        if delivered:
+            # Recorded only when it actually arrived, so the escalation
+            # stays open while nobody has been told.
+            with contextlib.suppress(HelmError, OSError):
+                coordinator.record_worker_message(worker_id, "answer", message)
+            with contextlib.suppress(HelmError, OSError):
+                coordinator.mark_hold_delivered(args.task_id, delivered=True)
+        print(
+            f"Authorized {args.action} for task {task['id']} [{task['status']}] "
+            f"worker={worker_id} "
+            f"[{'delivered' if delivered else 'NOT delivered'}]"
+        )
+        if authorization.get("grant_id"):
+            print(f"  Authority: standing grant {authorization['grant_id']}")
+        else:
+            print(
+                f"  Authority: explicit confirmation "
+                f"({(authorization.get('authority') or {}).get('mode', 'session')})"
+            )
+        if snapshot.get("scope") == "workspace":
+            print(
+                f"  Bound to {snapshot.get('branch')} @ "
+                f"{(snapshot.get('revision') or '')[:12]} plus its index, "
+                f"working tree, {len(snapshot.get('untracked', []))} untracked "
+                f"and {len(snapshot.get('artifacts', []))} declared artifact(s); "
+                "any change refuses at action-start"
+            )
+        else:
+            print("  No worktree to bind: this task holds no branch of its own")
+        if delivered:
+            print(
+                "  The task stays paused until the worker spends it with "
+                f"helm worker action-start {worker_id}"
+            )
+        else:
+            print(
+                "  Nothing was delivered and nothing is spent. Retry with the "
+                f"same command (helm approval release {args.task_id} --action "
+                f"{args.action} --confirm), or repair the task with "
+                f"helm approval repair {args.task_id} if its session is gone."
+            )
+            return 1
+    elif args.approval_command == "repair":
+        # Provider evidence, gathered here: core never talks to a
+        # presentation service and must not guess a session is alive.
+        live = False
+        with contextlib.suppress(HelmError, OSError):
+            adapter = HerdrAdapter(coordinator)
+            hold = coordinator.hold_worker_id(args.task_id)
+            live = bool(hold) and adapter.session_reachable(hold)
+        repaired = coordinator.repair_task_hold(
+            args.task_id, session_live=live, note=args.note
+        )
+        print(
+            f"Repaired task {repaired['task_id']}: {repaired['outcome']}"
+            + (
+                f" (hold {repaired['hold']['id']} waiting on "
+                f"{repaired['hold']['action']})"
+                if repaired.get("hold")
+                else ""
+            )
+        )
+        if repaired["outcome"] == "abandoned":
+            print(
+                "  Its session is gone, so nothing could be authorized into it. "
+                "The task is failed: its log is the evidence, and it can now be "
+                f"cleaned up with helm task cleanup {repaired['task_id']}."
+            )
+        elif repaired["outcome"] == "restate-requested":
+            print(
+                "  The recorded request named no usable action. The live worker "
+                "has been asked to re-report it with --action."
+            )
+        else:
+            print(
+                "  Authorize it with: helm approval release "
+                f"{repaired['task_id']} --action {repaired['hold']['action']} --confirm"
+            )
+    elif args.approval_command == "check":
+        covering = coordinator.approval_grant_for(args.action, args.project_id)
+        scope = args.project_id or "all projects"
+        if covering is None:
+            print(f"No standing approval covers {args.action} for {scope}; ask the user.")
+            return 1
+        print(
+            f"{covering['id']} covers {args.action} for "
+            f"{covering['project_id'] or 'all projects'}: {covering['note']}"
+        )
+    else:
+        _print_approval_grants(coordinator, include_revoked=args.include_revoked)
+    return 0
+
+
+def _cmd_gate(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.gate_command == "propose":
+        task = coordinator.propose_gate(args.task_id, args.gate_type, args.text)
+        print(
+            f"Proposed the {args.gate_type} gate on task {task['id']}; "
+            "waiting on the commander: helm gate decide "
+            f"{task['id']} --type {args.gate_type} --confirm|--skip"
+        )
+        shortfalls = ((task.get("gates") or {}).get(args.gate_type) or {}).get("shortfalls") or []
+        if shortfalls:
+            print(
+                "  The commander will see this proposal as thin: "
+                + "; ".join(shortfalls)
+                + ". Add a `Done means:` line and an `Out of scope:` line and propose again."
+            )
+    else:
+        task = coordinator.decide_gate(
+            args.task_id, args.gate_type,
+            confirm=args.confirm, skip=args.skip, note=args.note,
+        )
+        verb = "Skipped" if args.skip else "Confirmed"
+        print(f"{verb} the {args.gate_type} gate on task {task['id']}")
+        shortfalls = ((task.get("gates") or {}).get(args.gate_type) or {}).get("shortfalls") or []
+        if shortfalls and args.confirm:
+            print(f"  (confirmed thin: {'; '.join(shortfalls)})")
+        # And TELL the foreman. A gate is the one thing a foreman is
+        # explicitly instructed to stop and wait for, and the decision
+        # was recorded where only a poll would find it -- so a
+        # confirmed gate left the agent sitting idle, indefinitely,
+        # having done nothing wrong. Two foremen on two projects
+        # stalled that way in one session. Delivery is best-effort:
+        # the decision is already durable, and a foreman that cannot
+        # be reached still finds it in `helm project status`.
+        notice = (
+            f"Helm: the commander {verb.lower()} your {args.gate_type} gate"
+            f" on task {task['id']}."
+            + (f" Note: {args.note}" if args.note else "")
+            + (
+                " Proceed."
+                if not args.skip
+                else " It was skipped, not confirmed -- do not treat that as "
+                "approval of the contract as proposed."
+            )
+        )
+        delivered = False
+        live = None
+        with contextlib.suppress(HelmError, OSError):
+            live = next(
+                (
+                    worker
+                    for worker in coordinator.store.load()
+                    .get("workers", {})
+                    .values()
+                    if worker.get("task_id") == task["id"]
+                    and worker.get("status") == "running"
+                ),
+                None,
+            )
+            if live is not None:
+                delivered = bool(
+                    HerdrAdapter(coordinator).answer_worker(live["id"], notice)
+                )
+        if not delivered:
+            # Two very different failures were being reported in one
+            # soft sentence. A live agent that merely could not be
+            # reached will find the decision by polling; a session that
+            # has ENDED never will, and the gate is bound to that
+            # task's row -- so a replacement foreman re-proposes and
+            # the decision just made is spent on nothing. That case
+            # needs a different next command, and it needs to be hard
+            # to miss: an agent waiting on a gate that answers into a
+            # dead session stalls the project until a human notices.
+            if live is not None:
+                print(
+                    "  Not delivered into a live session. The decision is "
+                    "recorded; the foreman will see it in helm project "
+                    "status, or route it a message to move it along."
+                )
+            else:
+                project_id = task.get("project_id") or "<project>"
+                print(
+                    "  NOT DELIVERED -- no live session holds this task, so "
+                    "nothing is waiting on the decision you just made."
+                )
+                print(
+                    "  The decision is recorded on the task and stays "
+                    "recorded. But the gate is bound to THIS task, so a "
+                    "replacement foreman starts a new task and proposes "
+                    "its gates again; do not read this decision as "
+                    "already spent on the work."
+                )
+                print(
+                    f"  Revive the driver: helm foreman {project_id} "
+                    "(replace a stale one first with helm worker stop "
+                    "<worker-id> --reason \"...\")."
+                )
+    return 0
+
+
+def _cmd_authority(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    if args.authority_command == "init":
+        # Generated here, written 0600, and never printed: a capability
+        # read out into a transcript has already left the machine.
+        path = coordinator.configure_authority(secrets.token_urlsafe(48))
+        print("This root now requires an authorization capability.")
+        print(f"  Written to {path} (0600). Its value is never printed.")
+        print(f'  Load it into your own shell: export {AUTHORITY_ENV}="$(cat {path})"')
+        print(
+            "  Then remove the file if you like. No agent Helm starts can "
+            "inherit it: the worker environment is an allowlist."
+        )
+    else:
+        configured = bool(coordinator._authority_hash())
+        present = bool(os.environ.get(AUTHORITY_ENV))
+        print(
+            "Protected commands here require a capability"
+            if configured
+            else "Protected commands here are guarded by session role only"
+        )
+        print(f"  capability configured: {'yes' if configured else 'no'}")
+        print(f"  capability present in this session: {'yes' if present else 'no'}")
+        if not configured:
+            print(
+                "  Set one up with helm authority init. Without it, a process "
+                "that is neither marked nor descended from a worker is treated "
+                "as the root."
+            )
+    return 0
+
+
+def _cmd_review(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    outcome = HerdrAdapter(coordinator).run_review_cycle(
+        args.task_id,
+        reviewer_agent=args.reviewer_agent,
+        reviewer_model=args.reviewer_model,
+        reviewer_effort=args.reviewer_effort,
+        rounds=args.rounds,
+        timeout=args.timeout,
+    )
+    print(
+        f"Review of {outcome['task_id']}: {outcome['verdict']} "
+        f"(author={outcome['author_agent']} reviewer={outcome['reviewer_agent']} "
+        f"independence={outcome['independence']})"
+    )
+    print(f"  {outcome['reviewer_reason']}")
+    for entry in outcome["rounds"]:
+        # Say where a verdict came from when it did not come the
+        # normal way: a pane read is a recovery, not the record.
+        recovered = (
+            "  (recovered from the reviewer's output; its report never reached Helm)"
+            if entry.get("source") == "output"
+            else ""
+        )
+        print(f"  round {entry['round']}: {entry['verdict']}{recovered}")
+        if entry.get("text"):
+            print(f"    {entry['text'][:400]}")
+    # Unresolved means an objection still stands; a human decides.
+    return 0 if outcome["verdict"] == "approved" else 1
+
+
+def _cmd_inspect(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    _print_inspect(coordinator.inspect_task(args.task_id))
+    return 0
+
+
+# Every command the parser accepts except `doctor`, which `main` dispatches
+# before the role check; a guard test keeps the two lists in step.
+_COMMANDS: dict[str, Callable[[_Context, argparse.Namespace], int | None]] = {
+    "init": _cmd_init,
+    "run": _cmd_run,
+    "project": _cmd_project,
+    "task": _cmd_task,
+    "worker": _cmd_worker,
+    "learning": _cmd_learning,
+    "learn": _cmd_learning,
+    "agent": _cmd_agent,
+    "prefs": _cmd_prefs,
+    "herdr": _cmd_herdr,
+    "status": _cmd_status,
+    "skills": _cmd_skills,
+    "guide": _cmd_guide,
+    "domain": _cmd_domain,
+    "watchdog": _cmd_watchdog,
+    "eval": _cmd_eval,
+    "adopt": _cmd_adopt,
+    "ledger": _cmd_ledger,
+    "state": _cmd_state,
+    "pending": _cmd_pending,
+    "ask": _cmd_ask,
+    "ack": _cmd_ack,
+    "watch": _cmd_watch,
+    "route": _cmd_route,
+    "foreman": _cmd_foreman,
+    "board": _cmd_board,
+    "reflect": _cmd_reflect,
+    "tail": _cmd_tail,
+    "approval": _cmd_approval,
+    "gate": _cmd_gate,
+    "authority": _cmd_authority,
+    "review": _cmd_review,
+    "inspect": _cmd_inspect,
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     # The runner is an internal child process. Keep it out of the public
@@ -3380,1978 +5473,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"helm: {refusal}", file=sys.stderr)
             return 2
 
-        if args.command == "init":
-            initialized = store.initialize_root(helm_root or args.init_root)
-            print(f"Initialized Helm root {initialized}")
-            print(f"  projects={initialized / 'projects'}")
-            print(f"  state={initialized / 'state'}")
-            return 0
-
-        if args.command == "run":
-            if helm_root is None:
-                raise HelmError("a Helm root is required; run helm init first")
-            brief = _task_brief(args.brief)
-            if not brief:
-                raise HelmError(
-                    "No task supplied. Provide a brief or run helm run "
-                    f"{args.project_id} interactively to start a conversation."
-                )
-            project = coordinator.discover_project(helm_root, args.project_id)
-            task = coordinator.create_task(
-                project["id"], brief, delivery_policy=args.delivery, domain=args.domain,
-                agent=args.agent, model=args.model, effort=args.effort,
-                ticket=args.ticket,
-                no_domain=args.no_domain,
-            )
-            if args.herdr:
-                worker = HerdrAdapter(coordinator).launch_task(
-                    task["id"], args.worker_command_text, wait=not args.asynchronous
-                )
-                mode = (
-                    "herdr"
-                    if worker.get("execution") == "herdr"
-                    else "process fallback (Herdr unavailable)"
-                )
-            else:
-                worker = coordinator.launch_worker(
-                    task["id"], args.worker_command_text, wait=not args.asynchronous
-                )
-                mode = "process (--no-herdr)"
-            _ensure_foreman(coordinator, project["id"], herdr=args.herdr)
-            print(
-                f"Ran {_project_label(project)} task={task['id']} "
-                f"worker={worker['id']} [{worker['status']}] mode={mode} "
-                f"domain={task.get('domain') or 'none'} "
-                f"agent={worker.get('agent_id', 'default')} reason={worker.get('agent_reason', '')}"
-            )
-            return 0
-
-        if args.command == "project":
-            if args.project_command == "release":
-                outcome = coordinator.release_project(args.project_id)
-                print(
-                    f"Released {len(outcome['released'])} task(s) in {outcome['project_id']}"
-                )
-                for entry in outcome["kept"]:
-                    print(f"  kept {entry['task_id']}: {entry['reason']}")
-                with contextlib.suppress(HelmError, OSError):
-                    if HerdrAdapter(coordinator).close_project_space_if_finished(
-                        args.project_id
-                    ):
-                        print("  space closed")
-                with contextlib.suppress(HelmError, OSError):
-                    archived = coordinator.archive_tasks(outcome["released"])["archived"] if outcome["released"] else []
-                    if archived:
-                        print(f"  {len(archived)} record(s) archived")
-            elif args.project_command == "remove":
-                removed = coordinator.remove_project(args.project_id)
-                print(
-                    f"Removed project {removed['project_id']} from the live state "
-                    f"({len(removed['archived_tasks'])} task record(s) archived)"
-                )
-                if removed.get("status_moved_to"):
-                    print(f"  status record moved to {removed['status_moved_to']}")
-            elif args.project_command == "status":
-                _print_project_status(coordinator.project_status(args.project_id))
-            elif args.project_command == "domain":
-                project = coordinator.set_project_domains(args.project_id, args.domains)
-                configured = project.get("domains") or []
-                print(
-                    f"{_glyph_for(coordinator, args.project_id)} {args.project_id} "
-                    + (
-                        f"defaults to domain {', '.join(configured)}"
-                        if configured
-                        else "has no default domain; tasks need --domain"
-                    )
-                )
-            elif args.project_command == "note":
-                entry = coordinator.record_situation(
-                    args.project_id, args.text, supersedes=args.supersedes
-                )
-                print(f"Recorded {entry['id']}: {entry['text']}")
-            elif args.project_command == "action":
-                entry = coordinator.record_project_action_item(
-                    args.project_id,
-                    args.text,
-                    source=args.source,
-                    task_id=args.task_id,
-                )
-                print(f"Recorded action {entry['id']}: {entry['text']}")
-            elif args.project_command == "resolve":
-                entry = coordinator.resolve_action_item(args.project_id, args.item_id, note=args.note)
-                print(f"Closed {entry['id']}: {entry['text'][:100]}")
-            elif args.project_command == "add":
-                project = coordinator.register_project(
-                    args.name,
-                    args.root,
-                    project_id=args.project_id,
-                    delivery_policy=args.delivery,
-                    init_git=args.init_git,
-                    confirm=args.confirm,
-                )
-                print(f"Registered {_project_label(project)}  root={project['root']}  delivery={project['delivery_policy']}")
-            else:
-                _discover_if_configured(coordinator, helm_root)
-                _print_projects(coordinator.list_projects())
-            return 0
-
-        if args.command == "task":
-            if args.task_command == "create":
-                task = coordinator.create_task(
-                    args.project_id,
-                    args.brief,
-                    delivery_policy=args.delivery,
-                    domain=args.domain,
-                    agent=args.agent,
-                    model=args.model,
-                    effort=args.effort,
-                    shape=args.shape,
-                    shape_reason=args.shape_reason,
-                    blocked_by=args.blocked_by,
-                    ticket=args.ticket,
-                    no_domain=args.no_domain,
-                    read_only=args.read_only,
-                    base=args.base,
-                    new=args.new,
-                )
-                print(f"Created task {task['id']} [{task['status']}] project={task['project_id']} policy={task['delivery_policy']}")
-            elif args.task_command == "allocate":
-                task = coordinator.allocate_task(args.task_id)
-                print(f"Allocated {task['id']} workspace={task['workspace']} branch={task['branch']}")
-            elif args.task_command == "inspect":
-                _print_inspect(coordinator.inspect_task(args.task_id))
-            elif args.task_command == "provenance":
-                provenance = coordinator.task_provenance(args.task_id)
-                if args.as_json:
-                    print(json.dumps(provenance, indent=2))
-                else:
-                    print(coordinator.render_provenance(provenance), end="")
-                return 0
-            elif args.task_command == "evidence":
-                detail = {}
-                if args.detail:
-                    # A bad --detail used to surface as a raw json.loads
-                    # message ("Expecting value: line 1 column 1"), which
-                    # names neither the flag nor what it wanted. The most
-                    # likely mistake is prose, because the surrounding report
-                    # is prose.
-                    try:
-                        parsed = json.loads(args.detail)
-                    except json.JSONDecodeError as error:
-                        raise HelmError(
-                            f"--detail must be a JSON object of per-package counts, "
-                            f'e.g. \'{{"packages/foo": "12/12"}}\' -- could not parse '
-                            f"it ({error.msg} at position {error.pos})"
-                        ) from error
-                    if not isinstance(parsed, dict):
-                        raise HelmError("--detail must be a JSON object")
-                    detail = parsed
-                for item in args.suite:
-                    name, sep, count = item.partition("=")
-                    if not sep or not name.strip() or not count.strip().isdigit():
-                        raise HelmError(f"--suite takes NAME=COUNT, not {item!r}")
-                    detail[name.strip()] = int(count)
-                recorded = coordinator.record_task_evidence(
-                    args.task_id,
-                    tip=args.tip,
-                    command=args.suite_command,
-                    exit_code=args.exit_code,
-                    detail=detail or None,
-                    cases=args.cases,
-                    check=args.check_name,
-                )
-                ran = recorded.get("cases")
-                print(
-                    f"Recorded full-suite evidence for {args.task_id} at "
-                    f"{recorded['tip']} (exit {recorded['exit']}, "
-                    + (f"{ran} case(s) ran)" if ran is not None else "case count not reported)")
-                )
-                if ran == 0:
-                    print(
-                        "  0 cases ran: this is not evidence. A filter that matches nothing "
-                        "still exits green; select at suite level or verify the count, then re-record."
-                    )
-                elif ran is None:
-                    print(
-                        "  No case count: say what ran with --cases <n> or --suite <name>=<count>; "
-                        "a critical task is not approved without it."
-                    )
-            elif args.task_command == "reopen":
-                task = coordinator.reopen_task(args.task_id, args.note)
-                print(
-                    f"Reopened task {task['id']} from {task['reopened_from']}; "
-                    f"it is now {task['status']} and can take another round"
-                )
-                print(
-                    "  Continue it with helm task continue "
-                    f"{task['id']} --brief \"...\" --read-only|--state-changing"
-                )
-            elif args.task_command == "approve":
-                task = coordinator.approve_task(
-                    args.task_id, args.note, grant_id=args.grant_id
-                )
-                under = task["approval"].get("grant_id")
-                authority = f" under standing grant {under}" if under else ""
-                print(
-                    f"Approved task {task['id']}{authority}; "
-                    "merge remains an explicit separate command"
-                )
-            elif args.task_command == "pr":
-                pushed = coordinator.publish_task_branch(
-                    args.task_id,
-                    remote=args.remote,
-                    grant_id=args.grant_id,
-                    confirm=args.confirm,
-                )
-                print(
-                    f"Pushed {pushed['branch']} -> {pushed['remote']} "
-                    f"(authorized by {pushed['authorized_by']})"
-                )
-                if not args.no_open:
-                    _open_pull_request(coordinator, args.task_id, pushed)
-                    with contextlib.suppress(HelmError, OSError):
-                        task = coordinator.inspect_task(args.task_id)["task"]
-                        if task.get("status") in {"pr-open", "pr-merged"}:
-                            _release_finished_space(coordinator, task)
-            elif args.task_command == "pr-status":
-                task = coordinator.record_pr_status(
-                    args.task_id,
-                    state=args.state,
-                    url=args.url,
-                    comments=args.comments,
-                    checks=args.checks,
-                    review_decision=args.review_decision,
-                    merge_commit=args.merge_commit,
-                )
-                delivery = task.get("delivery") or {}
-                print(
-                    f"Recorded PR {args.state} for task {task['id']} "
-                    f"[{task['status']}]"
-                    + (f" {delivery.get('url')}" if delivery.get("url") else "")
-                )
-                if task["status"] == "pr-merged":
-                    _release_finished_space(coordinator, task)
-            elif args.task_command == "pr-sync":
-                task = _sync_pull_request_status(coordinator, args.task_id)
-                delivery = task.get("delivery") or {}
-                print(
-                    f"Synced PR for task {task['id']} [{task['status']}]"
-                    + (f" {delivery.get('url')}" if delivery.get("url") else "")
-                )
-                if task["status"] == "pr-merged":
-                    _release_finished_space(coordinator, task)
-            elif args.task_command == "shape":
-                reshaped = coordinator.reshape_task(args.task_id, args.shape, reason=args.reason)
-                history = reshaped.get("shape_history") or [{}]
-                print(
-                    f"Task {reshaped['id']} is now shaped {reshaped['shape']}"
-                    f" (was {history[-1].get('from')})"
-                    + (f": {args.reason}" if args.reason else "")
-                )
-            elif args.task_command == "cost":
-                usage = coordinator.task_usage(args.task_id, with_reviews=not args.no_reviews)
-                if args.as_json:
-                    print(json.dumps(usage, indent=2))
-                    return 0
-                print(f"Usage for task {args.task_id}:")
-                for entry in usage["workers"]:
-                    where = (
-                        f"{len(entry['transcripts'])} transcript(s), {entry['turns']} turns"
-                        if entry["metered"] else "no transcript Helm can read"
-                    )
-                    dollars = entry.get("cost_usd")
-                    print(
-                        f"  {entry['worker_id']} [{entry.get('role') or 'worker'} on "
-                        f"{entry['agent']}] {where}: in={entry['input_tokens']} "
-                        f"out={entry['output_tokens']} "
-                        f"cache_read={entry['cache_read_input_tokens']} "
-                        f"cache_write={entry['cache_creation_input_tokens']}"
-                        + (f" models={','.join(entry['models'])}" if entry["models"] else "")
-                        + (
-                            f" cost=${dollars:.2f} ({entry.get('cost_source') or 'reported'})"
-                            if isinstance(dollars, (int, float)) else ""
-                        )
-                    )
-                total = usage["total"]
-                unpriced = total.get("unpriced_models") or []
-                print(
-                    f"  total: {total['turns']} turns, in={total['input_tokens']} "
-                    f"out={total['output_tokens']} cache_read={total['cache_read_input_tokens']} "
-                    f"cache_write={total['cache_creation_input_tokens']}"
-                    + (
-                        f", peak context {_peak_cell(total.get('peak_context'))}"
-                        if total.get("peak_context") else ""
-                    )
-                    + (f", cost=${total['cost_usd']:.2f}" if total["cost_known"] else ", cost: not known")
-                    + (
-                        f"; unpriced: {', '.join(unpriced)} (set model.prices.<model>)"
-                        if unpriced else ""
-                    )
-                )
-                return 0
-            elif args.task_command == "outcome":
-                _print_outcome(coordinator.task_outcome(args.task_id))
-            elif args.task_command == "deliver":
-                _print_delivery(coordinator.deliver_task_artifacts(args.task_id, force=args.force))
-            elif args.task_command == "merge":
-                task = coordinator.merge_task(args.task_id)
-                print(f"Merged task {task['id']} with local fast-forward")
-                # A merge moves tracked files only. Without this the rendered
-                # video -- the actual product -- stays in the worktree and dies
-                # with it. Auto-cleanup delivers first, so this is usually a
-                # no-op reporting "identical"; it still runs for the roots that
-                # do not auto-clean.
-                try:
-                    delivered = task.get("delivered_artifacts")
-                    _print_delivery(
-                        delivered
-                        if delivered is not None
-                        else coordinator.deliver_task_artifacts(args.task_id)
-                    )
-                except (HelmError, OSError) as error:
-                    # Never silent. A swallowed failure here is how a finished
-                    # render was lost with every record saying the merge went
-                    # fine.
-                    print(
-                        f"  WARNING: build outputs were NOT delivered: {error}",
-                        file=sys.stderr,
-                    )
-                _release_finished_space(coordinator, task)
-            elif args.task_command == "continue":
-                task = coordinator.continue_task(
-                    args.task_id, args.brief, read_only=args.read_only
-                )
-                print(
-                    f"Task {task['id']} reopened for round {len(task.get('rounds', [])) + 1} "
-                    f"in {task['workspace']}"
-                )
-                print(f"  branch {task.get('branch') or '(none)'} — launch a worker to run it")
-            elif args.task_command == "cleanup":
-                task = coordinator.cleanup_task(
-                    args.task_id, delete_branch=args.delete_branch
-                )
-                print(f"Cleaned task {task['id']} workspace (dirty/unresolved work is always refused)")
-                if not task.get("branch"):
-                    pass  # a foreman drives rather than edits and owns no branch
-                elif task.get("branch_removed"):
-                    print(f"  branch {task['branch']} deleted")
-                else:
-                    print(
-                        f"  branch {task['branch']} kept; discard it with "
-                        f"helm task cleanup {task['id']} --delete-branch"
-                    )
-                _release_finished_space(coordinator, task)
-                with contextlib.suppress(HelmError, OSError):
-                    waiting = coordinator.waiting_learnings(task_id=task["id"])
-                    if waiting:
-                        print(
-                            f"  {len(waiting)} learning proposal(s) from this task await a decision: "
-                            f"helm learning triage --task {task['id']}"
-                        )
-                # A cleaned task's record can no longer change, so it leaves
-                # the live document here, where the commander already decided
-                # the task was finished.
-                with contextlib.suppress(HelmError, OSError):
-                    if coordinator.archive_tasks([task["id"]])["archived"]:
-                        print(f"  record archived to state/archive/tasks/{task['id']}.json")
-            return 0
-
-        if args.command == "worker":
-            if args.worker_command == "launch":
-                # Herdr by default, like `helm run`. A worker started off to
-                # the side has nowhere to be looked at, which matters most for
-                # the agents a foreman spawns: it launches through this
-                # command, so every one of them used to land invisible while
-                # the foreman itself sat in a tab. The adapter falls back to
-                # the process launcher when Herdr is unavailable, so this
-                # changes where a worker is shown, never whether it runs.
-                launcher = (
-                    HerdrAdapter(coordinator).launch_task
-                    if args.herdr
-                    else coordinator.launch_worker
-                )
-                worker = launcher(
-                    args.task_id,
-                    args.worker_command_text,
-                    wait=not args.asynchronous,
-                    domain=args.domain,
-                    agent=args.agent,
-                )
-                _ensure_foreman(coordinator, worker["project_id"], herdr=args.herdr)
-                print(
-                    f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
-                    f"pid={worker.get('pid')} agent={worker.get('agent_id', 'default')} "
-                    f"reason={worker.get('agent_reason', '')}"
-                )
-            elif args.worker_command == "round":
-                adapter = HerdrAdapter(coordinator)
-                data = coordinator.store.load()
-                # The resident is the task's most recent worker whose pane
-                # still exists. Its RECORD is usually settled -- a terminal
-                # result settles the worker while the interactive session
-                # stays open -- so liveness here means the pane, not the
-                # status field.
-                candidates = sorted(
-                    (
-                        w for w in data.get("workers", {}).values()
-                        if w.get("task_id") == args.task_id
-                    ),
-                    key=lambda w: (w.get("started_at") or "", w.get("id") or ""),
-                )
-                resident = None
-                if candidates and not args.fresh:
-                    latest = candidates[-1]
-                    layout = (
-                        data.get("integrations", {}).get("herdr", {})
-                        .get("workers", {}).get(latest["id"])
-                    )
-                    if layout is not None:
-                        resident = latest
-                if resident is not None:
-                    task = coordinator.continue_task(
-                        args.task_id, args.brief,
-                        read_only=args.read_only,
-                        effort=args.effort,
-                        reuse_worker=(
-                            resident["id"]
-                            if resident.get("status") == "running" else None
-                        ),
-                    )
-                    round_no = len(task.get("rounds", [])) + 1
-                    try:
-                        delivered = adapter.answer_worker(
-                        resident["id"],
-                        f"ROUND {round_no} for your task {args.task_id} "
-                        f"({'read-only' if args.read_only else 'state-changing'}). "
-                        "Same worktree, same branch, same reporting protocol; finish "
-                        f"with one result. BRIEF: {args.brief}",
-                        )
-                    except HerdrUnavailable:
-                        # A vanished pane mid-delivery is the same fact as a
-                        # refused delivery: the resident cannot take the
-                        # round. Raw provider errors used to escape here and
-                        # strand the task in its just-continued state.
-                        delivered = False
-                    if delivered:
-                        print(
-                            f"Round {round_no} delivered into live worker "
-                            f"{resident['id']} on {args.task_id}"
-                        )
-                        return 0
-                    # The session looked alive but the round never landed in it.
-                    # A resident nobody can reach is a dead driver: stand it
-                    # down and fall through to a fresh launch, saying so.
-                    coordinator.stop_worker(
-                        resident["id"],
-                        reason="round delivery failed; replacing the resident session",
-                    )
-                    # Stopping a still-"running" resident fails its task, but
-                    # this round was just opened on it: the failure belongs to
-                    # the dead session, not the round. Restore the round's own
-                    # state so the fresh launch below is not refused.
-                    with coordinator.store.locked() as data:
-                        stopped_task = data["tasks"][args.task_id]
-                        if stopped_task.get("status") == "failed":
-                            stopped_task["status"] = "allocated"
-                    print(
-                        f"Live session {resident['id']} did not accept the round; "
-                        "stopped it and launching a fresh worker"
-                    )
-                else:
-                    coordinator.continue_task(
-                        args.task_id, args.brief, read_only=args.read_only,
-                        effort=args.effort,
-                    )
-                try:
-                    worker = adapter.launch_task(args.task_id, None, wait=False)
-                except BaseException:
-                    # The round was opened but its worker never launched.
-                    # Left as-is the task sits in "allocated", which no later
-                    # round may continue from -- so put back the settled
-                    # status the round found it in.
-                    with coordinator.store.locked() as failed_data:
-                        stranded = failed_data["tasks"][args.task_id]
-                        if stranded.get("status") == "allocated":
-                            stranded["status"] = "completed"
-                    raise
-                print(
-                    f"Round launched with fresh worker {worker['id']} on {args.task_id}"
-                )
-            elif args.worker_command == "poll":
-                worker = coordinator.poll_worker(args.worker_id)
-                print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
-            elif args.worker_command == "wait":
-                worker = coordinator.wait_worker(args.worker_id)
-                print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
-            elif args.worker_command in {"message", "report"}:
-                payload: dict[str, Any] = {}
-                if args.payload:
-                    parsed = json.loads(args.payload)
-                    if not isinstance(parsed, dict):
-                        raise HelmError("--payload must be a JSON object")
-                    payload.update(parsed)
-                if args.path:
-                    payload["path"] = args.path
-                if args.action:
-                    payload["action"] = args.action
-                if args.subject:
-                    payload["subject"] = args.subject
-                if args.type == "approval-needed" and not args.action:
-                    # Refused at the edge as well as in core, so the worker gets
-                    # the usable form rather than a validation error.
-                    raise HelmError(
-                        "--type approval-needed needs --action naming exactly what "
-                        "you would do: push, publish, delete, or external"
-                    )
-                if args.wait is not None and args.type != "question":
-                    raise HelmError(
-                        "--wait goes with --type question: only a question has an "
-                        "answer to wait for"
-                    )
-                task = coordinator.record_worker_message(
-                    args.worker_id,
-                    args.type,
-                    args.text,
-                    payload=payload,
-                    requested_status=args.status,
-                )
-                # Push the update onward to the project's pane now.  Presentation
-                # must never decide whether the report itself was recorded.
-                released = False
-                released_tabs: list[str] = []
-                routed: list[str] = []
-                with contextlib.suppress(HelmError, OSError):
-                    adapter = HerdrAdapter(coordinator)
-                    adapter.route_worker_messages(args.worker_id)
-                    # Before anything closes. This command runs inside the
-                    # worker's own pane, so its output is printed onto the
-                    # surface the next two calls are about to remove; the
-                    # outcome and the decision it leaves have to reach the
-                    # driver, the project's own pane, and the durable record
-                    # first. A live foreman is one of those channels, not a
-                    # precondition -- a project without a driver is exactly the
-                    # case that needed telling.
-                    if args.type in Coordinator.TERMINAL_REPORT_KINDS:
-                        routed = adapter.notify_coordinator(args.worker_id)["channels"]
-                    released_tabs = adapter.release_finished_tabs()
-                    # A reported, clean finish releases the project's space.
-                    released = adapter.close_project_space_if_finished(task["project_id"])
-                told_foreman = "foreman" in routed
-                print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
-                turns_worker = coordinator.store.load().get("workers", {}).get(args.worker_id) or {}
-                if args.wait is not None and turns_worker.get("execution_mode") == "turns":
-                    # A turn cannot be answered from inside itself: the answer
-                    # is the prompt that opens the next one. Waiting here would
-                    # hold the turn open for an answer that can only arrive
-                    # after it ends.
-                    print("  You run in turns: end this turn now; Helm's answer opens your next one.", flush=True)
-                    return 0
-                if args.wait is not None:
-                    # The question returns its answer. Request and response
-                    # inside the worker's own tool call: no pane, no
-                    # keystrokes, no UI state to guess, on every runtime.
-                    print(f"  Waiting up to {args.wait:g}s for Helm's answer...", flush=True)
-                    notes = coordinator.wait_inbox(args.worker_id, args.wait)
-                    if notes:
-                        print(_format_inbox(args.worker_id, notes), end="")
-                        return 0
-                    print(
-                        f"  No answer within {args.wait:g}s. Keep waiting with: helm worker "
-                        f"inbox {args.worker_id} --wait {args.wait:g} (run it in the background "
-                        "if your harness can wake you when a command exits), and keep working "
-                        "on anything the answer does not block."
-                    )
-                    return 3
-                if args.type == "approval-needed":
-                    hold = coordinator.task_hold(task) or {}
-                    print(
-                        "  The task is paused, not finished; this session stays open. "
-                        "A human authorizes it with: helm approval release "
-                        f"{task['id']} --action {hold.get('action') or '<action>'} --confirm"
-                    )
-                    print(
-                        "  When told it is approved, run helm worker action-start "
-                        f"{args.worker_id} immediately before acting; it checks the "
-                        "approval against this exact state and spends it once."
-                    )
-                if told_foreman:
-                    print("  Told the project's foreman; it is theirs to act on")
-                if routed:
-                    print(f"  Routed the final outcome to: {', '.join(routed)}")
-                if released_tabs:
-                    print(f"  Closed {len(released_tabs)} finished worker tab(s)")
-                if released:
-                    print(f"Closed the Herdr space for project {task['project_id']}")
-                # Say it here too. The gate is recorded either way, but the
-                # coordinator reading this line is the one who can act on it
-                # now rather than at the next `helm status`.
-                if args.type in Coordinator.TERMINAL_REPORT_KINDS:
-                    for item in coordinator.open_action_items(task["project_id"]):
-                        if item.get("kind") != DELIVERY_DECISION_KIND:
-                            continue
-                        scope = f"task {item['task_id']}" if item.get("task_id") else "project"
-                        print(f"  Commander decision pending on {scope}: {item['text']}")
-            elif args.worker_command == "reconcile":
-                result = coordinator.reconcile_worker(args.worker_id, args.evidence)
-                print(
-                    f"Reconciled {result['worker']} ({result['was']} -> running); "
-                    f"task {result['task']} follows"
-                )
-            elif args.worker_command == "stop":
-                # Through the adapter, because a Herdr worker's pane is what
-                # is actually running it; core settles the record either way.
-                stopped = HerdrAdapter(coordinator).stop_worker(
-                    args.worker_id, args.reason
-                )
-                where = []
-                if stopped.get("signalled"):
-                    where.append("process signalled")
-                if stopped.get("tab_closed"):
-                    where.append("pane closed")
-                print(
-                    f"Stopped worker {stopped['id']} [{stopped['status']}] "
-                    f"task={stopped['task_id']}"
-                    + (f" ({', '.join(where)})" if where else "")
-                )
-                print(
-                    "  Its log and worktree are kept as evidence; remove them with "
-                    f"helm task cleanup {stopped['task_id']}"
-                )
-                with contextlib.suppress(HelmError, OSError):
-                    if HerdrAdapter(coordinator).close_project_space_if_finished(
-                        stopped["project_id"]
-                    ):
-                        print(f"Closed the Herdr space for project {stopped['project_id']}")
-            elif args.worker_command == "action-start":
-                started = coordinator.start_authorized_action(args.worker_id)
-                print(
-                    f"Authorized: {started['action']} for task {started['task_id']} "
-                    f"[{started['status']}]"
-                )
-                if started.get("note"):
-                    print(f"  Commander's note: {started['note']}")
-                print(
-                    "  This authorization is now spent. Act, then report the outcome "
-                    "with --type result and any receipt in --payload."
-                )
-                with contextlib.suppress(HelmError, OSError):
-                    HerdrAdapter(coordinator).route_worker_messages(args.worker_id)
-            elif args.worker_command == "inbox":
-                identity = coordinator.caller_identity()
-                worker_id = args.worker_id or identity["worker_id"]
-                if not worker_id:
-                    raise HelmError("name the worker whose inbox to read")
-                if identity["role"] != "root" and worker_id != identity["worker_id"]:
-                    # A message to one worker is that worker's context and
-                    # nobody else's -- the same wall as every other read.
-                    print(
-                        f"helm: a worker reads only its own inbox; you are "
-                        f"{identity['worker_id']} (by {identity['evidence']})",
-                        file=sys.stderr,
-                    )
-                    return 2
-                if args.wait is not None:
-                    notes = coordinator.wait_inbox(worker_id, args.wait)
-                elif args.peek:
-                    notes = coordinator.inbox_notes(worker_id)
-                else:
-                    notes = coordinator.read_inbox(worker_id, watch=args.changes)
-                if notes:
-                    print(_format_inbox(worker_id, notes), end="")
-                elif args.wait is not None:
-                    print(
-                        f"No message for {worker_id} within {args.wait:g}s; "
-                        "run this again to keep waiting."
-                    )
-                    return 3
-                elif not args.changes:
-                    print(f"No unread messages for {worker_id}.")
-                return 0
-            elif args.worker_command == "interrupt":
-                coordinator.require_same_project(args.worker_id, "worker interrupt")
-                sent = False
-                with contextlib.suppress(HelmError, OSError):
-                    sent = HerdrAdapter(coordinator).interrupt_worker(args.worker_id)
-                print(
-                    f"Interrupted worker {args.worker_id}"
-                    if sent else f"Could not reach worker {args.worker_id}'s session to interrupt it"
-                )
-                return 0 if sent else 1
-            elif args.worker_command == "answer":
-                # One worker, one driver. Two answers inside two minutes is a
-                # root and a foreman both replying to the same question, and the
-                # second lands while the agent is already acting on the first --
-                # interleaving with its own redraw and reading as an interrupt.
-                # Refuse rather than deliver, because two answers that disagree
-                # race and the later one wins silently.
-                # One project, one worker. An agent addressing a worker in
-                # another project is a context leak the receiver cannot undo,
-                # and --force must not buy past it -- it exists for a
-                # deliberate follow-up to your OWN worker, not for a boundary.
-                coordinator.require_same_project(args.worker_id, "worker answer")
-                racing = None if args.force else coordinator.recent_answer(args.worker_id)
-                if racing is not None:
-                    print(
-                        f"Refusing: worker {args.worker_id} was already answered at "
-                        f"{racing.get('created_at')}, which is inside Helm's "
-                        f"{int(Coordinator.ANSWER_RACE_SECONDS)}s window."
-                    )
-                    print(
-                        "  That is what two drivers answering one worker looks like. "
-                        "Decide who is driving this task and let them answer; ask the "
-                        "other for status instead."
-                    )
-                    print(f"  Deliberate follow-up? Resend with --force.")
-                    print(f"  Already sent: {(racing.get('text') or '')[:160]}")
-                    return 1
-                # Record first: the answer is part of the task's audit trail
-                # whether or not a presentation surface can deliver it.
-                task = coordinator.record_worker_message(args.worker_id, "answer", args.text)
-                # The inbox note IS the delivery; the pane is only a wake. Its
-                # id is the recorded message's id, so the two are one record.
-                recorded = coordinator.recent_answer(args.worker_id) or {}
-                note = coordinator.leave_inbox_note(
-                    args.worker_id, args.text, note_id=recorded.get("id")
-                )
-                outcome = "unreachable"
-                with contextlib.suppress(HelmError, OSError):
-                    adapter = HerdrAdapter(coordinator)
-                    adapter.answer_worker(args.worker_id, args.text, note=note)
-                    outcome = adapter.last_wake_outcome
-                print(
-                    f"Answered worker {args.worker_id} for task {task['id']} "
-                    f"[{_INBOX_DELIVERY_WORDS.get(outcome, _INBOX_DELIVERY_WORDS['unreachable'])}]"
-                )
-            return 0
-
-        if args.command in {"learning", "learn"}:
-            if args.learning_command == "teach":
-                taught = coordinator.teach(
-                    args.fact, domain=args.domain, project_id=args.project_id, note=args.note
-                )
-                print(f"Taught {taught['id']} and applied it to {taught['applied_path']}")
-                print(f"  {taught['proposed_fact']}")
-            elif args.learning_command == "mine":
-                mined = coordinator.mine_learnings(days=args.days, dry_run=args.dry_run)
-                verb = "would propose" if mined["dry_run"] else "proposed"
-                print(f"Mined the last {mined['days']:g} day(s): {mined['clusters']} recurring point(s), {verb} {len(mined['proposed'])}")
-                for entry in mined["proposed"]:
-                    if mined["dry_run"]:
-                        print(f"  [{entry['source']}] {entry['domain_id']} ({', '.join(entry['tasks'])}): {entry['fact'][:160]}")
-                    else:
-                        print(f"  {entry['id']} {entry['domain_id']}: {entry['proposed_fact'][:160]}")
-                if not mined["dry_run"] and mined["proposed"]:
-                    print("  Decide them with: helm learning triage --approve <ids> --reject <ids>")
-            elif args.learning_command == "triage":
-                approve = [p for p in args.approve.split(",") if p.strip()]
-                reject = [p for p in args.reject.split(",") if p.strip()]
-                if approve or reject:
-                    decided = coordinator.triage_learnings(
-                        approve=approve, reject=reject, scope=args.scope, note=args.note
-                    )
-                    for proposal in decided["applied"]:
-                        print(f"applied  {proposal['id']} -> {proposal['applied_path']}")
-                    for proposal in decided["rejected"]:
-                        print(f"rejected {proposal['id']}")
-                    for failure in decided["failed"]:
-                        print(f"FAILED   {failure['proposal_id']}: {failure['reason']}")
-                    return 1 if decided["failed"] else 0
-                waiting = coordinator.waiting_learnings(task_id=args.task_id, project_id=args.project_id)
-                if not waiting:
-                    print("No learning proposals are waiting.")
-                    return 0
-                print(f"{len(waiting)} learning proposal(s) waiting:")
-                for proposal in waiting:
-                    age_days = max(0.0, (time.time() - _dt.datetime.fromisoformat(
-                        str(proposal.get("created_at", "")).replace("Z", "+00:00")
-                    ).timestamp()) / 86400) if proposal.get("created_at") else 0.0
-                    origin = proposal.get("origin") or "task"
-                    evidence = len(proposal.get("source_message_ids") or []) + len(proposal.get("source_artifact_ids") or [])
-                    conflict = " CONFLICTS" if proposal.get("conflicts") else ""
-                    print(
-                        f"  {proposal['id']} {age_days:4.0f}d {proposal['domain_id']:<20} [{origin}; "
-                        f"{evidence} evidence]{conflict}: {proposal['proposed_fact'][:140]}"
-                    )
-                print("Decide with: helm learning triage --approve a,b --reject c [--scope project] [--note '...']")
-            elif args.learning_command == "stats":
-                stats = coordinator.knowledge_stats()
-                print(
-                    f"{stats['proposals']} proposal(s): "
-                    + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_status"].items()))
-                    + f"; {stats['stale']} waiting more than {7} days"
-                )
-                print("  by origin: " + ", ".join(f"{k} {v}" for k, v in sorted(stats["by_origin"].items())))
-            elif args.learning_command == "propose":
-                proposals = coordinator.generate_learning_proposals(
-                    args.task_id,
-                    domain=args.domain,
-                    fact=args.fact,
-                    rationale=args.rationale,
-                    confidence=args.confidence,
-                    artifact_ids=args.artifact_ids,
-                    message_ids=args.message_ids,
-                )
-                for proposal in proposals:
-                    _print_learning(proposal)
-            elif args.learning_command == "list":
-                proposals = coordinator.list_learning_proposals(
-                    domain=args.domain, status=args.status, task_id=args.task_id
-                )
-                if not proposals:
-                    print("No learning proposals.")
-                for proposal in proposals:
-                    _print_learning(proposal)
-            elif args.learning_command == "inspect":
-                print(_json(coordinator.inspect_learning_proposal(args.proposal_id)))
-            elif args.learning_command == "edit":
-                proposal = coordinator.edit_learning_proposal(
-                    args.proposal_id,
-                    proposed_fact=args.fact,
-                    rationale=args.rationale,
-                    confidence=args.confidence,
-                )
-                _print_learning(proposal)
-            elif args.learning_command == "approve":
-                proposal = coordinator.approve_learning_proposal(
-                    args.proposal_id, args.note, actor=args.actor
-                )
-                _print_learning(proposal)
-            elif args.learning_command == "reject":
-                proposal = coordinator.reject_learning_proposal(
-                    args.proposal_id, args.note, actor=args.actor
-                )
-                _print_learning(proposal)
-            elif args.learning_command == "apply":
-                proposal = coordinator.apply_learning_proposal(
-                    args.proposal_id, actor=args.actor, scope=args.scope
-                )
-                _print_learning(proposal)
-            return 0
-
-        if args.command == "agent":
-            if args.agent_command == "models":
-                _print_agent_models(coordinator, as_json=args.agent_models_json)
-            else:
-                _print_agents(coordinator, check=args.agent_command == "check")
-                if args.agent_command == "check" and getattr(args, "probe", False):
-                    _print_probe(coordinator)
-            return 0
-
-        if args.command == "prefs":
-            return _prefs_command(coordinator, helm_root, args)
-
-        if args.command == "herdr":
-            adapter = HerdrAdapter(coordinator)
-            if args.herdr_command == "launch":
-                worker = adapter.launch_task(
-                    args.task_id,
-                    args.worker_command_text,
-                    wait=not args.asynchronous,
-                    domain=args.domain,
-                    agent=args.agent,
-                )
-                mode = "herdr" if worker.get("execution") == "herdr" else "terminal fallback"
-                _ensure_foreman(coordinator, worker["project_id"])
-                print(
-                    f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
-                    f"pid={worker.get('pid')} mode={mode} "
-                    f"agent={worker.get('agent_id', 'default')} reason={worker.get('agent_reason', '')}"
-                )
-            elif args.herdr_command == "poll":
-                worker = adapter.poll_worker(args.task_id)
-                print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
-            elif args.herdr_command == "wait":
-                worker = adapter.wait_worker(args.task_id, timeout=args.timeout)
-                print(f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} exit={worker.get('exit_code')}")
-            elif args.herdr_command == "cleanup":
-                print(f"Cleaned Herdr worker resources: {adapter.cleanup_task(args.task_id)}")
-            elif args.herdr_command == "cleanup-project":
-                print(f"Cleaned Herdr project resources: {adapter.cleanup_project(args.project_id)}")
-            elif args.herdr_command == "cleanup-coordinator":
-                print(f"Cleaned Herdr coordinator resources: {adapter.cleanup_coordinator()}")
-            elif args.herdr_command == "relabel":
-                for entry in adapter.relabel():
-                    if entry.get("error"):
-                        print(f"  {entry['kind']} {entry['id']}: {entry['error']}")
-                    else:
-                        print(f"  renamed {entry['kind']} -> {entry['label']}")
-            return 0
-
-        if args.command == "status":
-            _discover_if_configured(coordinator, helm_root)
-            _print_status(coordinator, args.project_id)
-            return 0
-
-        if args.command == "skills":
-            project = coordinator.get_project(args.project_id)
-            if args.brief is not None:
-                selection = coordinator.select_skills(
-                    project, {"id": "-", "brief": args.brief}, args.agent
-                )
-                print(selection["reason"])
-                for skill in selection["selected"]:
-                    print(f"  {skill['id']}  {skill['path']}")
-                    print(f"    because: {skill['reason']}")
-                    print(f"    delivery: {skill['delivery']}")
-                for entry in selection["skipped"]:
-                    print(f"  - {entry['id']}: {entry['reason']}")
-                problems = selection["problems"]
-            else:
-                found = coordinator.discover_skills(project, args.agent)
-                print(f"Roots read: {', '.join(found['roots'])}")
-                if not found["skills"]:
-                    print("No readable skills in this project.")
-                for skill in found["skills"]:
-                    print(f"  {skill['id']}  {skill['path']}")
-                    print(f"    {skill['description'][:200]}")
-                    if skill["duplicate_of"]:
-                        print(f"    also present at {skill['duplicate_of']}")
-                problems = found["problems"]
-            for problem in problems:
-                # Reported rather than skipped in silence: a skill that cannot
-                # be read is the case most likely to matter.
-                print(f"  ! {problem.get('id') or '(root)'}: {problem['problem']}")
-            return 1 if problems else 0
-
-        if args.command == "guide":
-            # The id is checked before it touches a path: a domain is a
-            # directory name under domains/, never a path of its own.
-            if not _SAFE_DOMAIN_ID.fullmatch(args.domain_id):
-                raise HelmError(f"unknown domain: {args.domain_id}")
-            projects = coordinator.list_projects()
-            domain_root = coordinator._domain_root(projects[0] if projects else {"root": "."})
-            domain_dir = (domain_root / args.domain_id) if domain_root else None
-            if domain_dir is None or not domain_dir.is_dir():
-                raise HelmError(f"unknown domain: {args.domain_id}")
-            knowledge = domain_dir / "knowledge.md"
-            guardrails = domain_dir / "guardrails.md"
-            if knowledge.is_file():
-                text, omitted = bound_learned_knowledge(knowledge.read_text(encoding="utf-8", errors="replace"), str(knowledge))
-                print(text.rstrip("\n"))
-            else:
-                print(f"(no knowledge.md for {args.domain_id})")
-            if guardrails.is_file():
-                print("\n--- guardrails ---\n")
-                print(guardrails.read_text(encoding="utf-8", errors="replace").rstrip("\n"))
-            return 0
-        if args.command == "domain":
-            projects = coordinator.list_projects()
-            catalogue = coordinator.domain_catalogue(projects[0] if projects else {"root": "."})
-            if not catalogue:
-                print("No domains found.")
-                return 0
-            print("Choose by what the task IS, not by words in its brief.")
-            print("Pick a selectable domain, or none. Then pass --domain to helm run.\n")
-            for entry in catalogue:
-                if not entry["selectable"]:
-                    continue
-                print(f"  {entry['id']}")
-                print(f"    is for:  {entry['applies_to'] or '(undeclared)'}")
-                for line in entry["use_when"]:
-                    print(f"    use when: {line}")
-                for line in entry["not_for"]:
-                    print(f"    NOT for:  {line}")
-                if entry["extends"]:
-                    print(f"    composes: {', '.join(entry['extends'])}")
-                print()
-            blocks = [e["id"] for e in catalogue if not e["selectable"]]
-            if blocks:
-                print(f"Building blocks (reached only via extends): {', '.join(blocks)}")
-            return 0
-
-        if args.command == "watchdog":
-            # Root resolved here so a scheduler entry carries an absolute path:
-            # a launchd agent or systemd timer has no shell, no cwd worth
-            # trusting, and no idea which Helm root it was installed for.
-            root_path = Path(args.helm_root).resolve() if args.helm_root else Path.cwd()
-            if args.watchdog_command == "run":
-                return watchdog_module.run(
-                    root_path, args.interval, once=args.once,
-                    notify_command=args.notify_command, remind_minutes=args.remind_after,
-                    heal=not args.no_heal,
-                )
-            if args.watchdog_command == "install":
-                return watchdog_module.install(
-                    root_path, args.interval,
-                    notify_command=args.notify_command, remind_minutes=args.remind_after,
-                    heal=not args.no_heal,
-                )
-            if args.watchdog_command == "restart":
-                return watchdog_module.restart()
-            return watchdog_module.uninstall(root_path)
-
-        if args.command == "eval":
-            return _eval_command(coordinator, args)
-        if args.command == "adopt":
-            if helm_root is None:
-                raise HelmError("adopt needs a Helm root; run it from one, or pass --root")
-            adopted = coordinator.adopt_project(
-                args.path, helm_root=helm_root, project_id=args.project_id, label=args.label,
-                delivery_policy=args.delivery, domains=args.domains, base_branch=args.base_branch,
-                foreman=not args.no_foreman, review=not args.no_review,
-                agent=args.agent, model=args.model, effort=args.effort,
-            )
-            project = adopted["project"]
-            print(f"Adopted {project['id']} at {adopted['root']}")
-            if adopted["cloned_from"]:
-                print(f"  cloned from {adopted['cloned_from']}; the original was not touched")
-            if adopted["settings_written"] is not None:
-                print(f"  wrote {adopted['settings_file']}:")
-                for key, value in adopted["settings_written"].items():
-                    print(f"    {key}: {value}")
-            else:
-                print(f"  kept the existing {adopted['settings_file']}")
-            print(f"  base branch: {project.get('base_branch')}   delivery: {project.get('delivery_policy')}")
-            print(f"  foreman: {'no' if project.get('foreman') is False else 'appointed on the first request'}"
-                  f"   review: {'no' if project.get('review') is False else 'independent, on a different model'}")
-            report = doctor_module.run(coordinator, helm_root, project["id"])
-            for line in doctor_module.render_text(report):
-                print(line)
-            print(f"Next: helm route {project['id']} \"<what you want done, in your own words>\"")
-            # The project is adopted either way; the exit code says whether
-            # its own preflight found something that would stop the first
-            # task. Root-level warnings are printed above and are not this
-            # project's fault.
-            broken = [f for f in report.findings if f.scope == "project" and f.severity == doctor_module.ERROR]
-            return 1 if broken else 0
-        if args.command == "ledger":
-            report = coordinator.ledger(days=args.days, project_id=args.project_id)
-            if args.as_json:
-                print(json.dumps(report, indent=2))
-                return 0
-            _print_ledger(report)
-            return 0
-        if args.command == "state":
-            if args.state_command == "stats":
-                stats = coordinator.state_stats()
-                print(f"{stats['state_file']}: {stats['bytes'] / 1_000_000:.1f} MB")
-                print(
-                    f"  projects={stats['projects']} tasks={stats['tasks']} workers={stats['workers']} "
-                    f"messages={stats['messages']} artifacts={stats['artifacts']}"
-                )
-                print("  tasks by status: " + ", ".join(f"{k} {v}" for k, v in stats["tasks_by_status"].items()))
-                print(
-                    f"  archivable now: {stats['archivable']}   archive: {stats['archive_files']} file(s), "
-                    f"{stats['archive_bytes'] / 1_000_000:.1f} MB"
-                )
-                return 0
-            if args.state_command == "tidy":
-                tidied = coordinator.tidy_decisions(args.project_id, dry_run=args.dry_run)
-                _print_tidy(tidied)
-                return 0
-            result = coordinator.archive_tasks(
-                args.task_id or None, dry_run=args.dry_run, reconcile=args.reconcile
-            )
-            verb = "would archive" if result["dry_run"] else "archived"
-            print(f"{verb} {len(result['eligible'])} task record(s)")
-            if result["refused"]:
-                print(f"  not eligible: {', '.join(result['refused'][:8])}{' …' if len(result['refused']) > 8 else ''}")
-            if result["archived"]:
-                # An archived task takes its record with it; an item still
-                # pointing at it has nothing left to decide.
-                _print_tidy(coordinator.tidy_decisions())
-            return 0
-
-        if args.command == "pending":
-            # Deliberately narrow and deliberately silent. This is meant to run
-            # on every turn, so anything it prints when nothing is wrong is
-            # noise that trains the reader to skip it -- the same failure as an
-            # attention list full of healthy workers. It prints four things: an
-            # agent that asked a human and got no answer, a gate holding work
-            # still, an outcome nobody has relayed yet, and a worker that has
-            # stopped producing. Everything else waits to be asked for.
-            # RECONCILE FIRST, because reporting is a push and a push can be
-            # missed: a worker killed by the OS never reports anything, and its
-            # record sat as `running` until a human happened to run `helm
-            # watch`. Polling every worker whose process is gone settles those
-            # here, so this check reflects what is TRUE rather than what was
-            # reported -- and a task that died silently becomes a failure
-            # decision on its own, without anybody noticing first.
-            #
-            # Cheap by construction: `poll_worker` on an already-settled worker
-            # is a no-op, and the loop only touches workers still marked
-            # running.
-            with contextlib.suppress(HelmError, OSError):
-                for entry in list(coordinator.store.load().get("workers", {}).values()):
-                    if entry.get("status") != "running":
-                        continue
-                    with contextlib.suppress(HelmError, OSError):
-                        coordinator.poll_worker(entry["id"])
-
-            # (recency, text): a gate raised two minutes ago must not sit
-            # under a blocker from yesterday. The list is read top-down and the
-            # top is the only part reliably read, so ordering by age is the
-            # difference between surfacing something and burying it. Items with
-            # no timestamp sort oldest -- they are the long-standing ones.
-            # (recency, display, identity). The identity is the UNtruncated
-            # text: --changes compares on it, and comparing truncated lines
-            # lets a widening number look like a new item. Every append must
-            # carry all three -- a 2-tuple here crashes the whole command,
-            # which is the one command that must never fail silently.
-            entries: list[tuple[str, str, str]] = []
-            for item in coordinator.open_escalations(None):
-                glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
-                first = next(
-                    (line.strip() for line in item["text"].splitlines() if line.strip()), ""
-                )
-                stamp = str(item.get("at") or item.get("created_at") or "")
-                entries.append((
-                    stamp,
-                    f"{_when_label(stamp)} {glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
-                    f"{glyph} {item['kind']} {item['worker_id']}: {first}",
-                ))
-            for item in coordinator.open_action_items(None):
-                if item.get("kind") not in BLOCKING_GATE_KINDS:
-                    continue
-                stamp = str(item.get("at") or "")
-                entries.append((
-                    stamp,
-                    f"{_when_label(stamp)} {item['glyph']} {item['project_id']} GATE waiting: {item['text'][:100]}",
-                    f"{item['glyph']} {item['project_id']} GATE waiting: {item['text']}",
-                ))
-            # Owed but unrelayed outcomes. `mark_seen=False` matters: this runs
-            # unattended, and a check that consumed what it reported would be
-            # the exact hole this command exists to close.
-            for update in coordinator.project_updates_for_watch(None, mark_seen=False):
-                if update.get("kind") != "situation":
-                    continue
-                # OWED reports only. This command is read unattended and its
-                # whole value is that it changes when something needs the commander;
-                # a routine progress line has nothing that ever clears it, so
-                # including one makes the list permanently non-empty and every
-                # future change look like the same old news.
-                if not update.get("owed"):
-                    continue
-                # Wider than the rest on purpose. A terminal report's payload is
-                # usually at the END of the line -- a video id, a URL, a commit
-                # -- so a 100-character cut removes exactly the part worth
-                # reading and leaves something that looks like nothing was said.
-                stamp = str(update.get("at") or "")
-                entries.append((
-                    stamp,
-                    f"{_when_label(stamp)} {update['glyph']} {update['project_id']}: {update['text'][:220]}",
-                    f"{update['glyph']} {update['project_id']}: {update['text']}",
-                ))
-            # A request that reached a foreman and was never acted on. This is
-            # derived, not marked: `pending_foreman_requests` asks whether the
-            # foreman has spoken at all since the request arrived, so it cannot
-            # drift and needs nothing written. It already existed and was
-            # already correct -- but it was only ever read by `project status`,
-            # which nobody runs on a turn, so an unacted instruction sat in the
-            # record where no reader would meet it. Twice in one day a project
-            # went quiet with its driver idle on a delivered message, and both
-            # times the commander noticed before Helm did. Delivery is not
-            # action, and this is the line that says so.
-            # One snapshot for the whole sweep. Every helper below used to
-            # reach the store itself -- `pending_foreman_requests` once per
-            # project, the `foreman_for` inside it again, and `_glyph_for`
-            # once per *request* -- so a root with a dozen projects re-parsed
-            # tens of megabytes dozens of times to build a few lines of text.
-            # Nothing here writes, so one read is all the sweep is entitled to.
-            snapshot = coordinator.store.load()
-            glyphs = {
-                project["id"]: project_glyph(project.get("color", ""))
-                for project in snapshot.get("projects", {}).values()
-            }
-            for project in coordinator.list_projects(data=snapshot):
-                for request in coordinator.pending_foreman_requests(
-                    project["id"], data=snapshot
-                ):
-                    glyph = glyphs.get(project["id"], "")
-                    first = next(
-                        (line.strip() for line in request["text"].splitlines() if line.strip()),
-                        "",
-                    )
-                    stamp = str(request.get("at") or "")
-                    entries.append((
-                        stamp,
-                        f"{_when_label(stamp)} {glyph} {project['id']} foreman has not acted on: {first[:100]}",
-                        f"{glyph} {project['id']} foreman has not acted on: {first}",
-                    ))
-            # An answer nobody has read is the stall this whole channel was
-            # built to make visible: the note is a fact, its age is a fact,
-            # and a worker that has not run one helm command in that long is
-            # not acting on anything.
-            for entry in list(snapshot.get("workers", {}).values()):
-                if entry.get("status") != "running":
-                    continue
-                age = coordinator.oldest_unread_inbox_age(entry["id"])
-                if age is None or age < INBOX_UNREAD_STALL_SECONDS:
-                    continue
-                glyph = glyphs.get(entry.get("project_id"), "")
-                waited = f"{int(age) // 60}m" if age >= 60 else f"{int(age)}s"
-                stamp = _dt.datetime.fromtimestamp(
-                    time.time() - age, _dt.timezone.utc
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                line = (
-                    f"{glyph} {entry.get('project_id')}: message to {entry['id']} unread "
-                    f"for {waited} -- it has run no helm command since; check its session"
-                )
-                entries.append((stamp, f"{_when_label(stamp)} {line}", line))
-            for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
-                if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
-                    continue
-                # --heal acts only on the one verdict that is EVIDENCE rather
-                # than inference: the process is gone. A stalled worker may be
-                # thinking and an erroring one may recover; killing either on
-                # a heuristic is how a healthy reviewer dies. Seven silent
-                # foreman deaths in one day, each waiting on a human to
-                # notice, are why the dead ones stop waiting.
-                if getattr(args, "heal", False) and entry["verdict"] == "died":
-                    healed = _heal_dead_worker(coordinator, entry)
-                    if healed:
-                        entries.append((
-                            _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-                            healed[:220],
-                            healed,
-                        ))
-                        continue
-                glyph = _glyph_for(coordinator, entry["project_id"])
-                idle = max(
-                    entry.get("output_idle_seconds") or 0.0,
-                    entry.get("reported_idle_seconds") or 0.0,
-                )
-                # A health verdict carries no timestamp, but it does carry its
-                # own idleness -- so date it from that and it sorts among the
-                # timestamped items correctly instead of falling to the bottom
-                # as a block. Without this the list only claimed to be
-                # newest-first.
-                dated = (
-                    _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=idle)
-                ).isoformat().replace("+00:00", "Z")
-                entries.append((
-                    dated,
-                    f"{_when_label(seconds=idle)} {glyph} {entry['project_id']} "
-                    f"{entry['worker_id']} [{entry['verdict']}]: {entry['detail'][:80]}",
-                    f"{glyph} {entry['project_id']} {entry['worker_id']} "
-                    f"[{entry['verdict']}]: {entry['detail']}",
-                ))
-            # Knowledge that waits is knowledge nobody gets: a week unreviewed
-            # and the proposals join the list, as one line, oldest first.
-            with contextlib.suppress(HelmError, OSError):
-                stale = coordinator.stale_learnings()
-                if stale:
-                    oldest = stale[0]
-                    stamp = str(oldest.get("created_at") or "")
-                    line = (
-                        f"{len(stale)} learning proposal(s) waiting more than 7 days -- "
-                        "helm learning triage"
-                    )
-                    entries.append((stamp, f"{_when_label(stamp)} {line}", line))
-            ordered = sorted(entries, key=lambda e: e[0], reverse=True)
-            lines = [text for _at, text, _identity in ordered]
-            if args.changes:
-                # Only what is NEW since the last --changes call. An unattended
-                # watch that re-prints the whole list every poll buries the one
-                # new line under things already read, and trains its reader to
-                # skip it -- the same failure the list itself was built to fix.
-                #
-                # Compared with digits stripped, because a line carries elapsed
-                # time ("quiet for 7481s") that differs on every poll: without
-                # that, every health line reads as new, forever.
-                #
-                # The identity is built from the FULL text, never the truncated
-                # display line. Truncating first reintroduces the bug by the
-                # back door: when a counter grows from 994s to 1016s the line
-                # gets one character longer, the cut lands one character
-                # earlier, and the stripped tails differ -- so an unchanged
-                # item announces itself again purely because a number got wider.
-                #
-                # Only ELAPSED TIMES are normalised, not every digit. Stripping
-                # all of them also dissolved the worker id, whose digits are
-                # most of what distinguishes one from another: two ids differing
-                # only in where their digits sit reduced to the SAME key, so the
-                # second worker's news was SUPPRESSED once the first had been
-                # reported. That error runs the dangerous way -- a repeat is
-                # noise, but a swallowed item is the silence this command exists
-                # to prevent.
-                def _key(text: str) -> str:
-                    return re.sub(r"\d+s\b", "Ns", text)
-
-                seen_file = coordinator.store.directory / "pending-seen.json"
-                previous: set[str] = set()
-                with contextlib.suppress(OSError, ValueError):
-                    previous = set(json.loads(seen_file.read_text()))
-                current = {_key(identity) for _at, _text, identity in ordered}
-                fresh = [
-                    text
-                    for _at, text, identity in ordered
-                    if _key(identity) not in previous
-                ]
-                with contextlib.suppress(OSError):
-                    seen_file.write_text(json.dumps(sorted(current)))
-                for line in fresh:
-                    print(line.strip())
-                return 0
-            if not entries:
-                return 0
-            print(f"Commander, for your attention ({len(lines)}):")
-            for line in lines:
-                print(f"  {line}")
-            print("  (helm status for detail; helm ack <project> once relayed)")
-            return 0
-
-        if args.command == "ask":
-            if args.ask_command == "record":
-                message = coordinator.record_commander_ask(
-                    args.reason,
-                    args.text,
-                    project_id=args.project_id,
-                    task_id=args.task_id,
-                )
-                scope = args.project_id or "no single project"
-                print(f"Recorded a {args.reason} ask ({scope}) as {message['id']}")
-                return 0
-            counts = coordinator.commander_asks(args.project_id)
-            print("Asked of the commander:")
-            for reason, total in counts["recorded"].items():
-                print(f"  {reason:<14} {total}")
-            print(f"  {'recorded total':<14} {counts['recorded_total']}")
-            print("Already proven by the record, needing nobody's honesty:")
-            for name, total in counts["derived"].items():
-                print(f"  {name:<20} {total}")
-            if counts["recorded_total"] < counts["derived_total"]:
-                # Said out loud rather than left for the reader to notice. A
-                # rate computed from an under-recorded numerator is wrong in
-                # the direction that flatters Helm, which is the direction
-                # nobody checks.
-                print(
-                    "\nRecorded asks are below what the record already proves, so "
-                    "the coordinator is not marking every ask. Treat any rate "
-                    "computed from the recorded figure as a lower bound."
-                )
-            return 0
-
-        if args.command == "ack":
-            done = coordinator.acknowledge_updates(
-                args.project_id, args.entry_ids or None
-            )
-            if not done:
-                print("No owed reports were waiting to be acknowledged.")
-                return 0
-            print(f"Acknowledged {len(done)} report(s) as relayed:")
-            for entry in done:
-                first = next(
-                    (line.strip() for line in entry["text"].splitlines() if line.strip()),
-                    "",
-                )
-                print(f"  {entry['id']} {first[:96]}")
-            return 0
-
-        if args.command == "watch":
-            report = coordinator.sweep_workers(silence_seconds=args.silence)
-            # A merged PR used to age as pr-open until somebody ran pr-sync
-            # by hand. Read the remote here, at most once per task per
-            # interval, and say what moved; a remote that cannot be reached
-            # is skipped quietly, because an offline laptop is not news.
-            with contextlib.suppress(HelmError, OSError):
-                synced = coordinator.sync_open_pull_requests()
-                if synced["checked"]:
-                    print(
-                        f"PR sync: {len(synced['checked'])} checked"
-                        + (f", merged: {', '.join(synced['merged'])}" if synced["merged"] else "")
-                        + (f", closed: {', '.join(synced['closed'])}" if synced["closed"] else "")
-                    )
-                    for task_id in synced["merged"]:
-                        with contextlib.suppress(HelmError, OSError):
-                            _release_finished_space(coordinator, coordinator.inspect_task(task_id)["task"])
-            # Residue a standing cleanup grant covers is shed here, and the
-            # records that then hold nothing leave the live document.
-            with contextlib.suppress(HelmError, OSError):
-                swept = coordinator.sweep_residue_under_grants()
-                if swept["cleaned"]:
-                    print(f"Cleanup under standing grant: {len(swept['cleaned'])} task(s)")
-                    for entry in swept["cleaned"]:
-                        print(f"  {entry['task_id']}: {entry['reason']} (grant {entry['grant_id']})")
-                    coordinator.archive_tasks([entry["task_id"] for entry in swept["cleaned"]])
-                for entry in swept["skipped"]:
-                    print(f"  cleanup of {entry['task_id']} refused: {entry['reason']}")
-            # Decisions about tasks that have moved on or left the live
-            # document close here, so the list `watch` prints is only what a
-            # human can still act on.
-            with contextlib.suppress(HelmError, OSError):
-                tidied = coordinator.tidy_decisions()
-                if tidied["resolved"]:
-                    print(f"Closed {len(tidied['resolved'])} decision(s) nothing can act on")
-            updates = coordinator.project_updates_for_watch()
-            # A settled worker's pane is no longer evidence; leaving it open
-            # makes the panel harder to read for no benefit.
-            with contextlib.suppress(HelmError, OSError):
-                adapter = HerdrAdapter(coordinator)
-                released = adapter.release_finished_tabs()
-                if released:
-                    print(f"Closed {len(released)} finished worker tab(s)")
-                for project_id in adapter.close_finished_project_spaces():
-                    print(f"Closed the Herdr space for project {project_id}")
-            if updates:
-                print("Project updates:")
-                for update in updates:
-                    glyph = f"{update['glyph']} " if update.get("glyph") else ""
-                    print(
-                        f"  {glyph}{update['project_id']}: "
-                        f"{str(update.get('text', ''))[:220]}"
-                    )
-            if not report:
-                print("No running workers.")
-                return 0
-            attention = 0
-            for entry in report:
-                # `driving` belongs here: a foreman waiting on a worker it
-                # launched is doing its job, not failing. Left out, it fell to
-                # the foreman branch below and every healthy driver was stamped
-                # "nothing is driving it" -- so the one row that was fine read
-                # exactly like the two that were genuinely down, and the whole
-                # signal stopped being worth reading.
-                healthy = entry["verdict"] in HEALTHY_WORKER_VERDICTS
-                if healthy:
-                    mark = ""
-                elif entry.get("role") == "foreman":
-                    # The foreman is what would have noticed the others. When
-                    # it is down, nothing is driving the project at all, and
-                    # that outranks any single stalled worker on the list.
-                    mark = "  <-- URGENT: this project's foreman is down; nothing is driving it"
-                else:
-                    mark = "  <-- attention"
-                if mark:
-                    attention += 1
-                role = f"{entry['agent_id']}" + (
-                    " (foreman)" if entry.get("role") == "foreman" else ""
-                )
-                print(
-                    f"{_glyph_for(coordinator, entry['project_id'])} {entry['worker_id']} "
-                    f"[{entry['verdict']}] project={entry['project_id']} "
-                    f"task={entry['task_id']} agent={role}: {entry['detail']}{mark}"
-                )
-                if args.nudge and entry["verdict"] in {"stalled", "quiet"} and not entry["nudged_at"]:
-                    nudge = coordinator.nudge_worker(entry["worker_id"])
-                    with contextlib.suppress(HelmError, OSError):
-                        HerdrAdapter(coordinator).answer_worker(
-                            entry["worker_id"], nudge["text"]
-                        )
-                    print(f"  nudged {entry['worker_id']} for a status push")
-            # A non-zero exit lets a scheduled check page a human without
-            # anyone reading the output.
-            return 1 if attention else 0
-
-        if args.command == "route":
-            # Root Helm's whole job for one input: identify the project,
-            # make sure its one foreman is live, hand the request off, and
-            # come straight back -- never wait for that foreman to act on
-            # it. Ensuring the foreman only ever spawns (wait=False); the
-            # handoff itself is a pane send-text plus Enter, not a call that
-            # blocks on the foreman's own work. Neither step waits on what
-            # the foreman does with the request, so this command never
-            # becomes the thing that makes one busy project's input hold up
-            # another project's -- independent of how long either step
-            # itself happens to take.
-            #
-            # Truthful, not optimistic: the project's own decision to decline
-            # a foreman is reported as exactly that, not folded into the
-            # generic "could not start one" path used for an actual failure.
-            coordinator.get_project(args.project_id)  # truthful "unknown project" first
-            # Routing is the moment root touches this project, so it is the
-            # moment to say what the project said while nobody was reading.
-            # Printed before the hand-off: a request routed on top of an
-            # unread "investigation complete" is usually the wrong request.
-            _print_new_project_updates(
-                coordinator,
-                args.project_id,
-                heading="Before routing -- new from this project since you last looked:",
-                # Same filter as `status`, for a sharper reason: what a router
-                # needs is what the project SAID, and a standing delivery
-                # decision is neither new nor answerable here. Unfiltered, a
-                # dozen identical decision lines pushed the foreman's actual
-                # report off the top of the very output meant to prevent
-                # routing on top of it -- observed, not hypothesised.
-                skip_decisions=True,
-            )
-            if not coordinator.project_wants_foreman(args.project_id):
-                raise HelmError(
-                    f'{args.project_id} has declined a foreman ("foreman": false in its '
-                    "own record or .helm/project.json); there is nothing for route to hand "
-                    "this request to. Appoint one explicitly with helm foreman "
-                    f"{args.project_id} first if you want to route to it anyway."
-                )
-            existing = coordinator.foreman_for(args.project_id)
-            started = None
-            if existing is None:
-                started = _ensure_foreman(
-                    coordinator, args.project_id, herdr=args.herdr,
-                    command=args.worker_command_text, agent=args.agent,
-                    model=args.model,
-                    # The request goes into the brief this appointment composes,
-                    # so a foreman started by this very call comes up already
-                    # holding it rather than hoping to read it afterwards.
-                    request=args.text,
-                )
-                foreman = coordinator.foreman_for(args.project_id)
-            else:
-                foreman = existing
-            if foreman is None:
-                raise HelmError(
-                    f"{args.project_id} has no live foreman to route to; appointing one "
-                    "failed -- see the message above for why"
-                )
-            # Record first, always, while the worker is still whatever it
-            # currently is: the request is part of the project's durable
-            # record whether or not a presentation surface can deliver it,
-            # the same guarantee `helm worker answer` gives a worker's
-            # reply. This is safe to do before checking reachability
-            # because `record_worker_message` no longer touches this
-            # worker's `last_reported_at` for an `answer` push -- that field
-            # is the worker's own liveness signal, and an outbound message
-            # Helm is delivering is not evidence the worker is alive, let
-            # alone that it received it. Recording after the reachability
-            # check would instead let `session_reachable`'s own
-            # reconciliation of a dead Herdr pane (it settles the worker to
-            # "failed" -- the strongest evidence available that the session
-            # is over) run first and leave no running worker left to record
-            # onto, silently dropping the request while still saying
-            # "recorded". Recording first closes that gap: the request
-            # survives in the durable record regardless of what
-            # reachability turns out to be.
-            task = coordinator.record_worker_message(foreman["id"], "answer", args.text)
-            # Reachability is checked after recording, and is unaffected by
-            # having just recorded: `session_reachable` asks whether there
-            # is a live Herdr pane, with a provider that confirms it, for
-            # this worker right now -- not whether it has spoken recently.
-            # It is correct for a plain-process foreman too (no `helm herdr`
-            # input channel to send into at all) and for a foreman mid-task
-            # or quietly idle (both reachable, neither is what this checks).
-            # A foreman appointed by this very call is a separate case,
-            # handled below via `started is not None` -- its process was
-            # just spawned and cannot have a ready pane yet regardless of
-            # what `session_reachable` would say.
-            reachable = started is None and HerdrAdapter(coordinator).session_reachable(
-                foreman["id"]
-            )
-            if started is not None:
-                # A foreman appointed this call cannot have a ready pane yet
-                # -- the agent process was just spawned and has not had time
-                # to start reading, let alone attach a shell it can accept
-                # text into. Sending into it now is a race that would either
-                # be silently swallowed by a not-yet-listening pane or wedge
-                # ahead of the agent's own startup output; either way a
-                # "delivered" claim here would be false. The record above is
-                # what makes the request survive regardless: the foreman's
-                # own brief-time status read (`foreman_brief`,
-                # `helm project status`) surfaces it once it comes up.
-                print(
-                    f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
-                    f"newly appointed foreman {foreman['id']} task={task['id']} "
-                    "[recorded, and written into the brief this appointment composed; the "
-                    "foreman is still starting and comes up holding the request, "
-                    "not a live pane send]"
-                )
-                return 0
-            if not reachable:
-                # A live worker record with nothing that can actually
-                # receive text: a plain-process foreman with no Herdr pane
-                # at all, or a Herdr pane the provider says is gone or was
-                # closed by hand. Neither is "unhealthy" in the sense
-                # `worker_health` reports (a busy or quietly idle foreman
-                # is not that), so this checks reachability directly rather
-                # than reusing that verdict. Never claim a delivery that
-                # could not have happened; one foreman per project is
-                # preserved -- this does not stop or replace it, only says
-                # how to if that is wanted.
-                print(
-                    f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
-                    f"foreman {foreman['id']} task={task['id']} "
-                    "[recorded only; its foreman has no reachable session to send into -- "
-                    "either a plain process with no input channel, or its Herdr pane is gone. "
-                    f"Replace it with: helm worker stop {foreman['id']} --reason \"...\" "
-                    f"&& helm foreman {args.project_id}]"
-                )
-                return 0
-            delivered = False
-            with contextlib.suppress(HelmError, OSError):
-                delivered = HerdrAdapter(coordinator).answer_worker(foreman["id"], args.text)
-            print(
-                f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
-                f"foreman {foreman['id']} task={task['id']} "
-                f"[{'delivered' if delivered else 'recorded only; the send itself failed'}]"
-            )
-            return 0
-
-        if args.command == "foreman":
-            existing = coordinator.foreman_for(args.project_id)
-            if existing is not None:
-                # One project, one foreman: a second driver is worse than none.
-                # But "already has one" must never become a dead end -- a
-                # foreman whose pane was closed by hand still reads as running,
-                # and without a way out that project could never be given
-                # another driver. So say how to replace it.
-                health = {
-                    entry["worker_id"]: entry for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator))
-                }.get(existing["id"], {})
-                verdict = health.get("verdict", "unknown")
-                print(
-                    f"{_glyph_for(coordinator, args.project_id)} {args.project_id} already has "
-                    f"a foreman: {existing['id']} [{verdict}] task={existing['task_id']}"
-                )
-                if verdict not in {"healthy", "starting", "reported"}:
-                    print(
-                        f"  It is not driving anything. Replace it with: "
-                        f"helm worker stop {existing['id']} --reason \"...\" "
-                        f"&& helm foreman {args.project_id}"
-                    )
-                return 0
-            task = coordinator.create_foreman_task(
-                args.project_id, agent=args.agent, model=args.model, effort=args.effort
-            )
-            if args.herdr:
-                worker = HerdrAdapter(coordinator).launch_task(
-                    task["id"], args.worker_command_text, wait=False
-                )
-                mode = (
-                    "herdr"
-                    if worker.get("execution") == "herdr"
-                    else "process fallback (Herdr unavailable)"
-                )
-            else:
-                worker = coordinator.launch_worker(
-                    task["id"], args.worker_command_text, wait=False
-                )
-                mode = "process (--no-herdr)"
-            print(
-                f"{_glyph_for(coordinator, args.project_id)} {args.project_id} foreman "
-                f"{worker['id']} [{worker['status']}] task={task['id']} mode={mode} "
-                f"agent={worker.get('agent_id', 'default')}"
-            )
-            if not coordinator.project_wants_foreman(args.project_id):
-                # Started by hand for a project that has not declared one:
-                # say so, because nothing will reappoint it after it exits.
-                print(
-                    '  This project does not declare a foreman. Add "foreman": true to its '
-                    ".helm/project.json to have Helm appoint one itself."
-                )
-            # Say what it cannot do, every time. A driver that looks like a
-            # coordinator is the one mistake this command can cause.
-            print(
-                "  It drives this project's loops. It cannot approve, merge, push, "
-                "publish, delete, or grant a standing approval -- those stay here."
-            )
-            return 0
-
-        if args.command == "board":
-            projects = coordinator.board()
-            destination = Path(args.out) if args.out else store.directory / "board.html"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(
-                _board_html(projects, __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")),
-                encoding="utf-8",
-            )
-            shown = sum(len(p["tasks"]) for p in projects)
-            print(f"Board written: {destination}  ({shown} task(s) across {len(projects)} project(s))")
-            if args.open_it:
-                subprocess.run(["open", str(destination)], check=False)
-            return 0
-
-        if args.command == "reflect":
-            print(_json(coordinator.reflection_evidence(args.hours)))
-            return 0
-
-        if args.command == "tail":
-            for line in coordinator.worker_output(args.worker_id, args.lines):
-                print(line)
-            return 0
-
-        if args.command == "approval":
-            if args.approval_command == "grant":
-                granted = coordinator.grant_approval(
-                    args.action, project_id=args.project_id, note=args.note, stale_days=args.stale_days,
-                )
-                scope = granted["project_id"] or "all projects"
-                print(f"Granted {granted['id']}: {granted['action']} for {scope}")
-                # A standing approval is the one place a later action happens
-                # without anyone being asked, so say plainly what changed.
-                print(
-                    f"  Helm may now {granted['action']} for {scope} without asking again. "
-                    f"Withdraw it with: helm approval revoke {granted['id']}"
-                )
-            elif args.approval_command == "revoke":
-                revoked = coordinator.revoke_approval_grant(args.grant_id, args.note)
-                print(f"Revoked {revoked['id']}: {revoked['action']} for {revoked['project_id'] or 'all projects'}")
-            elif args.approval_command == "release":
-                task = coordinator.release_task_hold(
-                    args.task_id,
-                    action=args.action,
-                    note=args.note,
-                    grant_id=args.grant_id,
-                    confirm=args.confirm,
-                )
-                hold = task.get("hold") or {}
-                authorization = hold.get("authorization") or {}
-                snapshot = authorization.get("snapshot") or hold.get("snapshot") or {}
-                worker_id = hold.get("worker_id", "")
-                message = args.text or (
-                    f"Approved: {args.action}. The commander authorized exactly this"
-                    + (f" ({args.note})" if args.note else "")
-                    + ". Run `helm worker action-start "
-                    f"{worker_id}` immediately before you act -- it checks the approval "
-                    "against the state that was approved and spends it once -- then do "
-                    "it and report the outcome with --type result."
-                )
-                # Delivery is its own fact. The decision is already recorded and
-                # the task stays paused until the session itself acknowledges by
-                # spending the ticket, so a failed delivery is a retry rather
-                # than an authorization nobody received.
-                delivered = False
-                with contextlib.suppress(HelmError, OSError):
-                    adapter = HerdrAdapter(coordinator)
-                    if adapter.session_reachable(worker_id):
-                        delivered = adapter.answer_worker(worker_id, message)
-                if delivered:
-                    # Recorded only when it actually arrived, so the escalation
-                    # stays open while nobody has been told.
-                    with contextlib.suppress(HelmError, OSError):
-                        coordinator.record_worker_message(worker_id, "answer", message)
-                    with contextlib.suppress(HelmError, OSError):
-                        coordinator.mark_hold_delivered(args.task_id, delivered=True)
-                print(
-                    f"Authorized {args.action} for task {task['id']} [{task['status']}] "
-                    f"worker={worker_id} "
-                    f"[{'delivered' if delivered else 'NOT delivered'}]"
-                )
-                if authorization.get("grant_id"):
-                    print(f"  Authority: standing grant {authorization['grant_id']}")
-                else:
-                    print(
-                        f"  Authority: explicit confirmation "
-                        f"({(authorization.get('authority') or {}).get('mode', 'session')})"
-                    )
-                if snapshot.get("scope") == "workspace":
-                    print(
-                        f"  Bound to {snapshot.get('branch')} @ "
-                        f"{(snapshot.get('revision') or '')[:12]} plus its index, "
-                        f"working tree, {len(snapshot.get('untracked', []))} untracked "
-                        f"and {len(snapshot.get('artifacts', []))} declared artifact(s); "
-                        "any change refuses at action-start"
-                    )
-                else:
-                    print("  No worktree to bind: this task holds no branch of its own")
-                if delivered:
-                    print(
-                        "  The task stays paused until the worker spends it with "
-                        f"helm worker action-start {worker_id}"
-                    )
-                else:
-                    print(
-                        "  Nothing was delivered and nothing is spent. Retry with the "
-                        f"same command (helm approval release {args.task_id} --action "
-                        f"{args.action} --confirm), or repair the task with "
-                        f"helm approval repair {args.task_id} if its session is gone."
-                    )
-                    return 1
-            elif args.approval_command == "repair":
-                # Provider evidence, gathered here: core never talks to a
-                # presentation service and must not guess a session is alive.
-                live = False
-                with contextlib.suppress(HelmError, OSError):
-                    adapter = HerdrAdapter(coordinator)
-                    hold = coordinator.hold_worker_id(args.task_id)
-                    live = bool(hold) and adapter.session_reachable(hold)
-                repaired = coordinator.repair_task_hold(
-                    args.task_id, session_live=live, note=args.note
-                )
-                print(
-                    f"Repaired task {repaired['task_id']}: {repaired['outcome']}"
-                    + (
-                        f" (hold {repaired['hold']['id']} waiting on "
-                        f"{repaired['hold']['action']})"
-                        if repaired.get("hold")
-                        else ""
-                    )
-                )
-                if repaired["outcome"] == "abandoned":
-                    print(
-                        "  Its session is gone, so nothing could be authorized into it. "
-                        "The task is failed: its log is the evidence, and it can now be "
-                        f"cleaned up with helm task cleanup {repaired['task_id']}."
-                    )
-                elif repaired["outcome"] == "restate-requested":
-                    print(
-                        "  The recorded request named no usable action. The live worker "
-                        "has been asked to re-report it with --action."
-                    )
-                else:
-                    print(
-                        "  Authorize it with: helm approval release "
-                        f"{repaired['task_id']} --action {repaired['hold']['action']} --confirm"
-                    )
-            elif args.approval_command == "check":
-                covering = coordinator.approval_grant_for(args.action, args.project_id)
-                scope = args.project_id or "all projects"
-                if covering is None:
-                    print(f"No standing approval covers {args.action} for {scope}; ask the user.")
-                    return 1
-                print(
-                    f"{covering['id']} covers {args.action} for "
-                    f"{covering['project_id'] or 'all projects'}: {covering['note']}"
-                )
-            else:
-                _print_approval_grants(coordinator, include_revoked=args.include_revoked)
-            return 0
-        if args.command == "gate":
-            if args.gate_command == "propose":
-                task = coordinator.propose_gate(args.task_id, args.gate_type, args.text)
-                print(
-                    f"Proposed the {args.gate_type} gate on task {task['id']}; "
-                    "waiting on the commander: helm gate decide "
-                    f"{task['id']} --type {args.gate_type} --confirm|--skip"
-                )
-                shortfalls = ((task.get("gates") or {}).get(args.gate_type) or {}).get("shortfalls") or []
-                if shortfalls:
-                    print(
-                        "  The commander will see this proposal as thin: "
-                        + "; ".join(shortfalls)
-                        + ". Add a `Done means:` line and an `Out of scope:` line and propose again."
-                    )
-            else:
-                task = coordinator.decide_gate(
-                    args.task_id, args.gate_type,
-                    confirm=args.confirm, skip=args.skip, note=args.note,
-                )
-                verb = "Skipped" if args.skip else "Confirmed"
-                print(f"{verb} the {args.gate_type} gate on task {task['id']}")
-                shortfalls = ((task.get("gates") or {}).get(args.gate_type) or {}).get("shortfalls") or []
-                if shortfalls and args.confirm:
-                    print(f"  (confirmed thin: {'; '.join(shortfalls)})")
-                # And TELL the foreman. A gate is the one thing a foreman is
-                # explicitly instructed to stop and wait for, and the decision
-                # was recorded where only a poll would find it -- so a
-                # confirmed gate left the agent sitting idle, indefinitely,
-                # having done nothing wrong. Two foremen on two projects
-                # stalled that way in one session. Delivery is best-effort:
-                # the decision is already durable, and a foreman that cannot
-                # be reached still finds it in `helm project status`.
-                notice = (
-                    f"Helm: the commander {verb.lower()} your {args.gate_type} gate"
-                    f" on task {task['id']}."
-                    + (f" Note: {args.note}" if args.note else "")
-                    + (
-                        " Proceed."
-                        if not args.skip
-                        else " It was skipped, not confirmed -- do not treat that as "
-                        "approval of the contract as proposed."
-                    )
-                )
-                delivered = False
-                live = None
-                with contextlib.suppress(HelmError, OSError):
-                    live = next(
-                        (
-                            worker
-                            for worker in coordinator.store.load()
-                            .get("workers", {})
-                            .values()
-                            if worker.get("task_id") == task["id"]
-                            and worker.get("status") == "running"
-                        ),
-                        None,
-                    )
-                    if live is not None:
-                        delivered = bool(
-                            HerdrAdapter(coordinator).answer_worker(live["id"], notice)
-                        )
-                if not delivered:
-                    # Two very different failures were being reported in one
-                    # soft sentence. A live agent that merely could not be
-                    # reached will find the decision by polling; a session that
-                    # has ENDED never will, and the gate is bound to that
-                    # task's row -- so a replacement foreman re-proposes and
-                    # the decision just made is spent on nothing. That case
-                    # needs a different next command, and it needs to be hard
-                    # to miss: an agent waiting on a gate that answers into a
-                    # dead session stalls the project until a human notices.
-                    if live is not None:
-                        print(
-                            "  Not delivered into a live session. The decision is "
-                            "recorded; the foreman will see it in helm project "
-                            "status, or route it a message to move it along."
-                        )
-                    else:
-                        project_id = task.get("project_id") or "<project>"
-                        print(
-                            "  NOT DELIVERED -- no live session holds this task, so "
-                            "nothing is waiting on the decision you just made."
-                        )
-                        print(
-                            "  The decision is recorded on the task and stays "
-                            "recorded. But the gate is bound to THIS task, so a "
-                            "replacement foreman starts a new task and proposes "
-                            "its gates again; do not read this decision as "
-                            "already spent on the work."
-                        )
-                        print(
-                            f"  Revive the driver: helm foreman {project_id} "
-                            "(replace a stale one first with helm worker stop "
-                            "<worker-id> --reason \"...\")."
-                        )
-            return 0
-        if args.command == "authority":
-            if args.authority_command == "init":
-                # Generated here, written 0600, and never printed: a capability
-                # read out into a transcript has already left the machine.
-                path = coordinator.configure_authority(secrets.token_urlsafe(48))
-                print("This root now requires an authorization capability.")
-                print(f"  Written to {path} (0600). Its value is never printed.")
-                print(f'  Load it into your own shell: export {AUTHORITY_ENV}="$(cat {path})"')
-                print(
-                    "  Then remove the file if you like. No agent Helm starts can "
-                    "inherit it: the worker environment is an allowlist."
-                )
-            else:
-                configured = bool(coordinator._authority_hash())
-                present = bool(os.environ.get(AUTHORITY_ENV))
-                print(
-                    "Protected commands here require a capability"
-                    if configured
-                    else "Protected commands here are guarded by session role only"
-                )
-                print(f"  capability configured: {'yes' if configured else 'no'}")
-                print(f"  capability present in this session: {'yes' if present else 'no'}")
-                if not configured:
-                    print(
-                        "  Set one up with helm authority init. Without it, a process "
-                        "that is neither marked nor descended from a worker is treated "
-                        "as the root."
-                    )
-            return 0
-        if args.command == "review":
-            outcome = HerdrAdapter(coordinator).run_review_cycle(
-                args.task_id,
-                reviewer_agent=args.reviewer_agent,
-                reviewer_model=args.reviewer_model,
-                reviewer_effort=args.reviewer_effort,
-                rounds=args.rounds,
-                timeout=args.timeout,
-            )
-            print(
-                f"Review of {outcome['task_id']}: {outcome['verdict']} "
-                f"(author={outcome['author_agent']} reviewer={outcome['reviewer_agent']} "
-                f"independence={outcome['independence']})"
-            )
-            print(f"  {outcome['reviewer_reason']}")
-            for entry in outcome["rounds"]:
-                # Say where a verdict came from when it did not come the
-                # normal way: a pane read is a recovery, not the record.
-                recovered = (
-                    "  (recovered from the reviewer's output; its report never reached Helm)"
-                    if entry.get("source") == "output"
-                    else ""
-                )
-                print(f"  round {entry['round']}: {entry['verdict']}{recovered}")
-                if entry.get("text"):
-                    print(f"    {entry['text'][:400]}")
-            # Unresolved means an objection still stands; a human decides.
-            return 0 if outcome["verdict"] == "approved" else 1
-
-        if args.command == "inspect":
-            _print_inspect(coordinator.inspect_task(args.task_id))
-            return 0
-        parser.error("unknown command")
+        handler = _COMMANDS.get(args.command)
+        if handler is None:
+            parser.error("unknown command")
+        # One function per command, looked up in a table, each returning the
+        # exit status. A handler that returns nothing succeeded.
+        outcome = handler(_Context(coordinator, store, helm_root), args)
+        return 0 if outcome is None else outcome
     except (HelmError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         print(f"helm: {exc}", file=sys.stderr)
         return 2

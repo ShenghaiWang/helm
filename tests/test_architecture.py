@@ -324,5 +324,27 @@ class TestsPatchWhereTheCallerLooksTests(unittest.TestCase):
         self.assertEqual(offenders, [], "\n".join(offenders))
 
 
+class EveryCommandHasAHandlerTests(unittest.TestCase):
+    def test_the_parser_and_the_dispatch_table_name_the_same_commands(self) -> None:
+        """`main` looks each command up in a table; a command the parser
+        accepts but the table lacks would fall to "unknown command" at
+        runtime, and a table entry the parser never produces is dead code.
+        `doctor` is the one command dispatched before the table, because it
+        must run on a root whose state will not open."""
+        import argparse
+
+        from helm import cli
+
+        parser = cli._build_parser()
+        subcommands = next(
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        accepted = set(subcommands.choices) - {"doctor"}
+        self.assertEqual(accepted, set(cli._COMMANDS))
+        for name, handler in cli._COMMANDS.items():
+            self.assertTrue(callable(handler), name)
+
+
 if __name__ == "__main__":
     unittest.main()
