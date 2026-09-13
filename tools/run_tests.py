@@ -11,6 +11,12 @@ the plain discover so a failure there is easy to read.
     python3 tools/run_tests.py            # all modules, one process per core
     python3 tools/run_tests.py -j 4       # four at a time
     python3 tools/run_tests.py tests/test_gates.py tests/test_review.py
+
+A module that runs past --module-timeout (default 600s; the slowest takes
+about two minutes) is killed and reported as hung, with the name of the
+last test it started, instead of holding the whole run: the suite has
+stalled once or twice with no child process to blame, and the cost of a
+hang should be a named failure, not an afternoon.
 """
 
 from __future__ import annotations
@@ -29,13 +35,21 @@ SUMMARY = re.compile(r"^Ran (\d+) tests? in ([\d.]+)s", re.M)
 VERDICT = re.compile(r"^(OK|FAILED)(?: \((.*)\))?$", re.M)
 
 
-def run_module(path: Path) -> tuple[Path, int, str]:
+def run_module(path: Path, timeout: float) -> tuple[Path, int, str]:
     name = "tests." + path.stem
     started = time.monotonic()
-    result = subprocess.run(
-        [sys.executable, "-m", "unittest", name],
-        cwd=ROOT, capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest", "-v", name],
+            cwd=ROOT, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as hung:
+        partial = (hung.stdout or b"").decode(errors="replace") + (hung.stderr or b"").decode(errors="replace")
+        # Verbose output names each test as it starts, so the last line that
+        # has no verdict yet is the one that hung.
+        last = next((l for l in reversed(partial.splitlines()) if l.startswith("test_")), "?")
+        output = partial + f"\nHUNG after {timeout:.0f}s; last test started: {last}\n"
+        return path, 124, output + f"\n[{time.monotonic() - started:.1f}s]"
     output = result.stdout + result.stderr
     return path, result.returncode, output + f"\n[{time.monotonic() - started:.1f}s]"
 
@@ -44,13 +58,17 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("modules", nargs="*", help="test files; default: every tests/test_*.py")
     parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4)
+    parser.add_argument(
+        "--module-timeout", type=float, default=600.0,
+        help="seconds one module may run before it is killed and reported as hung",
+    )
     args = parser.parse_args(argv)
     modules = [Path(m) for m in args.modules] or sorted((ROOT / "tests").glob("test_*.py"))
     started = time.monotonic()
     failed: list[tuple[Path, str]] = []
     counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = {pool.submit(run_module, path): path for path in modules}
+        futures = {pool.submit(run_module, path, args.module_timeout): path for path in modules}
         for future in as_completed(futures):
             path, code, output = future.result()
             ran = SUMMARY.search(output)
@@ -60,7 +78,7 @@ def main(argv: list[str]) -> int:
             for key in ("failures", "errors", "skipped"):
                 found = re.search(rf"{key}=(\d+)", detail)
                 counts[key] += int(found.group(1)) if found else 0
-            status = "ok" if code == 0 else "FAILED"
+            status = "ok" if code == 0 else ("HUNG" if code == 124 else "FAILED")
             elapsed = output.rsplit("[", 1)[-1].rstrip("]\n")
             print(f"{status:6s} {path.name:40s} {ran.group(1) if ran else '?':>4s} tests  {elapsed}")
             if code != 0:
