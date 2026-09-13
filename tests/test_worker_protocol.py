@@ -1927,6 +1927,39 @@ class ClaudeWorkersWatchTheirInboxTests(HelmTestCase):
         self.assertEqual(parts[0], "printf")
         self.assertIn("arm your inbox watch", parts[-1])
 
+    def test_a_claude_worker_does_not_load_the_memory_files_above_its_workspace(self) -> None:
+        """Claude Code reads every CLAUDE.md from the cwd up to the filesystem
+        root, and the workspace sits under the Helm root -- so without this
+        every worker and foreman opened with the coordinator's own manual
+        ahead of its assignment. The project's own file, inside the
+        workspace, still loads."""
+        root = self.repo("unleaked")
+        project = self.coordinator.register_project("Unleaked", str(root), project_id="unleaked")
+        task = self.coordinator.create_task(project["id"], "read only your assignment")
+        bin_dir = Path(self.temp.name) / "bin-claude"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "claude").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "claude").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
+            worker = self.coordinator.prepare_external_worker(
+                task["id"], None, execution="herdr", agent="claude"
+            )
+        argv = worker["command"]
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        excluded = settings["claudeMdExcludes"]
+        workspace = Path(self.coordinator.inspect_task(task["id"])["task"]["workspace"])
+        above = set(Path(workspace).absolute().parents) | set(workspace.resolve().parents)
+        self.assertIn(str(workspace.parent / "CLAUDE.md"), excluded)
+        self.assertIn(str(self.state.directory / "CLAUDE.md"), excluded)
+        self.assertIn(str(self.state.directory / ".claude" / "CLAUDE.md"), excluded)
+        self.assertIn("/CLAUDE.md", excluded)
+        self.assertNotIn(str(workspace / "CLAUDE.md"), excluded)
+        for entry in excluded:
+            directory = Path(entry).parent
+            if directory.name == ".claude":
+                directory = directory.parent
+            self.assertIn(directory, above, entry)
+
     def test_other_runtimes_get_no_settings_flag(self) -> None:
         from helm import runtimes
         codex = runtimes.builtin_runtime("codex")

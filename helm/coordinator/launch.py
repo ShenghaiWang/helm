@@ -49,6 +49,25 @@ from ..values import (
 )
 
 
+def _memory_files_above(workspace: str | os.PathLike[str]) -> list[str]:
+    """Every Claude Code memory file an ancestor of `workspace` could supply.
+
+    Listed as absolute paths, for the `claudeMdExcludes` setting: `CLAUDE.md`,
+    `CLAUDE.local.md` and `.claude/CLAUDE.md` in each directory strictly above
+    the workspace, on both the path as given and its resolved form when a
+    symlink makes them differ. The workspace's own files are not listed.
+    """
+    seen: list[str] = []
+    given = Path(workspace).absolute()
+    for base in (given, given.resolve()):
+        for ancestor in base.parents:
+            for name in ("CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md"):
+                entry = str(ancestor / name)
+                if entry not in seen:
+                    seen.append(entry)
+    return seen
+
+
 class LaunchMixin:
     #: How long a returned wait may hold on for the runner's exit record
     #: after the assignment has settled on its own message.
@@ -452,7 +471,9 @@ class LaunchMixin:
             "arrives and act on it as if it had been typed here."
         )
 
-    def _worker_settings_file(self, worker_dir: Path, worker_id: str, agent_id: str) -> str:
+    def _worker_settings_file(
+        self, worker_dir: Path, worker_id: str, agent_id: str, workspace: str | os.PathLike[str] | None = None
+    ) -> str:
         """A settings file for runtimes that take one; "" for the rest.
 
         Claude Code: one SessionStart hook that prints the watch instruction
@@ -460,10 +481,20 @@ class LaunchMixin:
         watch. The watch is what turns the inbox from "read on your next helm
         command" into "woken within 20s, idle or busy", with nothing typed
         into the pane.
+
+        And an exclusion list. Claude Code loads every CLAUDE.md from the
+        working directory up to the filesystem root, and a worker's workspace
+        sits under the Helm root, so without it every worker and foreman
+        started with the root's own instructions -- fifty kilobytes written
+        for the coordinator, telling the agent that does the work never to do
+        the work -- ahead of the assignment Helm composed for it. Every memory
+        file above the workspace is excluded by path; the project's own, inside
+        the workspace, still loads.
         """
         if agent_id != "claude":
             return ""
-        hook = {
+        hook: dict[str, Any] = {
+            "claudeMdExcludes": _memory_files_above(workspace) if workspace else [],
             "hooks": {
                 "SessionStart": [
                     {
@@ -994,7 +1025,7 @@ class LaunchMixin:
             str(worker_dir),
             str(self.store.directory),
             str(project.get("git_common_dir") or ""),
-            self._worker_settings_file(worker_dir, worker_id, selected_agent["id"]),
+            self._worker_settings_file(worker_dir, worker_id, selected_agent["id"], workspace),
         )
         _pretrust_workspace(task.get("agent_id"), workspace)
         # Turn-based execution: the same agent, the same prompt, but run as

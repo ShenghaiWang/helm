@@ -755,7 +755,9 @@ about what a worker is allowed to *know*, not only what it is allowed to write.
   then the resolved domain's `knowledge.md` and `guardrails.md`, then that
   project's `.helm/knowledge.md`, then the task and its worktree. Nothing from
   another project's files, corpora, drafts, trackers, transcripts, or history
-  enters it — not as an example, a template, or a shortcut.
+  enters it — not as an example, a template, or a shortcut. Nor does this
+  file: a Claude Code worker's settings exclude every `CLAUDE.md` above its
+  workspace, so the coordinator's manual never reaches a worker or a foreman.
 - **The coordinator does not carry knowledge between projects.** Do not paste
   another project's findings, conventions, file contents, or credentials into a
   brief, and do not answer a project question from what a different project's

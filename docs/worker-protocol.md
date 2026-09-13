@@ -79,7 +79,16 @@ A worker cannot miss a note:
 - a Claude Code worker is launched with a `--settings` file whose
   SessionStart hook arms a persistent watch on `helm worker inbox --changes`,
   so an answer is never typed into the pane at all: the watch wakes the
-  session, idle or busy, within twenty seconds.
+  session, idle or busy, within twenty seconds. The same file excludes every
+  `CLAUDE.md` above the workspace (`claudeMdExcludes`): Claude Code reads
+  memory files from the working directory up to the filesystem root, and a
+  workspace sits under the Helm root, so without the exclusion every worker
+  and foreman opened with the root's own coordinator manual ahead of its
+  assignment. The project's own file, inside the workspace, still loads. A
+  runtime that reads `AGENTS.md` from the enclosing repository root has no
+  such exclusion, so a foreman on one of those, whose workspace lies inside
+  this repository, may still see the manual; a worker in its own worktree
+  does not.
 
 Reading marks the note read under the worker's own identity, so `helm worker
 answer` reports what Helm did — typed, nudged, watched, or left in the inbox —
