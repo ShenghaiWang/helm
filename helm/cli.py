@@ -2518,7 +2518,13 @@ def _worker_runner(config_path: str) -> int:
     return_code = 127
     try:
         _private_file(log_path)
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Appended, never truncated. The launcher created this log empty in a
+        # directory made for this one worker, so there is nothing stale to
+        # clear -- and the runner starts a Python interpreter and two git
+        # probes later than the launch, so anything written to the log in
+        # that window (a note from the launcher, or a test's fixture) would
+        # be erased by a truncating open.
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as log:
             try:
                 # Mirror worker output to this runner's own stdout as well as

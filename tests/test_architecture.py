@@ -204,19 +204,22 @@ class EveryGlobalAFunctionReachesForExistsTests(unittest.TestCase):
             for function in functions:
                 if function.__module__ != name:
                     continue
-                if not function.__code__.co_filename.endswith(".py"):
-                    # Generated code -- a dataclass's __repr__ or __eq__ is
-                    # compiled from a string -- resolves its globals through
-                    # the dataclasses module on Python before 3.13, and looks
-                    # up names this module was never meant to have.
-                    continue
+                # A global resolves in the function's own `__globals__`, which
+                # is this module's namespace for anything written here and a
+                # different one for a function another module made and
+                # handed over: a dataclass's generated `__repr__` is wrapped
+                # by `dataclasses._recursive_repr`, whose wrapper looks up
+                # `_thread` in the dataclasses module and was attached to a
+                # class here. Checking the namespace the function actually
+                # uses judges each by what it can reach, on every Python.
+                namespace = function.__globals__
                 for code in code_objects(function.__code__):
                     for instruction in dis.get_instructions(code):
                         if instruction.opname != "LOAD_GLOBAL":
                             continue
                         looked_up = instruction.argval
                         if (
-                            looked_up in vars(module)
+                            looked_up in namespace
                             or looked_up in dir(builtins)
                             or looked_up in self.DECORATOR_INJECTED
                         ):
