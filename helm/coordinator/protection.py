@@ -59,6 +59,13 @@ def _stamp_epoch(value: Any) -> float | None:
 class ProtectionMixin:
     """Holds, standing grants, and the protected acts they gate."""
 
+    def _snapshot_now(self, task_id: str, *, data: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The task's content snapshot from a read-only view, outside any lock."""
+        data = self.store.load() if data is None else data
+        task = self._task(data, task_id)
+        project = self._project(data, task["project_id"])
+        return self._snapshot(data, project, task)
+
     def _snapshot(
         self,
         data: dict[str, Any],
@@ -683,6 +690,14 @@ class ProtectionMixin:
                 "with helm task merge"
             )
         authority = self.authority(f"authorizing {action}")
+        # The worktree is hashed before the global lock is taken. It walks
+        # every untracked file and every declared artifact of one task, and
+        # holding every other project's writer behind that once cost
+        # forty-five minutes. The content belongs to the worktree, not to the
+        # state document, so the lock is held only to re-read the records and
+        # write the decision; a change in the window is caught the same way a
+        # change after release is, by `start_authorized_action` re-hashing.
+        current = self._snapshot_now(task_id)
         with self.store.locked() as data:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
@@ -723,7 +738,6 @@ class ProtectionMixin:
             # The precondition is the state the commander was shown, not
             # whatever the worktree has become since. Rebinding here silently
             # authorized a revision nobody had read.
-            current = self._snapshot(data, project, task)
             recorded = hold.get("snapshot")
             if recorded and current != recorded:
                 self._move_hold(
@@ -847,6 +861,13 @@ class ProtectionMixin:
         only the live session that received the go-ahead can make this call --
         which is why the task stays paused until it happens.
         """
+        preview = self.store.load()
+        previewed = preview.get("workers", {}).get(worker_id)
+        if previewed is None:
+            raise HelmError(f"unknown worker: {worker_id}")
+        # Hashed before the lock for the same reason as at release; the
+        # single-use ticket is still consumed under the lock.
+        current = self._snapshot_now(previewed["task_id"], data=preview)
         with self.store.locked() as data:
             worker = data["workers"].get(worker_id)
             if worker is None:
@@ -878,7 +899,6 @@ class ProtectionMixin:
             authorization = hold.get("authorization") or {}
             if authorization.get("ticket_consumed_at"):
                 raise SafetyError("this authorization has already been spent")
-            current = self._snapshot(data, project, task)
             approved = authorization.get("snapshot") or hold.get("snapshot")
             if approved and current != approved:
                 self._move_hold(
