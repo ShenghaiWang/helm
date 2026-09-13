@@ -17,7 +17,7 @@ import time
 from typing import Any
 
 from .. import archive, costs
-from ..values import DELIVERED_TASK_STATES, PROVENANCE_MARKER
+from ..values import DELIVERED_TASK_STATES, PROVENANCE_MARKER, SMART_ZONE_TOKENS
 
 
 def _epoch(stamp: Any) -> float | None:
@@ -117,7 +117,7 @@ class LedgerMixin:
                     not_followed += 1
         usage = {
             "turns": 0, "cost_usd": None, "cost_source": None, "input_tokens": 0,
-            "output_tokens": 0, "cache_read_input_tokens": 0,
+            "output_tokens": 0, "cache_read_input_tokens": 0, "peak_context": 0,
         }
         try:
             total = self.task_usage(task["id"])["total"]
@@ -131,6 +131,7 @@ class LedgerMixin:
                 "input_tokens": total.get("input_tokens", 0),
                 "output_tokens": total.get("output_tokens", 0),
                 "cache_read_input_tokens": total.get("cache_read_input_tokens", 0),
+                "peak_context": int(total.get("peak_context") or 0),
             }
         except Exception:  # noqa: BLE001 - a row without a cost is still a row
             pass
@@ -278,4 +279,5 @@ class LedgerMixin:
             "cost_usd": round(sum(costs_known), 2) if costs_known else None,
             "cost_known_for": len(costs_known),
             "priced_for": sum(1 for r in rows if r.get("cost_source") == "priced"),
+            "past_smart_zone": sum(1 for r in rows if int(r.get("peak_context") or 0) > SMART_ZONE_TOKENS),
         }

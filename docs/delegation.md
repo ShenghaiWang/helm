@@ -150,6 +150,16 @@ and stops a reviewer that has already failed or blocked before launching its
 replacement. The refusal is a backstop; the boundary is knowing which of you
 is driving.
 
+## Tasks that wait on other tasks
+
+`helm task create ... --blocked-by <task-id>` records that a task builds on
+another's delivered change. Helm refuses to launch it until every blocker is
+merged or PR-merged, because its worktree is cut from the base branch and
+cannot build on work that is not in it yet; `helm status` and `helm task
+inspect` show what a task waits on. A foreman slices a goal into
+independently grabbable tasks, declares what blocks what, and launches
+everything unblocked in parallel.
+
 ## The requirement and solution gates
 
 A requirement proposal says what done means and what is out of scope, or

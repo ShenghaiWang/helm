@@ -33,6 +33,16 @@ def _transcript(path: Path, session_id: str, turns: list[tuple[int, int, int, in
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+class PeakContextTests(HelmTestCase):
+    def test_the_largest_prompt_any_turn_carried_is_the_peak(self) -> None:
+        path = Path(self.temp.name) / "peak" / "sess-peak.jsonl"
+        _transcript(path, "sess-peak", [(100, 50, 0, 0), (30, 20, 90_000, 20_000), (10, 5, 50_000, 1_000)])
+        usage = costs.transcript_usage(path)
+        self.assertEqual(usage["peak_context"], 30 + 90_000 + 20_000)
+        summed = costs.sum_usage([usage, {"peak_context": 5, "turns": 0}])
+        self.assertEqual(summed["peak_context"], 110_030)
+
+
 class TranscriptUsageTests(HelmTestCase):
     def test_the_slug_is_the_cwd_with_everything_but_alphanumerics_dashed(self) -> None:
         self.assertEqual(

@@ -37,6 +37,7 @@ from ..git import (
 )
 from ..paths import _private_dir, canonical, inside, overlaps
 from ..values import (
+    DELIVERED_TASK_STATES,
     DELIVERY_POLICIES,
     GATE_TYPES,
     TASK_ROLES,
@@ -280,16 +281,7 @@ class LifecycleMixin:
                 # -- re-guessing one on every discovery pass is exactly the
                 # "whatever HEAD happens to be" behavior this setting exists
                 # to replace.
-                wanted: dict[str, Any] = {}
-                for key in (
-                    "delivery_policy", "color", "domains", "agent",
-                    "model", "foreman", "review", "base_branch", "execution",
-                ):
-                    if key in settings:
-                        wanted[key] = settings[key]
-                if "label" in settings:
-                    wanted["name"] = settings["label"]
-                    wanted["label"] = settings["label"]
+                wanted = self._settings_overrides(settings)
                 # Take the lock only when it would change something. Discovery
                 # runs at the head of most commands and re-applied these every
                 # time, so an unchanged root still paid a lock acquisition and
@@ -313,7 +305,7 @@ class LifecycleMixin:
                 raise SafetyError(
                     f"project root is already registered as {other['id']}; use that project id"
                 )
-        return self.register_project(
+        project = self.register_project(
             settings.get("label", pid),
             str(project_root),
             project_id=pid,
@@ -322,6 +314,32 @@ class LifecycleMixin:
             label=settings.get("label"),
             discovered=True,
         )
+        # Everything else the project declares -- its domains, agent, model,
+        # execution, base branch, checks -- applies at first sight too. It
+        # used to arrive only on the next discovery pass, so the first task
+        # on a newly adopted project ran without the project's own settings.
+        wanted = self._settings_overrides(settings)
+        if any(project.get(key) != value for key, value in wanted.items()):
+            with self.store.locked() as current:
+                record = current["projects"][pid]
+                record.update(wanted)
+                project = dict(record)
+        return project
+
+    @staticmethod
+    def _settings_overrides(settings: dict[str, Any]) -> dict[str, Any]:
+        """The recorded fields a project's own settings file decides."""
+        wanted: dict[str, Any] = {}
+        for key in (
+            "delivery_policy", "color", "domains", "agent",
+            "model", "foreman", "review", "base_branch", "execution", "checks",
+        ):
+            if key in settings:
+                wanted[key] = settings[key]
+        if "label" in settings:
+            wanted["name"] = settings["label"]
+            wanted["label"] = settings["label"]
+        return wanted
     def discover_projects(
         self, helm_root: str | os.PathLike[str] | None = None
     ) -> list[dict[str, Any]]:
@@ -429,6 +447,37 @@ class LifecycleMixin:
             return None
         return max(candidates, key=lambda task: str(task.get("created_at") or ""))
 
+    @staticmethod
+    def _validated_blockers(data: dict[str, Any], project_id: str, blocked_by: list[str] | None) -> list[str]:
+        blockers: list[str] = []
+        for raw in blocked_by or []:
+            blocker_id = _safe_text(raw).strip()
+            if not blocker_id:
+                continue
+            other = data.get("tasks", {}).get(blocker_id)
+            if other is None:
+                raise HelmError(f"unknown task to be blocked by: {blocker_id}")
+            if other.get("project_id") != project_id:
+                raise HelmError(
+                    f"a task can only be blocked by a task of its own project; {blocker_id} belongs to "
+                    f"{other.get('project_id')}"
+                )
+            if blocker_id not in blockers:
+                blockers.append(blocker_id)
+        return blockers
+
+    def open_blockers(self, data: dict[str, Any], task: dict[str, Any]) -> list[str]:
+        """The blockers this task still waits on: every one not yet delivered."""
+        waiting: list[str] = []
+        for blocker_id in task.get("blocked_by") or []:
+            other = data.get("tasks", {}).get(blocker_id)
+            if other is None:
+                record = self.archived_task(blocker_id)
+                other = record["task"] if record else None
+            if other is None or other.get("status") not in DELIVERED_TASK_STATES:
+                waiting.append(blocker_id)
+        return waiting
+
     def create_task(
         self,
         project_id: str,
@@ -448,6 +497,7 @@ class LifecycleMixin:
         new: bool = False,
         shape: str | None = None,
         shape_reason: str | None = None,
+        blocked_by: list[str] | None = None,
     ) -> dict[str, Any]:
         brief = _safe_text(brief).strip()
         if not brief:
@@ -725,6 +775,11 @@ class LifecycleMixin:
                         #: effort floor, evidence gate; see `SHAPE_POLICY`.
                         "shape": shape,
                         "shape_reason": _safe_text(shape_reason).strip() if shape_reason else "",
+                        # Tasks this one waits on. Helm launches it only once
+                        # every one is delivered, because its worktree is cut
+                        # from the base branch and cannot build on work that
+                        # is not in it yet; see `open_blockers`.
+                        "blocked_by": self._validated_blockers(data, project_id, blocked_by),
                         # Sticky: once any round is state-changing the task is
                         # a delivery candidate for good, however its last
                         # round was classified.

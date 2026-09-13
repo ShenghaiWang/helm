@@ -64,6 +64,10 @@ def transcript_usage(path: Path) -> dict[str, Any]:
         "turns": 0,
         "models": [],
         "by_model": {},
+        # The largest single prompt any turn carried: input plus everything
+        # read from or written to the cache. How deep into its context the
+        # session got, which no total can show.
+        "peak_context": 0,
         "session_id": None,
         "first_at": None,
         "last_at": None,
@@ -86,6 +90,12 @@ def transcript_usage(path: Path) -> dict[str, Any]:
                 if not isinstance(usage, dict):
                     continue
                 totals["turns"] += 1
+                prompt = sum(
+                    int(usage.get(field) or 0)
+                    for field in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+                    if isinstance(usage.get(field), (int, float))
+                )
+                totals["peak_context"] = max(totals["peak_context"], prompt)
                 model = message.get("model") if isinstance(message, dict) else None
                 model = model if isinstance(model, str) and model else ""
                 bucket = totals["by_model"].setdefault(model, {field: 0 for field in USAGE_FIELDS})
@@ -157,6 +167,7 @@ def worker_usage(worker: dict[str, Any]) -> dict[str, Any]:
         "cost_usd": worker.get("cost_usd"),
         "cost_source": "reported" if isinstance(worker.get("cost_usd"), (int, float)) else None,
         "by_model": {},
+        "peak_context": 0,
         "metered": False,
     }
     for field in USAGE_FIELDS:
@@ -172,6 +183,7 @@ def worker_usage(worker: dict[str, Any]) -> dict[str, Any]:
         for field in USAGE_FIELDS:
             result[field] += usage[field]
         _merge_by_model(result["by_model"], usage.get("by_model", {}))
+        result["peak_context"] = max(result["peak_context"], int(usage.get("peak_context") or 0))
         models.update(usage["models"])
     result["models"] = sorted(models)
     result["metered"] = bool(paths)
@@ -228,6 +240,7 @@ def sum_usage(entries: list[dict[str, Any]]) -> dict[str, Any]:
     total["cost_usd"] = 0.0
     total["cost_known"] = False
     total["by_model"] = {}
+    total["peak_context"] = 0
     total["priced"] = 0
     total["unpriced_models"] = []
     models: set[str] = set()
@@ -237,6 +250,7 @@ def sum_usage(entries: list[dict[str, Any]]) -> dict[str, Any]:
             total[field] += int(entry.get(field) or 0)
         total["turns"] += int(entry.get("turns") or 0)
         _merge_by_model(total["by_model"], entry.get("by_model", {}))
+        total["peak_context"] = max(total["peak_context"], int(entry.get("peak_context") or 0))
         cost = entry.get("cost_usd")
         if isinstance(cost, (int, float)):
             total["cost_usd"] += float(cost)

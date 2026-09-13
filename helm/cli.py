@@ -20,6 +20,7 @@ from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .values import GRANTABLE_ACTIONS, TASK_SHAPES
 from .coordinator.tidy import STALE_FOLLOW_UP_DAYS
 from .learned import bound_learned_knowledge
+from .values import SMART_ZONE_TOKENS
 from .core import (
     HEALTHY_WORKER_VERDICTS,
     EFFORT_LEVELS,
@@ -939,6 +940,8 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
                 f"  [{task['status']}] {_project_label(project)} task={task['id']} "
                 f"brief={task['brief']} policy={task['delivery_policy']}"
             )
+            if task.get("blocked_by"):
+                print(f"    blocked by {', '.join(task['blocked_by'])}")
             if task.get("workspace"):
                 print(f"    workspace={task['workspace']}")
             if task.get("domain"):
@@ -1055,14 +1058,22 @@ def _print_tidy(tidied: dict[str, Any]) -> None:
             print(f"  {entry['project_id']} {entry['id']} {entry['age_days']}d{task}: {entry['text']}")
 
 
+def _peak_cell(peak: Any) -> str:
+    """Thousands of tokens, with a marker past the smart zone."""
+    tokens = int(peak or 0)
+    if not tokens:
+        return ""
+    return f"{tokens // 1000}k" + ("!" if tokens > SMART_ZONE_TOKENS else "")
+
+
 def _print_ledger(report: dict[str, Any]) -> None:
     rows = report["rows"]
     scope = f" for {report['project_id']}" if report.get("project_id") else ""
     print(f"Ledger, last {report['days']:g} day(s){scope}: {len(rows)} worker task(s)")
     if not rows:
         return
-    print("| task | project | ticket | shape | status | to result | reviews | catches | asks | turns | ctx KB | out tokens | cost |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| task | project | ticket | shape | status | to result | reviews | catches | asks | turns | ctx KB | peak ctx | out tokens | cost |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for row in rows:
         cost = f"${row['cost_usd']:.2f}" if isinstance(row.get("cost_usd"), (int, float)) else ""
         minutes = f"{row['minutes_to_result']:g}m" if isinstance(row.get("minutes_to_result"), (int, float)) else ""
@@ -1071,6 +1082,7 @@ def _print_ledger(report: dict[str, Any]) -> None:
             f"{row['delivery']}{' (archived)' if row['archived'] else ''} | {minutes} | {row['review_rounds']} | "
             f"{row['review_catches']} | {row['questions'] + row['blockers'] + row['approvals']} | {row['turns']} | "
             f"{row['context_kb'] if row.get('context_kb') is not None else ''} | "
+            f"{_peak_cell(row.get('peak_context'))} | "
             f"{row['output_tokens']} | {cost} |"
         )
     totals = report["totals"]
@@ -1082,6 +1094,11 @@ def _print_ledger(report: dict[str, Any]) -> None:
         if totals.get("cost_usd") is not None
         else "not known (set model.prices.<model> to price transcripts)"
     )
+    if totals.get("past_smart_zone"):
+        print(
+            f"{totals['past_smart_zone']} task(s) ran a session past {SMART_ZONE_TOKENS // 1000}k tokens of context "
+            "(marked !): judgement generally falls off there; slice the work smaller or clear the session."
+        )
     print(
         f"totals: {totals['delivered']} delivered, {totals['failed']} failed, median time to result {median}, "
         f"{totals['review_rounds']} review round(s) with {totals['review_catches']} catch(es) "
@@ -1109,6 +1126,8 @@ def _print_inspect(report: dict[str, Any]) -> None:
         for finding in check.get("findings") or []:
             print(f"    shape check: {finding}")
     print(f"  policy: {task['delivery_policy']}")
+    if task.get("blocked_by"):
+        print(f"  blocked by: {', '.join(task['blocked_by'])} (launches once every one is delivered)")
     if task.get("context_bytes"):
         indexed = task.get("context_indexed") or []
         print(
@@ -1367,6 +1386,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="reasoning effort for this task; overrides the project pin and "
         "HELM_EFFORT. A runtime that cannot express it refuses rather than "
         "dropping it")
+    create.add_argument(
+        "--blocked-by", action="append", default=[], metavar="TASK_ID",
+        help="a task of the same project this one waits on; repeatable. Helm launches it only once every blocker is delivered",
+    )
     create.add_argument("--ticket",
         help="tracker id for this work; goes in the branch name so a human can find it")
     create.add_argument("--base",
@@ -1410,6 +1433,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     evidence_cmd.add_argument(
         "--cases", type=int, help="how many test cases actually ran, in total"
+    )
+    evidence_cmd.add_argument(
+        "--check", dest="check_name", help="the declared project check this run satisfies, by name"
     )
     evidence_cmd.add_argument(
         "--suite", action="append", default=[], metavar="NAME=COUNT",
@@ -3475,6 +3501,7 @@ def main(argv: list[str] | None = None) -> int:
                     effort=args.effort,
                     shape=args.shape,
                     shape_reason=args.shape_reason,
+                    blocked_by=args.blocked_by,
                     ticket=args.ticket,
                     no_domain=args.no_domain,
                     read_only=args.read_only,
@@ -3525,6 +3552,7 @@ def main(argv: list[str] | None = None) -> int:
                     exit_code=args.exit_code,
                     detail=detail or None,
                     cases=args.cases,
+                    check=args.check_name,
                 )
                 ran = recorded.get("cases")
                 print(
@@ -3644,6 +3672,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"  total: {total['turns']} turns, in={total['input_tokens']} "
                     f"out={total['output_tokens']} cache_read={total['cache_read_input_tokens']} "
                     f"cache_write={total['cache_creation_input_tokens']}"
+                    + (
+                        f", peak context {_peak_cell(total.get('peak_context'))}"
+                        if total.get("peak_context") else ""
+                    )
                     + (f", cost=${total['cost_usd']:.2f}" if total["cost_known"] else ", cost: not known")
                     + (
                         f"; unpriced: {', '.join(unpriced)} (set model.prices.<model>)"

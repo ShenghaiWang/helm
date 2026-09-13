@@ -719,6 +719,7 @@ class Coordinator(
         exit_code: int,
         detail: dict[str, Any] | None = None,
         cases: int | None = None,
+        check: str | None = None,
     ) -> dict[str, Any]:
         """Record a suite result as the evidence a reviewer actually reads.
 
@@ -748,6 +749,9 @@ class Coordinator(
             # status alone, so the count is the half of the evidence that
             # says what the exit status is about.
             "cases": executed,
+            # Which declared check this run satisfies, when the project
+            # declares any; matched by name, or by command when unnamed.
+            "check": _safe_text(check).strip() or None,
             "recorded_at": now(),
         }
         if detail:

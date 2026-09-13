@@ -117,7 +117,8 @@ helm tail <worker-id>         # a worker's decoded terminal output
 helm reflect [--hours N]      # recent evidence for a reflection on how Helm is working
 helm task cost <task-id>      # what a task's sessions consumed, from the runtimes' own transcripts; priced by model.prices when set
 helm task provenance <task-id> [--json]   # the provenance block a pull request body carries: task, agent, model, effort, reviews, suite
-helm ledger [--days N] [--project P] [--json]   # every worker task in the window: time to result, review rounds and catches, asks, tokens, cost
+helm task evidence <task-id> --tip <sha> --command '<cmd>' --exit <n> [--cases N] [--suite name=count] [--check name]   # record a run as evidence
+helm ledger [--days N] [--project P] [--json]   # every worker task in the window: time to result, review rounds and catches, asks, context handed over, peak context (! past 100k), tokens, cost
 helm state stats              # size of the live state document, counts, what could be archived
 helm state archive [--dry-run] [--reconcile] [TASK_ID ...]   # move settled records into state/archive/
 helm state tidy [--project P] [--dry-run]   # close the decisions and follow-ups nothing can act on; list stale follow-ups for your eye

@@ -242,6 +242,11 @@ SPLIT_ADVICE_LINES = 1500
 #: newest fit; earlier ones are counted and named, not silently dropped.
 LEARNED_KNOWLEDGE_BUDGET_BYTES = 6000
 
+#: The prompt size beyond which an agent's judgement is generally observed to
+#: fall off. Not a limit Helm enforces: a marker in the ledger, so a task
+#: whose session grew past it is one to look at rather than one to trust.
+SMART_ZONE_TOKENS = 100_000
+
 #: How much inherited base-domain knowledge a composed context carries in
 #: full. The smallest bases go first, so the budget buys the most guidance per
 #: byte; the rest are indexed by heading, with the command that reads one on
@@ -439,8 +444,7 @@ WHAT YOU OWN
   line the commander can check the result against, and an `Out of scope:`
   line saying what this round will not do; a proposal without those two is
   shown to the commander as thin, and thin proposals get skipped or sent
-  back. Then
-  -- do not spawn a worker yet. Once the commander confirms or explicitly
+  back. Do not spawn a worker yet. Once the commander confirms or explicitly
   skips it (you will see it decided on `helm project status`), propose the
   technical solution (approach, affected boundaries, verification, risks)
   with `--type solution` and wait for that same decision too. Only after both
@@ -450,6 +454,13 @@ WHAT YOU OWN
   read-only investigation is exempt: create that task with `--read-only` and
   skip the gates entirely, but never use `--read-only` for work that edits
   anything.
+- Slicing a goal into independently grabbable tasks and saying what blocks
+  what: `helm task create ... --blocked-by <task-id>` for a task that builds
+  on another's delivered change. Helm refuses to launch a blocked task until
+  its blockers are merged, so launch everything unblocked in parallel and
+  come back for the rest as deliveries land. Slice vertically: the first
+  task carries a thin path through every layer, so the whole flow gets
+  feedback before the rest is built on it.
 - Running the review loop, so a change is checked by someone other than its
   author before anyone is asked to trust it.
 - Keeping the project's record honest: `helm project note <id> "..."` at each

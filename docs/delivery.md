@@ -63,6 +63,25 @@ commander, with its id and age, so it is looked at rather than forgotten;
 That command is root-only, like the approvals: an agent that could close a
 decision would have decided it.
 
+## A project declares its checks; the worker runs them; Helm judges the record
+
+```json
+// projects/<id>/.helm/project.json
+{"checks": [
+  {"name": "unit", "command": "npm test", "cases": true},
+  {"name": "lint", "command": "npm run lint"},
+  "npm audit --audit-level=high"
+]}
+```
+
+A worker is handed the list with its task and the exact evidence command
+for each. Approval of a standard or critical task is refused until every
+declared check has a green record at the tip, recorded with `helm task
+evidence <task> --check <name> ...`; a check with `"cases": true` also needs
+a case count above zero. A small task is told to run them and is not gated.
+Helm runs none of them: a project's code is the worker's to execute, and
+Helm's part is the boundary and the record.
+
 ## The pull request carries its provenance
 
 `helm task provenance <task>` prints a short block for the PR body: which

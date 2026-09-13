@@ -1080,22 +1080,48 @@ class ProtectionMixin:
             required = bool(policy.get("evidence_required")) or (
                 shape == "standard" and self.preferences().evidence_standard == "require"
             )
+            declared = list(self._project(data, task["project_id"]).get("checks") or [])
+            head = _git(workspace, "rev-parse", "HEAD").strip()
+            reports = [
+                (message.get("payload") or {}).get("full_suite")
+                for message in data.get("messages", [])
+                if message.get("task_id") == task_id
+                and isinstance((message.get("payload") or {}).get("full_suite"), dict)
+            ]
+            green = [
+                report for report in reports
+                if head.startswith(str(report.get("tip") or "\0")) or str(report.get("tip") or "").startswith(head)
+            ]
+            if declared and shape != "small":
+                # The project's own checks, each with a green record at the
+                # tip; a check that asks for a case count is not satisfied by
+                # a run that says nothing about what ran. Helm ran none of
+                # them: the worker did, and the record is what is judged.
+                missing = []
+                for check in declared:
+                    satisfied = [
+                        report for report in green
+                        if int(report.get("exit", 1) or 0) == 0
+                        and (report.get("check") == check["name"] or report.get("command") == check["command"])
+                        and (not check.get("cases") or (isinstance(report.get("cases"), int) and report["cases"] > 0))
+                    ]
+                    if not satisfied:
+                        missing.append(check)
+                if missing:
+                    wanted = "; ".join(
+                        f"{check['name']} (`{check['command']}`{', with --cases' if check.get('cases') else ''})"
+                        for check in missing
+                    )
+                    raise SafetyError(
+                        f"the project declares checks with no green record for revision {head[:10]}: {wanted}. "
+                        f"The worker runs each and records it: helm task evidence {task_id} --tip {head[:10]} "
+                        "--check <name> --command '<command>' --exit 0 [--cases <n>]"
+                    )
             if required:
                 # A critical change is approved on evidence, not on a
                 # reviewer's word: the full suite's exit, recorded against
                 # the exact revision being approved -- and how many cases
                 # ran, because a suite that selected nothing exits green.
-                head = _git(workspace, "rev-parse", "HEAD").strip()
-                reports = [
-                    (message.get("payload") or {}).get("full_suite")
-                    for message in data.get("messages", [])
-                    if message.get("task_id") == task_id
-                    and isinstance((message.get("payload") or {}).get("full_suite"), dict)
-                ]
-                green = [
-                    report for report in reports
-                    if head.startswith(str(report.get("tip") or "\0")) or str(report.get("tip") or "").startswith(head)
-                ]
                 passed = [report for report in green if int(report.get("exit", 1) or 0) == 0]
                 if not passed:
                     raise SafetyError(

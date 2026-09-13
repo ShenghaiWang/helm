@@ -140,6 +140,13 @@ def _discovery_settings(project_root: Path) -> dict[str, Any]:
         result["base_branch"] = _validate_branch_name(
             settings["base_branch"], str(settings_file)
         )
+    # A project may declare the checks a change must pass before approval:
+    # the suite, a linter, a dependency audit. Helm hands them to the worker
+    # as the evidence it owes and gates approval on the record; it runs none
+    # of them. A check is a name and a command, and may say that its record
+    # must carry a case count (a suite that selected nothing exits green).
+    if "checks" in settings:
+        result["checks"] = _parse_checks(settings["checks"], str(settings_file))
     # A project may pin, allow, or deny its own task-varying skills. It is
     # guidance about that project's own files and nothing more: a skill
     # list cannot name another project, and it never widens what Helm may
@@ -165,6 +172,32 @@ def _discovery_settings(project_root: Path) -> dict[str, Any]:
             chosen[key] = [entry.strip() for entry in value if entry.strip()]
         result["skills"] = chosen
     return result
+
+
+def _parse_checks(declared: Any, where: str) -> list[dict[str, Any]]:
+    if not isinstance(declared, list):
+        raise HelmError(f"project settings checks must be a JSON list: {where}")
+    checks: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for entry in declared:
+        if isinstance(entry, str):
+            entry = {"name": entry.split()[0] if entry.split() else "", "command": entry}
+        if not isinstance(entry, dict):
+            raise HelmError(f"project settings checks entries must be strings or objects: {where}")
+        name = str(entry.get("name") or "").strip()
+        command = str(entry.get("command") or "").strip()
+        if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", name):
+            raise HelmError(f"project settings check needs a short name (letters, digits, . _ : -): {where}")
+        if not command or "\n" in command:
+            raise HelmError(f"project settings check {name!r} needs a one-line command: {where}")
+        if name in names:
+            raise HelmError(f"project settings checks name {name!r} twice: {where}")
+        cases = entry.get("cases", False)
+        if not isinstance(cases, bool):
+            raise HelmError(f"project settings check {name!r}: cases must be true or false: {where}")
+        names.add(name)
+        checks.append({"name": name, "command": command, "cases": cases})
+    return checks
 
 
 def _launch_runtime_id(profile: dict[str, Any], command: Sequence[str]) -> str | None:

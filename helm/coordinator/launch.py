@@ -416,6 +416,10 @@ class LaunchMixin:
                 "shape": task.get("shape") or "standard",
                 "shape_reason": task.get("shape_reason") or "",
                 "shape_means": shape_policy(task).get("means"),
+                # The checks this project declares. The worker runs each and
+                # records its result with the evidence command; Helm refuses
+                # approval without a green record for every one at the tip.
+                "checks": self._declared_checks(project, task),
             },
             "worker": {
                 "id": worker_id,
@@ -521,6 +525,44 @@ class LaunchMixin:
                 "done) and end your turn; never poll or sleep waiting for an answer."
             ),
         }
+
+    @staticmethod
+    def _declared_checks(project: dict[str, Any], task: dict[str, Any]) -> list[dict[str, Any]]:
+        declared = list(project.get("checks") or [])
+        if not declared:
+            return []
+        gated = (task.get("shape") or "standard") != "small"
+        return [
+            {
+                "name": check["name"],
+                "command": check["command"],
+                "cases": bool(check.get("cases")),
+                "record_with": (
+                    f"helm task evidence {task['id']} --tip <sha> --check {check['name']} "
+                    f"--command {shlex.quote(check['command'])} --exit <n>"
+                    + (" --cases <n>" if check.get("cases") else "")
+                ),
+                "gates_approval": gated,
+            }
+            for check in declared
+        ]
+
+    def _refuse_blocked(self, task_id: str) -> None:
+        """A task whose blockers are not delivered is not launched.
+
+        Its worktree is cut from the base branch, so work that has not
+        reached the base is not there to build on; launching anyway
+        produces a change against the wrong code and a merge nobody can
+        fast-forward. The refusal names what to deliver first.
+        """
+        data = self.store.load()
+        task = self._task(data, task_id)
+        waiting = self.open_blockers(data, task)
+        if waiting:
+            raise HelmError(
+                f"task {task_id} is blocked by {', '.join(waiting)}: deliver those first "
+                "(merged or pr-merged), then launch this one"
+            )
 
     def _reporting_contract(self, worker_id: str) -> dict[str, Any]:
         # A worker's environment is scrubbed and its cwd is the worktree, so
@@ -1424,6 +1466,7 @@ class LaunchMixin:
             self._apply_launch_overrides(task_id, domain=domain, agent=agent)
             command_args = self._optional_worker_command(command)
             self._preflight_launch(task_id, command_args)
+            self._refuse_blocked(task_id)
         except Exception:
             self._restore_launch_overrides(task_id, override_snapshot)
             raise
