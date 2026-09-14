@@ -60,6 +60,15 @@ class HealthMixin:
         r"credit balance is too low",
     )
 
+    #: Runtime notices that contain a signature's words without being a
+    #: failure. Claude Code prints the first when a turn ends while one of
+    #: its background shell commands is still running; the session is fine,
+    #: the command was simply dropped with the turn. A match whose excerpt
+    #: is one of these is skipped.
+    _BENIGN_NOTICES = (
+        r"didn't finish before the previous session ended",
+    )
+
     # A prompt is not a failure, but it is just as fatal in a pane nobody is
     # watching: the agent is alive, printing, and will wait forever. Runtime
     # flags stop most of these being asked at all; this catches the ones a
@@ -133,6 +142,8 @@ class HealthMixin:
                     # evidence of.
                     start = max(0, match.start() - 60)
                     excerpt = line[start:match.end() + 100].strip()
+                    if any(re.search(notice, excerpt, re.IGNORECASE) for notice in self._BENIGN_NOTICES):
+                        continue
                     if start > 0:
                         excerpt = f"...{excerpt}"
                     if excerpt not in found:

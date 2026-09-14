@@ -143,7 +143,13 @@ it waits. An answer, review findings, a continuation, a routed request, a
 gate decision or an authorization is the prompt that opens the next turn —
 `helm worker answer` reports `turned` — and nothing is ever typed. A worker
 is told this in its context: to ask, push a `question` and end the turn;
-when the work is done, push `result` and end.
+when the work is done, push `result` and end. It is also told that a
+background command does not outlive the turn and nothing re-invokes it when
+the command finishes, so every command whose result it needs runs in the
+foreground: two workers in one morning ended a turn "waiting to be woken"
+by a job that had died with the turn, and sat idle until a human noticed.
+Their runtime's notice about the dropped job is not read as a failure by
+the health check.
 
 Liveness is a pid and an exit code. A runner the machine killed — sleep, an
 OOM — is started again by the next message or by the watchdog's healing,

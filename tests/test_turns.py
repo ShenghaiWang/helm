@@ -75,6 +75,9 @@ class TurnsTests(HelmTestCase):
             context = json.loads(Path(worker["context_file"]).read_text())
             self.assertEqual(context["execution"]["mode"], "turns")
             self.assertIn("end your turn", context["execution"]["rules"])
+            # Two workers ended a turn waiting on a background command that
+            # nothing wakes them for; the contract has to say so in words.
+            self.assertIn("never end a turn waiting on one", context["execution"]["rules"])
             turns_dir = Path(worker["config_file"]).parent / "turns"
             self._wait_for(turns_dir / "1.json")
             first = json.loads((turns_dir / "1.json").read_text())

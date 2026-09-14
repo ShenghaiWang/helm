@@ -577,7 +577,10 @@ class LaunchMixin:
                 "arrives as the prompt that opens your next turn, with your full session "
                 "resumed. So: to ask, push a `question` (without --wait) and end your turn; "
                 "when a turn's work is done, push `status` (or `result` when the task is "
-                "done) and end your turn; never poll or sleep waiting for an answer."
+                "done) and end your turn; never poll or sleep waiting for an answer. "
+                "A background command does not survive the end of a turn, and nothing "
+                "re-invokes you when it finishes: run every command whose result you need "
+                "in the foreground, and never end a turn waiting on one."
             ),
         }
 

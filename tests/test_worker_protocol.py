@@ -785,6 +785,30 @@ class WorkerProtocolTests(HelmTestCase):
         # A narrow window excludes older activity rather than reporting it.
         self.assertEqual(self.coordinator.reflection_evidence(since_hours=0)["tasks_created"], 0)
 
+    def test_a_runtime_notice_about_a_dropped_background_job_is_not_a_failure(self) -> None:
+        """Claude Code prints "Background shell command didn't finish before
+        the previous session ended" when a turn ends with a job still running.
+        It carries the words of a failure signature and is not one; two
+        turns-mode workers were flagged erroring on it in one morning."""
+        root = self.repo("noticed")
+        project = self.coordinator.register_project("Noticed", str(root), project_id="noticed")
+        task = self.coordinator.create_task(project["id"], "finish a turn")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", "import time; time.sleep(300)"], wait=False
+        )
+        self.addCleanup(_terminate, worker.get("pid"))
+        self.coordinator.record_worker_message(worker["id"], "status", "working")
+        Path(worker["log_file"]).write_text(
+            '{"type":"system","subtype":"task_notification","summary":"Background shell command '
+            "didn't finish before the previous session ended\"}\n",
+            encoding="utf-8",
+        )
+        stale = time.time() - self.coordinator.SILENCE_SECONDS - 60
+        os.utime(worker["log_file"], (stale, stale))
+        health = {e["worker_id"]: e for e in self.coordinator.worker_health()}
+        self.assertNotEqual(health[worker["id"]]["verdict"], "erroring")
+        self.assertEqual(self.coordinator.worker_failures(worker["id"]), [])
+
     def test_a_worker_that_broke_in_its_own_session_is_noticed(self) -> None:
         root = self.repo("breaking")
         project = self.coordinator.register_project("Break", str(root), project_id="breaking")
