@@ -389,6 +389,30 @@ class Coordinator(
             "delivery_decision_project": False,
         }
 
+    def _live_work_under_lead(
+        self, data: dict[str, Any], lead: dict[str, Any]
+    ) -> list[str]:
+        """Running workers this lead started, by name, or an empty list.
+
+        Asked only when a lead reports a `result`, which is rare, so the sweep
+        over the worker table costs nothing in the common case.
+        """
+        found: list[str] = []
+        for candidate in data.get("workers", {}).values():
+            if candidate.get("status") != "running":
+                continue
+            if candidate.get("project_id") != lead.get("project_id"):
+                continue
+            task = data.get("tasks", {}).get(candidate.get("task_id")) or {}
+            if task.get("role") == "foreman":
+                continue
+            driver = self.driver_of_task(str(candidate.get("task_id") or ""), data=data)
+            if driver is not None and driver.get("id") == lead.get("id"):
+                found.append(
+                    f"{task_name(task, fallback=candidate['id'])} ({candidate['id']})"
+                )
+        return found
+
     def _ingest_worker_event(
         self,
         data: dict[str, Any],
@@ -436,6 +460,35 @@ class Coordinator(
                     {"outcome": settled, "conflicting": kind, "text": _safe_text(text)},
                 )
             return self._noop_event(task, worker, kind)
+        # A LEAD MAY NOT FINISH WHILE ITS OWN WORK IS STILL RUNNING. Its
+        # `result` ends its assignment, and a lead IS its unit of work -- so
+        # standing down with a live worker leaves that worker with nobody to
+        # answer it, review it, or raise what it needs. Under one driver per
+        # project there was at least a project-level driver left to catch it;
+        # now there is nothing, and the watchdog's repair costs a full re-brief
+        # of a lead that had the context and threw it away.
+        #
+        # Demoted rather than refused, because the harm here is losing the
+        # text. A lead's close-out prose is the handover, and a refusal would
+        # either discard it or push the lead into re-sending it. So the words
+        # are kept as the summary they actually are, the lead stays live, and
+        # it is told exactly what is still running. A lead that genuinely must
+        # stop is stood down by the root with `helm worker stop`, which is the
+        # deliberate path and stays deliberate.
+        if kind == "result" and task.get("role") == "foreman":
+            driving = self._live_work_under_lead(data, worker)
+            if driving:
+                names = ", ".join(driving)
+                kind = "status"
+                payload = {**(payload or {}), "summary": True, "kept_from": "result"}
+                text = (
+                    f"{_safe_text(text)}\n\n[Helm: recorded as a status, not a "
+                    f"result. You still have work running -- {names} -- and a "
+                    "lead that stands down leaves it with nobody to answer it, "
+                    "review it, or raise what it needs. Keep driving; report a "
+                    "result once it is done, or say it needs standing down and "
+                    "the root will do it.]"
+                )
         message = self._message(
             data, project, task, worker, kind, text, payload, status=requested_status
         )

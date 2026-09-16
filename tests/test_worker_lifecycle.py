@@ -436,6 +436,39 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         self.assertIn("killed by a signal", entry["detail"])
         self.assertNotIn("the session is alive", entry["detail"])
 
+    def test_a_lead_between_turns_is_idle_not_stalled(self) -> None:
+        """Between turns is not silence, and Helm already knows the difference.
+
+        A turns worker runs one process per turn and exits cleanly between
+        them, so there is no output, no process, and nothing in its pane --
+        which read as `stalled` and, in a panel listing live agents, as gone
+        altogether. The commander asked "did you kill it?" about a lead that
+        was working correctly.
+        """
+        _, task, worker = self._worker("betweenturns")
+        with self.coordinator.store.locked() as data:
+            live = data["workers"][worker["id"]]
+            live["execution_mode"] = "turns"
+            live["turns"] = [{"turn": 2, "exit": 0, "at": core.now()}]
+
+        def verdict_for():
+            return {
+                entry["worker_id"]: entry
+                for entry in self.coordinator.worker_health(liveness=lambda _w: True)
+            }[worker["id"]]
+
+        entry = verdict_for()
+        self.assertEqual(entry["verdict"], "between-turns")
+        self.assertIn("turn 2 ended cleanly", entry["detail"])
+        self.assertIn("idle, not stuck", entry["detail"])
+
+        # A prompt queued that no turn took IS a fault -- the one the old
+        # `stalled` verdict caught by accident -- and it is named as its own.
+        self.coordinator.deliver_turn(worker["id"], "carry on")
+        entry = verdict_for()
+        self.assertEqual(entry["verdict"], "runner-stopped")
+        self.assertIn("queued prompt(s) have not started a turn", entry["detail"])
+
     def test_a_worker_recorded_before_the_episode_fields_still_settles(self) -> None:
         """The scan survives only as a fallback, and only for those records."""
         _, task, worker = self._worker("legacy")

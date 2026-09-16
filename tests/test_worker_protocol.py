@@ -516,6 +516,56 @@ class WorkerProtocolTests(HelmTestCase):
         self.assertEqual(delivered[-1][0], second["id"])
         self.assertNotEqual(delivered[-1][0], first["id"])
 
+    def test_a_lead_cannot_finish_while_its_own_work_is_still_running(self) -> None:
+        """A lead IS its unit of work, so standing down orphans it.
+
+        Its `result` ends its assignment. With one driver per project there was
+        at least a project-level driver left to catch the worker; with one lead
+        per unit there is nothing, and the watchdog's repair costs a full
+        re-brief of a lead that had the context and threw it away.
+        """
+        root = self.repo("standdown")
+        project = self.coordinator.register_project(
+            "Stand down", str(root), project_id="standdown"
+        )
+        lead_task = self.coordinator.create_foreman_task(project["id"], ticket="TICKET-42")
+        lead = self.coordinator.prepare_external_worker(
+            lead_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            for gate, body in (
+                ("requirement", "goal: a unit; Done means: X; Out of scope: Y"),
+                ("solution", "approach: one; verification: tests"),
+            ):
+                self.coordinator.propose_gate(lead_task["id"], gate, body)
+                with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
+                    self.coordinator.decide_gate(lead_task["id"], gate, confirm=True, skip=False)
+            task = self.coordinator.create_task(project["id"], "the actual work")
+        coder = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""]
+        )
+
+        # Its close-out is KEPT -- that prose is the handover, and refusing it
+        # would either discard it or make the lead send it twice.
+        self.coordinator.record_worker_message(
+            lead["id"], "result", "Handing back: the push landed and I am done here."
+        )
+        data = self.coordinator.store.load()
+        self.assertEqual(data["workers"][lead["id"]]["status"], "running")
+        self.assertEqual(data["tasks"][lead_task["id"]]["status"], "running")
+        latest = [m for m in data["messages"] if m.get("worker_id") == lead["id"]][-1]
+        self.assertEqual(latest["kind"], "status")
+        self.assertIn("the push landed", latest["text"])
+        self.assertIn(coder["id"], latest["text"])
+        self.assertIn("recorded as a status, not a result", latest["text"])
+
+        # Once its work is done, it finishes normally.
+        self.coordinator.record_worker_message(coder["id"], "result", "the work is done")
+        self.coordinator.record_worker_message(lead["id"], "result", "Handing back for real.")
+        data = self.coordinator.store.load()
+        self.assertEqual(data["workers"][lead["id"]]["status"], "completed")
+        self.assertEqual(data["tasks"][lead_task["id"]]["status"], "completed")
+
     def test_a_worker_that_died_right_after_reporting_is_not_called_healthy(self) -> None:
         root = self.repo("vanishing")
         project = self.coordinator.register_project(

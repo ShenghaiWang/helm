@@ -750,7 +750,16 @@ def project_glyph(color: str) -> str:
 #: which no human can act on. `stalled` means gone dark and is absent here on
 #: purpose. Defined once: this set had drifted into four copies that disagreed.
 HEALTHY_WORKER_VERDICTS = frozenset(
-    {"healthy", "settled", "reported", "starting", "working", "driving", "quiet"}
+    {
+        "healthy", "settled", "reported", "starting", "working", "driving",
+        "quiet",
+        # Resting between turns is the normal state of a turns worker, not a
+        # fault: it runs one process per turn and exits cleanly in between. On
+        # the attention list it would be the loudest possible false alarm --
+        # one line per lead, forever, about nothing. `runner-stopped` is the
+        # neighbouring state that IS a fault and is deliberately not here.
+        "between-turns",
+    }
 )
 
 

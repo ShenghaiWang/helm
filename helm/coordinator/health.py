@@ -296,6 +296,18 @@ class HealthMixin:
                     answered_at = index
             awaiting = asked_at > answered_at
             broke = self.worker_failures(worker["id"])
+            # (last turn number, queued prompts) when this worker is a turns
+            # worker resting between turns, else None. Read from the record and
+            # the queue file rather than inferred from silence, because silence
+            # is exactly what this state looks like.
+            between_turns = None
+            if worker.get("execution_mode") == "turns" and not delivered:
+                turns = [t for t in (worker.get("turns") or []) if isinstance(t, dict)]
+                last_turn = turns[-1] if turns else None
+                if last_turn is not None and last_turn.get("exit") == 0:
+                    between_turns = (
+                        last_turn.get("turn"), self.queued_turn_count(worker["id"])
+                    )
             # A NEGATIVE EXIT IS A SIGNAL, AND A SIGNAL IS DEATH. Liveness is
             # probed from the pane, which outlives the process inside it: a
             # worker SIGKILLed at 16:10 was reported alive and merely quiet for
@@ -403,6 +415,31 @@ class HealthMixin:
                     "reported",
                     "delivered a terminal message; session still open",
                 )
+            elif between_turns is not None:
+                # BETWEEN TURNS IS NOT SILENCE. A turns worker runs one process
+                # per turn and exits cleanly between them, so there is no
+                # output, no process, and nothing in its pane -- which read as
+                # `stalled` and, in a panel that lists live agents, as gone
+                # altogether. The commander asked "did you kill it?" about a
+                # lead that was working correctly, which is the cost of making
+                # somebody infer a state Helm already knows.
+                ended, queued = between_turns
+                if queued:
+                    # A prompt is waiting and no turn took it: this IS a fault,
+                    # and the one the old `stalled` verdict caught by accident.
+                    verdict, detail = (
+                        "runner-stopped",
+                        f"turn {ended} ended cleanly but {queued} queued prompt(s) "
+                        "have not started a turn, so its runner is not picking "
+                        "them up; restart it with helm worker answer or heal it",
+                    )
+                else:
+                    verdict, detail = (
+                        "between-turns",
+                        f"turn {ended} ended cleanly and nothing is queued for it, "
+                        "so it is waiting for its next prompt. A turns worker "
+                        "runs no process between turns; this is idle, not stuck",
+                    )
             elif stale_output and stale_reports:
                 within_grace = (
                     output_idle is not None

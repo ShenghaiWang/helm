@@ -115,6 +115,21 @@ class WorkersMixin:
         _write_private_text(path, json.dumps(queued) + "\n")
         return path
 
+    def queued_turn_count(self, worker_id: str) -> int:
+        """How many prompts are waiting to open this worker's next turn.
+
+        Zero and "waiting for its next prompt" are the same sentence; nonzero
+        and no turn started is a runner that is not picking them up, which is
+        a fault. Told apart by reading the queue rather than by how long the
+        worker has been quiet, because both look identically quiet.
+        """
+        path = self.turns_dir(worker_id) / "next.json"
+        with contextlib.suppress(OSError, ValueError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                return len(loaded)
+        return 0
+
     def stop_turns(self, worker_id: str) -> None:
         """Tell a turns runner to exit once its current turn ends."""
         directory = self.turns_dir(worker_id)
