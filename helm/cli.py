@@ -701,6 +701,21 @@ def _when_label(stamp: str | None = None, seconds: float | None = None) -> str:
     return f"{local:%m-%d %H:%M} {_age_label(stamp, seconds)}"
 
 
+def _age_seconds(stamp: str | None) -> float:
+    """How old an ISO timestamp is, or 0 when it cannot be read.
+
+    Zero for an unreadable stamp on purpose: this gates whether something is
+    old enough to complain about, and complaining about a record whose age
+    nobody can establish is exactly the false alarm the gate exists to stop.
+    """
+    if not stamp:
+        return 0.0
+    with contextlib.suppress(ValueError):
+        moment = _dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return _dt.datetime.now(_dt.timezone.utc).timestamp() - moment.timestamp()
+    return 0.0
+
+
 def _age_label(stamp: str | None = None, seconds: float | None = None) -> str:
     """How long this has been waiting, compactly, for the front of a line.
 
@@ -3184,6 +3199,16 @@ def _eval_command(coordinator: Coordinator, args: argparse.Namespace) -> int:
 #: enough that a session parked on nothing is noticed inside a turn.
 INBOX_UNREAD_STALL_SECONDS = 300.0
 
+#: How long a routed request may sit before the attention list says a driver
+#: has not acted on it. Without this it fired at 3, 9, 14, 17 and 31 seconds:
+#: a driver cannot plausibly have acted in three seconds -- the request is
+#: queued as the prompt of its next turn and the runner has not started it --
+#: so every line was an assertion that something was being ignored when
+#: nothing was. That is the expensive kind of wrong on the one channel the
+#: commander is told to trust: a list that cries wolf is a list that gets
+#: skimmed, and then the real item in it is missed too.
+FOREMAN_REQUEST_GRACE_SECONDS = 180.0
+
 #: What `worker answer` says about how the note reached its reader. Each is
 #: a fact about what Helm did, not a guess about what the agent saw.
 _INBOX_DELIVERY_WORDS = {
@@ -4623,6 +4648,12 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
         for request in coordinator.pending_foreman_requests(
             project["id"], data=snapshot
         ):
+            # Young enough that it is still queued rather than ignored. The
+            # record keeps it either way -- `helm project status` shows it to
+            # the driver immediately, which is how the driver reads it at all.
+            # This is the ATTENTION list, and it is for what has gone wrong.
+            if _age_seconds(request.get("at")) < FOREMAN_REQUEST_GRACE_SECONDS:
+                continue
             glyph = glyphs.get(project["id"], "")
             first = next(
                 (line.strip() for line in request["text"].splitlines() if line.strip()),

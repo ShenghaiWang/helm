@@ -412,6 +412,30 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         if worker["id"] in settled:
             self.assertEqual(settled[worker["id"]]["verdict"], "reported")
 
+    def test_a_turn_killed_by_a_signal_is_not_reported_as_a_live_session(self) -> None:
+        """Liveness is probed from the pane, and a pane outlives its process.
+
+        A worker SIGKILLed at 16:10 was reported alive and merely quiet for
+        three and a half hours. "The session is alive" about a dead process is
+        an assertion of fact that is simply wrong, on the one channel the
+        commander is told to trust. The turns runner records each turn's exit,
+        so there is a direct observation to prefer over the proxy.
+        """
+        _, task, worker = self._worker("killed-turn")
+        with self.coordinator.store.locked() as data:
+            live = data["workers"][worker["id"]]
+            live["execution_mode"] = "turns"
+            live["turns"] = [{"turn": 1, "exit": -9, "at": core.now()}]
+
+        health = {
+            entry["worker_id"]: entry
+            for entry in self.coordinator.worker_health(liveness=lambda _w: True)
+        }
+        entry = health[worker["id"]]
+        self.assertEqual(entry["verdict"], "died")
+        self.assertIn("killed by a signal", entry["detail"])
+        self.assertNotIn("the session is alive", entry["detail"])
+
     def test_a_worker_recorded_before_the_episode_fields_still_settles(self) -> None:
         """The scan survives only as a fallback, and only for those records."""
         _, task, worker = self._worker("legacy")

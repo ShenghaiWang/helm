@@ -11,6 +11,7 @@ a bug in the handler itself would actually be caught.
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import io
 import os
 import shlex
@@ -27,6 +28,12 @@ from helm.herdr import HerdrAdapter
 from helm.naming import task_name
 
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT
+
+
+def _iso_seconds_ago(seconds: float) -> str:
+    """A UTC timestamp in Helm's own format, `seconds` in the past."""
+    moment = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class RouteCommandTests(HelmTestCase):
@@ -517,6 +524,22 @@ class RouteCommandTests(HelmTestCase):
         self.assertNotIn("has not acted on", pending_text())
 
         coordinator.record_worker_message(foreman["id"], "answer", "now investigate TICKET-77")
+
+        # Not yet: a driver cannot have acted in the second since this landed.
+        # The request is queued as the prompt of its next turn and the runner
+        # has not started it, so a line here would say something was being
+        # ignored when nothing was. That fired at 3, 9, 14, 17 and 31 seconds
+        # in practice, on the one channel the commander is told to trust.
+        self.assertNotIn("has not acted on", pending_text())
+
+        # Aged past the grace period, it is a real stall and it surfaces.
+        def age_the_request(seconds: float) -> None:
+            with coordinator.store.locked() as data:
+                for message in data["messages"]:
+                    if "TICKET-77" in message.get("text", ""):
+                        message["created_at"] = _iso_seconds_ago(seconds)
+
+        age_the_request(cli.FOREMAN_REQUEST_GRACE_SECONDS + 60)
         surfaced = pending_text()
         self.assertIn("has not acted on", surfaced)
         self.assertIn("TICKET-77", surfaced)

@@ -296,6 +296,20 @@ class HealthMixin:
                     answered_at = index
             awaiting = asked_at > answered_at
             broke = self.worker_failures(worker["id"])
+            # A NEGATIVE EXIT IS A SIGNAL, AND A SIGNAL IS DEATH. Liveness is
+            # probed from the pane, which outlives the process inside it: a
+            # worker SIGKILLed at 16:10 was reported alive and merely quiet for
+            # three and a half hours, and "the session is alive" about a dead
+            # process is an assertion of fact that is simply wrong. The turns
+            # runner writes each turn's exit, so for a turns worker there is a
+            # direct observation to prefer over the proxy.
+            killed_turn = None
+            if worker.get("execution_mode") == "turns":
+                turns = [t for t in (worker.get("turns") or []) if isinstance(t, dict)]
+                last_turn = turns[-1] if turns else None
+                if last_turn is not None and isinstance(last_turn.get("exit"), int):
+                    if last_turn["exit"] < 0:
+                        killed_turn = last_turn
             if finished:
                 # The process is already over; Helm simply has not caught up.
                 verdict, detail = "finished", "process exited; poll to settle the record"
@@ -320,6 +334,15 @@ class HealthMixin:
                         "directory on startup, that write fails immediately "
                         "and can look exactly like this"
                     )
+            elif killed_turn is not None and not delivered:
+                # Said as the observation it is, with the evidence in the line.
+                verdict, detail = (
+                    "died",
+                    f"turn {killed_turn.get('turn')} exited {killed_turn['exit']} "
+                    "(killed by a signal) and no later turn ran; its pane may "
+                    "still be open, which is not the same as the session being "
+                    "alive. Any work it did is uncommitted in its worktree",
+                )
             elif not delivered and self.worker_prompts(worker["id"]):
                 verdict, detail = (
                     "waiting-on-a-prompt",
@@ -374,11 +397,19 @@ class HealthMixin:
                         f"no protocol message and no terminal output for {int(output_idle)}s"
                     )
                     if alive is True:
-                        # Say what is known and stop there. Liveness rules out
-                        # "it died"; it does NOT distinguish a wedged agent from
-                        # one waiting on a slow model, and asserting "stuck"
-                        # sends a reader to kill work that was merely thinking.
-                        detail += "; the session is alive, so it is slow, wedged or looping, not gone"
+                        # SAY THE PROXY, NEVER THE CONCLUSION. What was checked
+                        # is the pane, and a pane outlives the process inside
+                        # it -- so "the session is alive" was a claim the check
+                        # cannot support, and it was wrong about a worker that
+                        # had been killed hours earlier. What liveness does
+                        # rule out is Helm having lost the session; it does not
+                        # distinguish a wedged agent from one waiting on a slow
+                        # model, and asserting "stuck" sends a reader to kill
+                        # work that was merely thinking.
+                        detail += (
+                            "; its pane is still there, which rules out Helm "
+                            "having lost it but says nothing about the process"
+                        )
                     verdict = "stalled"
             elif reported_idle is not None and reported_idle <= threshold:
                 verdict, detail = "healthy", "reporting"
