@@ -360,17 +360,39 @@ class HealthMixin:
                     f"its output reports failure and it has not reported: {broke[-1]}",
                 )
             elif held:
-                pending = hold.get("status") == "authorized-pending-delivery"
-                verdict, detail = (
-                    "authorized-undelivered" if pending else "awaiting-approval",
-                    (
-                        f"{hold.get('action')} was authorized and has not reached it; "
-                        "re-deliver with helm approval release"
-                        if pending
-                        else f"paused on {hold.get('action')}; the commander authorizes "
-                        "it with helm approval release"
-                    ),
-                )
+                # THREE STATES, NOT TWO. "Authorized" and "the session has it"
+                # and "the session has spent it" are different facts, and this
+                # read the first as all three: a hold stays
+                # `authorized-pending-delivery` until action-start consumes it,
+                # so an authorization that HAD arrived was still reported as
+                # "has not reached it" -- wrong on nine of eleven occurrences,
+                # each one sending the commander to re-release a decision that
+                # had landed, which mints a second authorization record for one
+                # decision in the audit trail that is meant to be the cleanest
+                # thing here. `delivery.delivered_at` is the fact that settles
+                # it, and it was already being recorded.
+                authorized = hold.get("status") == "authorized-pending-delivery"
+                arrived = bool((hold.get("delivery") or {}).get("delivered_at"))
+                action = hold.get("action")
+                if authorized and arrived:
+                    verdict, detail = (
+                        "authorized-unspent",
+                        f"{action} was authorized and the session has it; it spends "
+                        f"the authorization with helm worker action-start {worker['id']} "
+                        "immediately before acting",
+                    )
+                elif authorized:
+                    verdict, detail = (
+                        "authorized-undelivered",
+                        f"{action} was authorized and has not reached the session; "
+                        "re-deliver with helm approval release",
+                    )
+                else:
+                    verdict, detail = (
+                        "awaiting-approval",
+                        f"paused on {action}; the commander authorizes it with "
+                        "helm approval release",
+                    )
             elif awaiting:
                 verdict, detail = (
                     "awaiting-answer",

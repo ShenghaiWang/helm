@@ -5256,7 +5256,7 @@ def _cmd_approval(ctx: _Context, args: argparse.Namespace) -> int | None:
         # the task stays paused until the session itself acknowledges by
         # spending the ticket, so a failed delivery is a retry rather
         # than an authorization nobody received.
-        delivered = False
+        delivered = ""
         with contextlib.suppress(HelmError, OSError):
             adapter = HerdrAdapter(coordinator)
             if adapter.session_reachable(worker_id):
@@ -5268,10 +5268,20 @@ def _cmd_approval(ctx: _Context, args: argparse.Namespace) -> int | None:
                 coordinator.record_worker_message(worker_id, "answer", message)
             with contextlib.suppress(HelmError, OSError):
                 coordinator.mark_hold_delivered(args.task_id, delivered=True)
+        # SAY WHICH IT WAS. "delivered" was doing two jobs: it read as "the
+        # worker has it" and meant "handed to the transport". A turns worker's
+        # message is the prompt its NEXT turn opens with, so nothing has been
+        # received yet -- and the operator, told `[delivered]`, then met a
+        # watch line a minute later saying the opposite.
+        arrival = {
+            "typed": "delivered: the session took it",
+            "turned": "queued as the prompt its next turn opens with",
+            "nudged": "queued; the session was pointed at its inbox",
+            "watched": "queued; a live watch on its inbox will wake it",
+        }.get(str(delivered), "NOT delivered")
         print(
             f"Authorized {args.action} for task {task['id']} [{task['status']}] "
-            f"worker={worker_id} "
-            f"[{'delivered' if delivered else 'NOT delivered'}]"
+            f"worker={worker_id} [{arrival}]"
         )
         if authorization.get("grant_id"):
             print(f"  Authority: standing grant {authorization['grant_id']}")

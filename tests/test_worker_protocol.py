@@ -1253,6 +1253,10 @@ class LiveButSilentWorkerTests(HelmTestCase):
         The verdict must not claim more than liveness proves: a silent live
         worker may be wedged OR waiting on a slow model, and calling it stuck
         is how a reader is talked into killing work that was only thinking.
+
+        Nor may it claim more than the PROBE proves. What is checked is the
+        pane, and a pane outlives the process inside it -- so the line says
+        what was observed and what that rules out, and stops there.
         """
         worker = self._paneless("runaway")
         self._age(worker, 4_000)
@@ -1263,7 +1267,12 @@ class LiveButSilentWorkerTests(HelmTestCase):
         }
         entry = health[worker["id"]]
         self.assertEqual(entry["verdict"], "stalled")
-        self.assertIn("slow, wedged or looping, not gone", entry["detail"])
+        self.assertIn("no protocol message and no terminal output", entry["detail"])
+        self.assertIn("its pane is still there", entry["detail"])
+        self.assertIn("says nothing about the process", entry["detail"])
+        # Never as a claim about the session itself: a worker killed hours
+        # earlier was reported alive on exactly this line.
+        self.assertNotIn("the session is alive", entry["detail"])
 
     def test_a_provider_that_says_the_session_is_gone_settles_it_as_died(self) -> None:
         worker = self._paneless("gone")

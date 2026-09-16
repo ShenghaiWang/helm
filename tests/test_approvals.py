@@ -422,6 +422,40 @@ class ApprovalTests(HelmTestCase):
         self.assertIn("the staged index", message)
         self.assertNotIn(revision, message)
 
+    def test_an_authorization_that_arrived_is_not_reported_as_undelivered(self) -> None:
+        """"Authorized", "the session has it" and "it spent it" are three facts.
+
+        The verdict read the first as all three: a hold stays
+        `authorized-pending-delivery` until action-start consumes it, so an
+        authorization that HAD arrived still said "has not reached it" -- wrong
+        on nine of eleven occurrences. Each one sent the commander to re-release
+        a decision that had landed, which mints a second authorization record
+        for one decision in the audit trail meant to be the cleanest thing here.
+        """
+        project, task, worker = self._paused_on_approval("arrived")
+
+        def verdict_for() -> dict:
+            return {
+                entry["worker_id"]: entry
+                for entry in self.coordinator.worker_health(liveness=lambda _w: True)
+            }[worker["id"]]
+
+        self.assertEqual(verdict_for()["verdict"], "awaiting-approval")
+
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        # Authorized, but nothing has told the session yet.
+        entry = verdict_for()
+        self.assertEqual(entry["verdict"], "authorized-undelivered")
+        self.assertIn("has not reached the session", entry["detail"])
+
+        # Once it has arrived, the thing waiting is the session spending it.
+        self.coordinator.mark_hold_delivered(task["id"], delivered=True)
+        entry = verdict_for()
+        self.assertEqual(entry["verdict"], "authorized-unspent")
+        self.assertIn("the session has it", entry["detail"])
+        self.assertNotIn("has not reached", entry["detail"])
+        self.assertIn("action-start", entry["detail"])
+
     def test_a_session_can_take_back_its_own_unspent_request(self) -> None:
         """Every other exit from an open hold costs a root intervention.
 
