@@ -313,11 +313,12 @@ class ReviewTests(HelmTestCase):
     def test_the_reviewer_brief_forbids_rerunning_the_full_suite(self) -> None:
         """Reviewer guidance must prohibit duplicated full-suite runs.
 
-        The author is the one required to run and report the full unit
-        suite; the reviewer's brief must say plainly not to rerun it, that
-        focused/risk-targeted tests are the reviewer's own allowance, and
-        that missing/stale/masked/failed author evidence is a finding, not
-        something the reviewer resolves by running the suite itself.
+        The author runs the tests the change can affect and reports them;
+        the whole suite is CI's job on the pull request. The reviewer's
+        brief must say plainly not to run a suite, that focused/risk-targeted
+        tests are the reviewer's own allowance, that a missing full-suite run
+        is never the finding, and that missing/stale/masked/failed author
+        evidence is a finding the AUTHOR fixes.
         """
         root = self.repo("noduprun")
         project = self.coordinator.register_project(
@@ -329,11 +330,11 @@ class ReviewTests(HelmTestCase):
 
         brief = self._captured_reviewer_brief(task)
 
-        self.assertIn("already ran and reported the FULL unit suite", brief)
-        self.assertIn("Do NOT rerun the full suite", brief)
+        self.assertIn("ran the tests the change can affect", brief)
+        self.assertIn("Do NOT run the full suite", brief)
+        self.assertIn("its absence is NOT a finding", brief)
         self.assertIn("focused, risk-targeted tests", brief)
-        self.assertIn("do not run the suite yourself", brief)
-        self.assertIn("report that as a finding instead", brief)
+        self.assertIn("let the author fix and re-report it", brief)
 
     def test_the_reviewer_brief_quotes_the_authors_reported_full_suite_evidence(self) -> None:
         """The reviewer must be able to judge the author's own full-suite report.
@@ -1028,7 +1029,7 @@ class ReviewTests(HelmTestCase):
         for mandatory in (
             "FIRST WORD",
             "APPROVED or CHANGES-REQUESTED",
-            "Do NOT rerun the full suite",
+            "Do NOT run the full suite",
             "code-review domain",
         ):
             self.assertIn(mandatory, brief, mandatory)

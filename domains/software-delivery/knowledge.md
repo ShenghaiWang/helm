@@ -74,3 +74,8 @@ an end-to-end test runner, mobile simulators. Anything of that shape here is an
 **example filling a role**, not a requirement: read "review surface",
 "tracker", "verification tool", and "runtime environment", and bind each to
 whatever the project actually uses.
+## Approved learning: lp-5db3b8f6e5e3
+<!-- helm-learning: {"approved_at":"2026-09-14T23:11:10Z","approved_by":"user","confidence":1.0,"created_at":"2026-09-14T23:11:10Z","domain_id":"software-delivery","proposal_id":"lp-5db3b8f6e5e3"} -->
+- Fact: Before cleaning a task up, ask the remote whether its pull request is merged rather than trusting Helm's own delivery record. The commander merges PRs himself and does not always say so, so a task can sit at pr-open while the work is long since on main. A merged PR proves delivery and makes the worktree, branch and worker dirs safe residue. The converse matters more: an open or closed-unmerged PR is NOT delivered, and its branch may hold the only copy of unmerged commits.
+- Rationale: Commander's instruction, 2026-09-15, his words: 'sometimes, I merge the PR and forget to tell you, which might lost the opportunity to clean it up. when you do cleanup, can you check, if the pr merged, you can safe to clean local setup up'. The gap is one-directional -- Helm learns pr-merged only when told, so a human merge leaves the record stale and the residue uncleaned forever.
+<!-- /helm-learning: lp-5db3b8f6e5e3 -->

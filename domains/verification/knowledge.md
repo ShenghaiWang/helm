@@ -236,3 +236,8 @@ code — red before the fix, green after.
 
 Write that test the first time a model changes, not the first time an install
 crashes.
+## Approved learning: lp-328cd0190ff0
+<!-- helm-learning: {"approved_at":"2026-09-14T03:00:20Z","approved_by":"user","confidence":1.0,"created_at":"2026-09-14T03:00:20Z","domain_id":"verification","proposal_id":"lp-328cd0190ff0"} -->
+- Fact: Run only the unit tests the change can affect, never the whole suite. Pick the test files that cover the changed files and the code that imports them, run those, and report their commands and exit codes as the evidence. CI runs the full suite on the pull request; a local full-suite run costs many minutes and tells a reviewer nothing the targeted run did not. This holds whatever the task's shape says.
+- Rationale: Commander, 2026-09-14: a thirty-line change to one file spent over ten minutes on 75,000 tests while he waited for the PR.
+<!-- /helm-learning: lp-328cd0190ff0 -->
