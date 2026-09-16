@@ -217,12 +217,61 @@ class ProtectionMixin:
 
     @classmethod
     def _binding_of(cls, snapshot: dict[str, Any] | None) -> dict[str, Any]:
-        """A snapshot reduced to what an authorization actually covers."""
+        """A snapshot reduced to the parts an authorization compares by equality.
+
+        Artifacts are excluded here and compared by `_artifacts_intact`
+        instead, because the rule for them is not equality -- see there.
+        """
         return {
             key: value
             for key, value in (snapshot or {}).items()
             if key not in cls._UNBOUND_SNAPSHOT_KEYS
         }
+
+    @staticmethod
+    def _artifacts_intact(
+        approved: dict[str, Any] | None, current: dict[str, Any] | None
+    ) -> bool:
+        """Does every artifact the commander was shown still have those bytes?
+
+        THE DECLARATION AND THE CONTENT ARE DIFFERENT FACTS, and binding them
+        together was wrong in both directions.
+
+        Binding the whole artifact list by equality made FILING evidence
+        cancel the approval it was waiting on: the list grew, the snapshot
+        differed, the authorization died. That is the behaviour the rest of
+        Helm asks for, punished.
+
+        But dropping the list entirely -- the first fix -- reopened the exact
+        hole the content binding exists to close. An IGNORED file outside a
+        declared delivery folder is invisible to every other component: `git
+        ls-files --others --exclude-standard` skips it and `git diff HEAD`
+        never sees it. So an agent could declare one as an artifact, have the
+        commander approve a publish, then rewrite every byte of it, and
+        `action-start` would re-hash a snapshot that had not changed. That is
+        the failure the original binding comment describes almost word for
+        word: "the authorization to publish one file silently covered a
+        different one".
+
+        So the rule is neither equality nor absence. Every artifact present
+        when the commander decided must still be there with the same digest;
+        artifacts added since are ignored. Filing evidence stays free, and
+        tampering with approved evidence still refuses.
+        """
+        was = {
+            entry.get("id"): entry.get("digest")
+            for entry in ((approved or {}).get("artifacts") or [])
+        }
+        if not was:
+            return True
+        now = {
+            entry.get("id"): entry.get("digest")
+            for entry in ((current or {}).get("artifacts") or [])
+        }
+        # A missing id is a DELETED artifact, and it fails the same way a
+        # rewritten one does: what the commander approved is no longer there.
+        return all(artifact in now and now[artifact] == digest
+                   for artifact, digest in was.items())
 
     @classmethod
     def _snapshot_difference(
@@ -253,6 +302,19 @@ class ProtectionMixin:
                     moved.append(f"{phrase} (same count, different contents)")
             else:
                 moved.append(phrase)
+        if not cls._artifacts_intact(approved, current):
+            # Named specifically, because "an artifact changed" sends a reader
+            # somewhere completely different from "the working tree changed".
+            was = {e.get("id"): e.get("digest") for e in (approved.get("artifacts") or [])}
+            now = {e.get("id"): e.get("digest") for e in (current.get("artifacts") or [])}
+            gone = [a for a in was if a not in now]
+            rewritten = [a for a in was if a in now and now[a] != was[a]]
+            if rewritten:
+                moved.append(
+                    f"the contents of {len(rewritten)} approved artifact(s)"
+                )
+            if gone:
+                moved.append(f"{len(gone)} approved artifact(s) no longer declared")
         for key in set(approved) | set(current):
             if key in dict(cls._SNAPSHOT_COMPONENTS) or key in cls._UNBOUND_SNAPSHOT_KEYS:
                 continue
@@ -879,7 +941,10 @@ class ProtectionMixin:
             # whatever the worktree has become since. Rebinding here silently
             # authorized a revision nobody had read.
             recorded = hold.get("snapshot")
-            if recorded and self._binding_of(current) != self._binding_of(recorded):
+            if recorded and (
+                self._binding_of(current) != self._binding_of(recorded)
+                or not self._artifacts_intact(recorded, current)
+            ):
                 moved = self._snapshot_difference(recorded, current)
                 self._move_hold(
                     data, project, task, hold, "abandon",
@@ -1041,7 +1106,10 @@ class ProtectionMixin:
             if authorization.get("ticket_consumed_at"):
                 raise SafetyError("this authorization has already been spent")
             approved = authorization.get("snapshot") or hold.get("snapshot")
-            if approved and self._binding_of(current) != self._binding_of(approved):
+            if approved and (
+                self._binding_of(current) != self._binding_of(approved)
+                or not self._artifacts_intact(approved, current)
+            ):
                 moved = self._snapshot_difference(approved, current)
                 self._move_hold(
                     data, project, task, hold, "invalidate",

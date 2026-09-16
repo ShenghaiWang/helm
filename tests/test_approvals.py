@@ -401,6 +401,47 @@ class ApprovalTests(HelmTestCase):
         started = self.coordinator.start_authorized_action(worker["id"])
         self.assertEqual(started["action"], "publish")
 
+    def test_rewriting_an_approved_artifact_still_refuses(self) -> None:
+        """The hole the first version of the artifact fix opened.
+
+        Taking artifacts out of the binding stopped filing evidence from
+        cancelling an approval -- and reopened the exact failure the content
+        binding exists to close. An IGNORED file outside a declared delivery
+        folder is invisible to every other component: `ls-files --others
+        --exclude-standard` skips it and `git diff HEAD` never sees it. So its
+        bytes could be rewritten under an approval and nothing would notice,
+        which is the original comment's own words: "the authorization to
+        publish one file silently covered a different one".
+        """
+        project, task, worker = self._paused_on_approval("tamper")
+        workspace = Path(task["workspace"])
+        # Ignored, so no other part of the snapshot can see it.
+        (workspace / ".gitignore").write_text("render.bin\n", encoding="utf-8")
+        (workspace / "render.bin").write_bytes(b"approved bytes")
+        for command in (
+            ["git", "-C", str(workspace), "add", ".gitignore"],
+            ["git", "-C", str(workspace), "commit", "-qm", "ignore the render"],
+        ):
+            subprocess.run(command, check=True)
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "render", payload={"path": "render.bin"}
+        )
+        # Prove the premise: the other components cannot see this file at all.
+        snapshot = self.coordinator._snapshot_now(task["id"])
+        self.assertNotIn("render.bin", [e["path"] for e in snapshot["untracked"]])
+        self.assertIn("render.bin", [e["path"] for e in snapshot["artifacts"]])
+
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready", payload={"action": "publish"}
+        )
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+
+        # Every byte rewritten, nothing else touched.
+        (workspace / "render.bin").write_bytes(b"different bytes")
+        with self.assertRaises(SafetyError) as caught:
+            self.coordinator.start_authorized_action(worker["id"])
+        self.assertIn("artifact", str(caught.exception))
+
     def test_a_refusal_names_the_component_that_moved(self) -> None:
         """A refusal that misdescribes itself teaches distrust of correct ones.
 
