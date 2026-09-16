@@ -35,6 +35,7 @@ from ..git import (
     _has_head,
     _resolve_base_branch,
 )
+from ..naming import name_from
 from ..paths import _private_dir, canonical, inside, overlaps
 from ..values import (
     DELIVERED_TASK_STATES,
@@ -497,6 +498,7 @@ class LifecycleMixin:
         role: str = "worker",
         reviews: str | None = None,
         ticket: str | None = None,
+        title: str | None = None,
         read_only: bool = False,
         base: str | None = None,
         new: bool = False,
@@ -513,6 +515,11 @@ class LifecycleMixin:
         # ref, so an unusable one must fail here rather than at worktree
         # creation with a git error nobody can map back to the input.
         ticket = _validate_ticket_id(ticket, "task") if ticket else None
+        # Sanitized rather than validated: a title is display-only and never
+        # reaches a git ref, so whatever comes in leaves as lowercase words
+        # joined by dashes. Nothing here can carry structure a terminal or a
+        # log line would read.
+        title = name_from(title) or None
         model = _validate_model_id(model, "task") if model else None
         shape = _validate_shape(shape, "task") if shape else "standard"
         # Same reason as the ticket above: this becomes a git ref, so a bad
@@ -739,6 +746,12 @@ class LifecycleMixin:
                         # Recorded as well as put in the branch so a reader
                         # does not have to parse it back out of a ref.
                         "ticket": ticket,
+                        # What to call this task when there is no ticket. The
+                        # id stays the durable key; this is for the lines a
+                        # commander reads. Only the caller that knows what the
+                        # work is can supply it -- a driver's own brief says
+                        # what a driver is, not what this one is driving.
+                        "title": title,
                         # The base this task started from, resolved once in
                         # phase 2 and immutable from here on: allocate_task
                         # must build the worktree/branch from base_revision,

@@ -24,6 +24,7 @@ from unittest import mock
 from helm import cli
 from helm.core import Coordinator, HelmError, StateStore
 from helm.herdr import HerdrAdapter
+from helm.naming import task_name
 
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT
 
@@ -107,6 +108,91 @@ class RouteCommandTests(HelmTestCase):
             if m.get("worker_id") == first["id"]
         )
         self.assertNotIn("second, unrelated unit", first_texts)
+
+    def test_a_driver_is_named_for_the_work_it_was_appointed_for(self) -> None:
+        """A list of drivers has to read without a lookup.
+
+        A driver's brief is its role document, so naming it from its own brief
+        called every driver in every project `project-s-foreman`. The request
+        is the only thing at appointment that says which unit of work this
+        driver is for, so the name comes from that: its tracker id when it
+        names one, a few words of it otherwise.
+        """
+        helm_root = self._helm_root("route-names-root")
+        coordinator, project = self._project_root(helm_root, "route-names")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        code, _ = self._route(
+            helm_root, project["id"],
+            "TICKET-879: the detached backup mux holds its only slot",
+            "--command", command,
+        )
+        self.assertEqual(code, 0)
+        first = coordinator.foreman_for(project["id"])
+        data = coordinator.store.load()
+        self.assertEqual(task_name(data["tasks"][first["task_id"]]), "TICKET-879")
+
+        code, _ = self._route(
+            helm_root, project["id"], "rebuild the export pipeline",
+            "--command", command, "--new",
+        )
+        self.assertEqual(code, 0)
+        data = coordinator.store.load()
+        names = {
+            task_name(data["tasks"][w["task_id"]])
+            for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        }
+        # Two drivers, two names, and neither is the role document's.
+        self.assertEqual(names, {"TICKET-879", "rebuild-the-export"})
+
+    def test_helm_foreman_new_appoints_a_driver_beside_the_existing_one(self) -> None:
+        """Explicit appointment must not be a dead end at the first driver.
+
+        `helm foreman` reported "already has a foreman" and stopped, which was
+        right while one project meant one driver. Under a driver per unit of
+        work it makes a project's first driver its last: every later unit
+        queues behind it.
+        """
+        helm_root = self._helm_root("foreman-new-root")
+        coordinator, project = self._project_root(helm_root, "foreman-new")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        def run(*args):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = cli.main(["--root", str(helm_root), "foreman", project["id"], *args])
+            return code, output.getvalue()
+
+        code, first_out = run("--command", command, "--no-herdr", "--brief", "unit one")
+        self.assertEqual(code, 0)
+
+        # Without --new it still says what is there and appoints nothing.
+        code, repeat = run("--command", command, "--no-herdr")
+        self.assertEqual(code, 0)
+        self.assertIn("already has a foreman", repeat)
+
+        code, second_out = run(
+            "--command", command, "--no-herdr", "--new", "--ticket", "TICKET-42",
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("already has a foreman", second_out)
+
+        data = coordinator.store.load()
+        drivers = [
+            data["tasks"][w["task_id"]]
+            for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        ]
+        self.assertEqual(len(drivers), 2)
+        self.assertEqual(
+            {task_name(task) for task in drivers}, {"unit-one", "TICKET-42"}
+        )
+        # And each line says which driver it is talking about.
+        self.assertIn("unit-one", first_out)
+        self.assertIn("TICKET-42", second_out)
 
     def test_without_new_a_second_route_still_reuses_the_existing_driver(self) -> None:
         """The default is unchanged, and that is the point of it being opt-in.
@@ -266,6 +352,40 @@ class RouteCommandTests(HelmTestCase):
 
         # Acting on it is what clears it -- the foreman's own next push.
         coordinator.record_worker_message(foreman["id"], "status", "on it")
+        self.assertEqual(coordinator.pending_foreman_requests(project["id"]), [])
+
+    def test_one_drivers_reply_does_not_clear_anothers_unread_request(self) -> None:
+        """"Has it replied since?" is a question about ONE driver.
+
+        Answered up to a single position for the whole project, a busy
+        driver's reply marked every other driver's unread request as acted on:
+        the request was recorded, reported as recorded, and then never shown
+        to anybody again.
+        """
+        helm_root = self._helm_root("route-two-pending-root")
+        coordinator, project = self._project_root(helm_root, "route-two-pending")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        self._route(helm_root, project["id"], "first unit", "--command", command)
+        first = coordinator.foreman_for(project["id"])
+        self._route(
+            helm_root, project["id"], "second unit", "--command", command, "--new",
+        )
+        data = coordinator.store.load()
+        second_id = next(
+            w["id"] for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and w["id"] != first["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        )
+
+        # The SECOND driver has not spoken, so its request is still owed.
+        coordinator.record_worker_message(first["id"], "status", "on the first one")
+        pending = coordinator.pending_foreman_requests(project["id"])
+        self.assertEqual([entry["text"] for entry in pending], ["second unit"])
+
+        # Its own push is what clears it.
+        coordinator.record_worker_message(second_id, "status", "on the second one")
         self.assertEqual(coordinator.pending_foreman_requests(project["id"]), [])
 
     def test_pending_surfaces_a_request_the_foreman_has_not_acted_on(self) -> None:

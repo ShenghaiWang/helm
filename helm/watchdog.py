@@ -247,24 +247,43 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
     data = store.load()
     for project in data.get("projects", {}).values():
         project_id = project["id"]
-        driving = coordinator.foreman_for(project_id, data=data)
-        if driving is not None:
-            continue
+        # ORPHANED WORKERS, not a driverless project. The question used to be
+        # "does this project have a driver", which is the same question only
+        # while it has at most one: with several, a worker whose own driver
+        # died reads as covered because some other driver is still running,
+        # and nothing is ever told its work finished. So ask it per worker --
+        # `driver_of_task` names the driver that actually started each one.
         running = [
             worker for worker in data.get("workers", {}).values()
             if worker.get("project_id") == project_id and worker.get("status") == "running"
             and (data.get("tasks", {}).get(worker.get("task_id")) or {}).get("role") != "foreman"
+            and coordinator.driver_of_task(str(worker.get("task_id") or ""), data=data) is None
         ]
         if not running:
             continue
         with _quiet():
             if not coordinator.project_wants_foreman(project_id):
                 continue
-            appointed = cli._ensure_foreman(coordinator, project_id)
+            # `_ensure_foreman` would refuse here: it appoints only when the
+            # project has NONE, and the project having another driver is
+            # exactly the case that left these workers orphaned. So appoint
+            # outright, and tell it which work it is picking up -- a driver
+            # that has to discover its own charge from the record is a driver
+            # that may read it as somebody else's.
+            orphans = ", ".join(str(worker.get("task_id")) for worker in running)
+            appointed = cli._start_foreman(
+                coordinator,
+                project_id,
+                request=(
+                    "Take over work whose driver is gone. The tasks with no "
+                    f"live driver are: {orphans}. Read each with `helm inspect "
+                    "<task>` and drive it to an outcome."
+                ),
+            )
             if appointed:
                 reports.append(
-                    f"helm watchdog: {project_id} had {len(running)} running worker(s) and no "
-                    f"foreman; appointed {appointed['worker']['id']}"
+                    f"helm watchdog: {project_id} had {len(running)} running worker(s) with "
+                    f"no driver; appointed {appointed['worker']['id']}"
                 )
     return reports
 

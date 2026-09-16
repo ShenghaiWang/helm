@@ -21,6 +21,7 @@ from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .values import GRANTABLE_ACTIONS, TASK_SHAPES
 from .coordinator.tidy import STALE_FOLLOW_UP_DAYS
 from .learned import bound_learned_knowledge
+from .naming import task_name
 from .values import SMART_ZONE_TOKENS
 from .core import (
     HEALTHY_WORKER_VERDICTS,
@@ -2073,6 +2074,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-herdr", dest="herdr", action="store_false", default=True,
         help="start the foreman as a plain process instead of in the project's space",
     )
+    foreman.add_argument(
+        "--ticket",
+        help="the tracker id this driver is for; it becomes the driver's name",
+    )
+    foreman.add_argument(
+        "--brief",
+        help="what this driver is being appointed to drive; it names the driver "
+        "when there is no ticket, and it opens the driver's own document",
+    )
+    foreman.add_argument(
+        "--new", dest="new_lead", action="store_true", default=False,
+        help="appoint a driver for a separate unit of work beside the project's "
+        "existing one, instead of reporting that it already has one",
+    )
 
     route = commands.add_parser(
         "route",
@@ -2091,6 +2106,12 @@ def _build_parser() -> argparse.ArgumentParser:
     route.add_argument(
         "--no-herdr", dest="herdr", action="store_false", default=True,
         help="appoint a missing foreman as a plain process instead of in the project's space",
+    )
+    route.add_argument(
+        "--ticket",
+        help="the tracker id this request is about; it becomes the driver's "
+        "name, so a report about it reads without a lookup. Taken from the "
+        "request text when it names one and this is not given",
     )
     route.add_argument(
         "--new", dest="new_lead", action="store_true", default=False,
@@ -2760,9 +2781,11 @@ def _start_foreman(
     model: str | None = None,
     effort: str | None = None,
     request: str | None = None,
+    ticket: str | None = None,
 ) -> dict[str, Any]:
     task = coordinator.create_foreman_task(
-        project_id, agent=agent, model=model, effort=effort, request=request
+        project_id, agent=agent, model=model, effort=effort, request=request,
+        ticket=ticket,
     )
     if herdr:
         worker = HerdrAdapter(coordinator).launch_task(task["id"], command, wait=False)
@@ -2835,6 +2858,7 @@ def _ensure_foreman(
     agent: str | None = None,
     model: str | None = None,
     request: str | None = None,
+    ticket: str | None = None,
 ) -> dict[str, Any] | None:
     """Appoint a declared project's foreman if it has none.
 
@@ -2853,7 +2877,7 @@ def _ensure_foreman(
             return None
         started = _start_foreman(
             coordinator, project_id, herdr=herdr, command=command, agent=agent,
-            model=model, request=request,
+            model=model, request=request, ticket=ticket,
         )
     except (HelmError, SafetyError, OSError) as exc:
         print(
@@ -4501,7 +4525,7 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
             (line.strip() for line in item["text"].splitlines() if line.strip()), ""
         )
         stamp = str(item.get("at") or item.get("created_at") or "")
-        # The NAME, not the generated key. A line reading "w-904ead74c431
+        # The NAME, not the generated key. A line reading "w-z04ead74c431
         # paused on push" makes the reader resolve an id before it means
         # anything, and six of those get skimmed -- which is how the one item
         # that needed answering gets missed. `open_escalations` already
@@ -4913,7 +4937,7 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
         started = _start_foreman(
             coordinator, args.project_id, herdr=args.herdr,
             command=args.worker_command_text, agent=args.agent,
-            model=args.model, request=args.text,
+            model=args.model, request=args.text, ticket=args.ticket,
         )
         foreman = started["worker"]
     else:
@@ -4927,6 +4951,7 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
                 # so a foreman started by this very call comes up already
                 # holding it rather than hoping to read it afterwards.
                 request=args.text,
+                ticket=args.ticket,
             )
             foreman = coordinator.foreman_for(args.project_id)
         else:
@@ -5021,7 +5046,12 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
 
 def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
     coordinator = ctx.coordinator
-    existing = coordinator.foreman_for(args.project_id)
+    # `--new` says this appointment is for a separate unit of work, so "the
+    # project already has one" is not an answer to it. Without that escape,
+    # a project's first driver was also its last: every later unit of work
+    # queued behind it, which is the single-consumer queue the per-task driver
+    # exists to remove. See docs/task-lead.md.
+    existing = None if args.new_lead else coordinator.foreman_for(args.project_id)
     if existing is not None:
         # One project, one foreman: a second driver is worse than none.
         # But "already has one" must never become a dead end -- a
@@ -5044,7 +5074,8 @@ def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
             )
         return 0
     task = coordinator.create_foreman_task(
-        args.project_id, agent=args.agent, model=args.model, effort=args.effort
+        args.project_id, agent=args.agent, model=args.model, effort=args.effort,
+        request=args.brief, ticket=args.ticket,
     )
     if args.herdr:
         worker = HerdrAdapter(coordinator).launch_task(
@@ -5062,7 +5093,8 @@ def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
         mode = "process (--no-herdr)"
     print(
         f"{_glyph_for(coordinator, args.project_id)} {args.project_id} foreman "
-        f"{worker['id']} [{worker['status']}] task={task['id']} mode={mode} "
+        f"{task_name(task, fallback=worker['id'])} ({worker['id']}) "
+        f"[{worker['status']}] task={task['id']} mode={mode} "
         f"agent={worker.get('agent_id', 'default')}"
     )
     if not coordinator.project_wants_foreman(args.project_id):

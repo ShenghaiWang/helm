@@ -94,6 +94,61 @@ class WatchdogTests(HelmTestCase):
         self.assertEqual(healed, [worker["id"]])
         self.assertEqual(json.loads(memory.read_text()), {})
 
+    def test_a_worker_whose_own_driver_died_is_re_driven_beside_the_others(self) -> None:
+        """The question is per worker, not per project.
+
+        A project can run several drivers. Asked as "does this project have a
+        driver", a worker whose own driver died reads as covered because some
+        other driver is still running -- so nothing is ever told its work
+        finished, and it sits done and unadvanced.
+        """
+        import sys
+
+        root = self.repo("orphaned")
+        project = self.coordinator.register_project(
+            "Orphaned", str(root), project_id="orphaned"
+        )
+        # A live driver, driving its own work.
+        living = self.coordinator.create_foreman_task(project["id"])
+        self.coordinator.prepare_external_worker(living["id"], [sys.executable, "-c", ""])
+
+        # ...and a second driver that delegated a unit of work and then died.
+        dying_task = self.coordinator.create_foreman_task(project["id"])
+        dying = self.coordinator.prepare_external_worker(
+            dying_task["id"], [sys.executable, "-c", ""]
+        )
+        with mock.patch.dict("os.environ", {"HELM_WORKER_ID": dying["id"]}):
+            for kind, text in (
+                ("requirement", "goal: a unit; Done means: X; Out of scope: Y"),
+                ("solution", "approach: one; verification: tests"),
+            ):
+                self.coordinator.propose_gate(dying_task["id"], kind, text)
+                with mock.patch.dict("os.environ", {"HELM_WORKER_ID": ""}):
+                    self.coordinator.decide_gate(dying_task["id"], kind, confirm=True, skip=False)
+            task = self.coordinator.create_task(project["id"], "work with a dead driver")
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.coordinator.stop_worker(dying["id"], reason="its session ended")
+
+        # The property the watchdog is reading: this task's driver is gone,
+        # and the other driver being alive does not cover it.
+        self.assertIsNone(self.coordinator.driver_of_task(task["id"]))
+
+        appointed: list[str] = []
+        from helm import cli
+
+        def appoint(coordinator, project_id, **kwargs):
+            appointed.append(project_id)
+            return {"worker": {"id": "w-new-driver"}}
+
+        memory = Path(self.temp.name) / "orphaned.json"
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
+             mock.patch.object(cli, "_start_foreman", side_effect=appoint), \
+             mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
+             mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
+            reports = watchdog.heal_pass(None, memory)
+        self.assertEqual(appointed, [project["id"]])
+        self.assertIn("appointed w-new-driver", reports[0])
+
     def test_a_project_with_running_workers_and_no_foreman_is_re_driven(self) -> None:
         import sys
 
@@ -111,7 +166,7 @@ class WatchdogTests(HelmTestCase):
 
         memory = Path(self.temp.name) / "dead2.json"
         with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
-             mock.patch.object(cli, "_ensure_foreman", side_effect=appoint), \
+             mock.patch.object(cli, "_start_foreman", side_effect=appoint), \
              mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
              mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
             reports = watchdog.heal_pass(None, memory)
@@ -122,7 +177,7 @@ class WatchdogTests(HelmTestCase):
             data["projects"][project["id"]]["foreman"] = False
         appointed.clear()
         with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
-             mock.patch.object(cli, "_ensure_foreman", side_effect=appoint), \
+             mock.patch.object(cli, "_start_foreman", side_effect=appoint), \
              mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
              mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
             self.assertEqual(watchdog.heal_pass(None, memory), [])

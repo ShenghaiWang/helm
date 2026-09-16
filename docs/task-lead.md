@@ -1,7 +1,22 @@
 # The task lead
 
-**Status: proposed.** This is a written plan, not shipped behaviour. Nothing in
-`helm/` implements it yet.
+**Status: partly shipped, under the old name.** The lifetime change is landing
+first and the rename comes after, so everything below still says *foreman* in
+the code. What works today:
+
+- A confirmed gate pair belongs to the **driver that proposed it**, not to the
+  project, so two drivers in one project hold independent pairs.
+- `helm route --new` and `helm foreman --new` appoint a driver for a separate
+  unit of work beside the project's existing one.
+- Every driver carries a **name** — its tracker id, or a few words of the
+  request it was appointed for — and the reports address it by that name.
+- A worker's report reaches the driver that **started** it, not whichever one
+  the project lookup answers with.
+- A request routed to one driver is not cleared by a different driver's reply.
+- The watchdog asks whether **each worker** has a live driver, not whether the
+  project has one, and appoints a driver for orphaned work.
+
+Still to come: `--new` becoming the default, and the rename itself.
 
 ## What changes
 
@@ -124,8 +139,8 @@ answer "what about X?" on its own:
 instead of
 
 ```
-  09:41   6m  w-904ead74c431  paused on push
-  09:38   9m  w-2c4a02d59f85  review round 2
+  09:41   6m  w-z04ead74c431  paused on push
+  09:38   9m  w-zc4a02d59f85  review round 2
 ```
 
 **The generated id remains the durable key.** Names are for addressing and

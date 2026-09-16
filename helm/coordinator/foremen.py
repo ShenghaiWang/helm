@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from ..errors import HelmError, SafetyError
+from ..naming import ticket_of
 from ..paths import canonical
 from ..values import FOREMAN_DOMAIN, FOREMAN_RULES, _TERMINAL_WORKER_TASK_STATES, now
 
@@ -38,23 +39,33 @@ class ForemenMixin:
         re-proposed, under `gates.spent`. So the driver that spent a pair on
         this task is the driver that created it.
 
-        Falls back to the project's driver, which is the same answer whenever
-        a project has only one -- so this changes nothing until several exist.
+        A task WITH a binding whose driver is gone has no driver, and says so.
+        That is the whole point: falling through to the project's driver there
+        would report a dead driver's orphaned work as covered, which is how a
+        finished task sits unadvanced while every component reports correctly.
+
+        A task with NO binding anywhere is a different case -- the root
+        created it, or it predates the mechanism -- and for that the project's
+        driver is the honest answer.
         """
         data = data if data is not None else self.store.load()
         task = data.get("tasks", {}).get(task_id)
         if task is None:
             return None
         project_id = task.get("project_id")
-        for worker in data.get("workers", {}).values():
-            if worker.get("project_id") != project_id or worker.get("status") != "running":
-                continue
-            candidate = data.get("tasks", {}).get(worker.get("task_id")) or {}
-            if candidate.get("role") != "foreman":
+        bound = False
+        for candidate in data.get("tasks", {}).values():
+            if candidate.get("role") != "foreman" or candidate.get("project_id") != project_id:
                 continue
             gates = candidate.get("gates") or {}
-            if gates.get("bound_task_id") == task_id or task_id in (gates.get("spent") or {}):
-                return dict(worker)
+            if gates.get("bound_task_id") != task_id and task_id not in (gates.get("spent") or {}):
+                continue
+            bound = True
+            for worker in data.get("workers", {}).values():
+                if worker.get("task_id") == candidate.get("id") and worker.get("status") == "running":
+                    return dict(worker)
+        if bound:
+            return None
         return self.foreman_for(project_id or "", data=data)
 
     @staticmethod
@@ -175,34 +186,41 @@ class ForemenMixin:
         that carried the request. Nothing is stored, so this cannot drift.
         """
         data = data if data is not None else self.store.load()
-        foreman_tasks = {
-            task["id"]
-            for task in data.get("tasks", {}).values()
-            if task.get("project_id") == project_id and task.get("role") == "foreman"
-        }
-        if not foreman_tasks:
-            return []
-        # Only a live foreman can still act on one. A stood-down foreman's
+        messages = data.get("messages", [])
+        # ONE ANSWERED-UP-TO POSITION PER DRIVER, not one per project. A
+        # project can now run several drivers, and "has it replied since?" is
+        # a question about the driver the request was addressed to. Computed
+        # once for the project, a busy driver's reply marked every other
+        # driver's unread request as acted on: the request was recorded,
+        # reported as recorded, and then never shown to anybody again.
+        #
+        # Only a LIVE driver can still act on one. A stood-down driver's
         # unread request is not pending on anybody -- it is lost, and it
         # surfaces to the commander as an undriven project instead.
-        live = self.foreman_for(project_id, data=data)
-        if live is None:
-            return []
+        #
         # Ordered by position, not by `created_at`. Timestamps here are
-        # second-resolution, and a foreman answering promptly lands its reply
+        # second-resolution, and a driver answering promptly lands its reply
         # inside the same second as the request -- which read as "already
         # replied" and hid the request, reintroducing the bug this exists to
         # close. Append order is the actual sequence and has no ties.
-        messages = data.get("messages", [])
-        replied_at = max(
-            (
-                index
-                for index, message in enumerate(messages)
-                if message.get("worker_id") == live["id"]
-                and message.get("kind") != self.ANSWER_MESSAGE_KIND
-            ),
-            default=-1,
-        )
+        replied_at: dict[str, int] = {}
+        for worker in data.get("workers", {}).values():
+            if worker.get("project_id") != project_id or worker.get("status") != "running":
+                continue
+            task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+            if task.get("role") != "foreman":
+                continue
+            replied_at[str(task.get("id"))] = max(
+                (
+                    index
+                    for index, message in enumerate(messages)
+                    if message.get("worker_id") == worker["id"]
+                    and message.get("kind") != self.ANSWER_MESSAGE_KIND
+                ),
+                default=-1,
+            )
+        if not replied_at:
+            return []
         return [
             {
                 "message_id": message["id"],
@@ -211,9 +229,8 @@ class ForemenMixin:
                 "text": message.get("text", ""),
             }
             for index, message in enumerate(messages)
-            if index > replied_at
-            and message.get("kind") == self.ANSWER_MESSAGE_KIND
-            and message.get("task_id") in foreman_tasks
+            if message.get("kind") == self.ANSWER_MESSAGE_KIND
+            and index > replied_at.get(str(message.get("task_id")), index)
             # An `answer` is how `route` records a commander's request, and it
             # is also how several internal paths record a notice -- cleanup
             # writes one per worker to say an escalation is settled. Those are
@@ -291,6 +308,7 @@ class ForemenMixin:
         model: str | None = None,
         effort: str | None = None,
         request: str | None = None,
+        ticket: str | None = None,
     ) -> dict[str, Any]:
         """Create the task a project's foreman runs as.
 
@@ -300,8 +318,20 @@ class ForemenMixin:
         resolved per task, so the foreman's domain must not be the work's --
         a driver carrying `software-delivery` would leak it into every task it
         creates, including the ones that are not code.
+
+        THE NAME COMES FROM THE REQUEST, not from the brief. Every other task
+        can be named from its own brief because a brief opens by saying what
+        the work is; a driver's brief is its role document, which opens by
+        saying what a driver is. Named from that, every driver in every
+        project came out `project-s-foreman` -- identical, so the commander
+        reading a list of them got `project-s-foreman-2` and `-3` and had to
+        resolve each line anyway. The request is the only thing at appointment
+        that says which unit of work this driver is for, so it is what the
+        name is taken from: its tracker id if it carries one, a few words of
+        it otherwise.
         """
         brief = self.foreman_brief(project_id, request=request)
+        ticket = ticket or ticket_of({"brief": request or ""}) or None
         return self.create_task(
             project_id,
             brief,
@@ -310,6 +340,8 @@ class ForemenMixin:
             effort=effort,
             domain=FOREMAN_DOMAIN,
             role="foreman",
+            ticket=ticket,
+            title=None if ticket else request,
         )
 
     def project_wants_foreman(self, project_id: str) -> bool:

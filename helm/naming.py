@@ -1,13 +1,13 @@
 """Readable names for the things the commander reads about.
 
-Helm's records are keyed by generated ids -- `t-4b35d8a63df0`,
-`w-904ead74c431` -- and that is correct for a key: it is stable, unique, and
+Helm's records are keyed by generated ids -- `t-zb35d8a63df0`,
+`w-z04ead74c431` -- and that is correct for a key: it is stable, unique, and
 never needs rewriting. It is wrong for a *report*. Every surface the commander
 reads is a list of agents, and an opaque key forces them to resolve each line
 before it means anything:
 
-    09:41   6m  w-904ead74c431  paused on push
-    09:38   9m  w-2c4a02d59f85  review round 2
+    09:41   6m  w-z04ead74c431  paused on push
+    09:38   9m  w-zc4a02d59f85  review round 2
 
 Six of those is unreadable in practice; the reader skims, and a list that is
 skimmed is a list that hides the one item that needed answering.
@@ -73,15 +73,18 @@ def ticket_of(task: dict[str, Any] | None) -> str:
     return match.group(0) if match else ""
 
 
-def title_of(task: dict[str, Any] | None) -> str:
-    """A few words naming what the task is about, or "" if none can be found.
+def name_from(text: str | None) -> str:
+    """A few words naming what some text is about, or "" if none can be found.
 
-    Read from the brief's FIRST LINE only. That is where a brief says what the
-    work is; later text is prose, and matching it picks up whatever the author
-    happened to mention.
+    Reads the FIRST LINE only. That is where a request or a brief says what
+    the work is; later text is prose, and matching it picks up whatever the
+    author happened to mention.
+
+    This is also the sanitizer for a name supplied from outside: whatever
+    comes in leaves as lowercase words joined by dashes, so a name can never
+    carry anything a terminal or a log line would treat as structure.
     """
-    brief = str((task or {}).get("brief") or "")
-    first_line = brief.splitlines()[0] if brief else ""
+    first_line = (text or "").splitlines()[0] if text else ""
     words: list[str] = []
     for raw in _WORD.findall(first_line[:160]):
         word = raw.lower()
@@ -96,6 +99,23 @@ def title_of(task: dict[str, Any] | None) -> str:
         if len(words) == _TITLE_WORDS:
             break
     return "-".join(words)
+
+
+def title_of(task: dict[str, Any] | None) -> str:
+    """A few words naming what the task is about, or "" if none can be found.
+
+    A RECORDED title wins over the brief. For most tasks the two agree -- the
+    brief opens by saying what the work is -- but a driver's brief is its role
+    document, which opens by saying what a driver is. Deriving from it named
+    every driver in every project `project-s-foreman`, which is worse than the
+    id it replaced: it looks meaningful, it is identical for all of them, and
+    the disambiguator then hands the commander `project-s-foreman-3`. So the
+    caller that knows what the work is records it, and this reads it back.
+    """
+    recorded = name_from(str((task or {}).get("title") or ""))
+    if recorded:
+        return recorded
+    return name_from(str((task or {}).get("brief") or ""))
 
 
 def task_name(task: dict[str, Any] | None, *, fallback: str = "") -> str:

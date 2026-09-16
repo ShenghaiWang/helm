@@ -1,6 +1,6 @@
 import unittest
 
-from helm.naming import disambiguate, task_name, ticket_of, title_of
+from helm.naming import disambiguate, name_from, task_name, ticket_of, title_of
 
 
 class TheTrackerIdIsTheNameTests(unittest.TestCase):
@@ -57,6 +57,53 @@ class ALineIsNeverNamelessTests(unittest.TestCase):
         # `pending` is the one command that must never fail, so every helper it
         # reaches has to survive a missing record.
         self.assertEqual(task_name(None, fallback="w-1"), "w-1")
+
+
+class ARecordedTitleBeatsTheBriefTests(unittest.TestCase):
+    """The case a driver's own brief cannot answer.
+
+    Every other task can be named from its brief, because a brief opens by
+    saying what the work is. A driver's brief is its role document, which
+    opens by saying what a driver is -- so deriving from it named every driver
+    in every project the same thing.
+    """
+
+    def test_the_recorded_title_is_used_over_the_brief(self):
+        task = {
+            "title": "silent mic hard stop",
+            "brief": "You are this project's foreman. You own the loops inside",
+        }
+        self.assertEqual(task_name(task), "silent-mic-hard")
+
+    def test_a_ticket_still_wins_over_a_recorded_title(self):
+        task = {"ticket": "TICKET-123", "title": "silent mic hard stop"}
+        self.assertEqual(task_name(task), "TICKET-123")
+
+    def test_a_title_is_sanitized_not_trusted(self):
+        # It is display-only and reaches report lines, so whatever comes in
+        # leaves as lowercase words joined by dashes -- never as something a
+        # terminal or a log line would read as structure.
+        task = {"title": "ship\n\rit --now; rm -rf /"}
+        self.assertEqual(task_name(task), "ship")
+
+    def test_an_empty_title_falls_through_to_the_brief(self):
+        task = {"title": "   ", "brief": "rebuild the export pipeline"}
+        self.assertEqual(task_name(task), "rebuild-the-export")
+
+
+class NameFromTextTests(unittest.TestCase):
+    def test_leading_noise_is_dropped_but_interior_noise_is_kept(self):
+        # "the" leads, so it is skipped; once a real word has landed the
+        # same word is part of the phrase.
+        self.assertEqual(name_from("the mux holds the slot"), "mux-holds-the")
+        self.assertEqual(name_from("please fix the export pipeline"), "export-pipeline")
+
+    def test_only_the_first_line_is_read(self):
+        self.assertEqual(name_from("export pipeline\nand a lot of prose"), "export-pipeline")
+
+    def test_nothing_usable_gives_an_empty_name(self):
+        self.assertEqual(name_from("   "), "")
+        self.assertEqual(name_from(None), "")
 
 
 class NamesAreMadeUniqueWithoutPunishingTheCommonCaseTests(unittest.TestCase):
