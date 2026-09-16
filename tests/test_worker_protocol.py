@@ -457,6 +457,57 @@ class WorkerProtocolTests(HelmTestCase):
             self.assertFalse(adapter.notify_foreman(foreman["id"]))
             self.assertEqual(delivered, [])
 
+    def test_a_report_reaches_the_driver_that_started_the_work(self) -> None:
+        """Two drivers in one project, and a report belongs to exactly one.
+
+        The driver was looked up by PROJECT, which is the right answer only
+        while a project has one. With a driver per unit of work, the first
+        driver in the record answered for every worker in the project: the
+        driver that delegated the work was never told its work had finished,
+        and a driver that had delegated something else was woken with news
+        about a task it had never heard of.
+        """
+        root = self.repo("twodrivers")
+        project = self.coordinator.register_project(
+            "Two drivers", str(root), project_id="twodrivers"
+        )
+        drivers = []
+        for label in ("one", "two"):
+            driving = self.coordinator.create_foreman_task(project["id"])
+            driver = self.coordinator.prepare_external_worker(
+                driving["id"], [sys.executable, "-c", ""], execution="external"
+            )
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": driver["id"]}):
+                for kind, text in (
+                    ("requirement", f"goal: unit {label}; Done means: X; Out of scope: Y"),
+                    ("solution", f"approach: {label}; verification: tests"),
+                ):
+                    self.coordinator.propose_gate(driving["id"], kind, text)
+                    with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
+                        self.coordinator.decide_gate(
+                            driving["id"], kind, confirm=True, skip=False
+                        )
+                task = self.coordinator.create_task(project["id"], f"unit {label}")
+            drivers.append((driver, task))
+
+        (first, _), (second, second_task) = drivers
+        coder = self.coordinator.prepare_external_worker(
+            second_task["id"], [sys.executable, "-c", ""]
+        )
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        delivered: list[tuple[str, str]] = []
+
+        with mock.patch.object(
+            adapter, "answer_worker", side_effect=lambda w, t: delivered.append((w, t)) or True
+        ):
+            self.coordinator.record_worker_message(
+                coder["id"], "result", "unit two done, commit abc1234"
+            )
+            self.assertTrue(adapter.notify_foreman(coder["id"]))
+
+        self.assertEqual(delivered[-1][0], second["id"])
+        self.assertNotEqual(delivered[-1][0], first["id"])
+
     def test_a_worker_that_died_right_after_reporting_is_not_called_healthy(self) -> None:
         root = self.repo("vanishing")
         project = self.coordinator.register_project(

@@ -1533,7 +1533,14 @@ class HerdrAdapter:
         # A foreman's own reports go to Helm, never back into itself.
         if task.get("role") == "foreman":
             return False
-        foreman = self.coordinator.foreman_for(worker.get("project_id", ""))
+        # THIS worker's driver, not the project's. A report pushed to a driver
+        # that did not start the work is read as news about something it never
+        # delegated -- harmless with one driver per project, because then the
+        # two are the same record, and the wrong kind of wrong once a project
+        # runs several.
+        foreman = self.coordinator.driver_of_task(
+            str(worker.get("task_id") or ""), data=data
+        )
         if foreman is None or foreman["id"] == worker_id:
             return False
         latest = None

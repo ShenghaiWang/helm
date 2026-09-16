@@ -20,6 +20,43 @@ from ..values import FOREMAN_DOMAIN, FOREMAN_RULES, _TERMINAL_WORKER_TASK_STATES
 
 
 class ForemenMixin:
+    def driver_of_task(
+        self, task_id: str, *, data: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """The live driver that authorized this task, if one can be named.
+
+        With one driver per project "the project's driver" and "this task's
+        driver" are the same record, so nobody had to distinguish them. With a
+        driver per unit of work they diverge, and the difference matters most
+        exactly where it is least visible: a worker's terminal report is
+        pushed to its driver, and a report delivered to the WRONG driver is
+        read as news about work that driver never started.
+
+        Ownership is already in the state and needs no new field. A driver
+        spends its confirmed gate pair on the task it creates, which records
+        that task under `gates.bound_task_id` and, once the pair is
+        re-proposed, under `gates.spent`. So the driver that spent a pair on
+        this task is the driver that created it.
+
+        Falls back to the project's driver, which is the same answer whenever
+        a project has only one -- so this changes nothing until several exist.
+        """
+        data = data if data is not None else self.store.load()
+        task = data.get("tasks", {}).get(task_id)
+        if task is None:
+            return None
+        project_id = task.get("project_id")
+        for worker in data.get("workers", {}).values():
+            if worker.get("project_id") != project_id or worker.get("status") != "running":
+                continue
+            candidate = data.get("tasks", {}).get(worker.get("task_id")) or {}
+            if candidate.get("role") != "foreman":
+                continue
+            gates = candidate.get("gates") or {}
+            if gates.get("bound_task_id") == task_id or task_id in (gates.get("spent") or {}):
+                return dict(worker)
+        return self.foreman_for(project_id or "", data=data)
+
     @staticmethod
     def _live_foreman_task_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
         """The task record of the project's running foreman, from state in hand.
