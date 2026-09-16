@@ -475,6 +475,24 @@ class HealthMixin:    #: How long a queued prompt may sit before its runner is c
                         f"have started no turn in {int(unstarted_for)}s and nothing "
                         "has been written since; its runner is not picking them up",
                     )
+                elif queued:
+                    # A PROMPT IS QUEUED AND THE RUNNER IS WRITING, so it is
+                    # working on it -- a turn is only RECORDED when it ends, so
+                    # "no turn since the prompt landed" and "no turn running"
+                    # are different facts. The first version of this branch said
+                    # "nothing is queued for it" without checking whether
+                    # anything was, and a task lead read that, concluded its
+                    # round had never been picked up, and declared itself
+                    # blocked on a round that was executing while it wrote the
+                    # escalation. It came within one command of stopping the
+                    # worker to unstick it.
+                    verdict, detail = (
+                        "between-turns",
+                        f"turn {ended} ended cleanly and {queued} prompt(s) are "
+                        f"queued; the runner has written within the last "
+                        f"{int(self.TURN_PICKUP_GRACE_SECONDS)}s, so it is "
+                        "working on them. A turn is recorded only when it ends",
+                    )
                 else:
                     verdict, detail = (
                         "between-turns",

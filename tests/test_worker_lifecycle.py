@@ -526,9 +526,23 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         self.assertIn("started no turn", entry["detail"])
 
         # ...and a runner that IS writing since the prompt landed is working
-        # on it, however long the prompt has been there.
+        # on it, however long the prompt has been there -- AND THE LINE MUST
+        # SAY SO. The first version asserted "nothing is queued for it" in this
+        # branch without checking, and a task lead read that, concluded its
+        # round had never been picked up, and declared itself blocked on a
+        # round that was executing while it wrote the escalation.
         log.touch()
-        self.assertEqual(verdict_for()["verdict"], "between-turns")
+        entry = verdict_for()
+        self.assertEqual(entry["verdict"], "between-turns")
+        self.assertIn("1 prompt(s) are queued", entry["detail"])
+        self.assertIn("working on them", entry["detail"])
+        self.assertNotIn("nothing is queued", entry["detail"])
+
+        # With the queue empty, the other sentence is the true one.
+        queued.unlink()
+        entry = verdict_for()
+        self.assertEqual(entry["verdict"], "between-turns")
+        self.assertIn("nothing is queued", entry["detail"])
 
     def test_a_worker_recorded_before_the_episode_fields_still_settles(self) -> None:
         """The scan survives only as a fallback, and only for those records."""
