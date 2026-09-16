@@ -149,6 +149,83 @@ seven hundred references in `helm/` and ten documents. Sequence:
    it as a pure substitution.
 3. Keep the old CLI verb as an alias for one release.
 
+## How much work may run at once
+
+Helm should decide its own parallelism rather than leave it to whoever writes
+the brief. One root ran several units of work concurrently, each verifying
+locally at the same time, and took the machine out of memory: the session died,
+every agent with it, and finished work sat uncommitted in worktrees.
+
+**Measure the right thing.** The obvious model — cap the number of running
+agents — is wrong, and measurably so. Sampled on a live root: **five agents,
+0.8 GB resident between them, about 0.16 GB each.** At that price a machine can
+hold dozens. What actually consumed the memory was what those agents *ran*: a
+test runner spawning a worker per core, a compiler building a large native
+crate, a type-checker over a monorepo. Each of those is gigabytes; the agent
+holding its handle is rounding error.
+
+So the unit to meter is the **heavy operation**, not the agent. A capacity model
+built on agent count would have reported a healthy root minutes before it died.
+
+**The shape:**
+
+- **A named class of heavy operations** — full test suite, type-check, native
+  build. A lead declares it is about to run one and waits for a slot.
+- **Slots computed from headroom, not from a constant.** Available memory
+  divided by a measured per-operation cost, floored at one and capped so a
+  single heavy run can never take the last of the machine. Cost is *measured*
+  from previous runs, not guessed: a root's own history is better evidence than
+  any default shipped in the repository.
+- **A floor that is never spent.** Below it Helm refuses to start another heavy
+  operation and says what is holding the slots. Refusing is cheap — the work
+  waits. Allowing the overrun is not: it kills every agent and risks uncommitted
+  work.
+- **Everything else stays parallel.** Editing, reading, resolving conflicts,
+  drafting replies, waiting on CI — none of it is metered, because none of it
+  costs anything measurable.
+
+**Prefer not running it at all.** Where CI already runs the same check, pushing
+and reading the result is both cheaper and better evidence than a local run: it
+is the signal reviewers will see. A project may declare that in its own
+knowledge, and then the heavy-operation slot is needed only for what CI cannot
+answer — most usefully, proving a new test fails before its fix.
+
+**Report it.** `helm capacity` (or a section of `helm doctor`) should print
+total and available memory, load, the measured per-operation cost, how many
+slots that yields, and what currently holds them. A limit nobody can see gets
+worked around.
+
+## The bottleneck inventory
+
+Observed in one day on one root, ordered by what each actually cost. The list
+exists so "Helm should be faster" becomes something that can be worked through.
+
+**Structural — these are what the task lead is for:**
+
+| Bottleneck | What it cost |
+| --- | --- |
+| One driver per project is one queue with one consumer | a project blocked with zero workers running while independent work waited |
+| Gates bind to a driver row that outlives or under-lives the work | commander decisions silently discarded on replacement |
+| The coordinator as the serialization point | one confirmation round-trip per task, for tasks whose scope never changed |
+| Context lost on every replacement | repeated full re-briefs, because nothing but the coordinator's own context held the state |
+
+**Mechanical — each is independently fixable and none needs the redesign:**
+
+| Bottleneck | What it cost |
+| --- | --- |
+| A task working on a branch it did not allocate cannot be launched, continued or rounded | several tasks bricked with their work intact on disk; two manual interventions to free them |
+| Status reports an inference as fact — "authorized but undelivered", "the session is alive", "its output reports failure" | a verification round-trip per report, because the flag was wrong more often than right |
+| A worker and its driver cannot see each other's approval requests | duplicate authorizations released for one action |
+| A refusal exits zero | a caller gating on exit status proceeds as though the thing ran |
+| The attention watch fires seconds after a message that is still queued | constant noise on the one channel the commander is told to trust |
+| A session teardown fails every task it owned | reopens and branch repairs before any agent could touch the work again |
+
+**The one that outlasts the others.** Once the plumbing is fixed, the binding
+constraint is the *record*. Re-briefing happened because nothing else carried
+what was going on. A record good enough for a fresh coordinator to take over
+mid-stream makes a lead's death cost nothing; without it, every crash still
+costs a re-brief however fast the machinery gets.
+
 ## Open questions
 
 - **Cost.** One lead per task is more agents than one per project. Whether that
