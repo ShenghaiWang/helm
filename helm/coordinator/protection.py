@@ -190,6 +190,78 @@ class ProtectionMixin:
             "artifacts": artifacts,
             "delivered": delivered,
         }
+    #: What a snapshot records but an authorization is NOT bound to. Declared
+    #: artifacts are outputs *about* the work, not the work: filing evidence is
+    #: what a careful worker does while it waits for an approval, and waiting is
+    #: exactly when it has the time. Binding them made that behaviour cancel the
+    #: authorization it was waiting on -- observed twice in ten minutes on one
+    #: push, same commit both times, only the artifact count moving 3 -> 6 --
+    #: and it can loop: each refusal prompts a report, each report invalidates
+    #: the next approval. Their FILES are still covered, by `diff` when tracked,
+    #: `untracked` when not, and `delivered` when they sit in a declared
+    #: delivery folder. What leaves the binding is the declaration.
+    _UNBOUND_SNAPSHOT_KEYS = ("artifacts",)
+
+    #: Each comparable part of a snapshot and how to say it moved. Ordered from
+    #: the coarsest change to the finest, so a refusal leads with the thing a
+    #: reader would look at first.
+    _SNAPSHOT_COMPONENTS: tuple[tuple[str, str], ...] = (
+        ("revision", "the commit"),
+        ("branch_tip", "the branch tip"),
+        ("tree", "the committed tree"),
+        ("index", "the staged index"),
+        ("diff", "the tracked changes in the working tree"),
+        ("untracked", "the untracked files"),
+        ("delivered", "the delivery outputs"),
+    )
+
+    @classmethod
+    def _binding_of(cls, snapshot: dict[str, Any] | None) -> dict[str, Any]:
+        """A snapshot reduced to what an authorization actually covers."""
+        return {
+            key: value
+            for key, value in (snapshot or {}).items()
+            if key not in cls._UNBOUND_SNAPSHOT_KEYS
+        }
+
+    @classmethod
+    def _snapshot_difference(
+        cls, approved: dict[str, Any] | None, current: dict[str, Any] | None
+    ) -> str:
+        """What moved between two snapshots, in words a reader can act on.
+
+        The refusal used to print the requested revision and the current one,
+        which are IDENTICAL in the common case -- the tree moved, not the
+        commit. A reader is then sent to compare two matching hashes and
+        concludes the refusal is wrong; it cost a full investigation to find
+        36 files staged in the index. A correct refusal that misdescribes
+        itself teaches people to distrust correct refusals.
+        """
+        approved = approved or {}
+        current = current or {}
+        moved: list[str] = []
+        for key, phrase in cls._SNAPSHOT_COMPONENTS:
+            before, after = approved.get(key), current.get(key)
+            if before == after:
+                continue
+            if isinstance(before, list) or isinstance(after, list):
+                count_before = len(before or [])
+                count_after = len(after or [])
+                if count_before != count_after:
+                    moved.append(f"{phrase} ({count_before} -> {count_after})")
+                else:
+                    moved.append(f"{phrase} (same count, different contents)")
+            else:
+                moved.append(phrase)
+        for key in set(approved) | set(current):
+            if key in dict(cls._SNAPSHOT_COMPONENTS) or key in cls._UNBOUND_SNAPSHOT_KEYS:
+                continue
+            if approved.get(key) != current.get(key):
+                moved.append(str(key))
+        if not moved:
+            return "nothing this authorization binds"
+        return ", ".join(moved)
+
     def _hold_history(self, task: dict[str, Any]) -> list[dict[str, Any]]:
         holds = task.get("holds")
         if not isinstance(holds, list):
@@ -739,7 +811,8 @@ class ProtectionMixin:
             # whatever the worktree has become since. Rebinding here silently
             # authorized a revision nobody had read.
             recorded = hold.get("snapshot")
-            if recorded and current != recorded:
+            if recorded and self._binding_of(current) != self._binding_of(recorded):
+                moved = self._snapshot_difference(recorded, current)
                 self._move_hold(
                     data, project, task, hold, "abandon",
                     detail=(
@@ -750,16 +823,16 @@ class ProtectionMixin:
                     payload={
                         "requested_revision": recorded.get("revision"),
                         "current_revision": current.get("revision"),
+                        "moved": moved,
                     },
                     worker=worker,
                     message_kind="approval-invalidated",
                 )
                 self.store.save(data)
                 raise SafetyError(
-                    f"task {task_id} changed after it asked: the request was for "
-                    f"{recorded.get('revision')} and the worktree is now "
-                    f"{current.get('revision')}. Nothing was authorized; have the "
-                    "worker request approval for the state it is actually in."
+                    f"task {task_id} changed after it asked: {moved} moved since "
+                    "the request. Nothing was authorized; have the worker request "
+                    "approval for the state it is actually in."
                 )
             first_release = hold["status"] == "waiting"
             authorization = hold.get("authorization") or {}
@@ -900,23 +973,26 @@ class ProtectionMixin:
             if authorization.get("ticket_consumed_at"):
                 raise SafetyError("this authorization has already been spent")
             approved = authorization.get("snapshot") or hold.get("snapshot")
-            if approved and current != approved:
+            if approved and self._binding_of(current) != self._binding_of(approved):
+                moved = self._snapshot_difference(approved, current)
                 self._move_hold(
                     data, project, task, hold, "invalidate",
                     detail=(
                         "The work changed after the commander approved it; the "
-                        f"authorization for {hold['action']} no longer covers it"
+                        f"authorization for {hold['action']} no longer covers it "
+                        f"({moved} moved)"
                     ),
                     payload={
                         "approved_revision": approved.get("revision"),
                         "current_revision": current.get("revision"),
+                        "moved": moved,
                     },
                     worker=worker,
                     message_kind="approval-invalidated",
                 )
                 self.store.save(data)
                 raise SafetyError(
-                    "do not act: the work changed since the commander approved it, "
+                    f"do not act: {moved} changed since the commander approved it, "
                     "so the authorization was invalidated and must be given again"
                 )
             authorization["ticket_consumed_at"] = now()

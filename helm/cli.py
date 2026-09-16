@@ -5221,12 +5221,18 @@ def _cmd_approval(ctx: _Context, args: argparse.Namespace) -> int | None:
                 f"({(authorization.get('authority') or {}).get('mode', 'session')})"
             )
         if snapshot.get("scope") == "workspace":
+            # The artifact count is deliberately NOT here. It was, and it
+            # said the authorization covered something it does not: filing
+            # evidence while waiting then read as "the work changed", which
+            # cancelled the approval the worker was waiting on. Saying the
+            # binding is narrower than it is would be the same fault in the
+            # other direction, so this names exactly what refuses.
             print(
                 f"  Bound to {snapshot.get('branch')} @ "
                 f"{(snapshot.get('revision') or '')[:12]} plus its index, "
-                f"working tree, {len(snapshot.get('untracked', []))} untracked "
-                f"and {len(snapshot.get('artifacts', []))} declared artifact(s); "
-                "any change refuses at action-start"
+                f"working tree and {len(snapshot.get('untracked', []))} untracked "
+                "file(s); any change to those refuses at action-start. Filing an "
+                "artifact does not."
             )
         else:
             print("  No worktree to bind: this task holds no branch of its own")

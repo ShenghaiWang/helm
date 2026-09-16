@@ -376,6 +376,52 @@ class ApprovalTests(HelmTestCase):
                 with self.assertRaisesRegex(SafetyError, r"do not act"):
                     self.coordinator.start_authorized_action(worker["id"])
 
+    def test_filing_evidence_does_not_cancel_the_approval_it_waits_on(self) -> None:
+        """Declared artifacts are outputs ABOUT the work, not the work.
+
+        Binding them made the behaviour the rest of Helm asks for cancel the
+        authorization it was waiting on -- observed twice in ten minutes on one
+        push, same commit both times, only the artifact count moving 3 -> 6.
+        It can loop: each refusal prompts a report, each report invalidates the
+        next approval.
+        """
+        project, task, worker = self._paused_on_approval("evidence")
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        before = len(self._hold(task["id"])["snapshot"]["artifacts"])
+
+        # `change.txt` is already committed and does not move. Declaring it as
+        # an artifact is a change to the RECORD, not to the tree.
+        self.coordinator.record_worker_message(
+            worker["id"], "artifact", "the change", payload={"path": "change.txt"}
+        )
+        self.assertEqual(
+            len(self.coordinator._snapshot_now(task["id"])["artifacts"]), before + 1
+        )
+
+        started = self.coordinator.start_authorized_action(worker["id"])
+        self.assertEqual(started["action"], "publish")
+
+    def test_a_refusal_names_the_component_that_moved(self) -> None:
+        """A refusal that misdescribes itself teaches distrust of correct ones.
+
+        It printed the requested revision and the current one, which are
+        IDENTICAL whenever the tree moved rather than the commit. A reader
+        compares two matching hashes and concludes the refusal is wrong; it
+        cost a full investigation to find 36 files staged in the index.
+        """
+        project, task, worker = self._paused_on_approval("named")
+        workspace = Path(task["workspace"])
+        revision = self._hold(task["id"])["snapshot"]["revision"]
+
+        # Staged, not committed: the commit is unchanged on both sides.
+        (workspace / "staged.txt").write_text("staged", encoding="utf-8")
+        subprocess.run(["git", "-C", str(workspace), "add", "staged.txt"], check=True)
+        with self.assertRaises(SafetyError) as caught:
+            self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        message = str(caught.exception)
+        self.assertIn("the staged index", message)
+        self.assertNotIn(revision, message)
+
     def test_a_change_between_request_and_release_is_never_silently_rebound(self) -> None:
         """DEFECT 2: release built a fresh binding and authorized a newer revision."""
         project, task, worker = self._paused_on_approval("rebind")

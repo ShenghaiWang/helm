@@ -19,7 +19,10 @@ from helm.core import (
     base_after_merges,
     inside,
 )
-from helm import runtimes
+import shutil
+
+from helm import cli, runtimes
+from helm.core import Coordinator, StateStore
 from helm.herdr import HerdrAdapter
 
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS, needs_runtimes
@@ -1219,6 +1222,54 @@ class ReviewTests(HelmTestCase):
         # A reviewer for some other task must not block this one.
         other = self.coordinator.create_task(project["id"], "unrelated")
         self.assertIsNone(adapter._live_reviewer_for(data, other["id"]))
+
+    def test_every_review_refusal_exits_non_zero(self) -> None:
+        """The gate has to be enforceable by something other than a reader.
+
+        `helm review && push` is the shape this exists for. An exit status
+        that cannot tell "approved" from "never ran" makes that shape unsafe:
+        a refusal that exits 0 pushes an unreviewed change.
+        """
+        helm_root = self._helm_root("review-exit-root")
+        project_root = self.repo("review-exit")
+        destination = helm_root / "projects" / "review-exit"
+        shutil.move(str(project_root), str(destination))
+        coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+        project = coordinator.discover_project(helm_root, "review-exit")
+        task = coordinator.create_task(project["id"], "a change to review")
+
+        def review(*args):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = cli.main(["--root", str(helm_root), "review", *args])
+            return code, err.getvalue()
+
+        # Unknown task.
+        code, message = review("t-000000000000")
+        self.assertNotEqual(code, 0)
+        self.assertIn("unknown task", message)
+
+        # Known task, but nothing has been done on it to review.
+        code, message = review(task["id"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("no worker to review", message)
+
+        # And a runtime that cannot be told the effort the task asks for --
+        # which needs a real commit on the branch, or the empty-target refusal
+        # fires first and this would pass without reaching the case it names.
+        coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        workspace = Path(coordinator.store.load()["tasks"][task["id"]]["workspace"])
+        (workspace / "change.txt").write_text("a change", encoding="utf-8")
+        for command in (
+            ["git", "add", "change.txt"],
+            ["git", "commit", "-m", "a change"],
+        ):
+            subprocess.run(command, cwd=workspace, check=True, stdout=subprocess.DEVNULL)
+        code, message = review(
+            task["id"], "--reviewer-agent", "cursor", "--reviewer-effort", "medium",
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("effort", message)
 
     def test_a_replacement_review_closes_stale_failed_reviewer_session(self) -> None:
         """A failed reviewer with a live pane is closed before a replacement."""
