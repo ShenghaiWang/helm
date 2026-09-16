@@ -436,6 +436,49 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         self.assertIn("killed by a signal", entry["detail"])
         self.assertNotIn("the session is alive", entry["detail"])
 
+    def test_a_clean_turn_outranks_failure_text_in_the_scrollback(self) -> None:
+        """A worker DISCUSSING failure is not a worker IN failure.
+
+        `worker_failures` greps the rendered transcript, which for an agent
+        holds its tool output and its own prose. Two live leads were reported
+        as `erroring` on exactly that: one had run a command macOS does not
+        ship ("command not found: timeout", with exit=0 right after), the
+        other had written a design note about re-arming behaviour. Both had
+        just ended a turn cleanly.
+        """
+        _, task, worker = self._worker("scrollback")
+        log = Path(self.coordinator.store.load()["workers"][worker["id"]]["log_file"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            '{"type":"tool_result","content":"(eval):1: command not found: timeout\\nexit=0"}',
+            encoding="utf-8",
+        )
+        stale = time.time() - 4_000
+        os.utime(log, (stale, stale))
+        self.assertTrue(self.coordinator.worker_failures(worker["id"]))
+
+        def verdict_for():
+            return {
+                entry["worker_id"]: entry
+                for entry in self.coordinator.worker_health(liveness=lambda _w: True)
+            }[worker["id"]]
+
+        # A turns worker whose last turn exited 0 has a direct statement of its
+        # own execution outcome, and it outranks the text.
+        with self.coordinator.store.locked() as data:
+            live = data["workers"][worker["id"]]
+            live["execution_mode"] = "turns"
+            live["turns"] = [{"turn": 4, "exit": 0, "at": core.now()}]
+        self.assertEqual(verdict_for()["verdict"], "between-turns")
+
+        # A turn that did NOT end cleanly leaves the scrollback as the best
+        # evidence available, and it is used.
+        with self.coordinator.store.locked() as data:
+            data["workers"][worker["id"]]["turns"] = [
+                {"turn": 4, "exit": 1, "at": core.now()}
+            ]
+        self.assertEqual(verdict_for()["verdict"], "erroring")
+
     def test_a_lead_between_turns_is_idle_not_stalled(self) -> None:
         """Between turns is not silence, and Helm already knows the difference.
 

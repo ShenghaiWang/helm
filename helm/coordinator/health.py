@@ -299,6 +299,26 @@ class HealthMixin:    #: How long a queued prompt may sit before its runner is c
                     answered_at = index
             awaiting = asked_at > answered_at
             broke = self.worker_failures(worker["id"])
+            # THE TURN RECORD BEATS THE SCROLLBACK. `worker_failures` greps the
+            # rendered transcript, which for an agent contains its tool output
+            # and its own prose -- so a lead that ran a command macOS does not
+            # ship ("command not found: timeout", followed by exit=0) and a
+            # lead WRITING about failure modes both matched, and both were
+            # reported as `erroring` while working correctly. A worker
+            # discussing failure is indistinguishable from one in failure if
+            # text is all you look at.
+            #
+            # A turns worker has something better: its runner records each
+            # turn's exit. A last turn that exited 0 is the worker's own
+            # execution outcome, and it outranks anything in scrollback.
+            # Scrollback stays the fallback for a session worker, which has no
+            # such record.
+            clean_turn = None
+            if worker.get("execution_mode") == "turns":
+                recorded = [t for t in (worker.get("turns") or []) if isinstance(t, dict)]
+                if recorded and recorded[-1].get("exit") == 0:
+                    clean_turn = recorded[-1]
+
             # (last turn number, queued prompts) when this worker is a turns
             # worker resting between turns, else None. Read from the record and
             # the queue file rather than inferred from silence, because silence
@@ -373,7 +393,7 @@ class HealthMixin:    #: How long a queued prompt may sit before its runner is c
                     "waiting-on-a-prompt",
                     "its own session is asking for confirmation and nobody is watching it",
                 )
-            elif broke and not delivered and stale_output:
+            elif broke and not delivered and stale_output and clean_turn is None:
                 # Its own output says it failed, and it never reported. Left
                 # unread this looks like healthy work for as long as the
                 # session sits there. Only when the output has also gone
