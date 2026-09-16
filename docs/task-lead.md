@@ -227,6 +227,13 @@ total and available memory, load, the measured per-operation cost, how many
 slots that yields, and what currently holds them. A limit nobody can see gets
 worked around.
 
+**And the operation that actually does it, measured.** A scopeless
+`tsc --noEmit` in one task worktree reached **8.3 GB resident** and drove the
+load average past 90 on a machine with 0.06 GB free. One agent, one command.
+It finished, which was luck. This is the case for metering in one number: no
+count of agents predicts it, because the agent that launched it was holding
+about 0.2 GB at the time — the other 8.1 GB was the operation.
+
 **Measured again, on a live root running three leads.** Eleven agent processes
 held 2.6 GB between them while the machine showed zero free memory and a load
 average of 13.9. Neither number came from Helm: two transcription processes the
