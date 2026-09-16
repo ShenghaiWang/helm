@@ -227,6 +227,15 @@ total and available memory, load, the measured per-operation cost, how many
 slots that yields, and what currently holds them. A limit nobody can see gets
 worked around.
 
+**Measured again, on a live root running three leads.** Eleven agent processes
+held 2.6 GB between them while the machine showed zero free memory and a load
+average of 13.9. Neither number came from Helm: two transcription processes the
+commander was running held 2.3 GB and about eight cores. An agent-count model
+would have reported a healthy root; a memory-headroom model would have refused
+to start anything, correctly, and for a reason that had nothing to do with the
+agents. Both facts belong in the same report — what Helm is running, and what
+the machine has left after everything else on it.
+
 ## The bottleneck inventory
 
 Observed in one day on one root, ordered by what each actually cost. The list
