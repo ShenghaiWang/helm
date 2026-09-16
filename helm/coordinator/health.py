@@ -21,7 +21,10 @@ from ..paths import canonical
 from ..values import _dt_now, _parse_iso, _safe_text, now, project_glyph
 
 
-class HealthMixin:
+class HealthMixin:    #: How long a queued prompt may sit before its runner is called stopped.
+    TURN_PICKUP_GRACE_SECONDS = 120.0
+
+
     # ---------- worker health ----------
 
     # A worker that says nothing is indistinguishable from one that died, so
@@ -305,8 +308,18 @@ class HealthMixin:
                 turns = [t for t in (worker.get("turns") or []) if isinstance(t, dict)]
                 last_turn = turns[-1] if turns else None
                 if last_turn is not None and last_turn.get("exit") == 0:
+                    queued_at = self.queued_turn_age(worker["id"])
+                    touched = self.worker_output_touched_at(worker["id"])
+                    queued_since = self.queued_turn_queued_at(worker["id"])
+                    # Quiet SINCE the prompt landed, not quiet for a while. A
+                    # runner writes while it starts a turn, so a log that has
+                    # moved since is the runner working, whatever the clock
+                    # says.
+                    unstarted_for = 0.0 if touched > queued_since else queued_at
                     between_turns = (
-                        last_turn.get("turn"), self.queued_turn_count(worker["id"])
+                        last_turn.get("turn"),
+                        self.queued_turn_count(worker["id"]),
+                        unstarted_for,
                     )
             # A NEGATIVE EXIT IS A SIGNAL, AND A SIGNAL IS DEATH. Liveness is
             # probed from the pane, which outlives the process inside it: a
@@ -423,15 +436,24 @@ class HealthMixin:
                 # altogether. The commander asked "did you kill it?" about a
                 # lead that was working correctly, which is the cost of making
                 # somebody infer a state Helm already knows.
-                ended, queued = between_turns
-                if queued:
-                    # A prompt is waiting and no turn took it: this IS a fault,
-                    # and the one the old `stalled` verdict caught by accident.
+                ended, queued, unstarted_for = between_turns
+                if queued and unstarted_for > self.TURN_PICKUP_GRACE_SECONDS:
+                    # A prompt is waiting, the runner has had long enough to
+                    # notice, and nothing has been written since: this IS a
+                    # fault, and the one the old `stalled` verdict caught by
+                    # accident.
+                    #
+                    # Both halves are needed and this shipped with neither.
+                    # It fired twenty seconds after a prompt was queued, on a
+                    # runner that was alive and had written output 0.8 seconds
+                    # earlier -- the same "infer from an absence" mistake as
+                    # the line it replaced, one layer down. A runner picking a
+                    # prompt up writes while it does so.
                     verdict, detail = (
                         "runner-stopped",
-                        f"turn {ended} ended cleanly but {queued} queued prompt(s) "
-                        "have not started a turn, so its runner is not picking "
-                        "them up; restart it with helm worker answer or heal it",
+                        f"turn {ended} ended cleanly, but {queued} queued prompt(s) "
+                        f"have started no turn in {int(unstarted_for)}s and nothing "
+                        "has been written since; its runner is not picking them up",
                     )
                 else:
                     verdict, detail = (

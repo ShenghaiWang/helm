@@ -726,6 +726,21 @@ def _lead_label(coordinator: Coordinator, worker: dict[str, Any] | None) -> str:
     return worker_id
 
 
+def _epoch_of(stamp: str | None) -> float:
+    """An ISO timestamp as an epoch float, or 0 when it cannot be read.
+
+    Zero on purpose: a record whose age nobody can establish must not be the
+    reason something is called neglected.
+    """
+    if not stamp:
+        return 0.0
+    with contextlib.suppress(ValueError):
+        return _dt.datetime.fromisoformat(
+            str(stamp).replace("Z", "+00:00")
+        ).timestamp()
+    return 0.0
+
+
 def _age_seconds(stamp: str | None) -> float:
     """How old an ISO timestamp is, or 0 when it cannot be read.
 
@@ -4674,6 +4689,15 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
         project["id"]: project_glyph(project.get("color", ""))
         for project in snapshot.get("projects", {}).values()
     }
+    # Which live session owns each driving task, so a request can be checked
+    # against the one that is meant to be acting on it.
+    lead_of_task = {
+        worker.get("task_id"): worker["id"]
+        for worker in snapshot.get("workers", {}).values()
+        if worker.get("status") == "running"
+        and (snapshot.get("tasks", {}).get(worker.get("task_id")) or {}).get("role")
+        == "foreman"
+    }
     for project in coordinator.list_projects(data=snapshot):
         for request in coordinator.pending_foreman_requests(
             project["id"], data=snapshot
@@ -4683,6 +4707,19 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
             # the driver immediately, which is how the driver reads it at all.
             # This is the ATTENTION list, and it is for what has gone wrong.
             if _age_seconds(request.get("at")) < FOREMAN_REQUEST_GRACE_SECONDS:
+                continue
+            # AND STILL QUIET SINCE IT ARRIVED. The grace period fixed lines
+            # firing at three seconds, but elapsed time is still a proxy: it
+            # cannot tell a lead reading a long brief from one that never
+            # started. Two leads handed a 563-line document and a ticket were
+            # reported as "has not acted on" at three minutes while both were
+            # writing output that second. A log still growing after the request
+            # landed IS the lead acting on it, and it is directly observable,
+            # so ask that instead of inferring from silence.
+            lead_id = lead_of_task.get(request.get("task_id"))
+            if lead_id and coordinator.worker_output_touched_at(lead_id) > (
+                _epoch_of(request.get("at"))
+            ):
                 continue
             glyph = glyphs.get(project["id"], "")
             first = next(

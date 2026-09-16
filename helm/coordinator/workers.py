@@ -115,6 +115,36 @@ class WorkersMixin:
         _write_private_text(path, json.dumps(queued) + "\n")
         return path
 
+    def queued_turn_queued_at(self, worker_id: str) -> float:
+        """When the waiting prompt was queued, as an epoch float, or 0.
+
+        The reference point for "has anything happened since?". Without it the
+        only question available is "how long has it been quiet", which cannot
+        tell a runner starting a turn from one that will never start it.
+        """
+        path = self.turns_dir(worker_id) / "next.json"
+        with contextlib.suppress(OSError):
+            return path.stat().st_mtime
+        return 0.0
+
+    def queued_turn_age(self, worker_id: str) -> float:
+        """How long the waiting prompt has been waiting, in seconds, or 0."""
+        queued_at = self.queued_turn_queued_at(worker_id)
+        return max(0.0, time.time() - queued_at) if queued_at else 0.0
+
+    def worker_output_touched_at(self, worker_id: str) -> float:
+        """When this worker's output log was last written, as an epoch float.
+
+        The one cheap, direct observation of "is it doing anything right now".
+        Elapsed silence cannot tell a session reading a long brief from one
+        that never started; a log still growing settles it.
+        """
+        with contextlib.suppress(HelmError, OSError):
+            path = self._worker_log_path(worker_id)
+            if path is not None:
+                return path.stat().st_mtime
+        return 0.0
+
     def queued_turn_count(self, worker_id: str) -> int:
         """How many prompts are waiting to open this worker's next turn.
 

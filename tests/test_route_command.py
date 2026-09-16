@@ -475,6 +475,50 @@ class RouteCommandTests(HelmTestCase):
         coordinator.record_worker_message(second_id, "status", "on the second one")
         self.assertEqual(coordinator.pending_foreman_requests(project["id"]), [])
 
+    def test_a_lead_still_writing_output_is_not_called_neglectful(self) -> None:
+        """Elapsed time cannot tell reading from ignoring.
+
+        The grace period stopped lines firing at three seconds, but it is
+        still a proxy: two leads handed a 563-line diagnosis and a long ticket
+        were reported as "has not acted on" at three minutes while both were
+        writing output that second. A log that has moved since the request
+        landed IS the lead acting on it, and it is directly observable.
+        """
+        helm_root = self._helm_root("pending-working-root")
+        coordinator, project = self._project_root(helm_root, "pending-working")
+        command = shlex.join([sys.executable, "-c", "import time; time.sleep(600)"])
+        self._route(helm_root, project["id"], "the first request", "--command", command)
+        lead = coordinator.foreman_for(project["id"])
+
+        coordinator.record_worker_message(lead["id"], "status", "picked that up")
+        coordinator.record_worker_message(lead["id"], "answer", "now do TICKET-88")
+        with coordinator.store.locked() as data:
+            for message in data["messages"]:
+                if "TICKET-88" in message.get("text", ""):
+                    message["created_at"] = _iso_seconds_ago(
+                        cli.FOREMAN_REQUEST_GRACE_SECONDS + 60
+                    )
+
+        def pending_text() -> str:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                cli.main(["--root", str(helm_root), "pending"])
+            return output.getvalue()
+
+        # Its log has just been touched, so it is working on it, old or not.
+        log = Path(coordinator.store.load()["workers"][lead["id"]]["log_file"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("still reading the brief", encoding="utf-8")
+        self.assertNotIn("has not acted on", pending_text())
+
+        # A log that has not moved since the request landed is the real case
+        # this line exists for.
+        old = _dt.datetime.now().timestamp() - (cli.FOREMAN_REQUEST_GRACE_SECONDS + 300)
+        os.utime(log, (old, old))
+        surfaced = pending_text()
+        self.assertIn("has not acted on", surfaced)
+        self.assertIn("TICKET-88", surfaced)
+
     def test_pending_surfaces_a_request_the_foreman_has_not_acted_on(self) -> None:
         """`helm pending` must carry it, not just `helm project status`.
 
@@ -540,6 +584,15 @@ class RouteCommandTests(HelmTestCase):
                         message["created_at"] = _iso_seconds_ago(seconds)
 
         age_the_request(cli.FOREMAN_REQUEST_GRACE_SECONDS + 60)
+        # And quiet since: a log that has moved after the request landed means
+        # the lead is working on it, whatever the clock says.
+        log = Path(coordinator.store.load()["workers"][foreman["id"]]["log_file"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.touch()
+        old_time = _dt.datetime.now().timestamp() - (
+            cli.FOREMAN_REQUEST_GRACE_SECONDS + 300
+        )
+        os.utime(log, (old_time, old_time))
         surfaced = pending_text()
         self.assertIn("has not acted on", surfaced)
         self.assertIn("TICKET-77", surfaced)

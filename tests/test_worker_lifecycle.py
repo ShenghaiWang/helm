@@ -462,12 +462,30 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         self.assertIn("turn 2 ended cleanly", entry["detail"])
         self.assertIn("idle, not stuck", entry["detail"])
 
-        # A prompt queued that no turn took IS a fault -- the one the old
-        # `stalled` verdict caught by accident -- and it is named as its own.
+        # A PROMPT JUST QUEUED IS NOT A FAULT. A runner needs a moment to
+        # notice one, and it writes output while it starts the turn. This
+        # shipped with no grace and no such check, and cried wolf twenty
+        # seconds in on a runner that was alive and had written 0.8s earlier.
         self.coordinator.deliver_turn(worker["id"], "carry on")
+        self.assertEqual(verdict_for()["verdict"], "between-turns")
+
+        # Aged past the grace period, with nothing written since it landed,
+        # it IS the fault the old `stalled` verdict caught by accident.
+        queued = self.coordinator.turns_dir(worker["id"]) / "next.json"
+        stale = time.time() - (self.coordinator.TURN_PICKUP_GRACE_SECONDS + 60)
+        os.utime(queued, (stale, stale))
+        log = Path(self.coordinator.store.load()["workers"][worker["id"]]["log_file"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.touch()
+        os.utime(log, (stale - 60, stale - 60))
         entry = verdict_for()
         self.assertEqual(entry["verdict"], "runner-stopped")
-        self.assertIn("queued prompt(s) have not started a turn", entry["detail"])
+        self.assertIn("started no turn", entry["detail"])
+
+        # ...and a runner that IS writing since the prompt landed is working
+        # on it, however long the prompt has been there.
+        log.touch()
+        self.assertEqual(verdict_for()["verdict"], "between-turns")
 
     def test_a_worker_recorded_before_the_episode_fields_still_settles(self) -> None:
         """The scan survives only as a fallback, and only for those records."""
