@@ -194,6 +194,86 @@ class RouteCommandTests(HelmTestCase):
         self.assertIn("unit-one", first_out)
         self.assertIn("TICKET-42", second_out)
 
+    def test_a_named_request_reaches_the_driver_already_doing_that_work(self) -> None:
+        """A follow-up belongs to the driver that is already on it.
+
+        Without a way to address one, a request could only queue behind
+        whichever driver answered first or start one that has never heard of
+        the work. The name -- the tracker id -- is how it finds the right one.
+        """
+        helm_root = self._helm_root("route-named-root")
+        coordinator, project = self._project_root(helm_root, "route-named")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        self._route(helm_root, project["id"], "unrelated first unit", "--command", command)
+        first = coordinator.foreman_for(project["id"])
+        self._route(
+            helm_root, project["id"], "TICKET-42: the mux holds its only slot",
+            "--command", command, "--new",
+        )
+        data = coordinator.store.load()
+        second_id = next(
+            w["id"] for w in data["workers"].values()
+            if w.get("project_id") == project["id"] and w["id"] != first["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        )
+
+        # The name resolves to the driver appointed for that work.
+        self.assertEqual(
+            coordinator.driver_named(project["id"], "TICKET-42")["id"], second_id
+        )
+
+        # A follow-up naming that work reaches THAT driver, not the first one
+        # and not a third appointed for it. `foreman_for` is pinned to the
+        # first driver here so the assertion is about the name being used, not
+        # about which driver a project-wide lookup happens to answer with --
+        # state is written with sort_keys=True, so that order is random.
+        with mock.patch.object(
+            Coordinator, "foreman_for", return_value=dict(first)
+        ):
+            code, _ = self._route(
+                helm_root, project["id"], "TICKET-42 still has conflicts",
+                "--command", command,
+            )
+        self.assertEqual(code, 0)
+        data = coordinator.store.load()
+        drivers = {
+            w["id"] for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        }
+        self.assertEqual(len(drivers), 2, "a follow-up must not appoint a third driver")
+        texts = "".join(
+            m.get("text", "") for m in data["messages"] if m.get("worker_id") == second_id
+        )
+        self.assertIn("still has conflicts", texts)
+        first_texts = "".join(
+            m.get("text", "") for m in data["messages"] if m.get("worker_id") == first["id"]
+        )
+        self.assertNotIn("still has conflicts", first_texts)
+
+    def test_new_wins_over_a_matching_name(self) -> None:
+        # Saying --new is saying this is a separate unit of work; a name that
+        # happens to match must not quietly turn it into a follow-up.
+        helm_root = self._helm_root("route-named-new-root")
+        coordinator, project = self._project_root(helm_root, "route-named-new")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        self._route(
+            helm_root, project["id"], "TICKET-42: first slice", "--command", command
+        )
+        self._route(
+            helm_root, project["id"], "TICKET-42: second slice",
+            "--command", command, "--new",
+        )
+        data = coordinator.store.load()
+        drivers = [
+            w for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        ]
+        self.assertEqual(len(drivers), 2)
+
     def test_without_new_a_second_route_still_reuses_the_existing_driver(self) -> None:
         """The default is unchanged, and that is the point of it being opt-in.
 

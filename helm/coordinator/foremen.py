@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..naming import ticket_of
+from ..naming import task_name, ticket_of
 from ..paths import canonical
 from ..values import FOREMAN_DOMAIN, FOREMAN_RULES, _TERMINAL_WORKER_TASK_STATES, now
 
@@ -67,6 +67,35 @@ class ForemenMixin:
         if bound:
             return None
         return self.foreman_for(project_id or "", data=data)
+
+    def driver_named(
+        self, project_id: str, name: str, *, data: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """The project's live driver called `name`, if it has one.
+
+        A name is how a follow-up finds the work it is about. Without this the
+        only two things a request could do were queue behind whatever driver
+        answered first, or start a new one -- so "still blocked on the same
+        thing" either waited behind unrelated work or spawned an agent that
+        had never heard of it.
+
+        Compared case-insensitively because a tracker id is typed by hand and
+        a driver named from prose is lowercase; the name is a way to address
+        something, not a key.
+        """
+        wanted = (name or "").strip().lower()
+        if not wanted:
+            return None
+        data = data if data is not None else self.store.load()
+        for worker in data.get("workers", {}).values():
+            if worker.get("project_id") != project_id or worker.get("status") != "running":
+                continue
+            task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+            if task.get("role") != "foreman":
+                continue
+            if task_name(task).lower() == wanted:
+                return dict(worker)
+        return None
 
     @staticmethod
     def _live_foreman_task_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:

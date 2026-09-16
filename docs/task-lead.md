@@ -13,6 +13,9 @@ the code. What works today:
 - A worker's report reaches the driver that **started** it, not whichever one
   the project lookup answers with.
 - A request routed to one driver is not cleared by a different driver's reply.
+- A request that **names** work — `route --ticket TICKET-42`, or a tracker id in
+  the text — reaches the driver already doing it, rather than queueing behind
+  whichever driver answers first or starting one that has never heard of it.
 - The watchdog asks whether **each worker** has a live driver, not whether the
   project has one, and appoints a driver for orphaned work.
 

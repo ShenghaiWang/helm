@@ -21,7 +21,7 @@ from .watchdog import DEFAULT_INTERVAL as WATCHDOG_DEFAULT_INTERVAL
 from .values import GRANTABLE_ACTIONS, TASK_SHAPES
 from .coordinator.tidy import STALE_FOLLOW_UP_DAYS
 from .learned import bound_learned_knowledge
-from .naming import task_name
+from .naming import task_name, ticket_of
 from .values import SMART_ZONE_TOKENS
 from .core import (
     HEALTHY_WORKER_VERDICTS,
@@ -4928,8 +4928,21 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
     # `foreman_for` as "the" driver of a project, and flipping the default
     # before those are migrated would change what they answer rather than what
     # they do. See docs/task-lead.md.
+    # A NAMED DRIVER IS ADDRESSED, not queued behind and not duplicated. A
+    # follow-up -- "still blocked on the same thing" -- belongs to the driver
+    # already doing that work, and the name is how it finds it. Without this
+    # the request could only queue behind whichever driver answered first or
+    # start one that has never heard of the work.
+    addressed = args.ticket or ticket_of({"brief": args.text})
+    named = (
+        coordinator.driver_named(args.project_id, addressed)
+        if addressed and not args.new_lead
+        else None
+    )
     started = None
-    if args.new_lead:
+    if named is not None:
+        foreman = named
+    elif args.new_lead:
         # Take the record `_start_foreman` returns rather than re-reading
         # `foreman_for` afterwards: with more than one driver live, "the"
         # driver of a project is not a question with one answer, and the
