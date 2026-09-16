@@ -157,7 +157,7 @@ class RouteCommandTests(HelmTestCase):
     def test_helm_foreman_new_appoints_a_driver_beside_the_existing_one(self) -> None:
         """Explicit appointment must not be a dead end at the first driver.
 
-        `helm foreman` reported "already has a foreman" and stopped, which was
+        `helm foreman` reported "already has a task lead" and stopped, which was
         right while one project meant one driver. Under a driver per unit of
         work it makes a project's first driver its last: every later unit
         queues behind it.
@@ -178,13 +178,13 @@ class RouteCommandTests(HelmTestCase):
         # Without --new it still says what is there and appoints nothing.
         code, repeat = run("--command", command, "--no-herdr")
         self.assertEqual(code, 0)
-        self.assertIn("already has a foreman", repeat)
+        self.assertIn("already has a task lead", repeat)
 
         code, second_out = run(
             "--command", command, "--no-herdr", "--new", "--ticket", "TICKET-42",
         )
         self.assertEqual(code, 0)
-        self.assertNotIn("already has a foreman", second_out)
+        self.assertNotIn("already has a task lead", second_out)
 
         data = coordinator.store.load()
         drivers = [
@@ -607,7 +607,7 @@ class RouteCommandTests(HelmTestCase):
         with contextlib.redirect_stderr(stderr):
             code = cli.main(["--root", str(helm_root), "route", project["id"], "do something"])
         self.assertEqual(code, 2)
-        self.assertIn("declined a foreman", stderr.getvalue())
+        self.assertIn("declined a task lead", stderr.getvalue())
         self.assertNotIn("see the message above", stderr.getvalue())
 
     # -- an unknown project ------------------------------------------------
@@ -855,7 +855,7 @@ class RouteCommandTests(HelmTestCase):
         # how to hand the project a new one.
         settled = coordinator.store.load()["workers"][worker["id"]]
         self.assertNotEqual(settled["status"], "running")
-        self.assertIn(f"helm foreman {project['id']}", output)
+        self.assertIn(f"helm lead {project['id']}", output)
 
     def test_a_dead_panes_request_is_recorded_before_reconciliation_can_lose_it(self) -> None:
         """The exact bug this round fixes: the request must not be lost.

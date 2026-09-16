@@ -526,7 +526,7 @@ def install(
         if notify_command:
             print(f"  Each notification also runs your command: {notify_command}")
         print(
-            "  A worker that reads as dead on two checks a minute apart is stopped, a dead foreman "
+            "  A worker that reads as dead on two checks a minute apart is stopped, a dead task lead "
             "replaced, and a project with running workers and no driver re-driven."
             if heal else "  Healing is off (--no-heal): deaths are reported, never acted on."
         )

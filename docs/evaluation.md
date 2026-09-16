@@ -8,9 +8,9 @@ the real fix started from and scores each against what shipped:
 - **single**: one `claude -p` session in a worktree, handed the ticket, no
   Helm;
 - **delegated**: delegation without the protocol — one launched worker in an
-  isolated worktree with the brief and knowledge, no foreman, no gates, no
+  isolated worktree with the brief and knowledge, no task lead, no gates, no
   independent review (a project with `"foreman": false`);
-- **helm**: the whole protocol, routed to a foreman.
+- **helm**: the whole protocol, routed to a task lead.
 
 ```sh
 helm eval add T-12 --base <sha> --merge <sha> --brief-file t12.md --title "..."
@@ -43,7 +43,7 @@ and then enforced from outside the arm:
   Helm task branch that reaches past the base is refused by name until its
   task is cleaned up. `helm eval sanitize <ticket> --arm <arm>` does this by
   hand and says what it removed;
-- the brief states the rule in the same words on every arm, and the foreman
+- the brief states the rule in the same words on every arm, and the task lead
   is told to put it in the worker's brief;
 - collection reads the candidate's commits, diff and transcript for the
   shipped commit, the pull request, the real id or a cherry-pick trailer. A
@@ -57,7 +57,7 @@ tokens (`helm task cost`), human interventions **by kind** — `helm ask`
 records, gate decisions, approvals — review rounds and the catches among
 them. Every run has the same wall-clock cap (`settings.max_minutes`, 120 by
 default): past it, the next `helm eval status` ends the run's sessions the
-way `helm worker stop` does — a helm run's foreman included — and records it
+way `helm worker stop` does — a helm run's task lead included — and records it
 as `timed-out`, with whatever it had committed as its candidate. The judge's
 patches are written at collection, so they outlive the branch, and a
 replaced run's record is kept aside rather than overwritten.

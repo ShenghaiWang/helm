@@ -119,7 +119,7 @@ digest, and everything under the project's declared delivery directories,
 which is where ignored build outputs live. Workspace identity is verified
 first, and anything unreadable is a refusal, not an empty binding.
 
-A foreman asking for a protected action on a worker's branch names that task:
+A task lead asking for a protected action on a worker's branch names that task:
 `--type approval-needed --action push --subject <task-id>`. The authorization
 then binds to the worker's branch and tree, not to the project root's own
 checkout — a fetch or checkout in the commander's working copy no longer

@@ -962,7 +962,7 @@ class GateDecisionDeliveryTests(HelmTestCase):
         self.assertIn("NOT DELIVERED", output)
         # It must name the recovery command, and warn that the gate binding
         # does not survive the driver it was bound to.
-        self.assertIn("helm foreman deadforeman", output)
+        self.assertIn("helm lead deadforeman", output)
         self.assertIn("proposes", output.lower() + output)
         self.assertNotIn(
             "route it a message to move it along", output,

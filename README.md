@@ -34,8 +34,8 @@ Then start your agent CLI with this directory as its working root. It reads
 
 ```text
 you:   work on the next ticket for api: add rate limiting to the login route
-agent: routes it to api's foreman; the foreman proposes a requirement gate
-you:   helm gate decide <foreman-task> --type requirement --confirm
+agent: routes it to a task lead for it; the lead proposes a requirement gate
+you:   helm gate decide <lead-task> --type requirement --confirm
        ... the solution gate the same way ...
 agent: a worker is launched in its own worktree; a reviewer on another model
        reads the change; you are asked only for the delivery decision
@@ -50,17 +50,20 @@ shows the whole board; `helm ledger` shows what each task cost and caught.
 ```text
 commander   → the human; owns approval and anything irreversible
 coordinator → picks the project, composes context, holds the approval gate
-foreman     → one per project; turns goals into tasks, drives and answers workers
+task lead   → one per unit of work, named for it; turns a goal into a task,
+              drives and answers the worker, and ends when the work does
 worker      → one per task; works only in its own worktree, reports by protocol
 reviewer    → independent agent on a different model; cross-checks every change
 ```
 
 One request travels like this:
 
-1. **Route.** `helm route <project> "..."` hands the commander's words to that
-   project's foreman and returns at once; a project without a foreman gets
-   one appointed first.
-2. **Gate.** The foreman proposes a requirement contract and then a technical
+1. **Route.** `helm route <project> "..."` hands the commander's words to a
+   task lead and returns at once; `--ticket` reaches the lead already on that
+   work, `--new` appoints one for a separate unit, and work with no lead gets
+   one appointed first. Several leads run side by side and none waits on the
+   others.
+2. **Gate.** The lead proposes a requirement contract and then a technical
    solution; only the root confirms each, and one confirmed pair authorizes
    exactly one state-changing task.
 3. **Cut a worktree.** The task's worktree and branch are cut from a fresh,
@@ -105,8 +108,8 @@ prose:
 
 ## Why Helm
 
-**It drives the work; you do not.** A foreman per project turns a goal into
-a task, launches the worker, answers its questions, runs the review loop,
+**It drives the work; you do not.** A task lead per unit of work turns a goal
+into a task, launches the worker, answers its questions, runs the review loop,
 and escalates only what it cannot decide. You say what you want once; the
 next thing you hear is the result, or the one decision only you can make.
 
@@ -365,8 +368,8 @@ none. See [docs/knowledge.md](docs/knowledge.md) and
 
 A worker's `result` is a milestone, not the end. Every terminal report is
 written into the project's status record as it arrives, so a final summary
-flows worker → foreman → Helm and survives the pane and the session. While a
-foreman is live it keeps driving; once no driver is left — the foreman
+flows worker → task lead → Helm and survives the pane and the session. While a
+lead is live it keeps driving; once no driver is left — the lead
 reported, stood down, or the project declined one — Helm records a
 **delivery decision** for the commander: read the outcome, then choose
 review, another round, local merge, PR delivery, or cleanup. It shows in
@@ -375,7 +378,7 @@ closes itself once the task is merged, continued, or cleaned up; a free-text
 follow-up from `helm project action` is never auto-closed.
 
 Recording an outcome is not delivering it. A worker reports from inside its
-own pane, so Helm routes the summary and the decision to the live foreman,
+own pane, so Helm routes the summary and the decision to the live lead,
 the project's overview pane and the durable record before any of that runs
 and a tab is released; a tab whose outcome reached nothing is kept, because
 that pane is then the only copy.
@@ -420,7 +423,7 @@ also runs under an empty home and a bare `PATH`.
 
 | Read | For |
 | --- | --- |
-| [docs/delegation.md](docs/delegation.md) | the coordinator, `route`, the foreman, the requirement and solution gates, one driver per task |
+| [docs/delegation.md](docs/delegation.md) | the coordinator, `route`, the task lead, the requirement and solution gates, one driver per task |
 | [docs/worker-protocol.md](docs/worker-protocol.md) | worker messages, the inbox and answers, confirmations, `watch`, `stop` |
 | [docs/worker-lifecycle.md](docs/worker-lifecycle.md) | the state machine that reconciles a worker's messages with what the OS observed |
 | [docs/approvals.md](docs/approvals.md) | the authority boundary, standing grants, a paused task and its release, repair |
@@ -445,13 +448,13 @@ Herdr ownership.
 
 ```text
 helm init [ROOT]
-helm adopt PATH [--id ID] [--label L] [--delivery local|pr] [--domain D]... [--base-branch B] [--no-foreman] [--no-review] [--agent A] [--model M] [--effort E]
+helm adopt PATH [--id ID] [--label L] [--delivery local|pr] [--domain D]... [--base-branch B] [--no-lead] [--no-review] [--agent A] [--model M] [--effort E]
 helm doctor [--project PROJECT_ID] [--json] [--probe-runtimes]
 helm status [--project PROJECT_ID] · pending [--changes] [--heal] · ack PROJECT · ask record|show
 helm watch [--silence SECONDS] [--nudge] · watchdog install|run [--notify-command CMD] [--remind-after MIN] [--no-heal] · restart|uninstall
 helm route PROJECT TEXT [--agent A] [--model M] [--no-herdr]
-helm foreman PROJECT [--agent A] [--command CMD] [--no-herdr]
-helm gate propose|decide FOREMAN_TASK --type requirement|solution
+helm lead PROJECT [--agent A] [--command CMD] [--no-herdr] [--new] [--ticket T]
+helm gate propose|decide LEAD_TASK --type requirement|solution
 helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async|--wait]
 helm task create --project P --brief TEXT [--read-only] [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--blocked-by TASK_ID]... [--base B] [--new]
 helm task shape TASK_ID small|standard|critical [--reason TEXT]

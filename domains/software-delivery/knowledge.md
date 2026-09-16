@@ -37,7 +37,7 @@ For coding work delivered through a pull request, the reviewed branch is not
 the finish line. Done means the PR has been opened, monitored, all actionable
 comments and failing checks have been addressed through further coding/review
 rounds, reviewers have approved, and Helm has recorded the PR as merged. Until
-then the work stays active under the project's single foreman. The merge action
+then the work stays active under that unit of work's task lead. The merge action
 itself still requires the authorized human/tooling; an agent does not merge on
 its own authority.
 

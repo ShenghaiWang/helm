@@ -10,10 +10,10 @@ The outcome is kept in the task worktree, the branch, the PR, delivered
 artifacts, the project status record, messages and logs — never by keeping
 an agent session alive as storage. Every terminal report is written into the
 project's status record as it arrives, so a final summary flows worker →
-foreman → Helm and survives the pane, the session and the conversation.
+task lead → Helm and survives the pane, the session and the conversation.
 
-While the project's foreman is live, the result is pushed to it and nobody is
-asked to merge anything. Once no driver is left — the foreman reported,
+While the work's task lead is live, the result is pushed to it and nobody is
+asked to merge anything. Once no driver is left — the task lead reported,
 stood down, or the project declined one — Helm records a **delivery
 decision** as a commander-visible action item on that project: read the
 outcome, then choose review, another round, local merge, PR delivery, or
@@ -30,14 +30,14 @@ Recording the outcome is not the same as delivering it. A worker reports by
 running a Helm command *inside its own pane*, so the confirmation is printed
 onto the surface that releasing the tab is about to remove. Helm therefore
 routes the final summary and the decision before any of that runs — to the
-project's live foreman, to the project's own overview pane, and to the
+work's live task lead, to the project's own overview pane, and to the
 durable status record — and records which of those accepted it. A project
 with no driver is the case that most needs telling. A finished tab whose
 outcome reached nothing at all is not released, because that pane is then the
 only copy.
 
 The decision is deduplicated, so the several paths that can raise it — a
-worker result, a foreman's final report, a foreman standing down — produce one
+worker result, a task lead's final report, a task lead standing down — produce one
 item. It names the single unresolved task when there is one and stays
 project-scoped when there are several. It closes itself once the decision has
 been taken: the task reaching `merged` or `pr-merged`, being continued with
@@ -51,7 +51,7 @@ pointing at that task — a delivery gate, a failure decision, or a free-text
 follow-up — has nothing left to decide. `helm state tidy` closes those as
 "task archived", after re-running the derived gates so a delivery decided
 elsewhere or a failure since retried closes too; `helm watch` and `helm state
-archive` run the same pass. A failed foreman or reviewer never raises a
+archive` run the same pass. A failed task lead or reviewer never raises a
 failure decision at all: neither owns a worktree, so none of retry, continue
 or cleanup applies — the review loop re-runs a failed round, and the next
 command that starts work appoints a driver.
@@ -87,7 +87,7 @@ Helm's part is the boundary and the record.
 `helm task provenance <task>` prints a short block for the PR body: which
 task and ticket, its shape, which agent and model wrote it at what effort,
 how many independent review rounds ran and what they said, and the suite
-evidence at the tip. The foreman pastes it; Helm writes nothing to the PR.
+evidence at the tip. The task lead pastes it; Helm writes nothing to the PR.
 When Helm syncs a PR it reads the body, records whether the block is there,
 and notes a missing one on the project's record once, naming the command.
 A later reader asking who wrote a change, how it was checked, or whether a
@@ -141,7 +141,7 @@ helm task pr-status <task-id> --state merged --url https://example/pull/1
 ```
 
 `pr-open` is deliberately not final: checks, review comments and human
-replies can still arrive, so the project's single foreman stays responsible
+replies can still arrive, so that work's task lead stays responsible
 for monitoring it. PR delivery still requires the explicit protected push
 command; monitoring records observations and never approves or merges on its
 own. `helm watch` and the watchdog read every open PR on their own, at most

@@ -29,7 +29,7 @@ helm adopt projects/widgets --no-review        # already under projects/: adopte
 Clones the repository into `projects/<id>` from its own `origin` when it has
 one (otherwise from the path; the original is never moved or touched), writes
 `.helm/project.json` with the label, delivery policy, domains and any
-`--base-branch`, `--no-foreman`, `--no-review`, `--agent`, `--model` or
+`--base-branch`, `--no-lead`, `--no-review`, `--agent`, `--model` or
 `--effort` you passed — only when there is none; an existing file is the
 owner's and is read instead — registers the project, then runs `helm doctor
 --project <id>` and prints it. The exit code is that preflight's verdict for
@@ -142,8 +142,8 @@ findings become proposals on their own. It also heals: a worker that reads as pr
 checks a minute apart — its process gone with no exit record, or the pane
 gone and the worker silent past the threshold, never a worker still in its
 startup grace — is stopped so its task can be reopened or retried, a dead
-foreman is replaced by one that reads the project record and carries on,
-and a project with running workers and no driver gets a foreman appointed.
+task lead is replaced by one that reads the project record and carries on,
+and a project with running workers and no driver gets a task lead appointed.
 Stalled or erroring workers are reported and never touched; `--no-heal`
 turns the healing off. `helm watchdog restart` makes a running watchdog
 pick up new code.

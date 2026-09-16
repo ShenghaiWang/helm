@@ -4,10 +4,10 @@ applies_to: Keeping concurrent pieces of work from contaminating each other, and
 use_when:
   - several changes are in flight at once
   - a new worktree-backed task is about to be created, even a single one
-  - a foreman is about to create a worktree-backed task for someone else
+  - a task lead is about to create a worktree-backed task for someone else
 not_for:
-  - allocating a worktreeless role's own workspace (foreman, reviewer) --
-    neither gets a worktree of its own, even though a foreman still reads
+  - allocating a worktreeless role's own workspace (task lead, reviewer) --
+    neither gets a worktree of its own, even though a task lead still reads
     this before creating a worktree-backed task for someone else
 selectable: false
 ---
@@ -49,11 +49,11 @@ retarget its review.
 
 This happens once, before a new **worktree-backed** task is created -- not
 while a worker is already inside its worktree, and not for a driving role
-(foreman, reviewer) that never gets a worktree of its own -- because a stale
+(task lead, reviewer) that never gets a worktree of its own -- because a stale
 or unverified base is a defect in the *isolation*, not in the work:
 everything downstream (the branch, the diff, the review) inherits whatever
 the base actually was. The driver that creates the task is the one that must
-have it, so a foreman reads this before calling `helm task create` /
+have it, so a task lead reads this before calling `helm task create` /
 `helm worker launch`, not after.
 
 - Resolve the project's **configured** default/base branch. Never hardcode a

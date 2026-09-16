@@ -213,21 +213,29 @@ class WorkerProtocolTests(HelmTestCase):
         with self.assertRaisesRegex(HelmError, r"not delivered a terminal message"):
             self.coordinator.settle_reported_worker(quiet["id"])
 
-    def test_a_foreman_tab_is_called_foreman(self) -> None:
+    def test_a_task_leads_tab_is_never_a_slug_of_its_role_document(self) -> None:
         """Its brief is standing text, so slugging it named the tab after that.
 
-        Every foreman got a tab reading like the opening words of "You are this
-        project's foreman...", which says nothing about which pane it is.
+        Every lead got a tab reading like the opening words of "You are a task
+        lead...", which says nothing about which pane it is. Its name does --
+        and a lead with no ticket and no request has no name to give, so the
+        tab says what it is and stops there.
         """
-        foreman_task = {"role": "foreman", "brief": "You are this project's foreman. You own..."}
+        lead_task = {"role": "foreman", "brief": "You are a task lead. You own ONE unit..."}
         worker = {"id": "w-fe58cded506e"}
-        self.assertEqual(HerdrAdapter._worker_tab_label(foreman_task, worker), "foreman")
+        self.assertEqual(HerdrAdapter._worker_tab_label(lead_task, worker), "lead")
+
+        # Given the work it leads, the tab says which one it is.
+        named = {"role": "foreman", "ticket": "TICKET-42", "brief": lead_task["brief"]}
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(named, worker), "lead TICKET-42"
+        )
 
         # An ordinary worker still gets its brief and a disambiguating suffix,
         # because a project has many of those at once.
         worker_task = {"role": "worker", "brief": "Implement slice S0 of the migration"}
         label = HerdrAdapter._worker_tab_label(worker_task, worker)
-        self.assertNotEqual(label, "foreman")
+        self.assertNotEqual(label, "lead")
         self.assertIn("fe58", label)
 
     def test_a_reviewer_gets_no_checkout_and_no_branch(self) -> None:
@@ -452,7 +460,7 @@ class WorkerProtocolTests(HelmTestCase):
                 payload={"summary": True},
             )
             status = self.coordinator.project_status(project["id"])
-            self.assertTrue(any("Foreman report:" in entry["text"] and "task round 5" in entry["text"] for entry in status["situation"]))
+            self.assertTrue(any("Task lead report:" in entry["text"] and "task round 5" in entry["text"] for entry in status["situation"]))
             self.coordinator.record_worker_message(foreman["id"], "result", "project driven")
             self.assertFalse(adapter.notify_foreman(foreman["id"]))
             self.assertEqual(delivered, [])

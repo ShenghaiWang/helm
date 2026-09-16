@@ -27,12 +27,12 @@ happens. Stdout only reaches Helm when the worker exits, so a long task that
 reports nothing until then is indistinguishable from one that died.
 
 Routine `status` is a heartbeat: it is routed to the project pane but does
-not interrupt the foreman. Add `--payload '{"summary":true}'` when the status
+not interrupt the task lead. Add `--payload '{"summary":true}'` when the status
 is a meaningful intermediate outcome — a coding or review round completing, a
 reviewer sending the author back, a PR state changing, a delivery gate
-opening. A foreman's own summary status is recorded into `helm project
+opening. A task lead's own summary status is recorded into `helm project
 status` as a commander-facing progress line; a worker summary is recorded
-there too and also wakes the foreman.
+there too and also wakes the task lead.
 
 Workers may also emit one JSON object per line on stdout:
 
@@ -63,7 +63,7 @@ a wake. Herdr's runtime hooks say whether the agent is `idle`, `working` or
 after a pause (sent together, the newline races the paste); a working one
 gets a single pointer line; a blocked one — a dialog is up — gets nothing
 typed, because `Enter` would answer the dialog. Nothing presses Escape: it
-cancelled whatever tool call the agent was inside, which is how a foreman
+cancelled whatever tool call the agent was inside, which is how a task lead
 once lost the review it was blocked on. `helm worker interrupt` does that on
 purpose, as its own verb.
 
@@ -83,18 +83,18 @@ A worker cannot miss a note:
   `CLAUDE.md` above the workspace (`claudeMdExcludes`): Claude Code reads
   memory files from the working directory up to the filesystem root, and a
   workspace sits under the Helm root, so without the exclusion every worker
-  and foreman opened with the root's own coordinator manual ahead of its
+  and task lead opened with the root's own coordinator manual ahead of its
   assignment. The project's own file, inside the workspace, still loads.
   The same file turns Claude Code's auto memory off (`autoMemoryEnabled`):
   that memory directory is keyed to the enclosing git repository, so a
-  foreman inside the Helm root would otherwise read the commander's own
+  task lead inside the Helm root would otherwise read the commander's own
   notes about this root, and a worker would read and write the notes of
   whoever runs sessions in that project's repository.
   Under `execution.turns` each turn is started with a settings file that
   carries the exclusions alone: a turn is woken by being started, so it
   needs no hook. A
   runtime that reads `AGENTS.md` from the enclosing repository root has no
-  such exclusion, so a foreman on one of those, whose workspace lies inside
+  such exclusion, so a task lead on one of those, whose workspace lies inside
   this repository, may still see the manual; a worker in its own worktree
   does not.
 
@@ -116,7 +116,7 @@ push, deletion, other destructive or external actions, missing credentials —
 still reach a human, and Helm cannot grant them; see
 [approvals.md](approvals.md).
 
-A foreman's `blocker` pauses its task rather than ending it: a driver's whole
+A task lead's `blocker` pauses its task rather than ending it: a driver's whole
 job is to meet obstacles and escalate them, so the session stays live and an
 answer resumes it. A plain worker's blocker still ends its assignment, because
 a worker that cannot do the one thing it was made for needs a new task.

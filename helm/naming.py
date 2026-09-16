@@ -52,6 +52,11 @@ _TICKET = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b")
 
 _WORD = re.compile(r"[A-Za-z0-9]+")
 
+#: Roles whose brief is a standing role document rather than a statement of
+#: the work. Spelled here rather than imported so this module keeps depending
+#: on nothing: it is read by `pending`, which must never fail to load.
+_WORKTREELESS_ROLES = frozenset({"foreman"})
+
 #: How many words a derived title may carry. Three is enough to distinguish
 #: work in one project and short enough to sit in a column.
 _TITLE_WORDS = 3
@@ -115,6 +120,17 @@ def title_of(task: dict[str, Any] | None) -> str:
     recorded = name_from(str((task or {}).get("title") or ""))
     if recorded:
         return recorded
+    if (task or {}).get("role") in _WORKTREELESS_ROLES:
+        # A DRIVER'S BRIEF IS NEVER A DESCRIPTION OF ITS WORK. It is the
+        # standing role document, the same text for every driver in every
+        # project, so slugging it produced `project-s-foreman` -- identical for
+        # all of them, and as a label it reads "lead project-s-foreman", which
+        # is worse than the id it replaced because it looks meaningful.
+        #
+        # A driver appointed with neither a ticket nor a request has nothing
+        # that says what it is for, and the honest answer to that is the id.
+        # An ugly name beats a wrong one.
+        return ""
     return name_from(str((task or {}).get("brief") or ""))
 
 

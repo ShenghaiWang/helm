@@ -1063,7 +1063,7 @@ class DeliveryTests(HelmTestCase):
         decisions = self._decisions(project["id"])
         self.assertEqual([item["task_id"] for item in decisions], [task["id"]])
         self.assertTrue(
-            any("Foreman report:" in e["text"] for e in
+            any("Task lead report:" in e["text"] for e in
                 self.coordinator.project_status(project["id"])["situation"])
         )
 

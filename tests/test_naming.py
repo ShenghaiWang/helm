@@ -91,6 +91,35 @@ class ARecordedTitleBeatsTheBriefTests(unittest.TestCase):
         self.assertEqual(task_name(task), "rebuild-the-export")
 
 
+class ADriversBriefIsNeverItsNameTests(unittest.TestCase):
+    """The standing role document says what a driver IS, not what it is for.
+
+    Slugged, it produced `project-s-foreman` -- identical for every driver in
+    every project, and as a tab label it read "lead project-s-foreman", which
+    is worse than the id it replaced because it looks meaningful.
+    """
+
+    ROLE_DOCUMENT = "You are this project's foreman. You own the loops inside one project"
+
+    def test_a_driver_with_nothing_to_go_on_falls_back_to_the_id(self):
+        task = {"id": "t-1", "role": "foreman", "brief": self.ROLE_DOCUMENT}
+        self.assertEqual(task_name(task, fallback="w-abc"), "w-abc")
+
+    def test_a_ticket_still_names_it(self):
+        task = {"id": "t-1", "role": "foreman", "ticket": "TICKET-42", "brief": self.ROLE_DOCUMENT}
+        self.assertEqual(task_name(task), "TICKET-42")
+
+    def test_a_recorded_title_still_names_it(self):
+        task = {"id": "t-1", "role": "foreman", "title": "silent mic hard stop",
+                "brief": self.ROLE_DOCUMENT}
+        self.assertEqual(task_name(task), "silent-mic-hard")
+
+    def test_an_ordinary_task_is_still_named_from_its_brief(self):
+        # A worker's brief IS the statement of its work, so nothing changes.
+        task = {"id": "t-2", "role": "worker", "brief": "rebuild the export pipeline"}
+        self.assertEqual(task_name(task), "rebuild-the-export")
+
+
 class NameFromTextTests(unittest.TestCase):
     def test_leading_noise_is_dropped_but_interior_noise_is_kept(self):
         # "the" leads, so it is skipped; once a real word has landed the

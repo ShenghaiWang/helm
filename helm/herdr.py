@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
+from .naming import task_name
 from .values import shape_check, shape_policy
 from .core import (
     Coordinator,
@@ -325,20 +326,25 @@ class HerdrAdapter:
         worker: dict[str, Any],
         data: dict[str, Any] | None = None,
     ) -> str:
-        # A foreman is one per project and its brief is the same standing text
-        # every time, so slugging it produced a tab named after the opening
-        # words of that text -- "you-are-this-projects-f-fe58" -- which says
-        # nothing about which pane it is. It is the foreman; name it that.
+        # A task lead's brief is the same standing role document every time, so
+        # slugging it produced a tab named after the opening words of that text
+        # -- "you-are-this-projects-f-fe58" -- which says nothing about which
+        # pane it is. Its NAME does: the ticket it was appointed for, or a few
+        # words of the request. "lead" alone was enough while a project had one
+        # of them; with several it is the same failure the slug had, one word
+        # shorter.
         if (task or {}).get("role") == "foreman":
-            # A dead foreman's pane is KEPT, because a blocked or failed task
+            # A dead task lead's pane is KEPT, because a blocked or failed task
             # is diagnosed from it. Labelled the same as the live one, the
             # corpse and the driver are typographically identical, and "which
             # of these is running my project" becomes a question only the state
             # file can answer -- asked twice in one session before this said so.
+            name = task_name(task, fallback="")
+            label = f"lead {name}" if name else "lead"
             state = (task or {}).get("status")
             if state in _EVIDENCE_TASK_STATES:
-                return f"foreman ({state})"
-            return "foreman"
+                return f"{label} ({state})"
+            return label
         # PURPOSE, not a slug of the brief. Slugging produced tabs like
         # "dsk-719-pr-19699-deli-617c": the first words of whatever the brief
         # happened to open with, which reads as noise and repeats the ticket
@@ -1160,7 +1166,7 @@ class HerdrAdapter:
             raise HelmError(
                 f"task {task_id} already has a running reviewer "
                 f"({existing['id']} on {existing.get('agent_id')}); wait for it, or stop "
-                "it first. A project with a foreman already runs this loop -- driving it "
+                "it first. A project with a task lead already runs this loop -- driving it "
                 "from the coordinator as well starts a second one."
             )
         choice = self.coordinator.pick_reviewer_agent(

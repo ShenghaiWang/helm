@@ -194,7 +194,7 @@ class ForemenMixin:
     def pending_foreman_requests(
         self, project_id: str, *, data: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        """Requests routed to this project's foreman that it has not acted on.
+        """Requests routed to this project's task lead that it has not acted on.
 
         ``helm route`` records the commander's request as an ``answer`` on the
         foreman's own task, then relies on the foreman reading it when it comes
@@ -272,7 +272,7 @@ class ForemenMixin:
         ]
 
     def foreman_brief(self, project_id: str, *, request: str | None = None) -> str:
-        """The role document a project's foreman is started with.
+        """The role document a project's task lead is started with.
 
         A foreman is a bounded delegate, not a second coordinator: it drives
         loops inside one project so Helm is not the thing running them, while
@@ -339,7 +339,7 @@ class ForemenMixin:
         request: str | None = None,
         ticket: str | None = None,
     ) -> dict[str, Any]:
-        """Create the task a project's foreman runs as.
+        """Create the task a project's task lead runs as.
 
         It gets one domain, and it is about driving rather than about the work
         it drives: how to brief a worker, when to answer instead of escalate,
@@ -422,11 +422,11 @@ class ForemenMixin:
         return None
 
     def stand_down_idle_foreman(self, project_id: str) -> dict[str, Any] | None:
-        """Let a project's foreman finish once there is nothing left to drive.
+        """Let a project's task lead finish once there is nothing left to drive.
 
         A foreman was appointed once and never terminated, while releasing a
         project's space requires that no worker in the project is running. So
-        for any project with a foreman -- which is every project by default --
+        for any project with a task lead -- which is every project by default --
         "a finished project releases its space" could never happen. A guarantee
         that cannot fire is worse than no guarantee: it reads as automatic
         cleanup while spaces accumulate for every project ever touched.
@@ -474,7 +474,7 @@ class ForemenMixin:
                 task["status"] = "completed"
             self._message(
                 locked, project, task, worker, "status",
-                "Foreman stood down: nothing left to drive",
+                "Task lead stood down: nothing left to drive",
                 {"status": "completed"},
             )
             # "Nothing left to drive" is not the same as "nothing left to
@@ -484,6 +484,6 @@ class ForemenMixin:
             # for it at all.
             with contextlib.suppress(HelmError, OSError):
                 self.raise_delivery_decision_for_project(
-                    project_id, data=locked, source="Foreman stood down"
+                    project_id, data=locked, source="Task lead stood down"
                 )
             return dict(worker)

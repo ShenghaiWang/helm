@@ -78,7 +78,7 @@ class AdoptTests(HelmTestCase):
         self.assertEqual(code, 0, text)
         self.assertIn("Adopted gadgets at", text)
         self.assertIn("cloned from", text)
-        self.assertIn("foreman: no", text)
+        self.assertIn("task lead: no", text)
         self.assertIn("helm doctor: root", text)
         self.assertIn("project gadgets", text)
         self.assertIn('Next: helm route gadgets', text)

@@ -58,7 +58,7 @@ What keeps a space open, and why:
 - a **failed or blocked** task, while its pane holds the diagnosis;
 - an **approval-needed** task, because a human still has to look.
 
-A foreman's own task never holds a space open: it produces no branch, so it
+A task lead's own task never holds a space open: it produces no branch, so it
 has nothing to deliver. `HELM_KEEP_SPACES=1` keeps every space.
 
 ## A closed space closes the report

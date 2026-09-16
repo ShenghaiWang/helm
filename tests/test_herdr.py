@@ -648,20 +648,44 @@ class HerdrTests(HelmTestCase):
         task = {"role": "foreman", "status": "blocked"}
         worker = {"id": "w-dead0001"}
         self.assertEqual(
-            HerdrAdapter._worker_tab_label(task, worker), "foreman (blocked)"
+            HerdrAdapter._worker_tab_label(task, worker), "lead (blocked)"
         )
         self.assertEqual(
             HerdrAdapter._worker_tab_label(
                 {"role": "foreman", "status": "failed"}, worker
             ),
-            "foreman (failed)",
+            "lead (failed)",
         )
         # The live one keeps the plain name, so the exception stays legible.
         self.assertEqual(
             HerdrAdapter._worker_tab_label(
                 {"role": "foreman", "status": "running"}, worker
             ),
-            "foreman",
+            "lead",
+        )
+
+    def test_a_task_leads_tab_is_named_for_the_work_it_leads(self) -> None:
+        """"lead" alone was enough while a project had one of them.
+
+        With several, every tab in the panel reads identically and "which of
+        these is TICKET-42" is a question only the state file can answer --
+        which is the failure the brief-slug had, one word shorter.
+        """
+        from helm.herdr import HerdrAdapter
+
+        worker = {"id": "w-lead0001"}
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"role": "foreman", "status": "running", "ticket": "TICKET-42"}, worker
+            ),
+            "lead TICKET-42",
+        )
+        # And a dead one still says so, beside its name.
+        self.assertEqual(
+            HerdrAdapter._worker_tab_label(
+                {"role": "foreman", "status": "failed", "ticket": "TICKET-42"}, worker
+            ),
+            "lead TICKET-42 (failed)",
         )
 
     def test_a_ticketed_task_tab_leads_with_the_ticket_then_its_purpose(self) -> None:

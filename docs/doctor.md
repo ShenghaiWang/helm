@@ -57,7 +57,7 @@ helm doctor [--project <id>] [--json]
 - `--json` emits the machine-readable document below instead of text. The
   findings are identical; only the rendering differs.
 
-Doctor is read-only, so it is available to every caller — coordinator, foreman,
+Doctor is read-only, so it is available to every caller — coordinator, task lead,
 and worker alike. It authorizes nothing.
 
 ## Structural path allowlist

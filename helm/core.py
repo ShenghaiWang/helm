@@ -503,7 +503,7 @@ class Coordinator(
         source = (
             "Approval request"
             if kind == self.HOLD_MESSAGE_KIND
-            else "Foreman report"
+            else "Task lead report"
             if is_foreman
             else "Worker result"
             if kind == "result"
@@ -808,7 +808,7 @@ class Coordinator(
         """The answer this worker was sent moments ago, if it was sent one.
 
         One worker must have one driver.  Prose said so and nothing enforced
-        it, so a root and a project's foreman both answered the same question
+        it, so a root and a project's task lead both answered the same question
         inside a minute: the second `send-text` arrived while the agent was
         already acting on the first, interleaved with its own redraw, and
         Claude Code read the arriving keystrokes as an interrupt.  They agreed

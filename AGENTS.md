@@ -47,7 +47,7 @@ starts inherits it. Keep the two in step.
 - `helm init` is an initialization tool only. Do not make it part of a normal
   conversational request, and do not use it to repair or overwrite a project.
 - One task means one project and one task worktree. Never modify another
-  project, the Helm state, a foreman's files, or a user-owned worktree. The
+  project, the Helm state, a task lead's files, or a user-owned worktree. The
   delegated worker uses the assigned task worktree (an isolated worktree), or a
   unique one created under Helm state when the harness has not supplied one;
   never edit a project root as a shortcut.
@@ -149,14 +149,14 @@ a worker agent the coordinator spawns for that task.
   continue a task inline because it looks small. “It is only one file” is not
   an exception; neither is a failed or blocked worker, which is replaced by a
   new worker for a new task, not finished by the coordinator.
-- **A foreman clears two gates before a state-changing worker launches.** It
+- **A task lead clears two gates before a state-changing worker launches.** It
   proposes a requirement contract, then a technical solution, with `helm gate
-  propose <foreman-task> --type requirement|solution --text "..."`, and only
+  propose <lead-task> --type requirement|solution --text "..."`, and only
   the root decides each with `helm gate decide ... --confirm|--skip`. `helm
   task create` refuses a state-changing worker task until both are decided
   unless it is `--read-only`. One confirmed pair authorizes exactly one new
   state-changing task — spent at that task's creation, recorded on the
-  foreman task as `gates.bound_task_id` so the spend is visible even if the
+  lead's task as `gates.bound_task_id` so the spend is visible even if the
   worker never successfully launches. A second, separate state-changing task
   needs the requirement or solution gate proposed and reconfirmed again; do
   not read "the gates are confirmed" as a standing green light for more than
@@ -184,16 +184,24 @@ a worker agent the coordinator spawns for that task.
   only; it never converts the task into inline coordinator work.
 - **Routing is one hand-off, not a channel to keep open.** `helm route
   <project-id> "<text>"` is root Helm's whole job for one piece of commander
-  input: identify the project, make sure its one foreman is live (spawned,
-  never waited on), hand the request into that foreman's own session with a
-  fire-and-forget push, and return. It never blocks on what the foreman does
-  with the request, so a busy project's foreman can never delay routing to
-  another project. It is root-only, like every other command that spawns or
-  drives an agent.
+  input: identify the project, make sure a task lead is live for that request
+  (spawned, never waited on), hand it into that lead's own session with a
+  fire-and-forget push, and return. It never blocks on what the lead does with
+  the request, so a busy lead can never delay routing to another project or to
+  another unit of work in the same one. It is root-only, like every other
+  command that spawns or drives an agent.
+
+  **Which lead gets it.** Pass `--ticket TICKET-123` and the request reaches
+  the live lead named for that work, because a follow-up belongs to whoever is
+  already on it; a tracker id in the request text is read the same way. With
+  no match, the project's existing lead takes it. `--new` overrides both and
+  appoints a lead for this request, which is what a separate unit of work
+  wants: several leads in one project run side by side and none waits on the
+  others.
 - **Workers push; the coordinator never polls.** A worker reports through the
   worker protocol — `status`, `result`, `blocker`, `failure`, `approval-needed`,
   and `artifact` — by calling the reporting command in its own context document
-  as it works, not only when it exits. This is also how a foreman keeps root
+  as it works, not only when it exits. This is also how a task lead keeps root
   informed after `route` hands it a request: it pushes through this same
   protocol as its own task's worker record, and root discovers what happened
   by reading the durable project status record (`helm project status`,
@@ -202,8 +210,8 @@ a worker agent the coordinator spawns for that task.
   `approval-needed` is the one that pauses rather than ends: it must name the
   exact protected action, the worker stays live and addressable, and the task
   resumes only when that same session spends the authorization with `helm
-  worker action-start`. **A foreman's `blocker` now pauses the same way**, and
-  only a foreman's: a driver's whole job is to meet obstacles and escalate
+  worker action-start`. **A task lead's `blocker` now pauses the same way**, and
+  only a lead's: a driver's whole job is to meet obstacles and escalate
   them, so a verb that ended the reporter meant every escalation cost the
   project its driver and a full re-brief. Its task still shows `blocked` so the
   escalation is visible; the session stays live and an answer resumes it. A
@@ -230,11 +238,11 @@ a worker agent the coordinator spawns for that task.
   `pr-open` stays visible for comment/check monitoring. Keep outcomes in
   worktrees, branches, PR records, artifacts, project status, messages and
   logs — not by keeping stale agent sessions alive.
-- **A final summary flows worker → foreman → Helm, and the decision comes back
+- **A final summary flows worker → task lead → Helm, and the decision comes back
   to the commander.** Helm writes every terminal report into the project's own
   status record as it arrives, so the outcome survives the pane, the session,
-  and this conversation. While a foreman is live it keeps driving and nobody is
-  asked to merge anything. The moment no driver is left — the foreman reported,
+  and this conversation. While a lead is live it keeps driving and nobody is
+  asked to merge anything. The moment no driver is left — the lead reported,
   stood down, or the project declined one — Helm records a commander-visible
   delivery decision for the work still unresolved: inspect the outcome, then
   choose review, another round, local merge, PR delivery, or cleanup. It shows
@@ -271,9 +279,9 @@ a worker agent the coordinator spawns for that task.
   anything closes.** A worker reports by running a Helm command inside its own
   pane, which means the confirmation prints onto the exact surface about to be
   released. So the final summary and the decision it leaves are pushed to the
-  live foreman, to the project's own overview pane, and to the durable record
+  live task lead, to the project's own overview pane, and to the durable record
   *before* any tab is released or space closed, and where they landed is
-  recorded. No live foreman is not an exception — a project with no driver is
+  recorded. No live task lead is not an exception — a project with no driver is
   the case that most needs telling. A tab whose outcome reached nothing at all
   is kept, because that pane is then the only copy.
 - **Drive the worker on the user's behalf.** Helm's job is to supply the goal
@@ -363,13 +371,13 @@ a worker agent the coordinator spawns for that task.
   A worker that reports nothing is indistinguishable from a dead one — treat
   prolonged silence as a fault to investigate, not as progress.
 
-- **One driver per task.** A project's foreman runs the review loop because
+- **One driver per task.** A unit of work's task lead runs the review loop because
   its brief says to. A coordinator that also drives that task directly runs it
   too, and both are correct alone. Started seconds apart they put two reviewers
   on one worktree, burn two agents, and let whichever finishes first set the
   verdict while the other's findings reach nobody. So
   decide who is driving a given task and stand the other down: `helm worker
-  stop <foreman-id>` when the coordinator takes it, or leave it to the foreman
+  stop <lead-id>` when the coordinator takes it, or leave it to the lead
   and ask it for status instead of running the loop yourself. Helm now refuses
   to start a second reviewer for a task that already has a live one, which
   makes the damage impossible rather than merely discouraged. Within that one
@@ -380,24 +388,31 @@ a worker agent the coordinator spawns for that task.
   reviewer before launching the replacement, so a dead review cannot keep
   burning an agent beside the real one. The refusal and cleanup are backstops,
   not the boundary. The boundary is knowing which of you is driving.
-- **Every project gets a foreman, automatically.** Any command that starts work
-  appoints one first if the project has none, so this never depends on the
-  coordinator remembering; `helm foreman <project>` does it explicitly, and a
-  project opts out with `"foreman": false` in its own `.helm/project.json`. Its
-  brief is that project's status record, and its job is the loops inside it:
-  turning a goal into a delegated task, launching the worker, answering it,
-  running `helm review` so an independent agent cross-checks the change, and
-  reporting the outcome. One project, one foreman — a second driver answering
-  the same worker is worse than none. The foreman's authority is narrower
-  than the coordinator's and enforced in code, not asked for in prose: every
-  agent Helm starts inherits `HELM_WORKER_ID`, and `helm` refuses approve,
-  merge, push, publish, delete, and `approval grant` for any agent, and refuses
-  spawning for anything that is not a foreman. A foreman escalates to the
-  coordinator exactly where the coordinator escalates to the commander.
+- **Work gets a task lead, automatically.** Any command that starts work
+  appoints one first if nothing is driving, so this never depends on the
+  coordinator remembering; `helm lead <project>` does it explicitly (`helm
+  foreman` still works for one release), and a project opts out with
+  `"foreman": false` in its own `.helm/project.json` — the key keeps the old
+  spelling because it is on existing records. A lead owns **one unit of work**,
+  is named for it — its tracker id where there is one — and ends when it ends.
+  Its job is the loops inside that work: turning the goal into a delegated
+  task, launching the worker, answering it, running `helm review` so an
+  independent agent cross-checks the change, and reporting the outcome.
+
+  **One lead per unit of work, not per project.** Two leads answering the same
+  worker is worse than none, and Helm refuses that. Two leads on two separate
+  units is the point: they hold independent gate pairs, their workers report to
+  whichever lead started them, and neither queues behind the other. A lead's
+  authority is narrower than the coordinator's and enforced in code, not asked
+  for in prose: every agent Helm starts inherits `HELM_WORKER_ID`, and `helm`
+  refuses approve, merge, push, publish, delete, and `approval grant` for any
+  agent, and refuses spawning for anything that is not a lead. A lead escalates
+  to the coordinator exactly where the coordinator escalates to the
+  commander.
 
 What stays with the coordinator: choosing the project, resolving the domain and
 composing bounded context, creating the task and worktree, spawning and driving
-the worker (or appointing the foreman that drives it), relaying its messages to
+the worker (or appointing the task lead that drives it), relaying its messages to
 the user, holding the approval gate, and raising learning proposals. Read-only
 inspection needed to do those is expected.
 
@@ -408,7 +423,7 @@ friendly — in that order, because a friendly reply that is wrong is worse than
 a blunt one that is right.
 
 **The whole interface is warm, not one sentence.** Everything the commander
-reads from Helm — the coordinator's replies, a foreman's report lines,
+reads from Helm — the coordinator's replies, a task lead's report lines,
 `helm pending`, `helm status`, `helm watch`, the watchdog's notifications —
 is one conversation with one person, and it should feel like a good chief of
 staff talking to them: warm, direct, on their side. Speak to them, never
@@ -470,7 +485,7 @@ see the shape of. This applies to what the coordinator writes, not only to what
 Helm prints.
 
 The reporting chain has three hops and the coordinator owns the last one: a
-foreman pushes anything needing a human, Helm records it, and **the coordinator
+task lead pushes anything needing a human, Helm records it, and **the coordinator
 relays it — unprompted**. Check what is pending at the start of a turn and lead
 with it, rather than waiting to be asked. "The commander did not ask" is not a
 reason a dead reviewer or a waiting gate goes unmentioned; they cannot ask about
@@ -503,7 +518,7 @@ out loud rather than describe the watch as armed.
 
 Be honest about the one hop this does not fix. The coordinator only exists
 inside a turn, so nothing reaches the commander while they are away, however
-diligently the foreman reports. That gap needs a scheduled check delivering
+diligently the lead reports. That gap needs a scheduled check delivering
 outside the conversation; do not describe the chain as complete without it.
 
 Relay a worker's findings as the worker's, not as Helm's own. Say plainly what
@@ -757,7 +772,7 @@ about what a worker is allowed to *know*, not only what it is allowed to write.
   another project's files, corpora, drafts, trackers, transcripts, or history
   enters it — not as an example, a template, or a shortcut. Nor does this
   file: a Claude Code worker's settings exclude every `CLAUDE.md` above its
-  workspace, so the coordinator's manual never reaches a worker or a foreman.
+  workspace, so the coordinator's manual never reaches a worker or a task lead.
 - **The coordinator does not carry knowledge between projects.** Do not paste
   another project's findings, conventions, file contents, or credentials into a
   brief, and do not answer a project question from what a different project's

@@ -701,6 +701,31 @@ def _when_label(stamp: str | None = None, seconds: float | None = None) -> str:
     return f"{local:%m-%d %H:%M} {_age_label(stamp, seconds)}"
 
 
+def _lead_label(coordinator: Coordinator, worker: dict[str, Any] | None) -> str:
+    """How a task lead is addressed in a line the commander reads.
+
+    The NAME first, the generated key in brackets behind it. A line opening
+    `w-z04ead74c431` has to be resolved before it means anything, and a report
+    of six such lines is unreadable in practice -- which is the whole reason
+    names exist. The id stays because it is what every other command takes.
+
+    Falls back to the bare id when the record cannot be read: a label is worth
+    less than the line it sits in, so nothing here may raise.
+    """
+    if not worker:
+        return ""
+    worker_id = str(worker.get("id") or "")
+    with contextlib.suppress(HelmError, OSError, KeyError):
+        task = coordinator.store.load().get("tasks", {}).get(worker.get("task_id")) or {}
+        name = task_name(task, fallback="")
+        # `task_name`'s last resort is the task id, which is right for a record
+        # and wrong for a label: it puts two opaque keys side by side where a
+        # name should be. An unnamed lead is addressed by its worker id alone.
+        if name and name not in {worker_id, str(task.get("id") or "")}:
+            return f"{name} ({worker_id})"
+    return worker_id
+
+
 def _age_seconds(stamp: str | None) -> float:
     """How old an ISO timestamp is, or 0 when it cannot be read.
 
@@ -764,7 +789,7 @@ def _print_project_status(status: dict[str, Any]) -> None:
     if status.get("pending_requests"):
         # Above the action items: an unanswered routed request is the one thing
         # here that a foreman is supposed to be acting on right now.
-        print("  routed requests awaiting the foreman:")
+        print("  routed requests awaiting the task lead:")
         for entry in status["pending_requests"]:
             first = entry["text"].strip().splitlines()[0][:120]
             print(f"    {entry['at'][:10]} {first} (task={entry['task_id']})")
@@ -1020,7 +1045,7 @@ def _release_finished_space(coordinator: Coordinator, task: dict[str, Any]) -> N
         if stood_down:
             print(
                 f"{_glyph_for(coordinator, task['project_id'])} {task['project_id']} "
-                f"foreman {stood_down['id']} stood down; nothing left to drive"
+                f"task lead {stood_down['id']} stood down; nothing left to drive"
             )
     # A task transition such as merge/deliver is when Helm knows the result has
     # been acted on. Release the settled tabs before deciding whether the whole
@@ -1603,9 +1628,9 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--subject",
         help=(
-            "with --type approval-needed from a foreman: the task whose branch the "
+            "with --type approval-needed from a task lead: the task whose branch the "
             "action is about, so the authorization binds to that branch and tree "
-            "rather than to the foreman's own workspace"
+            "rather than to the task lead's own workspace"
         ),
     )
     report.add_argument("--path")
@@ -1769,7 +1794,10 @@ def _build_parser() -> argparse.ArgumentParser:
     adopt.add_argument("--delivery", choices=("local", "pr"), default="local")
     adopt.add_argument("--domain", dest="domains", action="append", help="domain default; repeatable (default: software-delivery)")
     adopt.add_argument("--base-branch", help="pin the base branch instead of resolving it from the remote")
-    adopt.add_argument("--no-foreman", action="store_true", help="this project is driven by the coordinator directly")
+    adopt.add_argument(
+        "--no-lead", "--no-foreman", dest="no_foreman", action="store_true",
+        help="this project is driven by the coordinator directly, with no task lead",
+    )
     adopt.add_argument("--no-review", action="store_true", help="skip the independent review loop for this project")
     adopt.add_argument("--agent", help=f"pin every worker of this project to a runtime (built in: {_BUILTIN_AGENT_NAMES})")
     adopt.add_argument("--model", help="pin the model")
@@ -1967,7 +1995,7 @@ def _build_parser() -> argparse.ArgumentParser:
         target_parser.add_argument(
             "--no-heal", action="store_true",
             help="report deaths but never act on them; by default a worker that reads as dead on two "
-                 "checks a minute apart is stopped, a dead foreman replaced, a driverless project re-driven",
+                 "checks a minute apart is stopped, a dead task lead replaced, a driverless project re-driven",
         )
         target_parser.add_argument(
             "--notify-command",
@@ -2012,7 +2040,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "is replaced with a fresh appointment that composes its own "
             "catch-up brief from the project record. Stalled or erroring "
             "workers are reported, never touched -- thinking is not dying. "
-            "Built for the unattended watch, where a silent foreman death "
+            "Built for the unattended watch, where a silent task lead death "
             "otherwise waits on a human noticing"
         ),
     )
@@ -2083,21 +2111,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     foreman = commands.add_parser(
-        "foreman", help="put a foreman in charge of one project's loops"
+        "lead", aliases=["foreman"],
+        help="put a task lead in charge of one unit of work",
     )
     foreman.add_argument("project_id")
     foreman.add_argument("--agent",
-        help=f"agent runtime or configured profile for the foreman (built in: {_BUILTIN_AGENT_NAMES})")
+        help=f"agent runtime or configured profile for the task lead (built in: {_BUILTIN_AGENT_NAMES})")
     foreman.add_argument("--model",
-        help="model the foreman runs on; overrides the project pin and HELM_MODEL. "
+        help="model the task lead runs on; overrides the project pin and HELM_MODEL. "
              "Pass 'runtime' to leave the choice to the runtime's own default")
     foreman.add_argument("--effort", choices=EFFORT_LEVELS,
-        help="reasoning effort for the foreman; overrides the project pin and HELM_EFFORT")
+        help="reasoning effort for the task lead; overrides the project pin and HELM_EFFORT")
     foreman.add_argument("--command", dest="worker_command_text",
-        help="foreman command, parsed without a shell")
+        help="task lead command, parsed without a shell")
     foreman.add_argument(
         "--no-herdr", dest="herdr", action="store_false", default=True,
-        help="start the foreman as a plain process instead of in the project's space",
+        help="start the task lead as a plain process instead of in the project's space",
     )
     foreman.add_argument(
         "--ticket",
@@ -2116,21 +2145,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
     route = commands.add_parser(
         "route",
-        help="hand a request to one project's foreman and return immediately",
+        help="hand a request to one project's task lead and return immediately",
     )
     route.add_argument("project_id")
-    route.add_argument("text", help="the request text for that project's foreman")
+    route.add_argument("text", help="the request text for that project's task lead")
     route.add_argument("--agent",
-        help="agent runtime or configured profile for a foreman route appoints "
+        help="agent runtime or configured profile for a task lead route appoints "
         "(built in: claude, codex, pi, opencode); ignored if the project already has one")
     route.add_argument("--model",
-        help="model for a foreman route appoints; overrides the project pin and HELM_MODEL; "
+        help="model for a task lead route appoints; overrides the project pin and HELM_MODEL; "
         "ignored if the project already has one")
     route.add_argument("--command", dest="worker_command_text",
-        help="foreman command, parsed without a shell; only used if route appoints a foreman")
+        help="task lead command, parsed without a shell; only used if route appoints a task lead")
     route.add_argument(
         "--no-herdr", dest="herdr", action="store_false", default=True,
-        help="appoint a missing foreman as a plain process instead of in the project's space",
+        help="appoint a missing task lead as a plain process instead of in the project's space",
     )
     route.add_argument(
         "--ticket",
@@ -2259,13 +2288,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     gate = commands.add_parser(
         "gate",
-        help="propose (foreman) and decide (commander) the requirement/solution gates",
+        help="propose (task lead) and decide (commander) the requirement/solution gates",
     )
     gate_commands = gate.add_subparsers(dest="gate_command", required=True)
     gate_propose = gate_commands.add_parser(
-        "propose", help="foreman: propose the requirement or solution contract for a task"
+        "propose", help="task lead: propose the requirement or solution contract for a task"
     )
-    gate_propose.add_argument("task_id", help="the foreman task driving the project")
+    gate_propose.add_argument("task_id", help="the task lead's own task")
     gate_propose.add_argument("--type", dest="gate_type", required=True,
         choices=("requirement", "solution"))
     gate_propose.add_argument("--text", required=True,
@@ -2512,13 +2541,13 @@ def _worker_runner(config_path: str) -> int:
             state_dir = Path(config["state_dir"]).resolve()
             workspace = Path(cwd).resolve()
             if not workspace.is_dir():
-                return _runner_failure(config_path, "foreman workspace is missing")
+                return _runner_failure(config_path, "task lead workspace is missing")
             if workspace != state_dir and state_dir not in workspace.parents:
                 return _runner_failure(
-                    config_path, "foreman workspace is not Helm-owned state"
+                    config_path, "task lead workspace is not Helm-owned state"
                 )
         except (OSError, KeyError) as exc:
-            return _runner_failure(config_path, f"foreman workspace verification failed: {exc}")
+            return _runner_failure(config_path, f"task lead workspace verification failed: {exc}")
     else:
         # One retry on a short delay: the worktree is created moments before
         # the runner starts, and a still-settling filesystem fails this probe
@@ -2859,11 +2888,11 @@ def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | 
         replacement = _ensure_foreman(coordinator, project_id)
         if replacement is None:
             return (
-                f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead foreman "
-                f"{worker_id} stopped; project declines a foreman, so none was appointed"
+                f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead task lead "
+                f"{worker_id} stopped; project declines a task lead, so none was appointed"
             )
         return (
-            f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead foreman "
+            f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead task lead "
             f"{worker_id} replaced by {replacement['worker']['id']}, which reads the "
             "project record and carries on"
         )
@@ -2906,7 +2935,7 @@ def _ensure_foreman(
         )
     except (HelmError, SafetyError, OSError) as exc:
         print(
-            f"helm: {project_id} asks for a foreman and has none; could not start one: {exc}",
+            f"helm: {project_id} asks for a task lead and has none; could not start one: {exc}",
             file=sys.stderr,
         )
         return None
@@ -2923,7 +2952,7 @@ def _ensure_foreman(
         else "every project gets one by default"
     )
     print(
-        f"{_glyph_for(coordinator, project_id)} {project_id} appointed foreman "
+        f"{_glyph_for(coordinator, project_id)} {project_id} appointed task lead "
         f"{started['worker']['id']} ({source})"
     )
     return started
@@ -3337,6 +3366,7 @@ def _authority_refusal(coordinator: Coordinator, args: argparse.Namespace) -> st
     if role == "root":
         return None
     command = "learning" if args.command in {"learning", "learn"} else args.command
+    command = "foreman" if command == "lead" else command
     sub = getattr(args, f"{command}_command", None)
     for key in ((command, sub), (command, None)):
         if key in _ROOT_ONLY_COMMANDS:
@@ -4018,7 +4048,7 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
                 "authorizes nothing and leaves the task answerable."
             )
         if told_foreman:
-            print("  Told the project's foreman; it is theirs to act on")
+            print("  Told the project's task lead; it is theirs to act on")
         if routed:
             print(f"  Routed the final outcome to: {', '.join(routed)}")
         if released_tabs:
@@ -4478,7 +4508,7 @@ def _cmd_adopt(ctx: _Context, args: argparse.Namespace) -> int | None:
     else:
         print(f"  kept the existing {adopted['settings_file']}")
     print(f"  base branch: {project.get('base_branch')}   delivery: {project.get('delivery_policy')}")
-    print(f"  foreman: {'no' if project.get('foreman') is False else 'appointed on the first request'}"
+    print(f"  task lead: {'no' if project.get('foreman') is False else 'appointed on the first request'}"
           f"   review: {'no' if project.get('review') is False else 'independent, on a different model'}")
     report = doctor_module.run(coordinator, helm_root, project["id"])
     for line in doctor_module.render_text(report):
@@ -4662,8 +4692,8 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
             stamp = str(request.get("at") or "")
             entries.append((
                 stamp,
-                f"{_when_label(stamp)} {glyph} {project['id']} foreman has not acted on: {first[:100]}",
-                f"{glyph} {project['id']} foreman has not acted on: {first}",
+                f"{_when_label(stamp)} {glyph} {project['id']} task lead has not acted on: {first[:100]}",
+                f"{glyph} {project['id']} task lead has not acted on: {first}",
             ))
     # An answer nobody has read is the stall this whole channel was
     # built to make visible: the note is a fact, its age is a fact,
@@ -4912,13 +4942,13 @@ def _cmd_watch(ctx: _Context, args: argparse.Namespace) -> int | None:
             # The foreman is what would have noticed the others. When
             # it is down, nothing is driving the project at all, and
             # that outranks any single stalled worker on the list.
-            mark = "  <-- URGENT: this project's foreman is down; nothing is driving it"
+            mark = "  <-- URGENT: this unit of work has no task lead; nothing is driving it"
         else:
             mark = "  <-- attention"
         if mark:
             attention += 1
         role = f"{entry['agent_id']}" + (
-            " (foreman)" if entry.get("role") == "foreman" else ""
+            " (task lead)" if entry.get("role") == "foreman" else ""
         )
         print(
             f"{_glyph_for(coordinator, entry['project_id'])} {entry['worker_id']} "
@@ -4972,9 +5002,9 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
     )
     if not coordinator.project_wants_foreman(args.project_id):
         raise HelmError(
-            f'{args.project_id} has declined a foreman ("foreman": false in its '
+            f'{args.project_id} has declined a task lead ("foreman": false in its '
             "own record or .helm/project.json); there is nothing for route to hand "
-            "this request to. Appoint one explicitly with helm foreman "
+            "this request to. Appoint one explicitly with helm lead "
             f"{args.project_id} first if you want to route to it anyway."
         )
     # `--new` gives this request its OWN driver rather than queueing it behind
@@ -5031,7 +5061,7 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
             foreman = existing
     if foreman is None:
         raise HelmError(
-            f"{args.project_id} has no live foreman to route to; appointing one "
+            f"{args.project_id} has no live task lead to route to; appointing one "
             "failed -- see the message above for why"
         )
     # Record first, always, while the worker is still whatever it
@@ -5080,9 +5110,10 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
         # `helm project status`) surfaces it once it comes up.
         print(
             f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
-            f"newly appointed foreman {foreman['id']} task={task['id']} "
+            f"newly appointed task lead {_lead_label(coordinator, foreman)} "
+            f"task={task['id']} "
             "[recorded, and written into the brief this appointment composed; the "
-            "foreman is still starting and comes up holding the request, "
+            "task lead is still starting and comes up holding the request, "
             "not a live pane send]"
         )
         return 0
@@ -5099,11 +5130,11 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
         # how to if that is wanted.
         print(
             f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
-            f"foreman {foreman['id']} task={task['id']} "
-            "[recorded only; its foreman has no reachable session to send into -- "
+            f"task lead {_lead_label(coordinator, foreman)} task={task['id']} "
+            "[recorded only; its task lead has no reachable session to send into -- "
             "either a plain process with no input channel, or its Herdr pane is gone. "
             f"Replace it with: helm worker stop {foreman['id']} --reason \"...\" "
-            f"&& helm foreman {args.project_id}]"
+            f"&& helm lead {args.project_id}]"
         )
         return 0
     delivered = False
@@ -5111,7 +5142,7 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
         delivered = HerdrAdapter(coordinator).answer_worker(foreman["id"], args.text)
     print(
         f"{_glyph_for(coordinator, args.project_id)} {args.project_id} routed to "
-        f"foreman {foreman['id']} task={task['id']} "
+        f"task lead {_lead_label(coordinator, foreman)} task={task['id']} "
         f"[{'delivered' if delivered else 'recorded only; the send itself failed'}]"
     )
     return 0
@@ -5137,13 +5168,14 @@ def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
         verdict = health.get("verdict", "unknown")
         print(
             f"{_glyph_for(coordinator, args.project_id)} {args.project_id} already has "
-            f"a foreman: {existing['id']} [{verdict}] task={existing['task_id']}"
+            f"a task lead: {_lead_label(coordinator, existing)} [{verdict}] "
+            f"task={existing['task_id']}"
         )
         if verdict not in {"healthy", "starting", "reported"}:
             print(
                 f"  It is not driving anything. Replace it with: "
                 f"helm worker stop {existing['id']} --reason \"...\" "
-                f"&& helm foreman {args.project_id}"
+                f"&& helm lead {args.project_id}"
             )
         return 0
     task = coordinator.create_foreman_task(
@@ -5165,7 +5197,7 @@ def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
         )
         mode = "process (--no-herdr)"
     print(
-        f"{_glyph_for(coordinator, args.project_id)} {args.project_id} foreman "
+        f"{_glyph_for(coordinator, args.project_id)} {args.project_id} task lead "
         f"{task_name(task, fallback=worker['id'])} ({worker['id']}) "
         f"[{worker['status']}] task={task['id']} mode={mode} "
         f"agent={worker.get('agent_id', 'default')}"
@@ -5438,7 +5470,7 @@ def _cmd_gate(ctx: _Context, args: argparse.Namespace) -> int | None:
             # soft sentence. A live agent that merely could not be
             # reached will find the decision by polling; a session that
             # has ENDED never will, and the gate is bound to that
-            # task's row -- so a replacement foreman re-proposes and
+            # task's row -- so a replacement task lead re-proposes and
             # the decision just made is spent on nothing. That case
             # needs a different next command, and it needs to be hard
             # to miss: an agent waiting on a gate that answers into a
@@ -5446,7 +5478,7 @@ def _cmd_gate(ctx: _Context, args: argparse.Namespace) -> int | None:
             if live is not None:
                 print(
                     "  Not delivered into a live session. The decision is "
-                    "recorded; the foreman will see it in helm project "
+                    "recorded; the task lead will see it in helm project "
                     "status, or route it a message to move it along."
                 )
             else:
@@ -5458,12 +5490,12 @@ def _cmd_gate(ctx: _Context, args: argparse.Namespace) -> int | None:
                 print(
                     "  The decision is recorded on the task and stays "
                     "recorded. But the gate is bound to THIS task, so a "
-                    "replacement foreman starts a new task and proposes "
+                    "replacement task lead starts a new task and proposes "
                     "its gates again; do not read this decision as "
                     "already spent on the work."
                 )
                 print(
-                    f"  Revive the driver: helm foreman {project_id} "
+                    f"  Revive the task lead: helm lead {project_id} "
                     "(replace a stale one first with helm worker stop "
                     "<worker-id> --reason \"...\")."
                 )
@@ -5566,6 +5598,9 @@ _COMMANDS: dict[str, Callable[[_Context, argparse.Namespace], int | None]] = {
     "ack": _cmd_ack,
     "watch": _cmd_watch,
     "route": _cmd_route,
+    # `lead` is the name; `foreman` is kept for one release so a script, a
+    # habit or an older brief does not break on the day the word changed.
+    "lead": _cmd_foreman,
     "foreman": _cmd_foreman,
     "board": _cmd_board,
     "reflect": _cmd_reflect,

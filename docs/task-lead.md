@@ -1,41 +1,45 @@
 # The task lead
 
-**Status: partly shipped, under the old name.** The lifetime change is landing
-first and the rename comes after, so everything below still says *foreman* in
-the code. What works today:
+**Status: shipped.** The lifetime change and the rename both landed. Everything
+below is behaviour, not plan. What works today:
 
-- A confirmed gate pair belongs to the **driver that proposed it**, not to the
-  project, so two drivers in one project hold independent pairs.
-- `helm route --new` and `helm foreman --new` appoint a driver for a separate
+- A confirmed gate pair belongs to the **lead that proposed it**, not to the
+  project, so two leads in one project hold independent pairs.
+- `helm route --new` and `helm lead --new` appoint a task lead for a separate
   unit of work beside the project's existing one.
-- Every driver carries a **name** — its tracker id, or a few words of the
-  request it was appointed for — and the reports address it by that name.
-- A worker's report reaches the driver that **started** it, not whichever one
+- Every lead carries a **name** — its tracker id, or a few words of the
+  request it was appointed for — and every report addresses it by that name.
+- A worker's report reaches the lead that **started** it, not whichever one
   the project lookup answers with.
-- A request routed to one driver is not cleared by a different driver's reply.
+- A request routed to one lead is not cleared by a different lead's reply.
 - A request that **names** work — `route --ticket TICKET-42`, or a tracker id in
-  the text — reaches the driver already doing it, rather than queueing behind
-  whichever driver answers first or starting one that has never heard of it.
-- The watchdog asks whether **each worker** has a live driver, not whether the
-  project has one, and appoints a driver for orphaned work.
+  the text — reaches the lead already doing it, rather than queueing behind
+  whichever lead answers first or starting one that has never heard of it.
+- The watchdog asks whether **each worker** has a live lead, not whether the
+  project has one, and appoints one for orphaned work.
+- The word is **task lead** everywhere a commander reads: `helm lead`, the
+  appointment and routing lines, the Herdr tab, the attention list, the role
+  document a lead is started with. `helm foreman` and `--no-foreman` keep
+  working for one release.
 
-Two things deliberately *not* done, decided rather than pending:
+Two decisions, recorded rather than pending:
 
-- **`--new` stays opt-in.** Appointing a driver per request was the obvious
-  next step and is the wrong default: a name now routes a follow-up to the
-  driver already doing that work, which removes most of the queueing without
-  paying for an agent per unrecognised message. Flipping it is a one-line
-  change if the queue ever bites again.
-- **The rename waits.** Everything here still says *foreman* in the code. The
-  substitution is about seven hundred references and delivers nothing on its
-  own, so it happens once the lifetime work is finished rather than beside it.
+- **`--new` stays opt-in.** Appointing a lead per request was the obvious next
+  step and is the wrong default: a name now routes a follow-up to the lead
+  already doing that work, which removes most of the queueing without paying
+  for an agent per unrecognised message. Flipping it is a one-line change if
+  the queue ever bites again.
+- **Two spellings stay, on purpose.** The task record's `role` is still
+  `"foreman"` and a project still declines one with `"foreman": false`. Both
+  are values on existing records, so renaming them is a migration rather than a
+  rename, and it buys nothing: no commander reads either.
 
-## What changes
+## What changed
 
-Today a project gets one **foreman**: a long-lived agent that turns goals into
-tasks, drives each one, and reports. This replaces it with a **task lead** — one
-per task, created with the task and ending with it — that owns a single
-deliverable end to end.
+A project used to get one **foreman**: a long-lived agent that turned goals into
+tasks, drove each one, and reported. It is now a **task lead** — one per unit of
+work, created with it and ending with it — that owns a single deliverable end to
+end.
 
 ```
 Helm (coordinator)     gates, approvals, and the commander
@@ -46,19 +50,20 @@ Helm (coordinator)     gates, approvals, and the commander
 
 ## Why
 
-Three failures follow from the foreman outliving the work it drives, and all
-three are structural rather than bad luck.
+Three failures followed from one driver outliving the work it drove, and all
+three were structural rather than bad luck.
 
-**A confirmed gate pair binds to the foreman's task row.** Replace the foreman —
+**A confirmed gate pair binds to the driver's task row.** Replace that driver —
 because it completed, failed, or was killed with its session — and the
-commander's decision is silently discarded. When the lead *is* the task, the
+commander's decision was silently discarded. When the lead *is* the work, the
 binding cannot outlive or under-live its subject.
 
-**One foreman is one queue with one consumer.** Several independent units of
-work behind a single driver serialise: proposals, answers and escalations all
-funnel through one agent, and a driver blocked on any one of them blocks the
-rest. In one observed day a project's foreman spent twenty-two minutes blocked
-with zero workers running while four independent units of work waited.
+**One driver per project is one queue with one consumer.** Several independent
+units of work behind a single driver serialise: proposals, answers and
+escalations all funnel through one agent, and a driver blocked on any one of
+them blocks the rest. In one observed day a project's driver spent twenty-two
+minutes blocked with zero workers running while four independent units of work
+waited.
 
 **A long-lived agent that does not live long is the worst case.** It is paid for
 as continuity and does not deliver it: each replacement loses its context and
@@ -112,7 +117,7 @@ the record, not an argument for a long-lived agent.
 ## What this loses, stated rather than hidden
 
 With no project-level agent, nothing watches a project between the commander's
-turns and the coordinator's. The foreman did not really solve this either — its
+turns and the coordinator's. The old project driver did not solve this either — its
 reports sat in the status record until someone relayed them — but dropping the
 layer makes the gap explicit. The plan does not close it. The honest answer is a
 scheduled check that delivers outside the conversation, which is a separate

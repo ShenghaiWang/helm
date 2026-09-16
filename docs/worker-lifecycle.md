@@ -130,7 +130,7 @@ sitting there, and settling it on that message would mark a live agent failed.
    `approval-needed`. Ordinary nonterminal messages (`status`, `question`,
    `artifact`) after process settlement stay rejected — there is no session
    left to progress or to ask. A worker settled any other way (an explicit `helm worker stop`,
-   a foreman stand-down, `settle_reported_worker`) also rejects late pushes:
+   a task lead stand-down, `settle_reported_worker`) also rejects late pushes:
    those are decisions, not observations.
 
 6. **Contradiction stays visible without changing the outcome.** A `result`
@@ -145,7 +145,7 @@ sitting there, and settling it on that message would mark a live agent failed.
 
 7. **Everything else is preserved.** The safe process fallback when Herdr is
    unavailable, Herdr pane and space lifecycle, explicit `helm worker stop` and
-   foreman stand-down (which are commands, not observations, and settle
+   task lead stand-down (which are commands, not observations, and settle
    deliberately), cleanup and resource release, approval immutability, and
    project isolation are untouched by this contract.
 

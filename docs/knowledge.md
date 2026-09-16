@@ -246,7 +246,7 @@ decision is acted on:
 
 | Composed into | Reaches | What it does there |
 | --- | --- | --- |
-| `driving-delegated-work` | a project's foreman | decide at brief time, before a coder starts |
+| `driving-delegated-work` | a task lead | decide at brief time, before a coder starts |
 | `software-delivery` | the author of a change | write the document, implement against it |
 | `code-review` | the independent reviewer | read the behaviour against the contract |
 
@@ -262,7 +262,7 @@ a keyword. The one reversal is doubt — a "rename" that moves a serialized
 name, a public symbol, or a config key is a contract change, and gets the
 spec.
 
-The foreman decides and **writes the verdict, its one-line reason, and any
+The task lead decides and **writes the verdict, its one-line reason, and any
 convention or path the coder needs into the task brief**, because a worker's
 context is its brief plus composed knowledge, and a decision kept only in the
 project's progress record never reaches the coder. It is a coordination call:

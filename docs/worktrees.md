@@ -32,7 +32,7 @@ that moment has to happen before the task exists, not be checked afterward.
 | Composed into | Reaches | What it does there |
 | --- | --- | --- |
 | `branch-isolation` | every worktree-backed task | the procedure itself |
-| `driving-delegated-work` | a project's foreman | before `helm task create` / `helm worker launch` |
+| `driving-delegated-work` | a task lead | before `helm task create` / `helm worker launch` |
 
 For a genuinely local-only project (no remote at all), the gate uses the
 local base tip and records explicitly that no remote exists, rather than
@@ -68,7 +68,7 @@ release branch.
 `helm task create --ticket X` refuses when the project already has a worker
 task for X on the same base whose worktree still exists, and points at `helm
 task continue <id>` (after `helm task reopen <id>` for a failed or blocked
-one). A foreman that made a task per round gave one ticket a dozen checkouts,
+one). A task lead that made a task per round gave one ticket a dozen checkouts,
 each with its own install and cold build; the round belongs on the task that
 already holds the branch. Read-only tasks and a different base are exempt,
 and `--new` starts a deliberate second line of work.
@@ -80,7 +80,7 @@ decides whether a branch is its own to touch.
 ## What a worker may touch
 
 One task means one project and one task worktree. A worker never modifies
-another project, Helm's own state, a foreman's files, or a user-owned
+another project, Helm's own state, a task lead's files, or a user-owned
 worktree, and never edits a project root as a shortcut. If the harness did
 not supply a worktree, the worker creates a unique one under Helm `state/`
 before editing. A task worktree must be clean to be approved, untracked

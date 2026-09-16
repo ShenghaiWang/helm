@@ -276,14 +276,14 @@ class RepositoryTests(HelmTestCase):
         ):
             self.assertIn(required, readme)
         for required in (
-            "worker → foreman → Helm",
+            "worker → task lead → Helm",
             "delivery decision",
             "declined one",
             "routes it before",
             "only copy",
         ):
             self.assertIn(required, agents)
-        # A foreman has to know its final report is the handover, or it stops
+        # A task lead has to know its final report is the handover, or it stops
         # at "done" and the decision is never raised.
         self.assertIn("handover", FOREMAN_RULES)
         # Delivered is not finalized: both surfaces have to say cleanup is a

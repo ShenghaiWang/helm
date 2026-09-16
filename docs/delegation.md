@@ -1,8 +1,8 @@
-# Delegation: coordinator, foreman, worker
+# Delegation: coordinator, task lead, worker
 
 How work moves from a commander's sentence to a worker's worktree, and who
 may do what along the way. Read this before driving a project or changing
-`helm route`, `helm foreman`, `helm gate` or `helm task create`.
+`helm route`, `helm lead`, `helm gate` or `helm task create`.
 
 ## The coordinator never does the work
 
@@ -30,25 +30,31 @@ doing the work itself. See [herdr.md](herdr.md) and
 
 What stays with the coordinator: choosing the project, resolving the domain
 and composing bounded context, creating the task and worktree, spawning and
-driving the worker (or appointing the foreman that drives it), relaying its
+driving the worker (or appointing the task lead that drives it), relaying its
 messages to the commander, holding the approval gate, and raising learning
 proposals. Read-only inspection needed to do those is expected.
 
-## `route` hands one input to one project's foreman, and returns
+## `route` hands one input to one task lead, and returns
 
 ```sh
 helm route PROJECT "the request, in the commander's own words" [--agent ...] [--model ...] [--no-herdr]
 ```
 
 This is root Helm's whole job for one piece of commander input: identify the
-project, make sure its one foreman is live, hand the request off, and come
-straight back. It never waits on what the foreman does with the request — a
-missing foreman is appointed without waiting, an existing one is handed the
-text with a fire-and-forget pane send, and either way the call returns
-without sitting on that foreman's own work. A busy project's foreman can
-never delay `route` for another project.
+project, make sure a task lead is live for that request, hand it off, and come
+straight back. It never waits on what the lead does with the request — a
+missing lead is appointed without waiting, an existing one is handed the text
+with a fire-and-forget pane send, and either way the call returns without
+sitting on that lead's own work. A busy lead can never delay `route`, for
+another project or for another unit of work in the same one.
 
-For an *existing* foreman the request is recorded on its task first, always,
+**Which lead gets it.** `--ticket TICKET-123`, or a tracker id in the request
+text, reaches the live lead named for that work — a follow-up belongs to
+whoever is already on it. With no match the project's existing lead takes it.
+`--new` overrides both and appoints a lead for this request, which is what a
+separate unit of work wants.
+
+For an *existing* lead the request is recorded on its task first, always,
 and only then does `route` check whether anything is there to send it to.
 The order matters. Checking reachability first would let a dead pane's
 reconciliation settle the worker to `failed` before the request was written,
@@ -58,38 +64,46 @@ because an outbound push never refreshes the worker's own liveness signal:
 
 What `route` reports depends on what it found:
 
-- **A foreman appointed by this call.** Its agent process was just spawned and
+- **A task lead appointed by this call.** Its agent process was just spawned and
   has no pane ready to receive text, so nothing is sent into one. The output
-  says `recorded` and `starting`, never `delivered`; the foreman picks the
-  request up when it reads its own status (`foreman_brief`,
+  says `recorded` and `starting`, never `delivered`; the task lead picks the
+  request up when it reads its own status (`lead brief`,
   `helm project status`).
-- **An existing foreman with a live, provider-confirmed pane.** The text is
+- **An existing lead with a live, provider-confirmed pane.** The text is
   sent into that session, and the output says `[delivered]` only if the send
   itself succeeded (`recorded only; the send itself failed` otherwise). A
-  foreman driving its project hard and one sitting correctly idle both read
+  lead driving its work hard and one sitting correctly idle both read
   as reachable.
-- **An existing foreman with no reachable session** — a plain-process foreman
+- **An existing lead with no reachable session** — a plain-process lead
   with no input channel, or a pane the provider says is gone. `route` refuses
   to send into a pane nobody is reading and reports `recorded only`, with the
   request already durably on record. Reconciling a dead pane may settle that
-  foreman's worker record to `failed`, in which case the output also says how
-  to appoint a replacement (`helm foreman PROJECT`); `route` never replaces
+  task lead's worker record to `failed`, in which case the output also says how
+  to appoint a replacement (`helm lead PROJECT`); `route` never replaces
   one automatically.
 
-Reporting from the foreman back to root is push-based after this one
+Reporting from the task lead back to root is push-based after this one
 hand-off, like any worker's: `status`, `result`, `blocker` and
 `approval-needed` through the worker protocol, landing in the project's
 status record. Root reads that record; nothing asks a live pane to wait or
 poll. See [worker-protocol.md](worker-protocol.md).
 
-## A foreman drives one project's loops
+## A task lead drives one unit of work
 
 ```sh
-helm foreman PROJECT   # one project, one foreman; a second is refused
+helm lead PROJECT                      # appoint a task lead
+helm lead PROJECT --new --ticket T-1   # a second one, for a separate unit
 ```
 
+One lead per unit of work, not per project. Two leads answering the same
+worker is worse than none and is refused; two leads on two separate units is
+the point — they hold independent gate pairs, each worker reports to the lead
+that started it, and neither queues behind the other. A lead is named for the
+work it leads and ends when that work ends. `helm lead` still works for one
+release.
+
 `helm watch` tells you a worker is stalled; somebody still has to answer it,
-and that somebody does not have to be the coordinator. A foreman is an agent
+and that somebody does not have to be the coordinator. A task lead is an agent
 started with the project's status record as its brief, and it owns the loops
 inside that project: turning a goal into a delegated task, launching the
 worker, answering its questions, running `helm review` so an independent
@@ -97,15 +111,15 @@ agent cross-checks the change, and reporting the outcome upward.
 
 **Every project gets one automatically.** Any command that starts work —
 `helm run`, `helm worker launch`, `helm herdr launch` — appoints the project's
-foreman first if it has none. A project that does not want one says so in its
+task lead first if nothing is driving. A project that wants none says so in its
 own file, and that is the whole of what a project may say on the subject:
 
 ```json
 { "foreman": false }
 ```
 
-Two documents reach a foreman, and the split is deliberate. `FOREMAN_RULES` in
-`helm/core.py` is the **boundary**: what a foreman is and what it may never
+Two documents reach a task lead, and the split is deliberate. `FOREMAN_RULES` in
+`helm/core.py` is the **boundary**: what a task lead is and what it may never
 do. That has to be code, because a domain file cannot be allowed to define
 authority. The `driving-delegated-work` domain is the **craft**: how to brief
 a worker, when to answer instead of escalating, what a review is worth. It
@@ -114,37 +128,37 @@ independence rules and the rubric for [when a change needs a spec
 first](knowledge.md#deciding-when-a-change-needs-a-spec-first) arrive
 composed rather than restated.
 
-A foreman's authority is narrower than the coordinator's, and narrower in
+A task lead's authority is narrower than the coordinator's, and narrower in
 code rather than in prose. Every agent Helm starts inherits `HELM_WORKER_ID`,
 so `helm` knows who is calling it: approving, merging, pushing, publishing,
 deleting, and granting a standing approval are refused for any agent, and
-spawning is refused for anything that is not a foreman — delegation is one
-level deep. A foreman escalates to the coordinator exactly where the
+spawning is refused for anything that is not a task lead — delegation is one
+level deep. A task lead escalates to the coordinator exactly where the
 coordinator escalates to the commander.
 
-A foreman produces no branch, so it is never offered as work to merge and
-gets no board card. `helm watch` lists foremen first and calls a broken one
-urgent: a stalled worker costs one task, while a stalled foreman costs
+A task lead produces no branch, so it is never offered as work to merge and
+gets no board card. `helm watch` lists task leads first and calls a broken one
+urgent: a stalled worker costs one task, while a stalled lead costs
 everything the project was going to do next.
 
 ### A dead driver is replaced
 
 Sessions die — the laptop sleeps, the OS reclaims memory, a provider
 returns errors for an hour. The watchdog settles a worker that reads as
-provably dead on two checks a minute apart, replaces a dead foreman with one
-that reads the project record and carries on, and appoints a foreman to a
+provably dead on two checks a minute apart, replaces a dead lead with one
+that reads the project record and carries on, and appoints a task lead to a
 project whose workers are running with nobody to answer them. Nothing acts
 on a stall: a silent worker may be thinking, and killing it on a heuristic
 is how a healthy reviewer dies.
 
 ### One driver per task
 
-A foreman runs the review loop because its brief says to; a coordinator that
+A task lead runs the review loop because its brief says to; a coordinator that
 also drives the same task directly runs it too, and both are correct alone.
 Started seconds apart they put two reviewers on one worktree and let
 whichever finishes first set the verdict. So decide who is driving a task
-and stand the other down — `helm worker stop <foreman-id>` when the
-coordinator takes it, or leave it to the foreman and ask for status. Helm
+and stand the other down — `helm worker stop <lead-id>` when the
+coordinator takes it, or leave it to the task lead and ask for status. Helm
 refuses to start a second reviewer for a task that already has a live one,
 and stops a reviewer that has already failed or blocked before launching its
 replacement. The refusal is a backstop; the boundary is knowing which of you
@@ -156,7 +170,7 @@ is driving.
 another's delivered change. Helm refuses to launch it until every blocker is
 merged or PR-merged, because its worktree is cut from the base branch and
 cannot build on work that is not in it yet; `helm status` and `helm task
-inspect` show what a task waits on. A foreman slices a goal into
+inspect` show what a task waits on. A task lead slices a goal into
 independently grabbable tasks, declares what blocks what, and launches
 everything unblocked in parallel.
 
@@ -164,25 +178,25 @@ everything unblocked in parallel.
 
 A requirement proposal says what done means and what is out of scope, or
 the commander is told it does not: `helm gate propose` reports the shortfall
-to the foreman, the pending list marks the gate `[thin: …]`, and a decision
+to the task lead, the pending list marks the gate `[thin: …]`, and a decision
 that confirms it anyway says so. The check is on the record and
 deterministic; whether to confirm, skip or send it back stays the
 commander's call.
 
-Before a foreman may launch a state-changing worker, it clears two
+Before a task lead may launch a state-changing worker, it clears two
 commander-decided gates on its own driving task, in order:
 
 ```sh
-helm gate propose <foreman-task> --type requirement --text "goal, scope, exclusions, acceptance evidence"
-helm gate decide  <foreman-task> --type requirement --confirm   # or --skip; root only
-helm gate propose <foreman-task> --type solution    --text "approach, boundaries, verification, risks"
-helm gate decide  <foreman-task> --type solution    --confirm   # or --skip; root only
+helm gate propose <lead-task> --type requirement --text "goal, scope, exclusions, acceptance evidence"
+helm gate decide  <lead-task> --type requirement --confirm   # or --skip; root only
+helm gate propose <lead-task> --type solution    --text "approach, boundaries, verification, risks"
+helm gate decide  <lead-task> --type solution    --confirm   # or --skip; root only
 ```
 
-The foreman proposes; only the root (the commander, or a capability the root
+The task lead proposes; only the root (the commander, or a capability the root
 configured) may confirm or skip — the same authority boundary that guards
 `approval release`. `helm task create` refuses a `worker`-role task for that
-project until both gates on its foreman are decided, unless the task is
+project until both gates on its lead are decided, unless the task is
 `--read-only` (pure investigation that changes nothing). A material change to
 the requirement invalidates both gates; a material change to the solution
 invalidates only the solution gate — propose it again rather than reusing a
@@ -190,14 +204,16 @@ stale decision.
 
 A confirmed pair authorizes exactly one *new* state-changing task, not an
 open stream of them. The pair is spent on the task that consumes it, and
-`helm task inspect <foreman-task>` shows which one under
+`helm task inspect <lead-task>` shows which one under
 `gates.bound_task_id`. A second, separate `helm task create` for the same
-project is refused with "already authorized task …" until the foreman
+project is refused with "already authorized task …" until the task lead
 proposes a gate again and the root reconfirms it — even if the first task's
 worker never launched, because spending happens at task creation, so the
 binding is always on the record. Proposing a new pair overwrites a confirmed
-one that no task has bound yet, and a confirmed gate is bound to one foreman
-task row, so replacing the foreman discards the decision.
+one that no task has bound yet, and a confirmed gate is bound to the task row
+of the lead that proposed it, so replacing that lead discards its decision —
+and only its own. Another lead's pair is untouched, because gates are looked up
+by caller rather than by project.
 
 The gate does not apply to `helm task continue` on the same task: a
 continuation round is the same task asking for another pass, so it rides on
@@ -231,7 +247,7 @@ project's recorded runs ran nothing or never said how many cases ran.
 
 `helm review --rounds` and `--reviewer-effort` override the shape for one
 review; an effort named on the task outranks the shape's floor; the worker
-is told its task's shape and what it means. The shape is the foreman's
+is told its task's shape and what it means. The shape is the task lead's
 word, so the review checks it against the diff: a change that touches a
 migration, auth, tokens, billing, a lock or persistence, or a `small`
 change of more than 200 lines, is reported to the reviewer as a shape

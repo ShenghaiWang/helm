@@ -210,13 +210,13 @@ progress as it happens and write each decision to the durable record rather
 than holding it in the conversation.
 
 For meaningful intermediate outcomes, use an explicit summary status rather
-than an ordinary heartbeat. A worker can wake the foreman with
+than an ordinary heartbeat. A worker can wake its task lead with
 `helm worker message <id> --type status --payload '{"summary":true}' --text
-"round 3 implemented; waiting on reviewer"`. A foreman uses the same summary
+"round 3 implemented; waiting on reviewer"`. A task lead uses the same summary
 payload for commander-facing progress lines such as "task round 5: reviewer
 approved, waiting on merge decision"; Helm records those in project
 status. Worker summaries are recorded in project status too and wake the
-foreman; foreman summaries are the curated line for the commander. Do not
+task lead; task lead summaries are the curated line for the commander. Do not
 summarize every command or test line -- summarize a changed state of play.
 
 Treat a worker result as a milestone, not final delivery. The driver still has
@@ -224,7 +224,7 @@ to move or monitor the outcome on the project's delivery surface: local work
 finishes at `merged` after the task branch lands in the project worktree, while
 PR work finishes at `pr-merged` after the open PR has been monitored through
 comments, checks, and merge. `pr-open` is active work for the project's single
-foreman to watch. Once final delivery is recorded, release the worker sessions;
+task lead to watch. Once final delivery is recorded, release the worker sessions;
 the durable outcome is the branch, PR record, artifacts, project status,
 messages, and logs, not a stale agent tab.
 
