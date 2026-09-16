@@ -217,7 +217,32 @@ class LifecycleMixin:
             raise SafetyError("workspace belongs to a different Git project")
         branch = _git(expected, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
         if branch != task["branch"]:
-            raise SafetyError("workspace branch does not match the assigned task")
+            # A DEAD END UNTIL THIS MESSAGE EXISTED. A whole class of
+            # legitimate work never sits on the branch Helm allocated --
+            # merging main into an existing pull request's own branch, or
+            # appending a commit to one somebody else authored. The worker
+            # correctly checks that branch out, and from then on the task
+            # cannot be launched, continued or rounded: its work sits intact on
+            # disk with no route back in. Four rounds stopped on this in one
+            # day, and the way out took forty minutes to find.
+            #
+            # The check itself is right and stays: committing into a branch
+            # nobody recorded is how a task's work becomes unfindable. What was
+            # wrong is a refusal that named neither branch nor any way forward.
+            # `checkout -B` puts the recorded branch on the commit that is
+            # already there -- the working tree is untouched and nothing is
+            # rewritten, so it makes the record true rather than bypassing it.
+            actual = branch or "a detached HEAD"
+            raise SafetyError(
+                f"task {task['id']} is recorded on {task['branch']} but its "
+                f"worktree is on {actual}. Nothing is lost: the commits are "
+                f"where they are. Put the recorded branch on them with "
+                f"`git -C {expected} checkout -B {task['branch']} HEAD` -- the "
+                "working tree is untouched and no history is rewritten -- and "
+                "push with an explicit refspec "
+                f"(`git push <remote> HEAD:{actual}`) if the work belongs on "
+                "the other branch."
+            )
         return expected
     def verify_task_workspace(self, task_id: str) -> Path:
         data = self.store.load()

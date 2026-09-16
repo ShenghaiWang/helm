@@ -1494,6 +1494,57 @@ class TaskLifecycleTests(HelmTestCase):
         self.assertEqual(report.read_text(encoding="utf-8"), "what the round found\n")
 
 
+class AWorktreeOnAnotherBranchSaysHowToGetBackTests(HelmTestCase):
+    """A refusal with no way forward is a bricked task.
+
+    Legitimate work often does not sit on the branch Helm allocated -- merging
+    main into an existing pull request's own branch, or appending a commit to
+    one somebody else authored. The worker checks that branch out, and from
+    then on the task cannot be launched, continued or rounded while its work
+    sits intact on disk. Four rounds stopped on this in one day.
+    """
+
+    def _task_on_another_branch(self, name: str) -> tuple[dict, Path]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "append to somebody's branch")
+        self.coordinator.allocate_task(task["id"])
+        workspace = Path(self.coordinator.store.load()["tasks"][task["id"]]["workspace"])
+        subprocess.run(
+            ["git", "-C", str(workspace), "checkout", "-q", "-b", "feat/theirs"],
+            check=True,
+        )
+        return self.coordinator.store.load()["tasks"][task["id"]], workspace
+
+    def test_the_refusal_names_both_branches_and_the_one_command_that_fixes_it(self) -> None:
+        task, workspace = self._task_on_another_branch("foreign")
+        with self.assertRaises(SafetyError) as caught:
+            self.coordinator.verify_task_workspace(task["id"])
+        message = str(caught.exception)
+        self.assertIn(task["branch"], message)
+        self.assertIn("feat/theirs", message)
+        self.assertIn("checkout -B", message)
+        # And the way out actually works.
+        subprocess.run(
+            ["git", "-C", str(workspace), "checkout", "-B", task["branch"], "HEAD"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.assertEqual(self.coordinator.verify_task_workspace(task["id"]), workspace)
+
+    def test_a_detached_head_is_named_rather_than_reported_as_an_empty_branch(self) -> None:
+        root = self.repo("detached")
+        project = self.coordinator.register_project("detached", str(root), project_id="detached")
+        task = self.coordinator.create_task(project["id"], "work from a tag")
+        self.coordinator.allocate_task(task["id"])
+        workspace = Path(self.coordinator.store.load()["tasks"][task["id"]]["workspace"])
+        subprocess.run(
+            ["git", "-C", str(workspace), "checkout", "-q", "--detach", "HEAD"], check=True
+        )
+        with self.assertRaises(SafetyError) as caught:
+            self.coordinator.verify_task_workspace(task["id"])
+        self.assertIn("a detached HEAD", str(caught.exception))
+
+
 class AStoppedTaskCanBeReadAndReopenedTests(HelmTestCase):
     """`continue` said a person must read it first and gave them no way to say so.
 
