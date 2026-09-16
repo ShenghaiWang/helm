@@ -1631,6 +1631,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     action_start.add_argument("worker_id")
 
+    withdraw = worker_commands.add_parser(
+        "withdraw",
+        help="take back this session's own unspent approval request",
+    )
+    withdraw.add_argument("worker_id")
+    withdraw.add_argument(
+        "--reason", default="",
+        help="why it is no longer needed; it lands on the record",
+    )
+
     answer = worker_commands.add_parser(
         "answer", help="answer a worker's question from the task goal and let it continue"
     )
@@ -3973,6 +3983,15 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
                 f"{args.worker_id} immediately before acting; it checks the "
                 "approval against this exact state and spends it once."
             )
+            # Said here because this is the moment a session learns it is
+            # holding one. A worker that later has to stand down without
+            # acting used to be deadlocked: it could not report and could not
+            # let go, and the only exit failed a task whose work was done.
+            print(
+                f"  If the action turns out not to be needed: helm worker withdraw "
+                f"{args.worker_id} --reason \"...\" takes the request back. It "
+                "authorizes nothing and leaves the task answerable."
+            )
         if told_foreman:
             print("  Told the project's foreman; it is theirs to act on")
         if routed:
@@ -4035,6 +4054,16 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
         )
         with contextlib.suppress(HelmError, OSError):
             HerdrAdapter(coordinator).route_worker_messages(args.worker_id)
+    elif args.worker_command == "withdraw":
+        withdrawn = coordinator.withdraw_task_hold(args.worker_id, reason=args.reason)
+        print(
+            f"Withdrew the request for {withdrawn['action']} on task "
+            f"{withdrawn['task_id']} [{withdrawn['task_status']}]"
+        )
+        print(
+            "  Nothing was authorized and nothing is spent. Ask again when the "
+            "work is in a state worth deciding about."
+        )
     elif args.worker_command == "inbox":
         identity = coordinator.caller_identity()
         worker_id = args.worker_id or identity["worker_id"]

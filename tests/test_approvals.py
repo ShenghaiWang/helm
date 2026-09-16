@@ -422,6 +422,58 @@ class ApprovalTests(HelmTestCase):
         self.assertIn("the staged index", message)
         self.assertNotIn(revision, message)
 
+    def test_a_session_can_take_back_its_own_unspent_request(self) -> None:
+        """Every other exit from an open hold costs a root intervention.
+
+        The one that existed -- `helm approval repair` -- abandons the hold and
+        FAILS the task, including a task whose work was delivered. So a worker
+        told to stand down while holding an unspent request had nothing to do
+        and no way to say so. Withdrawing a request authorizes nothing; it
+        leaves strictly less permission than before.
+        """
+        project, task, worker = self._paused_on_approval("withdraw")
+        self.assertEqual(self._hold(task["id"])["status"], "waiting")
+
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+            withdrawn = self.coordinator.withdraw_task_hold(
+                worker["id"], reason="told to stand down"
+            )
+        self.assertEqual(withdrawn["action"], "publish")
+        hold = self._hold(task["id"])
+        self.assertEqual(hold["status"], "abandoned")
+        self.assertIsNone(hold["authorization"])
+        # The task is answerable again, not failed: the session is still live
+        # and still holds the work.
+        self.assertEqual(
+            self.coordinator.store.load()["tasks"][task["id"]]["status"], "running"
+        )
+        # And it can now file what it was trying to say.
+        self.coordinator.record_worker_message(worker["id"], "result", "stood down")
+        self.assertEqual(
+            self.coordinator.store.load()["tasks"][task["id"]]["status"], "completed"
+        )
+
+    def test_withdrawing_is_refused_for_another_session_and_for_a_spent_hold(self) -> None:
+        # Cancelling somebody else's pending decision is a way to make the
+        # commander's answer land on nothing.
+        project, task, worker = self._paused_on_approval("withdraw-bounds")
+        other = self.coordinator.create_task(project["id"], "some other work")
+        stranger = self.coordinator.prepare_external_worker(
+            other["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": stranger["id"]}):
+            with self.assertRaisesRegex(SafetyError, r"may withdraw its approval request"):
+                self.coordinator.withdraw_task_hold(worker["id"])
+
+        # An in-flight hold is reported, not withdrawn: the action may already
+        # have happened, and abandoning the record would hide it.
+        self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        self.coordinator.start_authorized_action(worker["id"])
+        self.assertEqual(self._hold(task["id"])["status"], "in-flight")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+            with self.assertRaisesRegex(SafetyError, r"in flight"):
+                self.coordinator.withdraw_task_hold(worker["id"])
+
     def test_a_change_between_request_and_release_is_never_silently_rebound(self) -> None:
         """DEFECT 2: release built a fresh binding and authorized a newer revision."""
         project, task, worker = self._paused_on_approval("rebind")

@@ -351,6 +351,74 @@ class ProtectionMixin:
             # refuses it and no round can reopen it. Failed is the honest,
             # cleanable, retryable state, and its log is still the evidence.
             task["status"] = "failed"
+    def withdraw_task_hold(self, worker_id: str, *, reason: str = "") -> dict[str, Any]:
+        """Let a session take back its own unspent approval request.
+
+        Every other way out of an open hold costs a root intervention, and the
+        one that exists -- `helm approval repair` -- abandons the hold and
+        FAILS the task, including tasks whose work was in fact delivered. So a
+        worker told to stand down while holding an unspent request had nothing
+        it could do and no way to say so.
+
+        The asymmetry this corrects: Helm is strict about the HARMLESS
+        direction. Spending an authorization is the dangerous one and stays
+        with the root, at `release` and again at `action-start`. Withdrawing a
+        *request* authorizes nothing -- it leaves strictly less permission than
+        before -- so the session that asked may take it back.
+
+        Two bounds. Only the session that asked, or the root, may withdraw:
+        another agent cancelling a pending decision is a way to make a
+        commander's answer land on nothing. And never an `in-flight` hold --
+        the action may already be happening, and abandoning that record would
+        hide it. That one still needs its outcome reported.
+        """
+        identity = self.caller_identity()
+        with self.store.locked() as data:
+            worker = data.get("workers", {}).get(worker_id)
+            if worker is None:
+                raise HelmError(f"unknown worker: {worker_id}")
+            if identity["role"] != "root" and identity.get("worker_id") != worker_id:
+                raise SafetyError(
+                    f"only {worker_id} or the root may withdraw its approval request; "
+                    f"this command was identified as {identity.get('worker_id') or 'the root'}"
+                )
+            task = self._task(data, worker["task_id"])
+            project = self._project(data, task["project_id"])
+            hold = self.task_hold(task)
+            if hold is None:
+                raise HelmError(f"task {task['id']} has no open approval request")
+            if hold.get("worker_id") != worker_id:
+                raise SafetyError(
+                    f"hold {hold['id']} was asked for by {hold.get('worker_id')}, "
+                    f"not by {worker_id}"
+                )
+            if hold["status"] == "in-flight":
+                raise SafetyError(
+                    f"hold {hold['id']} is in flight: the authorized {hold['action']} "
+                    "may already have happened, so it is reported, not withdrawn. "
+                    "Push a result with its receipts, or a question saying what went wrong."
+                )
+            self._move_hold(
+                data, project, task, hold, "abandon",
+                detail=(
+                    f"Approval request for {hold['action']} withdrawn by {worker_id}"
+                    + (f": {_safe_text(reason).strip()}" if reason else "")
+                ),
+                payload={"withdrawn_by": worker_id},
+                worker=worker,
+                message_kind="approval-abandoned",
+            )
+            if task["status"] == "approval-needed":
+                # It is answerable again: nothing is waiting on a human, and the
+                # session is still live and still holding the work.
+                task["status"] = "running"
+            return {
+                "task_id": task["id"],
+                "hold_id": hold["id"],
+                "action": hold["action"],
+                "task_status": task["status"],
+            }
+
     def _hold_request(
         self,
         data: dict[str, Any],
