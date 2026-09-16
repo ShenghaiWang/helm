@@ -2092,6 +2092,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-herdr", dest="herdr", action="store_false", default=True,
         help="appoint a missing foreman as a plain process instead of in the project's space",
     )
+    route.add_argument(
+        "--new", dest="new_lead", action="store_true", default=False,
+        help="appoint a driver for THIS request instead of handing it to the "
+        "project's existing one -- use it when the request is a separate unit "
+        "of work that should run beside the others, not a follow-up to one",
+    )
 
     board = commands.add_parser(
         "board", help="write a single page showing what every agent produced"
@@ -4887,21 +4893,44 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
             "this request to. Appoint one explicitly with helm foreman "
             f"{args.project_id} first if you want to route to it anyway."
         )
-    existing = coordinator.foreman_for(args.project_id)
+    # `--new` gives this request its OWN driver rather than queueing it behind
+    # the project's existing one. One driver per project makes a single queue
+    # with a single consumer: independent units of work wait on each other for
+    # no reason, and a driver blocked on any one of them blocks the rest --
+    # measured at twenty-two minutes with zero workers running while four
+    # independent units waited. A driver per unit of work has no shared queue.
+    #
+    # It is opt-in rather than the default because seven call sites still read
+    # `foreman_for` as "the" driver of a project, and flipping the default
+    # before those are migrated would change what they answer rather than what
+    # they do. See docs/task-lead.md.
     started = None
-    if existing is None:
-        started = _ensure_foreman(
+    if args.new_lead:
+        # Take the record `_start_foreman` returns rather than re-reading
+        # `foreman_for` afterwards: with more than one driver live, "the"
+        # driver of a project is not a question with one answer, and the
+        # request must reach the driver this call just appointed for it.
+        started = _start_foreman(
             coordinator, args.project_id, herdr=args.herdr,
             command=args.worker_command_text, agent=args.agent,
-            model=args.model,
-            # The request goes into the brief this appointment composes,
-            # so a foreman started by this very call comes up already
-            # holding it rather than hoping to read it afterwards.
-            request=args.text,
+            model=args.model, request=args.text,
         )
-        foreman = coordinator.foreman_for(args.project_id)
+        foreman = started["worker"]
     else:
-        foreman = existing
+        existing = coordinator.foreman_for(args.project_id)
+        if existing is None:
+            started = _ensure_foreman(
+                coordinator, args.project_id, herdr=args.herdr,
+                command=args.worker_command_text, agent=args.agent,
+                model=args.model,
+                # The request goes into the brief this appointment composes,
+                # so a foreman started by this very call comes up already
+                # holding it rather than hoping to read it afterwards.
+                request=args.text,
+            )
+            foreman = coordinator.foreman_for(args.project_id)
+        else:
+            foreman = existing
     if foreman is None:
         raise HelmError(
             f"{args.project_id} has no live foreman to route to; appointing one "

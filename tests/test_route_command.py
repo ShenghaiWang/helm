@@ -57,6 +57,87 @@ class RouteCommandTests(HelmTestCase):
                 code = cli.main(["--root", str(helm_root), "route", *args])
         return code, output.getvalue()
 
+    # -- one driver per unit of work --------------------------------------
+
+    def test_new_appoints_a_second_driver_beside_the_first(self) -> None:
+        """`--new` is how a request stops queueing behind unrelated work.
+
+        One driver per project is one queue with one consumer: independent
+        units wait on each other for no reason, and a driver blocked on any
+        one of them blocks the rest. This is the opt-in escape until the
+        remaining `foreman_for` callers are migrated.
+        """
+        helm_root = self._helm_root("route-new-root")
+        coordinator, project = self._project_root(helm_root, "route-new")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        code, _ = self._route(
+            helm_root, project["id"], "first unit of work", "--command", command
+        )
+        self.assertEqual(code, 0)
+        first = coordinator.foreman_for(project["id"])
+        self.assertIsNotNone(first)
+
+        code, output = self._route(
+            helm_root, project["id"], "second, unrelated unit", "--command", command, "--new",
+        )
+        self.assertEqual(code, 0)
+
+        data = coordinator.store.load()
+        drivers = {
+            w["id"]
+            for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        }
+        self.assertEqual(len(drivers), 2, "--new must appoint a driver beside the existing one")
+
+        # The request reaches the driver appointed FOR IT, not whichever one
+        # `foreman_for` happens to answer with now that there are two.
+        second = (drivers - {first["id"]}).pop()
+        texts = "".join(
+            m.get("text", "")
+            for m in data["messages"]
+            if m.get("worker_id") == second
+        )
+        self.assertIn("second, unrelated unit", texts)
+        first_texts = "".join(
+            m.get("text", "")
+            for m in data["messages"]
+            if m.get("worker_id") == first["id"]
+        )
+        self.assertNotIn("second, unrelated unit", first_texts)
+
+    def test_without_new_a_second_route_still_reuses_the_existing_driver(self) -> None:
+        """The default is unchanged, and that is the point of it being opt-in.
+
+        Seven call sites still read `foreman_for` as "the" driver of a
+        project. Flipping the default before they are migrated would change
+        what they answer rather than what they do.
+        """
+        helm_root = self._helm_root("route-reuse-root")
+        coordinator, project = self._project_root(helm_root, "route-reuse")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        self._route(helm_root, project["id"], "first request", "--command", command)
+        first = coordinator.foreman_for(project["id"])
+        self._route(helm_root, project["id"], "a follow-up to the first", "--command", command)
+
+        data = coordinator.store.load()
+        drivers = {
+            w["id"]
+            for w in data["workers"].values()
+            if w.get("project_id") == project["id"]
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        }
+        self.assertEqual(len(drivers), 1, "the default must not appoint a second driver")
+        texts = "".join(
+            m.get("text", "")
+            for m in data["messages"]
+            if m.get("worker_id") == first["id"]
+        )
+        self.assertIn("a follow-up to the first", texts)
+
     # -- a project with no foreman yet -----------------------------------
 
     def test_route_appoints_a_missing_foreman_and_never_claims_delivery(self) -> None:
