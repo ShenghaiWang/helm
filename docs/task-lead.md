@@ -19,7 +19,16 @@ the code. What works today:
 - The watchdog asks whether **each worker** has a live driver, not whether the
   project has one, and appoints a driver for orphaned work.
 
-Still to come: `--new` becoming the default, and the rename itself.
+Two things deliberately *not* done, decided rather than pending:
+
+- **`--new` stays opt-in.** Appointing a driver per request was the obvious
+  next step and is the wrong default: a name now routes a follow-up to the
+  driver already doing that work, which removes most of the queueing without
+  paying for an agent per unrecognised message. Flipping it is a one-line
+  change if the queue ever bites again.
+- **The rename waits.** Everything here still says *foreman* in the code. The
+  substitution is about seven hundred references and delivers nothing on its
+  own, so it happens once the lifetime work is finished rather than beside it.
 
 ## What changes
 
