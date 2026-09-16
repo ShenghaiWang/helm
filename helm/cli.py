@@ -4495,10 +4495,17 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
             (line.strip() for line in item["text"].splitlines() if line.strip()), ""
         )
         stamp = str(item.get("at") or item.get("created_at") or "")
+        # The NAME, not the generated key. A line reading "w-904ead74c431
+        # paused on push" makes the reader resolve an id before it means
+        # anything, and six of those get skimmed -- which is how the one item
+        # that needed answering gets missed. `open_escalations` already
+        # resolved it against the task record; fall back to the key if it
+        # somehow did not, because this command must never fail.
+        who = item.get("name") or item["worker_id"]
         entries.append((
             stamp,
-            f"{_when_label(stamp)} {glyph} {item['kind']} {item['worker_id']}: {first[:100]}",
-            f"{glyph} {item['kind']} {item['worker_id']}: {first}",
+            f"{_when_label(stamp)} {glyph} {item['kind']} {who}: {first[:100]}",
+            f"{glyph} {item['kind']} {who}: {first}",
         ))
     for item in coordinator.open_action_items(None):
         if item.get("kind") not in BLOCKING_GATE_KINDS:

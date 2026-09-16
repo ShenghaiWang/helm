@@ -30,6 +30,7 @@ from . import models
 from . import preferences as prefs
 from . import runtimes
 from .errors import HelmError, SafetyError
+from .naming import task_name
 from .paths import (
     _safe_configuration_path,
     _file_digest,
@@ -1906,6 +1907,11 @@ class Coordinator(
                 "project_id": msg_project_id,
                 "role": task.get("role", "worker"),
                 "worker_id": worker_id,
+                # Computed here, where the task record is already in hand. A
+                # reader that resolved the name itself would need one store
+                # read per line, and this feeds `pending`, which runs every
+                # turn and must stay cheap.
+                "name": task_name(task, fallback=worker_id),
                 "task_id": message.get("task_id"),
                 "created_at": str(message.get("created_at") or ""),
                 "text": str(message.get("text", "")),
