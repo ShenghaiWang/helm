@@ -32,6 +32,70 @@ class GateTests(HelmTestCase):
     def _as_foreman(self, worker_id: str):
         return mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker_id})
 
+    def test_two_drivers_in_one_project_hold_independent_gate_pairs(self) -> None:
+        """The property the whole per-task-lead change exists for.
+
+        Gates used to be looked up by PROJECT, which made one pair per project
+        by construction: two independent units of work queued behind one
+        confirmation each, and a driver blocked on any of them blocked the
+        rest. They are looked up by CALLER now, so each driver spends the pair
+        it proposed and neither can spend the other's.
+        """
+        root = self.repo("twodrivers")
+        project = self.coordinator.register_project(
+            "twodrivers", str(root), project_id="twodrivers"
+        )
+        first_task = self.coordinator.create_foreman_task(project["id"])
+        first = self.coordinator.prepare_external_worker(
+            first_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        second_task = self.coordinator.create_foreman_task(project["id"])
+        second = self.coordinator.prepare_external_worker(
+            second_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+
+        # Only the FIRST driver's pair is settled.
+        with self._as_foreman(first["id"]):
+            self.coordinator.propose_gate(
+                first_task["id"], "requirement", "goal: unit one; Done means: X; Out of scope: Y"
+            )
+        self.coordinator.decide_gate(first_task["id"], "requirement", confirm=True, skip=False)
+        with self._as_foreman(first["id"]):
+            self.coordinator.propose_gate(
+                first_task["id"], "solution", "approach: one; verification: tests"
+            )
+        self.coordinator.decide_gate(first_task["id"], "solution", confirm=True, skip=False)
+
+        # The SECOND driver cannot ride on it: its own gates are unproposed,
+        # and before this change the project-wide lookup would have found the
+        # first driver's confirmed pair and let it through.
+        with self._as_foreman(second["id"]):
+            with self.assertRaisesRegex(HelmError, "requirement gate has not been proposed"):
+                self.coordinator.create_task(project["id"], "unit two")
+
+        # The first driver still spends its own pair, unaffected by the second
+        # existing at all.
+        with self._as_foreman(first["id"]):
+            task = self.coordinator.create_task(project["id"], "unit one")
+        self.assertEqual(task["role"], "worker")
+
+        # And the second gets there independently, on its own confirmations --
+        # no re-proposal by the first, no waiting for it.
+        with self._as_foreman(second["id"]):
+            self.coordinator.propose_gate(
+                second_task["id"], "requirement", "goal: unit two; Done means: X; Out of scope: Y"
+            )
+        self.coordinator.decide_gate(second_task["id"], "requirement", confirm=True, skip=False)
+        with self._as_foreman(second["id"]):
+            self.coordinator.propose_gate(
+                second_task["id"], "solution", "approach: two; verification: tests"
+            )
+        self.coordinator.decide_gate(second_task["id"], "solution", confirm=True, skip=False)
+        with self._as_foreman(second["id"]):
+            other = self.coordinator.create_task(project["id"], "unit two")
+        self.assertEqual(other["role"], "worker")
+        self.assertNotEqual(task["id"], other["id"])
+
     def test_state_changing_worker_refused_until_both_gates_confirmed(self) -> None:
         project, foreman_task, worker = self._project_with_live_foreman("gatedproject")
         with self._as_foreman(worker["id"]):

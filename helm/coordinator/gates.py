@@ -67,6 +67,43 @@ class GatesMixin:
         carried["bound_at"] = None
         return carried
 
+    def _gate_holder_in(
+        self, data: dict[str, Any], project_id: str
+    ) -> dict[str, Any] | None:
+        """The task whose gates authorize a new state-changing task here.
+
+        Resolved from the CALLER, not from the project. A driver asking to
+        spawn a worker is asking to spend the pair IT proposed, and
+        `caller_identity` attributes the command by process lineage as well as
+        the environment marker -- a signal the caller cannot clear.
+
+        This is what lets a project hold more than one driver. Looking the
+        holder up by project made the answer a singleton by construction: one
+        driver per project, so one gate pair per project, so several
+        independent units of work queued behind one confirmation each. Asking
+        who is calling instead gives each driver its own pair, and the pair
+        binds to the row that IS the unit of work -- which is also why
+        replacing a driver can no longer discard a decision the commander
+        already made.
+
+        Root falls through to the project's driver, because root has no task
+        of its own to hold gates on. With one driver per project the two
+        answers are identical, so this changes nothing until more than one
+        exists.
+        """
+        identity = self.caller_identity()
+        worker_id = identity.get("worker_id")
+        if worker_id:
+            worker = data.get("workers", {}).get(worker_id) or {}
+            task = data.get("tasks", {}).get(str(worker.get("task_id") or ""))
+            if (
+                task is not None
+                and task.get("project_id") == project_id
+                and task.get("role") == "foreman"
+            ):
+                return task
+        return self._live_foreman_task_in(data, project_id)
+
     def _require_gates_confirmed(
         self,
         data: dict[str, Any],
@@ -97,7 +134,7 @@ class GatesMixin:
         checks without consuming, for a caller that only needs to know
         whether the gates are currently settled.
         """
-        foreman_task = self._live_foreman_task_in(data, project_id)
+        foreman_task = self._gate_holder_in(data, project_id)
         if foreman_task is None:
             raise HelmError(
                 "no live foreman for this project; a state-changing worker task "
