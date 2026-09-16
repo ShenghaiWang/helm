@@ -227,6 +227,17 @@ total and available memory, load, the measured per-operation cost, how many
 slots that yields, and what currently holds them. A limit nobody can see gets
 worked around.
 
+**A limit has to say whose operation it is.** The first version of this rule
+banned whole-project operations "whatever the justification", and a repository
+whose pre-commit hook runs a scopeless type-check made that rule forbid `git
+commit` itself. Both leads stopped and asked rather than improvise, which was
+right — but the only paths the rule left them were bypassing a safety gate or
+leaving work uncommitted in a worktree, and uncommitted work in a worktree is
+exactly what dies when the machine goes down. So the limit is about operations
+*Helm chooses to run*. A repository's own gate is its price for committing, and
+refusing it means refusing to work there. What to do when the machine is
+starved is wait.
+
 **And the operation that actually does it, measured.** A scopeless
 `tsc --noEmit` in one task worktree reached **8.3 GB resident** and drove the
 load average past 90 on a machine with 0.06 GB free. One agent, one command.
