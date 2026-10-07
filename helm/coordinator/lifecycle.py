@@ -525,6 +525,7 @@ class LifecycleMixin:
         role: str = "worker",
         reviews: str | None = None,
         review_tip: str | None = None,
+        review_episode: str | None = None,
         ticket: str | None = None,
         title: str | None = None,
         read_only: bool = False,
@@ -537,6 +538,12 @@ class LifecycleMixin:
         brief, brief_cut = _bounded_brief(brief)
         if not brief:
             raise HelmError("task brief is required")
+        if review_episode is not None:
+            # Issued by `new_review_episode` and written into this brief by
+            # the review loop, so the first round's handoff can name it.
+            review_episode = str(review_episode).strip()
+            if role != "reviewer" or not self.REVIEW_EPISODE.fullmatch(review_episode):
+                raise HelmError("a review episode is a reviewer task's, as Helm issued it")
         if role not in TASK_ROLES:
             raise HelmError(f"task role must be one of {sorted(TASK_ROLES)}")
         # Validated before it is used, not after: this value goes into a git
@@ -882,6 +889,7 @@ class LifecycleMixin:
                         task["review_rounds"] = [{
                             "round": 1,
                             "tip": task["review_tip"],
+                            "episode": review_episode or self.new_review_episode(),
                             "handed_off_at": task["created_at"],
                             "opened_by": creator_id or "root",
                             "result": None,

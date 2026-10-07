@@ -677,6 +677,53 @@ class ProtectionMixin:
         rounds = task.get("review_rounds") or []
         return rounds[-1] if rounds else None
 
+    #: What Helm issues as a review round's episode, and all it accepts back.
+    REVIEW_EPISODE = re.compile(r"rv-[0-9a-f]{12}")
+
+    @staticmethod
+    def new_review_episode() -> str:
+        """A fresh identifier for one review round's handoff."""
+        return new_id("rv")
+
+    def _review_result_round(
+        self, task: dict[str, Any], payload: dict[str, Any]
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Which round of `task` a reviewer's result answers, and how it binds.
+
+        A kept reviewer is asked again in the same session, so arrival order
+        says nothing about which question a result answers: a retried push of
+        round one's verdict can land after round two was handed off. Each
+        round is therefore issued an episode, the handoff names it, and the
+        result names it back. Returns one of:
+
+        - ("bound", round): the result answers the round still waiting on it.
+        - ("duplicate", round): that round already has its verdict.
+        - ("stale", round-or-None): it names a round already closed, one this
+          task never issued, or none at all once there is more than one
+          round it could be -- it answers nothing current.
+        - ("legacy", round-or-None): a reviewer recorded before episodes; the
+          current round, as before.
+
+        With only one round ever issued, a result that names none can answer
+        nothing else, so it binds there.
+        """
+        rounds = task.get("review_rounds") or []
+        current = rounds[-1] if rounds else None
+        if current is None or not current.get("episode"):
+            return "legacy", current
+        named = str((payload or {}).get("review_episode") or "").strip()
+        if named:
+            target = next((r for r in rounds if r.get("episode") == named), None)
+        elif len(rounds) == 1:
+            target = current
+        else:
+            return "stale", None
+        if target is None or target is not current:
+            return "stale", target
+        if current.get("result"):
+            return "duplicate", current
+        return "bound", current
+
     def _open_review_round(self, reviewer_task_id: str, review_tip: str) -> dict[str, Any]:
         """Hand a kept reviewer its next round: one new, immutable commit.
 
@@ -685,8 +732,9 @@ class ProtectionMixin:
         driving the reviewed task. A round already handed off is never moved:
         while it has no verdict, the verdict it is about to produce belongs to
         the commit it was handed, so a new round cannot open over it. Each
-        round is appended, never edited, and a result is recorded against the
-        round current when it lands.
+        round is appended, never edited, and is issued its own episode: the
+        handoff names it, and a result fills this round only by naming it
+        back (see `_review_result_round`).
         """
         review_tip = str(review_tip).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", review_tip):
@@ -717,6 +765,7 @@ class ProtectionMixin:
             episode = {
                 "round": len(rounds) + 1,
                 "tip": review_tip,
+                "episode": self.new_review_episode(),
                 "handed_off_at": now(),
                 "opened_by": opened_by,
                 "result": None,

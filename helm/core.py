@@ -497,18 +497,43 @@ class Coordinator(
             # reviewer stopped reading. A reviewer with no pinned commit
             # approves nothing a push gate will accept.
             #
-            # The round current when the result lands is the one the reviewer
-            # was last handed: rounds are appended only after a verdict, and
-            # never edited, so this is the commit that round's brief named.
-            review_round = self._current_review_round(task)
-            payload = {
-                **(payload or {}),
-                "reviewed_tip": (
-                    review_round.get("tip") if review_round is not None
-                    else task.get("review_tip")
-                ) or None,
-                "review_round": review_round.get("round") if review_round is not None else None,
-            }
+            # Which round it answers is what the result itself names -- the
+            # episode its handoff issued -- never which round happens to be
+            # current when it lands: a kept reviewer's retried push of round
+            # one can arrive after round two was handed off, and filling round
+            # two with it would stamp the old verdict onto the new commit.
+            binding, review_round = self._review_result_round(task, payload or {})
+            if binding == "duplicate":
+                return self._noop_event(task, worker, kind)
+            if binding == "stale":
+                # Kept, because it is what the reviewer said, but as a status:
+                # it fills no round, settles nothing, and is no verdict any
+                # gate reads.
+                named = _safe_text(str((payload or {}).get("review_episode") or "none"))
+                current = self._current_review_round(task) or {}
+                kind, requested_status = "status", None
+                payload = {
+                    **(payload or {}), "kept_from": "result", "stale_review_result": True,
+                    "review_round": review_round.get("round") if review_round else None,
+                }
+                text = (
+                    f"{_safe_text(text)}\n\n[Helm: not recorded as a verdict. It names "
+                    f"review episode {named}, and the round waiting on a verdict is "
+                    f"round {current.get('round')} (episode {current.get('episode')}). "
+                    "Report this round's verdict with --review-round "
+                    f"{current.get('episode')}.]"
+                )
+                review_round = None
+            else:
+                payload = {
+                    **(payload or {}),
+                    "reviewed_tip": (
+                        review_round.get("tip") if review_round is not None
+                        else task.get("review_tip")
+                    ) or None,
+                    "review_round": review_round.get("round") if review_round is not None else None,
+                    "review_episode": (review_round or {}).get("episode"),
+                }
         else:
             review_round = None
         message = self._message(

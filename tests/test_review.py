@@ -30,6 +30,13 @@ from helm.herdr import HerdrAdapter
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS, needs_runtimes
 
 
+def _handed_round(text: str) -> dict:
+    """What a kept reviewer sends back: the round its handoff named."""
+    match = re.search(r"--review-round (rv-[0-9a-f]{12})", text)
+    assert match, f"the handoff names no review round: {text!r}"
+    return {"review_episode": match.group(1)}
+
+
 class ReviewTests(HelmTestCase):
     _JSON_LITERAL = r'"(?:[^"\\]|\\.)*"'
 
@@ -209,7 +216,9 @@ class ReviewTests(HelmTestCase):
             if worker_id == author["id"]:
                 self.coordinator.record_worker_message(worker_id, "result", "addressed")
             else:
-                self.coordinator.record_worker_message(worker_id, "result", "APPROVED verified")
+                self.coordinator.record_worker_message(
+                    worker_id, "result", "APPROVED verified", payload=_handed_round(text)
+                )
             return True
 
         with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
@@ -1572,7 +1581,9 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
             else:
                 # Committed after round two was pinned: not what it read.
                 self.commit_on_task_branch(task, "third, unread")
-                self.coordinator.record_worker_message(worker_id, "result", "APPROVED ok")
+                self.coordinator.record_worker_message(
+                    worker_id, "result", "APPROVED ok", payload=_handed_round(text)
+                )
             return True
 
         with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
@@ -1595,6 +1606,135 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
         patch = (self.state.directory / "reviews" / task["id"] / "diff.patch").read_text()
         self.assertIn("second round", patch)
         self.assertNotIn("third, unread", patch)
+
+    # ---------- a result answers the round it names, never the one it lands in ----------
+
+    def test_a_delayed_result_from_the_last_round_never_fills_the_next(self) -> None:
+        project, task, author, a = self._reviewed_task("delayedround")
+        review, reviewer = self._reviewer_for(project, task)
+        first = self.coordinator.inspect_task(review["id"])["task"]["review_rounds"][0]
+        self.coordinator.record_worker_message(
+            reviewer["id"], "result", "CHANGES-REQUESTED for A",
+            payload={"review_episode": first.get("episode")},
+        )
+        self.commit_on_task_branch(task, "B")
+        b = self._rev(task["workspace"])
+        # The kept reviewer is put back to work for round two, as the loop does.
+        with self.coordinator.store.locked() as data:
+            worker = data["workers"][reviewer["id"]]
+            worker["status"] = "running"
+            self.coordinator.begin_worker_episode(worker)
+            data["tasks"][review["id"]]["status"] = "running"
+        second = self.coordinator._open_review_round(review["id"], b)
+
+        def round_two() -> dict:
+            return self.coordinator.inspect_task(review["id"])["task"]["review_rounds"][1]
+
+        # Round one's verdict, retried late -- naming its own round, naming
+        # none, or naming a round this reviewer was never handed.
+        for payload in (
+            {"review_episode": first.get("episode")}, {}, {"review_episode": "rv-000000000000"},
+        ):
+            with self.subTest(payload=payload):
+                self.coordinator.record_worker_message(
+                    reviewer["id"], "result", "CHANGES-REQUESTED for A", payload=payload
+                )
+                self.assertIsNone(round_two()["result"])
+                stored = self.coordinator.inspect_task(review["id"])
+                self.assertEqual(stored["task"]["status"], "running")
+                self.assertEqual(stored["messages"][-1]["kind"], "status")
+                self.assertTrue(stored["messages"][-1]["payload"]["stale_review_result"])
+        data = self.coordinator.store.load()
+        self.assertNotIn(b, [tip for _, tip in self.coordinator._review_verdicts(
+            data, data["tasks"][task["id"]]
+        )])
+
+        # Round two's own verdict, sent the way its handoff says to, fills it
+        # and is about B.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main([
+                "--state-dir", str(self.state.directory), "worker", "message",
+                reviewer["id"], "--type", "result", "--text", "APPROVED B",
+                "--review-round", str(second.get("episode")),
+            ]), 0)
+        result = self._result(review["id"])
+        self.assertEqual(round_two()["result"], result["id"])
+        self.assertEqual(result["payload"]["reviewed_tip"], b)
+        data = self.coordinator.store.load()
+        self.assertTrue(self.coordinator._review_passed(data, data["tasks"][task["id"]], b))
+
+        # Said twice, it is recorded once.
+        count = len(self.coordinator.inspect_task(review["id"])["messages"])
+        with self.coordinator.store.locked() as data:
+            data["workers"][reviewer["id"]]["status"] = "running"
+        self.coordinator.record_worker_message(
+            reviewer["id"], "result", "APPROVED B",
+            payload={"review_episode": second["episode"]},
+        )
+        self.assertEqual(len(self.coordinator.inspect_task(review["id"])["messages"]), count)
+        self.assertTrue(first.get("episode"))
+        self.assertNotEqual(second.get("episode"), first.get("episode"))
+
+    def test_the_loop_binds_each_rounds_verdict_to_the_round_it_handed_off(self) -> None:
+        root = self.repo("loopepisode")
+        project = self.coordinator.register_project("Loopepisode", str(root), project_id="loopepisode")
+        task = self.coordinator.create_task(project["id"], "write the code")
+        author = self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.commit_on_task_branch(task, "first round")
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        original_launch = adapter.launch_task
+        state: dict = {"handed": False}
+        tips: dict[str, str] = {}
+
+        def named(text: str) -> dict:
+            match = re.search(r"--review-round (rv-[0-9a-f]{12})", text)
+            return {"review_episode": match.group(1)} if match else {}
+
+        def fake_launch(review_task_id, command, wait=False):
+            worker = original_launch(review_task_id, command, wait=wait)
+            brief = self.coordinator.inspect_task(review_task_id)["task"]["brief"]
+            state["first"] = named(brief)
+            state["reviewer"] = worker["id"]
+            self.coordinator.record_worker_message(
+                worker["id"], "result", "CHANGES-REQUESTED round one", payload=state["first"]
+            )
+            return worker
+
+        def fake_answer(worker_id, text):
+            if worker_id == author["id"]:
+                self.commit_on_task_branch(task, "second round")
+                tips["second"] = self._rev(task["workspace"])
+                self.coordinator.record_worker_message(worker_id, "result", "addressed")
+            else:
+                # Round one's push, retried, lands after round two was handed
+                # off; round two's verdict only ever reaches the pane.
+                self.coordinator.record_worker_message(
+                    worker_id, "result", "CHANGES-REQUESTED round one", payload=state["first"]
+                )
+                state["handed"] = True
+            return True
+
+        def pane(worker_id, since, brief=""):
+            return {"kind": "result", "text": "APPROVED from the pane"} if state["handed"] else None
+
+        with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
+             mock.patch.object(adapter, "answer_worker", side_effect=fake_answer), \
+             mock.patch.object(adapter, "_verdict_from_output", side_effect=pane), \
+             mock.patch.object(self.coordinator, "pick_reviewer_agent", return_value={
+                 "agent": "codex",
+                 "command": [sys.executable, "-c", "import time; time.sleep(60)"],
+                 "independence": "different-runtime", "reason": "test",
+             }):
+            outcome = adapter.run_review_cycle(task["id"], rounds=2, timeout=1.0)
+
+        self.assertEqual(outcome["verdict"], "approved")
+        self.assertTrue(state["first"], "round one's brief names its review round")
+        reviewer_task_id = self.coordinator.store.load()["workers"][state["reviewer"]]["task_id"]
+        rounds = self.coordinator.inspect_task(reviewer_task_id)["task"]["review_rounds"]
+        result = self._result(reviewer_task_id)
+        self.assertEqual(rounds[1]["result"], result["id"])
+        self.assertEqual(result["payload"]["reviewed_tip"], tips["second"])
+        self.assertEqual(result["payload"]["recovered_from"], "worker-output")
 
     # ---------- only the review loop's driver moves a reviewer's commit ----------
 
@@ -1834,7 +1974,9 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
                 self.coordinator.record_worker_message(worker_id, "result", "addressed")
             else:
                 told.append(text)
-                self.coordinator.record_worker_message(worker_id, "result", "APPROVED kept")
+                self.coordinator.record_worker_message(
+                    worker_id, "result", "APPROVED kept", payload=_handed_round(text)
+                )
             return True
 
         def diff(task_arg, base, tip=None):

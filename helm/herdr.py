@@ -1687,7 +1687,7 @@ class HerdrAdapter:
             if reviewer_worker is not None:
                 current = self.coordinator.store.load().get("workers", {}).get(reviewer_worker["id"])
                 reviewer_is_running = bool(current and current.get("status") == "running")
-            kept_round: tuple[str, str] | None = None
+            kept_round: tuple[str, str, str] | None = None
             if reviewer_worker is not None and reviewer_is_running:
                 kept_round = self._prepare_kept_review_round(
                     task, review_base, review_task["id"]
@@ -1733,7 +1733,12 @@ class HerdrAdapter:
                     task, review_base, review_tip
                 )
                 shape_handoff = self._shape_handoff(task, review_base, review_tip)
-                instructions = self._review_instructions(task, review_base, review_tip)
+                # Issued here so this round's own brief can name it; the
+                # reviewer task records it as round one's episode.
+                review_episode = self.coordinator.new_review_episode()
+                instructions = self._review_instructions(
+                    task, review_base, review_tip, review_episode
+                )
                 # The contract gets whatever the instructions and the diff
                 # pointer leave: whole when it fits, otherwise an excerpt and
                 # the path of a file holding all of it. It is never allowed to
@@ -1798,6 +1803,7 @@ class HerdrAdapter:
                     # exists before starting another.
                     reviews=task_id,
                     review_tip=review_tip,
+                    review_episode=review_episode,
                     # A reviewer reads a diff; it never writes one. It needs the
                     # branch and the base commit, both of which are in the brief
                     # above, not a checkout of its own -- and a checkout of its
@@ -1817,14 +1823,14 @@ class HerdrAdapter:
                 # Prepared above: the commit is pinned, the diff file the
                 # reviewer was told to read holds exactly it, and the round is
                 # open on the record, so the verdict is attached to it.
-                review_tip, emptiness = kept_round
+                review_tip, emptiness, review_episode = kept_round
                 self.answer_worker(
                     reviewer_worker["id"],
                     f"The author has pushed changes for round {round_number}. Re-read the "
                     f"diff on {task['branch']} at commit {review_tip} (the diff file you "
                     f"were given has been rewritten for it{emptiness}) and reply again "
                     "with APPROVED or CHANGES-REQUESTED as the first word of a result "
-                    "message.",
+                    "message." + self._review_episode_line(review_episode),
                 )
             outcome = self._await_terminal(
                 reviewer_worker["id"],
@@ -1846,7 +1852,13 @@ class HerdrAdapter:
                         reviewer_worker["id"],
                         "result",
                         outcome["text"],
-                        payload={"recovered_from": "worker-output"},
+                        # Bound to the round whose handoff this loop just
+                        # delivered and read the pane after -- never left to
+                        # whichever round is current when it is recorded.
+                        payload={
+                            "recovered_from": "worker-output",
+                            "review_episode": review_episode,
+                        },
                     )
             if outcome is None:
                 history.append({"round": round_number, "verdict": "timeout"})
@@ -2741,7 +2753,9 @@ class HerdrAdapter:
     REVIEW_POINTER_RESERVE = 1_500
 
     @staticmethod
-    def _review_instructions(task: dict[str, Any], review_base: str, review_tip: str) -> str:
+    def _review_instructions(
+        task: dict[str, Any], review_base: str, review_tip: str, episode: str = ""
+    ) -> str:
         """What every reviewer is told about its workspace, base, and verdict.
 
         Mandatory: the brief is fitted around it, never through it.
@@ -2789,6 +2803,16 @@ class HerdrAdapter:
             "whose FIRST WORD is APPROVED or CHANGES-REQUESTED -- Helm reads "
             "that word to decide whether the loop continues -- followed by "
             "your findings."
+            + (HerdrAdapter._review_episode_line(episode) if episode else "")
+        )
+
+    @staticmethod
+    def _review_episode_line(episode: str) -> str:
+        """The round's episode, which its verdict must name to count for it."""
+        return (
+            f" Send that result with --review-round {episode}: it names this "
+            "round, and a result naming any other round is kept as a note, "
+            "never as this round's verdict."
         )
 
     _CONTRACT_HEADER = (
@@ -2899,14 +2923,14 @@ class HerdrAdapter:
 
     def _prepare_kept_review_round(
         self, task: dict[str, Any], review_base: str, reviewer_task_id: str
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         """Pin, diff and open the next round for a kept reviewer, or None.
 
         In that order, and all or nothing as far as the reviewer can see: the
         round is opened on the record only once its diff file holds exactly
-        the pinned commit. Returns the commit and a note for the message when
-        its diff is empty; None when the round cannot be handed to this
-        reviewer, with nothing moved.
+        the pinned commit. Returns the commit, a note for the message when its
+        diff is empty, and the episode the round was issued; None when the
+        round cannot be handed to this reviewer, with nothing moved.
         """
         try:
             review_tip = self._review_round_tip(task)
@@ -2916,7 +2940,7 @@ class HerdrAdapter:
         if not diff_path:
             return None
         try:
-            self.coordinator._open_review_round(reviewer_task_id, review_tip)
+            opened = self.coordinator._open_review_round(reviewer_task_id, review_tip)
         except HelmError:
             return None
         try:
@@ -2926,7 +2950,7 @@ class HerdrAdapter:
         return review_tip, (
             " -- it is empty: at this commit the branch makes no change against "
             "the review base" if empty else ""
-        )
+        ), str(opened.get("episode") or "")
 
     def _precomputed_diff(
         self, task: dict[str, Any], review_base: str, review_tip: str | None = None

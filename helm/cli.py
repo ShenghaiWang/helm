@@ -1675,6 +1675,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     report.add_argument("--path")
+    report.add_argument(
+        "--review-round",
+        metavar="EPISODE",
+        help=(
+            "with --type result from a reviewer: the review round the verdict "
+            "answers, exactly as its handoff named it"
+        ),
+    )
     report.add_argument("--payload", help="JSON object payload")
     report.add_argument(
         "--wait", nargs="?", const=100.0, type=float, metavar="SECONDS",
@@ -4104,6 +4112,8 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
             payload["action"] = args.action
         if args.subject:
             payload["subject"] = args.subject
+        if args.review_round:
+            payload["review_episode"] = args.review_round
         if args.type == "approval-needed" and not args.action:
             # Refused at the edge as well as in core, so the worker gets
             # the usable form rather than a validation error.
@@ -4146,6 +4156,19 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
             released = adapter.close_project_space_if_finished(task["project_id"])
         told_foreman = "foreman" in routed
         print(f"Recorded {args.type} for task {task['id']} [{task['status']}]")
+        if args.type == "result" and task.get("role") == "reviewer":
+            mine = [
+                m for m in coordinator.store.load().get("messages", [])
+                if m.get("worker_id") == args.worker_id
+            ]
+            if mine and (mine[-1].get("payload") or {}).get("stale_review_result"):
+                waiting = coordinator._current_review_round(task) or {}
+                print(
+                    "  Not counted as a verdict: it does not name the review round "
+                    f"waiting on one. If it is round {waiting.get('round')}'s verdict, "
+                    f"send it again with --review-round {waiting.get('episode')}.",
+                    file=sys.stderr,
+                )
         turns_worker = coordinator.store.load().get("workers", {}).get(args.worker_id) or {}
         if args.wait is not None and turns_worker.get("execution_mode") == "turns":
             # A turn cannot be answered from inside itself: the answer
