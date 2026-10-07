@@ -1703,6 +1703,27 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
         self.assertTrue(rounds[0]["result"])
         self.assertEqual(rounds[1]["opened_by"], driving["id"])
 
+    def test_a_reviewer_task_is_not_continued_with_a_free_form_round(self) -> None:
+        project, task, author, a = self._reviewed_task("reviewercontinue")
+        review, reviewer = self._reviewer_for(project, task)
+        self.coordinator.record_worker_message(reviewer["id"], "result", "CHANGES-REQUESTED x")
+        self.commit_on_task_branch(task, "B the lead wants judged")
+
+        with self.assertRaisesRegex(HelmError, rf"helm review {task['id']}"):
+            self.coordinator.continue_task(review["id"], "now review B", read_only=True)
+        argv = ["--state-dir", str(self.state.directory)]
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main([
+                *argv, "task", "continue", review["id"], "--brief", "now review B",
+                "--read-only",
+            ])
+        self.assertNotEqual(code, 0)
+        stored = self.coordinator.inspect_task(review["id"])["task"]
+        self.assertEqual(stored["status"], "completed")
+        self.assertFalse(stored.get("rounds"))
+        # The only verdict on record is the one about the bytes it was handed.
+        self.assertEqual(self._result(review["id"])["payload"]["reviewed_tip"], a)
+
     # ---------- a round's diff file always holds that round's commit ----------
 
     def _revert_to_base(self, task: dict) -> None:

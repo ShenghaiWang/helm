@@ -136,7 +136,13 @@ independent review that approved that exact tip. Each reviewer task is pinned
 to the exact commit it was handed before it read anything -- the commit its
 diff was built from -- and its result is recorded against that commit, never
 against whatever the branch points at when the verdict lands; the latest
-review of the current tip must begin `APPROVED`. The request is refused
+review of the current tip must begin `APPROVED`. A reviewer kept for another
+round gets a new, recorded round with its own commit and a rewritten diff
+file (written empty when the change is empty), and only after its last round
+has a verdict; only the root or the lead driving the reviewed task may open
+one, so an author cannot move its reviewer onto a commit nobody read. A
+reviewer task is never continued with a free-form round -- `helm review`
+starts the next one. The request is refused
 without one (`helm review <task>` runs it), `helm worker action-start`
 re-checks it before the authorization is spent, and so does `helm task pr`.
 `small` tasks are exempt, and so is a project that declined review

@@ -1430,6 +1430,19 @@ class LaunchMixin:
             raise HelmError("a round needs its own brief")
         with self.store.locked() as data:
             task = self._task(data, task_id)
+            if task.get("role") == "reviewer":
+                # A reviewer's verdict is recorded against the commit its round
+                # was handed, and only the review loop builds that hand-off:
+                # it pins the commit, writes the diff of exactly it, and opens
+                # a new round on the record. A generic round carries a brief
+                # nobody pinned, so whatever the reviewer judged would be
+                # recorded against the previous round's commit.
+                raise HelmError(
+                    f"task {task_id} is a reviewer task; a reviewer is not continued "
+                    "with a free-form round. Run: helm review "
+                    f"{task.get('reviews') or '<task>'} -- it hands a reviewer the "
+                    "exact commit and diff its verdict will be recorded against"
+                )
             live = [
                 worker
                 for worker in self._task_workers(data, task_id)
