@@ -1524,7 +1524,10 @@ def _build_parser() -> argparse.ArgumentParser:
     cleanup_cmd.add_argument(
         "--delete-branch",
         action="store_true",
-        help="also delete the task branch when it still holds unmerged commits",
+        help=(
+            "also delete the task branch when it still holds unmerged commits -- "
+            "never when a remote holds none of them, since it is then their only copy"
+        ),
     )
     pr_cmd = task_commands.add_parser(
         "pr", help="push the task branch so the change can be reviewed on the remote"
@@ -3814,7 +3817,9 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
             print(f"  branch {task['branch']} deleted")
         else:
             print(
-                f"  branch {task['branch']} kept; discard it with "
+                f"  branch {task['branch']} kept; its task log says why (helm "
+                f"inspect {task['id']}). A branch holding commits no remote has "
+                "is never deleted; one that is pushed is discarded with "
                 f"helm task cleanup {task['id']} --delete-branch"
             )
         _release_finished_space(coordinator, task)

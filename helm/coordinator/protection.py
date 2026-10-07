@@ -1783,6 +1783,39 @@ class ProtectionMixin:
         # A registration whose directory is already gone still makes git call
         # the branch checked out, which would refuse the delete below.
         _git(root, "worktree", "prune", check=False)
+        # Forced or not, a branch that is the ONLY copy of its commits is never
+        # deleted. --delete-branch used to skip even the base comparison below,
+        # so a stopped PR task's branch went with commits no remote had. Only
+        # reachability counts as "somewhere else": any remote ref, or the base
+        # branch a local merge lands on.
+        elsewhere = ["--remotes"]
+        base_ref = f"refs/heads/{task['base_branch']}"
+        if _git(root, "rev-parse", "--verify", "--quiet", base_ref, check=False):
+            elsewhere.append(base_ref)
+        only_here = _git(
+            root, "rev-list", "--count", branch, "--not", *elsewhere, check=False
+        ).strip()
+        unpushed = int(only_here) if only_here.isdigit() else None
+        # A PR recorded as merged is the forge holding them: a squash merge
+        # leaves the branch's own commits unreachable from main, and the forge
+        # deletes the head branch after merging, so no remote ref may name them
+        # -- yet the change landed and the pull request keeps them.
+        landed = (task.get("delivery") or {}).get("state") == "pr-merged"
+        if unpushed != 0 and not landed:
+            task["branch_removed"] = False
+            detail = (
+                f"{unpushed} commit(s) on it are not on any remote or on "
+                f"{task['base_branch']}, so this branch is their only copy"
+                if unpushed
+                else "whether its commits exist anywhere else could not be determined"
+            )
+            self._message(
+                data, project, task, None, "cleanup",
+                f"Task branch {branch} kept: {detail}. Push it, or delete it "
+                f"yourself with git branch -D {branch} if the work is unwanted",
+                {"branch": branch, "unpushed": unpushed},
+            )
+            return
         counted = _git(
             root, "rev-list", "--count", f"{task['base_branch']}..{branch}", check=False
         )
@@ -1809,6 +1842,30 @@ class ProtectionMixin:
             else f"Task branch {branch} could not be deleted; it may be checked out elsewhere",
             {"branch": branch, "unmerged": unmerged},
         )
+    def _live_work_refusal(self, task: dict[str, Any]) -> str | None:
+        """Why cleanup must not touch this task whatever its status says, or None.
+
+        Read from the records that describe the work -- the PR Helm recorded
+        and the approval hold -- never from `status`, because status is the
+        one word other paths overwrite. A stopped worker once wrote `failed`
+        over `pr-open`, the sweep then judged a live PR by that word, and its
+        branch went with commits that existed nowhere else.
+        """
+        delivery = task.get("delivery") or {}
+        url = str(delivery.get("url") or "").strip()
+        if url and delivery.get("state") not in {"pr-merged", "pr-closed"}:
+            return (
+                f"its pull request {url} is not merged or closed; if it has "
+                f"since settled, record it first with: helm task pr-sync {task['id']}"
+            )
+        hold = self.task_hold(task)
+        if hold is not None:
+            return (
+                f"it has an open approval hold for {hold.get('action')} "
+                f"({hold.get('id')}, {hold.get('status')}); answer it, or recover "
+                f"it with: helm approval repair {task['id']}"
+            )
+        return None
     def _release_hold(
         self, data: dict[str, Any], project: dict[str, Any], task: dict[str, Any]
     ) -> str | None:
@@ -1826,6 +1883,9 @@ class ProtectionMixin:
             return None
         if task["status"] == "pr-open":
             return "PR open; monitor comments/checks until it merges"
+        live = self._live_work_refusal(task)
+        if live is not None:
+            return live
         branch = task.get("branch")
         if not branch:
             return None
@@ -1880,6 +1940,12 @@ class ProtectionMixin:
             elif stale_days is not None and age_days >= stale_days and status == "completed":
                 reason, delete_branch = f"completed but undelivered for {age_days:.0f} days", False
             else:
+                continue
+            # The status check above is a first cut, not the protection: the
+            # status is exactly what a stopped worker used to overwrite.
+            live = self._live_work_refusal(task)
+            if live is not None:
+                skipped.append({"task_id": task["id"], "reason": _safe_text(live)[:160]})
                 continue
             try:
                 self.cleanup_task(task["id"], delete_branch=delete_branch)
@@ -1944,6 +2010,11 @@ class ProtectionMixin:
         with self.store.locked() as data:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
+            # Before anything else, and whatever the status says: a live PR or
+            # an open approval is work someone is still deciding about.
+            live = self._live_work_refusal(task)
+            if live is not None:
+                raise SafetyError(f"refusing cleanup of task {task_id}: {live}")
             # A task that never launched a worker is shed here too: it holds a
             # checkout and nothing else, and it is the one shape that could
             # never satisfy "a terminal worker" no matter how long it waited.

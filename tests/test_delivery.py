@@ -722,9 +722,22 @@ class DeliveryTests(HelmTestCase):
         self.assertIn(task["branch"], self._branches(root))
         messages = self.coordinator.inspect_task(task["id"])["messages"]
         kept = [m for m in messages if "kept" in m["text"]]
-        self.assertTrue(kept and "--delete-branch" in kept[-1]["text"])
+        self.assertTrue(kept and "not on any remote" in kept[-1]["text"])
 
-        # Discarding it stays possible, but only when asked for by name.
+        # Asking for the branch by name does not change that while the branch
+        # is the only copy of its commits: --delete-branch is not a way to
+        # destroy work that exists nowhere else.
+        refused = self.coordinator.cleanup_task(task["id"], delete_branch=True)
+        self.assertFalse(refused["branch_removed"])
+        self.assertIn(task["branch"], self._branches(root))
+
+        # Once a remote holds them, discarding stays possible -- by name only.
+        remote = Path(self.temp.name) / "preserving-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(root), "push", "-q", "origin", task["branch"]], check=True)
+        kept_again = self.coordinator.cleanup_task(task["id"])
+        self.assertFalse(kept_again["branch_removed"])
         discarded = self.coordinator.cleanup_task(task["id"], delete_branch=True)
         self.assertTrue(discarded["branch_removed"])
         self.assertNotIn(task["branch"], self._branches(root))

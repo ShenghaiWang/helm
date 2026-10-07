@@ -1133,6 +1133,18 @@ class ApprovalTests(HelmTestCase):
         self.assertFalse(adapter.session_reachable(worker["id"]))
         settled = self.coordinator.store.load()["workers"][worker["id"]]
         self.assertEqual(settled["status"], "failed")
+        # Losing the session settles the worker, not the request: the task is
+        # still approval-needed and its hold still names what was asked. It
+        # cannot be authorized -- nothing could receive it -- and the refusal
+        # points at repair, which is where it is abandoned on the record.
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "approval-needed"
+        )
+        self.assertEqual(self._hold(task["id"])["status"], "waiting")
+        with self.assertRaisesRegex(HelmError, r"helm approval repair"):
+            self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)
+        repaired = self.coordinator.repair_task_hold(task["id"], session_live=False)
+        self.assertEqual(repaired["outcome"], "abandoned")
         self.assertEqual(self._hold(task["id"])["status"], "abandoned")
 
     def test_an_agent_cannot_run_the_commands_its_rules_forbid_it(self) -> None:

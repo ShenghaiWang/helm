@@ -185,9 +185,15 @@ naming exactly what that task still holds and the command that sheds it:
 
 ```sh
 helm task cleanup <task>                   # worktree, worker directories, merged branch
-helm task cleanup <task> --delete-branch   # also discard a branch with unmerged commits
+helm task cleanup <task> --delete-branch   # also discard a branch with unmerged, pushed commits
 helm project release <id>                  # the same, task by task, reporting what it kept
 ```
+
+A branch that is the only copy of its commits -- none of them on any remote
+ref or on the base branch, and no pull request recorded as merged -- is kept
+even with `--delete-branch`, and the task log says so. Cleanup also refuses a
+task whose recorded pull request is not merged or closed, or that holds an
+open approval, whatever its status reads.
 
 What it names is read from Helm's own record of what the task owns, not from
 a live look at the disk: `helm status` and `helm watch` run no git or

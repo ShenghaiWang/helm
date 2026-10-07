@@ -196,7 +196,10 @@ It signals a process worker, closes a Herdr worker's pane, and settles the
 record either way — including when the provider cannot be reached, because a
 stop nobody can record is the state this exists to make impossible. A worker
 that had already reported and merely kept its session open is ended too, and
-its exit recorded, so the cleanup that follows is not refused. The log and
+its exit recorded, so the cleanup that follows is not refused. Stopping
+settles the worker, not always the task: a task that is `pr-open`,
+`approval-needed` or `approved` keeps that status, and an open approval hold
+stays open for `helm approval repair` to resolve on the record. The log and
 worktree are kept as evidence; `helm task cleanup` removes those deliberately,
 afterwards ([delivery.md](delivery.md)).
 

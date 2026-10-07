@@ -738,6 +738,10 @@ class WorkersMixin:
             self.store.save(data)
             return worker
 
+    #: Task states that describe the work, not the session doing it. Ending a
+    #: session -- stopped on purpose or lost with its pane -- leaves them alone.
+    _STATUS_A_SESSION_CANNOT_END = frozenset({"pr-open", "approval-needed", "approved"})
+
     def mark_worker_lost(
         self, worker_id: str, detail: str, *, kind: str = "lost"
     ) -> dict[str, Any]:
@@ -758,10 +762,18 @@ class WorkersMixin:
             worker["status"] = "failed"
             worker["exit_code"] = 1
             worker["ended_at"] = now()
-            task["status"] = "failed"
-            self._abandon_open_hold(
-                data, project, task, f"its session is gone: {detail}"
-            )
+            # The worker is settled either way; the task is not always its to
+            # fail. A PR, an approval request or an approved branch is a fact
+            # about the work, and writing `failed` over it is what let the
+            # sweep read a live PR as stale failed residue and delete its
+            # branch. An open hold stays open too: `helm approval repair` is
+            # the commander's way out of a hold whose session is gone, and it
+            # abandons it on the record rather than as a side effect here.
+            if task.get("status") not in self._STATUS_A_SESSION_CANNOT_END:
+                task["status"] = "failed"
+                self._abandon_open_hold(
+                    data, project, task, f"its session is gone: {detail}"
+                )
             # A task abandoned on purpose and a task whose provider vanished
             # are both failures, and the record should not pretend otherwise
             # -- but it should say which one happened, because only one of
