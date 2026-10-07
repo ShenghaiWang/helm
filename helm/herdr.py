@@ -1686,7 +1686,16 @@ class HerdrAdapter:
                     task, review_base, review_tip
                 )
                 shape_handoff = self._shape_handoff(task, review_base, review_tip)
-                contract_handoff = self._contract_handoff(review_data, task_id)
+                instructions = self._review_instructions(task, review_base, review_tip)
+                # The contract gets whatever the instructions and the diff
+                # pointer leave: whole when it fits, otherwise an excerpt and
+                # the path of a file holding all of it. It is never allowed to
+                # push the instructions past the limit, where `create_task`
+                # would cut them.
+                contract_handoff = self._contract_handoff(
+                    review_data, task_id,
+                    room=SAFE_TEXT_LIMIT - len(instructions) - self.REVIEW_POINTER_RESERVE,
+                )
                 # Terminal protocol results settle workers even when their
                 # interactive pane remains open. Do not reopen a completed
                 # worker for another review round; launch a fresh reviewer task.
@@ -1706,49 +1715,7 @@ class HerdrAdapter:
                     # instructions are kept whole; the sections after them
                     # give way from the last one back.
                     self._fit_review_brief(
-                        contract_handoff
-                        + f"Run every git command in {task['workspace']} -- that is the "
-                        "author's checkout of this branch, and it is the only "
-                        "repository you have. Your own workspace is deliberately empty: "
-                        "you are reading a diff, not building one, so you were given no "
-                        "checkout of your own.\n\n"
-                        "The author ran the tests the change can affect and reported "
-                        "them with their exact, unmasked exit status -- that is the "
-                        "author's job, not yours. Targeted is the standard here: a local "
-                        "full-suite run is not expected and its absence is NOT a finding, "
-                        "because the pull request's own CI runs the whole suite. Do NOT "
-                        "run the full suite yourself. You MAY "
-                        "run the type checker, the linter, and a small number of "
-                        "focused, risk-targeted tests aimed at the specific lines you are "
-                        "unsure of -- that is real verification and is expected. Report a "
-                        "finding when the author's evidence is missing altogether, stale "
-                        "(predates the current diff), masked (exit status not shown, or "
-                        "piped through something that swallows it), shows a failure, or "
-                        "plainly misses a test file that covers a changed file -- and let "
-                        "the author fix and re-report it. What you must not do "
-                        "either way is change what is under review -- no edits to tracked "
-                        "files, no commit, no stage, no branch or checkout change. "
-                        "Leave `git status` as clean as you found it, and say in your "
-                        "verdict what you ran (or what evidence you checked instead) and "
-                        "what it returned.\n\n"
-                        "The previous wording forbade running 'anything that writes', "
-                        "which a careful reviewer correctly read as a ban on the test "
-                        "suite -- so it asked permission, nobody answered, and it "
-                        "published a review it had to caveat as static-only. That is "
-                        "the gap this paragraph closes, without reopening the door to a "
-                        "second full run of a suite the author already ran.\n\n"
-                        f"Review the change on branch {task['branch']} at commit "
-                        f"{review_tip} against "
-                        f"{review_base}, following the code-review domain in "
-                        "your context. Your verdict is recorded against commit "
-                        f"{review_tip} and no other: a commit the author adds after "
-                        "it is not covered by it. Diff against that base exactly, not against "
-                        f"{task['base_branch']}: the base branch has moved since this "
-                        "work started, and measuring against a different tree turns a "
-                        "correct figure into a finding. Finish with one result message "
-                        "whose FIRST WORD is APPROVED or CHANGES-REQUESTED -- Helm reads "
-                        "that word to decide whether the loop continues -- followed by "
-                        "your findings.",
+                        contract_handoff + instructions,
                         [
                             # The pointer that keeps the reviewer off `git
                             # diff`, so it is the last to give way.
@@ -2695,27 +2662,110 @@ class HerdrAdapter:
             f"{lines}\n{advice}"
         )
 
-    def _contract_handoff(self, data: dict[str, Any], task_id: str) -> str:
+    #: Brief room kept for the diff pointer when sizing the contract.
+    REVIEW_POINTER_RESERVE = 1_500
+
+    @staticmethod
+    def _review_instructions(task: dict[str, Any], review_base: str, review_tip: str) -> str:
+        """What every reviewer is told about its workspace, base, and verdict.
+
+        Mandatory: the brief is fitted around it, never through it.
+        """
+        return (
+            f"Run every git command in {task['workspace']} -- that is the "
+            "author's checkout of this branch, and it is the only "
+            "repository you have. Your own workspace is deliberately empty: "
+            "you are reading a diff, not building one, so you were given no "
+            "checkout of your own.\n\n"
+            "The author ran the tests the change can affect and reported "
+            "them with their exact, unmasked exit status -- that is the "
+            "author's job, not yours. Targeted is the standard here: a local "
+            "full-suite run is not expected and its absence is NOT a finding, "
+            "because the pull request's own CI runs the whole suite. Do NOT "
+            "run the full suite yourself. You MAY "
+            "run the type checker, the linter, and a small number of "
+            "focused, risk-targeted tests aimed at the specific lines you are "
+            "unsure of -- that is real verification and is expected. Report a "
+            "finding when the author's evidence is missing altogether, stale "
+            "(predates the current diff), masked (exit status not shown, or "
+            "piped through something that swallows it), shows a failure, or "
+            "plainly misses a test file that covers a changed file -- and let "
+            "the author fix and re-report it. What you must not do "
+            "either way is change what is under review -- no edits to tracked "
+            "files, no commit, no stage, no branch or checkout change. "
+            "Leave `git status` as clean as you found it, and say in your "
+            "verdict what you ran (or what evidence you checked instead) and "
+            "what it returned.\n\n"
+            "The previous wording forbade running 'anything that writes', "
+            "which a careful reviewer correctly read as a ban on the test "
+            "suite -- so it asked permission, nobody answered, and it "
+            "published a review it had to caveat as static-only. That is "
+            "the gap this paragraph closes, without reopening the door to a "
+            "second full run of a suite the author already ran.\n\n"
+            f"Review the change on branch {task['branch']} at commit "
+            f"{review_tip} against "
+            f"{review_base}, following the code-review domain in "
+            "your context. Your verdict is recorded against commit "
+            f"{review_tip} and no other: a commit the author adds after "
+            "it is not covered by it. Diff against that base exactly, not against "
+            f"{task['base_branch']}: the base branch has moved since this "
+            "work started, and measuring against a different tree turns a "
+            "correct figure into a finding. Finish with one result message "
+            "whose FIRST WORD is APPROVED or CHANGES-REQUESTED -- Helm reads "
+            "that word to decide whether the loop continues -- followed by "
+            "your findings."
+        )
+
+    _CONTRACT_HEADER = (
+        "THE CONFIRMED CONTRACT. The commander confirmed this requirement for "
+        "the change you are reviewing. Judge the change against it: work that "
+        "is correct but does not meet it, or does more than it, is a finding.\n"
+    )
+
+    def _contract_handoff(
+        self, data: dict[str, Any], task_id: str, *, room: int | None = None
+    ) -> str:
         """The commander's confirmed contract for the reviewed task, for its reviewer.
 
         A reviewer was never shown it. It judged the diff against the brief
         it could reconstruct from the code, so a change that was correct and
         not what was asked for read as APPROVED. The requirement is what the
         commander confirmed the work must do; the solution, when confirmed,
-        is the approach they agreed to. First in the brief, and never cut.
+        is the approach they agreed to. First in the brief, and never lost.
+
+        Whole when it fits in `room`. Each confirmed text may itself be as
+        long as a brief, so a contract that does not fit is written whole to
+        a file beside the diff, and the brief carries the start of it and that
+        file's path -- rather than the whole contract pushing the reviewer's
+        instructions off the end of the brief, which is where `create_task`
+        cuts.
         """
         contract = self.coordinator.confirmed_contract_for(task_id, data=data)
         if not contract.get("requirement"):
             return ""
-        parts = [
-            "THE CONFIRMED CONTRACT. The commander confirmed this requirement for "
-            "the change you are reviewing. Judge the change against it: work that "
-            "is correct but does not meet it, or does more than it, is a finding.\n"
-            f"Requirement: {contract['requirement'].strip()}\n"
-        ]
+        body = f"Requirement: {contract['requirement'].strip()}\n"
         if contract.get("solution"):
-            parts.append(f"Confirmed approach: {contract['solution'].strip()}\n")
-        return "".join(parts) + "\n"
+            body += f"Confirmed approach: {contract['solution'].strip()}\n"
+        whole = self._CONTRACT_HEADER + body + "\n"
+        if room is None or len(whole) <= room:
+            return whole
+        target = self.coordinator.store.directory / "reviews" / task_id / "contract.md"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            pointer = (
+                f"\n[...the contract is longer than this brief can hold; Helm wrote "
+                f"ALL of it to\n  {target}\nREAD THAT FILE before judging the change "
+                "-- the excerpt above is only its beginning.]\n\n"
+            )
+        except OSError:
+            pointer = (
+                "\n[...the contract is longer than this brief can hold and Helm "
+                "could not write it to a file; ask for the rest before judging "
+                "the change.]\n\n"
+            )
+        keep = max(0, room - len(self._CONTRACT_HEADER) - len(pointer))
+        return self._CONTRACT_HEADER + body[:keep] + pointer
 
     #: Shown where a section of a reviewer's brief was cut to fit.
     _REVIEW_SECTION_CUT = (

@@ -1041,7 +1041,9 @@ class ReviewTests(HelmTestCase):
         self.assertLess(brief.index("FIRST WORD"), brief.index("ARTIFACTS THE AUTHOR"))
         self.assertLess(len(brief), 20_000)
 
-    def _gated_task(self, name: str) -> tuple[dict, dict]:
+    def _gated_task(
+        self, name: str, requirement: str | None = None, solution: str | None = None
+    ) -> tuple[dict, dict]:
         """A task a lead created by spending a confirmed gate pair."""
         import os
 
@@ -1053,8 +1055,8 @@ class ReviewTests(HelmTestCase):
         )
         with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
             for kind, text in (
-                ("requirement", "goal: cache the rate table. Done means: one fetch per hour. Out of scope: the UI"),
-                ("solution", "approach: a TTL dict in rates.py; verification: unit tests"),
+                ("requirement", requirement or "goal: cache the rate table. Done means: one fetch per hour. Out of scope: the UI"),
+                ("solution", solution or "approach: a TTL dict in rates.py; verification: unit tests"),
             ):
                 self.coordinator.propose_gate(lead_task["id"], kind, text)
                 with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
@@ -1086,6 +1088,45 @@ class ReviewTests(HelmTestCase):
         self.assertTrue(brief.startswith("THE CONFIRMED CONTRACT"), brief[:200])
         self.assertIn("Done means: one fetch per hour", brief)
         self.assertIn("a TTL dict in rates.py", brief)
+
+    def test_a_maximum_size_contract_cannot_push_the_instructions_off_the_brief(self) -> None:
+        """Each confirmed text may be as long as a brief, and both were inlined.
+
+        The contract alone then filled the brief, and `create_task` cut the
+        instructions after it -- the workspace, the base, and the verdict word
+        Helm parses.
+        """
+        limit = 20_000
+        requirement = "goal: " + "r" * (limit - 30) + " REQUIREMENT-END"
+        solution = "approach: " + "s" * (limit - 30) + " SOLUTION-END"
+        task, _worker = self._gated_task("hugecontract", requirement, solution)
+        self.commit_on_task_branch(task)
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertLessEqual(len(brief), limit)
+        self.assertTrue(brief.startswith("THE CONFIRMED CONTRACT"), brief[:200])
+        self.assertIn(f"Run every git command in {task['workspace']}", brief)
+        self.assertIn("FIRST WORD is APPROVED or CHANGES-REQUESTED", brief)
+        self.assertIn("followed by your findings.", brief)
+        self.assertIn("diff.patch", brief)
+        contract_file = self.state.directory / "reviews" / task["id"] / "contract.md"
+        self.assertIn(str(contract_file), brief)
+        written = contract_file.read_text(encoding="utf-8")
+        self.assertIn("REQUIREMENT-END", written)
+        self.assertIn("SOLUTION-END", written)
+
+    def test_a_contract_that_fits_stays_whole_in_the_brief(self) -> None:
+        requirement = "goal: " + "r" * 6_000 + " REQUIREMENT-END"
+        task, _worker = self._gated_task("fitcontract", requirement)
+        self.commit_on_task_branch(task)
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertIn("REQUIREMENT-END", brief)
+        self.assertIn("a TTL dict in rates.py", brief)
+        self.assertNotIn("contract.md", brief)
+        self.assertLessEqual(len(brief), 20_000)
 
     def test_a_long_change_cannot_push_the_evidence_or_contract_off_the_brief(self) -> None:
         """The whole diffstat went inline ahead of the evidence.
