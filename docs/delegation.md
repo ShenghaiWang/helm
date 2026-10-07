@@ -50,7 +50,9 @@ another project or for another unit of work in the same one.
 
 **Which lead gets it.** `--ticket TICKET-123`, or a tracker id in the request
 text, reaches the live lead named for that work — a follow-up belongs to
-whoever is already on it. With no match the project's existing lead takes it.
+whoever is already on it. A tracker id that matches no live lead is a new
+unit of work: it gets its own lead, named for it, and never another ticket's.
+Only a request with no tracker id at all goes to the project's existing lead.
 `--new` overrides both and appoints a lead for this request, which is what a
 separate unit of work wants.
 

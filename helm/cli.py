@@ -5119,7 +5119,13 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
     started = None
     if named is not None:
         foreman = named
-    elif args.new_lead:
+    elif args.new_lead or addressed:
+        # A request that names its work and finds no driver for it is a NEW
+        # unit of work, exactly as `--new` says outright. Falling through to
+        # "the project's driver" handed it to whichever lead `foreman_for`
+        # answered with -- another ticket's -- which then took up work it had
+        # never been told about while the work's own name went unanswered.
+        #
         # Take the record `_start_foreman` returns rather than re-reading
         # `foreman_for` afterwards: with more than one driver live, "the"
         # driver of a project is not a question with one answer, and the
@@ -5127,7 +5133,7 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
         started = _start_foreman(
             coordinator, args.project_id, herdr=args.herdr,
             command=args.worker_command_text, agent=args.agent,
-            model=args.model, request=args.text, ticket=args.ticket,
+            model=args.model, request=args.text, ticket=addressed or None,
         )
         foreman = started["worker"]
     else:
@@ -5141,9 +5147,11 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
                 # so a foreman started by this very call comes up already
                 # holding it rather than hoping to read it afterwards.
                 request=args.text,
-                ticket=args.ticket,
             )
-            foreman = coordinator.foreman_for(args.project_id)
+            # The worker this call appointed, never a re-read: a re-read
+            # answers "some driver of this project", which is not the
+            # question once more than one can be live.
+            foreman = started["worker"] if started is not None else None
         else:
             foreman = existing
     if foreman is None:

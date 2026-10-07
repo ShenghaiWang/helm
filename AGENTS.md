@@ -193,8 +193,10 @@ a worker agent the coordinator spawns for that task.
 
   **Which lead gets it.** Pass `--ticket TICKET-123` and the request reaches
   the live lead named for that work, because a follow-up belongs to whoever is
-  already on it; a tracker id in the request text is read the same way. With
-  no match, the project's existing lead takes it. `--new` overrides both and
+  already on it; a tracker id in the request text is read the same way. A
+  tracker id with no live lead gets a new lead named for it, never another
+  ticket's; only a request with no tracker id goes to the project's existing
+  lead. `--new` overrides both and
   appoints a lead for this request, which is what a separate unit of work
   wants: several leads in one project run side by side and none waits on the
   others.

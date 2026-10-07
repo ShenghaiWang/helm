@@ -281,6 +281,111 @@ class RouteCommandTests(HelmTestCase):
         ]
         self.assertEqual(len(drivers), 2)
 
+    def _drivers(self, coordinator, project_id: str) -> dict[str, dict]:
+        data = coordinator.store.load()
+        return {
+            w["id"]: data["tasks"][w["task_id"]]
+            for w in data["workers"].values()
+            if w.get("project_id") == project_id and w.get("status") == "running"
+            and (data["tasks"].get(w.get("task_id")) or {}).get("role") == "foreman"
+        }
+
+    def _texts_for(self, coordinator, worker_id: str) -> str:
+        data = coordinator.store.load()
+        return "".join(
+            m.get("text", "") for m in data["messages"] if m.get("worker_id") == worker_id
+        )
+
+    def test_a_ticket_with_no_lead_appoints_its_own_rather_than_borrowing_one(self) -> None:
+        """A named request never reaches another ticket's lead.
+
+        Observed: a request for one ticket, routed with `--ticket`, matched no
+        live lead and fell through to "the project's lead" -- a lead driving a
+        different ticket, which then took up work it had never been briefed
+        on. A name that matches nothing is a new unit of work, exactly as
+        `--new` says outright.
+        """
+        helm_root = self._helm_root("route-ticket-miss-root")
+        coordinator, project = self._project_root(helm_root, "route-ticket-miss")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        self._route(
+            helm_root, project["id"], "the export stalls", "--ticket", "TICKET-1215",
+            "--command", command,
+        )
+        other = coordinator.driver_named(project["id"], "TICKET-1215")
+        self.assertIsNotNone(other)
+
+        code, output = self._route(
+            helm_root, project["id"], "the mic goes silent", "--ticket", "TICKET-1052",
+            "--command", command,
+        )
+        self.assertEqual(code, 0)
+        drivers = self._drivers(coordinator, project["id"])
+        self.assertEqual(len(drivers), 2, "an unmatched ticket must appoint its own lead")
+        own = coordinator.driver_named(project["id"], "TICKET-1052")
+        self.assertIsNotNone(own, "the new lead must be named for the ticket")
+        self.assertNotEqual(own["id"], other["id"])
+        self.assertIn("the mic goes silent", self._texts_for(coordinator, own["id"]))
+        self.assertNotIn("the mic goes silent", self._texts_for(coordinator, other["id"]))
+        self.assertIn("TICKET-1052", output)
+
+    def test_a_ticket_in_the_text_with_no_lead_appoints_its_own(self) -> None:
+        # The same rule when the ticket is read from the request rather than
+        # passed as a flag, and when the existing lead is unnamed.
+        helm_root = self._helm_root("route-text-miss-root")
+        coordinator, project = self._project_root(helm_root, "route-text-miss")
+        command = shlex.join([sys.executable, "-c", ""])
+
+        self._route(helm_root, project["id"], "unrelated first unit", "--command", command)
+        first = coordinator.foreman_for(project["id"])
+
+        code, _ = self._route(
+            helm_root, project["id"], "TICKET-77: the upload retries forever",
+            "--command", command,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self._drivers(coordinator, project["id"])), 2)
+        own = coordinator.driver_named(project["id"], "TICKET-77")
+        self.assertIsNotNone(own)
+        self.assertIn("upload retries forever", self._texts_for(coordinator, own["id"]))
+        self.assertNotIn("upload retries forever", self._texts_for(coordinator, first["id"]))
+
+    def test_an_appointed_lead_gets_the_request_not_whichever_lead_a_reread_finds(self) -> None:
+        # With no ticket the default is unchanged: no lead, so one is
+        # appointed. The request reaches the worker that appointment returned,
+        # never a re-read of "the" project's lead.
+        helm_root = self._helm_root("route-reread-root")
+        coordinator, project = self._project_root(helm_root, "route-reread")
+        command = shlex.join([sys.executable, "-c", ""])
+        decoy = {"id": "w-decoy", "task_id": "t-decoy", "project_id": project["id"]}
+        real_foreman_for = Coordinator.foreman_for
+        real_start = cli._start_foreman
+        appointed = {"done": False}
+
+        def start_foreman(*a, **k):
+            started = real_start(*a, **k)
+            appointed["done"] = True
+            return started
+
+        def foreman_for(self, project_id, *, data=None):
+            # Truthful until the appointment returns; any re-read after it
+            # answers with somebody else.
+            if not appointed["done"]:
+                return real_foreman_for(self, project_id, data=data)
+            return dict(decoy)
+
+        with mock.patch.object(Coordinator, "foreman_for", foreman_for), \
+                mock.patch.object(cli, "_start_foreman", start_foreman):
+            code, _ = self._route(
+                helm_root, project["id"], "first request", "--command", command
+            )
+        self.assertEqual(code, 0)
+        drivers = self._drivers(coordinator, project["id"])
+        self.assertEqual(len(drivers), 1)
+        (lead_id,) = drivers
+        self.assertIn("first request", self._texts_for(coordinator, lead_id))
+
     def test_without_new_a_second_route_still_reuses_the_existing_driver(self) -> None:
         """The default is unchanged, and that is the point of it being opt-in.
 
