@@ -2921,7 +2921,9 @@ def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | 
                 f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead worker "
                 f"{worker_id} stopped so its task can be reopened or retried"
             )
-        replacement = _ensure_foreman(coordinator, project_id)
+        replacement = _ensure_foreman(
+            coordinator, project_id, ticket=ticket_of(task) or None
+        )
         if replacement is None:
             return (
                 f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead task lead "
@@ -2937,6 +2939,41 @@ def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | 
             f"{_glyph_for(coordinator, project_id)} {project_id} heal FAILED for "
             f"{worker_id}: {exc}"
         )
+
+
+def _ticket_of_task(coordinator: Coordinator, task_id: str | None) -> str | None:
+    """The ticket a task is named by, for naming a lead appointed beside it."""
+    task = (coordinator.store.load().get("tasks") or {}).get(task_id or "")
+    return ticket_of(task) or None
+
+
+def _relabel_leads_named_by(coordinator: Coordinator, task: dict[str, Any]) -> None:
+    """Rename the tab of a lead that just took this task's ticket as its name.
+
+    The record changes under the lock in `create_task`; the tab was labelled
+    at launch and says `lead t-...` until something renames it. Only the lead
+    that created the task or spent its gate pair on it, and only a tab Helm
+    recorded. A rename that cannot reach Herdr changes nothing else.
+    """
+    ticket = ticket_of(task)
+    if not ticket:
+        return
+    data = coordinator.store.load()
+    for worker in data.get("workers", {}).values():
+        lead_task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+        if (
+            worker.get("status") != "running"
+            or lead_task.get("role") != "foreman"
+            or lead_task.get("project_id") != task.get("project_id")
+            or lead_task.get("ticket") != ticket
+        ):
+            continue
+        took_it_on = worker["id"] == task.get("created_by") or (
+            (lead_task.get("gates") or {}).get("bound_task_id") == task["id"]
+        )
+        if took_it_on:
+            with contextlib.suppress(HelmError, OSError):
+                HerdrAdapter(coordinator).relabel_worker(worker["id"])
 
 
 def _ensure_foreman(
@@ -3511,7 +3548,10 @@ def _cmd_run(ctx: _Context, args: argparse.Namespace) -> int | None:
             task["id"], args.worker_command_text, wait=not args.asynchronous
         )
         mode = "process (--no-herdr)"
-    _ensure_foreman(coordinator, project["id"], herdr=args.herdr)
+    _relabel_leads_named_by(coordinator, task)
+    _ensure_foreman(
+        coordinator, project["id"], herdr=args.herdr, ticket=ticket_of(task) or None
+    )
     print(
         f"Ran {_project_label(project)} task={task['id']} "
         f"worker={worker['id']} [{worker['status']}] mode={mode} "
@@ -3612,6 +3652,7 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
             base=args.base,
             new=args.new,
         )
+        _relabel_leads_named_by(coordinator, task)
         print(f"Created task {task['id']} [{task['status']}] project={task['project_id']} policy={task['delivery_policy']}")
     elif args.task_command == "allocate":
         task = coordinator.allocate_task(args.task_id)
@@ -3879,7 +3920,10 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
             domain=args.domain,
             agent=args.agent,
         )
-        _ensure_foreman(coordinator, worker["project_id"], herdr=args.herdr)
+        _ensure_foreman(
+            coordinator, worker["project_id"], herdr=args.herdr,
+            ticket=_ticket_of_task(coordinator, worker.get("task_id")),
+        )
         print(
             f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
             f"pid={worker.get('pid')} agent={worker.get('agent_id', 'default')} "
@@ -4391,7 +4435,10 @@ def _cmd_herdr(ctx: _Context, args: argparse.Namespace) -> int | None:
             agent=args.agent,
         )
         mode = "herdr" if worker.get("execution") == "herdr" else "terminal fallback"
-        _ensure_foreman(coordinator, worker["project_id"])
+        _ensure_foreman(
+            coordinator, worker["project_id"],
+            ticket=_ticket_of_task(coordinator, worker.get("task_id")),
+        )
         print(
             f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
             f"pid={worker.get('pid')} mode={mode} "

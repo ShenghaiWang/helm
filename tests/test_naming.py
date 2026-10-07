@@ -15,11 +15,35 @@ class TheTrackerIdIsTheNameTests(unittest.TestCase):
         task = {"brief": "TICKET-456 -- clear the upload gate on the stop branch"}
         self.assertEqual(task_name(task), "TICKET-456")
 
-    def test_only_the_first_line_is_read_for_a_ticket(self):
-        # Later prose mentions other work; matching it would name a task after
-        # whatever it happened to reference.
-        task = {"brief": "Resolve the merge conflicts\n\nRelated: OTHER-999"}
-        self.assertNotEqual(task_name(task), "OTHER-999")
+    def test_a_ticket_after_the_first_line_is_found_when_it_is_the_only_one(self):
+        # A request often says what it is about after a sentence of context.
+        # Reading only the first line left that work, and the lead appointed
+        # for it, named by a generated id.
+        task = {"brief": "The mic goes silent after a minute.\n\nThis is TICKET-1052."}
+        self.assertEqual(ticket_of(task), "TICKET-1052")
+        long_line = {"brief": ("context " * 40) + "for TICKET-7"}
+        self.assertEqual(ticket_of(long_line), "TICKET-7")
+
+    def test_two_different_tickets_name_neither(self):
+        # Later prose mentions other work; picking whichever came first would
+        # name a task after something it merely referenced.
+        task = {"brief": "Resolve the merge conflicts\n\nRelated: OTHER-999 and OTHER-1000"}
+        self.assertEqual(ticket_of(task), "")
+        self.assertNotIn(task_name(task), {"OTHER-999", "OTHER-1000"})
+        both = {"brief": "TICKET-1 and TICKET-2 together"}
+        self.assertEqual(ticket_of(both), "")
+
+    def test_the_same_ticket_repeated_is_still_one(self):
+        task = {"brief": "Follow up\nTICKET-5 is blocked; see TICKET-5 notes"}
+        self.assertEqual(ticket_of(task), "TICKET-5")
+
+    def test_the_opening_line_names_the_work_over_a_later_reference(self):
+        task = {"brief": "TICKET-1: fix the export\n\nDepends on TICKET-2 landing."}
+        self.assertEqual(ticket_of(task), "TICKET-1")
+
+    def test_a_drivers_role_document_never_names_it(self):
+        task = {"role": "foreman", "brief": "You are a task lead.\n\nSee TICKET-9 in the record."}
+        self.assertEqual(ticket_of(task), "")
 
     def test_the_field_is_trusted_over_a_different_id_in_the_prose(self):
         task = {"ticket": "TICKET-1", "brief": "TICKET-2 mentioned in passing"}

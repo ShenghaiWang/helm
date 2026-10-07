@@ -63,19 +63,37 @@ _TITLE_WORDS = 3
 
 
 def ticket_of(task: dict[str, Any] | None) -> str:
-    """The task's tracker id, from its own field or its brief's first line.
+    """The task's tracker id, from its own field or from its brief.
 
     The field is authoritative. The brief is a fallback for tasks created
     before `--ticket` was passed, or by a caller that put the id only in the
     prose -- common enough that ignoring it would leave real work unnamed.
+
+    The brief is read whole, because a request often says what it is about
+    after a sentence of context, and reading only the first line left that
+    work -- and the lead appointed for it -- named by a generated id. But an
+    id is only taken when it is unambiguous: one id on the opening line (the
+    place a request says what it is), or else exactly one distinct id in the
+    whole text. A brief that names two pieces of work is not named after
+    whichever came first.
+
+    A driver's brief is its role document, not a statement of its work, so
+    only its recorded field ever names it.
     """
     recorded = str((task or {}).get("ticket") or "").strip()
     if recorded:
         return recorded
+    if (task or {}).get("role") in _WORKTREELESS_ROLES:
+        return ""
     brief = str((task or {}).get("brief") or "")
     first_line = brief.splitlines()[0] if brief else ""
-    match = _TICKET.search(first_line[:160])
-    return match.group(0) if match else ""
+    opening = set(_TICKET.findall(first_line))
+    if len(opening) == 1:
+        return opening.pop()
+    if opening:
+        return ""
+    found = set(_TICKET.findall(brief))
+    return found.pop() if len(found) == 1 else ""
 
 
 def name_from(text: str | None) -> str:

@@ -857,6 +857,9 @@ class LifecycleMixin:
                         "workspace_removed": False,
                     }
                     data["tasks"][task_id] = task
+                    # After the gates above are spent, so a pair bound to this
+                    # task counts as the lead taking it on.
+                    self._lead_inherits_ticket(data, task)
                     self._message(
                         data,
                         project,

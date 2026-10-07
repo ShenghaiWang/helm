@@ -1927,6 +1927,25 @@ class HerdrAdapter:
                 renamed.append({"kind": "tab", "id": tab_id, "error": str(exc)})
         return renamed
 
+    def relabel_worker(self, worker_id: str) -> bool:
+        """Rename one worker's recorded tab to what its task is called now.
+
+        For a name that changed after launch -- a lead that took the ticket of
+        the work it took on. Only a tab Helm recorded is touched; True when
+        the rename was sent.
+        """
+        data = self.coordinator.store.load()
+        tab_id = (self._herdr_state(data).get("workers", {}).get(worker_id) or {}).get("tab_id")
+        worker = data.get("workers", {}).get(worker_id)
+        if not tab_id or worker is None:
+            return False
+        task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+        try:
+            self.client.tab_rename(tab_id, self._worker_tab_label(task, worker, data))
+        except HerdrUnavailable:
+            return False
+        return True
+
     @staticmethod
     def _live_reviewer_for(data: dict[str, Any], task_id: str) -> dict[str, Any] | None:
         """The running reviewer already assigned to this task, if there is one.

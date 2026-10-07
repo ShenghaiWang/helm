@@ -220,6 +220,7 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
 
     from . import cli
     from .core import Coordinator
+    from .naming import ticket_of
     from .state import StateStore
 
     store = StateStore(root / "state", helm_root=root) if root else StateStore()
@@ -280,9 +281,16 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
             # that has to discover its own charge from the record is a driver
             # that may read it as somebody else's.
             orphans = ", ".join(str(worker.get("task_id")) for worker in running)
+            # Named for the work it adopts when that work is one ticket;
+            # several tickets name none of them, and it keeps its id.
+            tickets = {
+                ticket_of(data.get("tasks", {}).get(worker.get("task_id")))
+                for worker in running
+            }
             appointed = cli._start_foreman(
                 coordinator,
                 project_id,
+                ticket=tickets.pop() if len(tickets) == 1 and "" not in tickets else None,
                 request=(
                     "Take over work whose driver is gone. The tasks with no "
                     f"live driver are: {orphans}. Read each with `helm inspect "

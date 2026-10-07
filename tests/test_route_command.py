@@ -386,6 +386,121 @@ class RouteCommandTests(HelmTestCase):
         (lead_id,) = drivers
         self.assertIn("first request", self._texts_for(coordinator, lead_id))
 
+    def test_an_unnamed_lead_takes_the_ticket_of_the_task_it_creates(self) -> None:
+        """A lead appointed without a ticket stops being `lead t-...`.
+
+        Observed: a lead auto-appointed with no request sat in its tab as
+        `lead t-cf34077d417b` for the whole of the ticket it was driving, and
+        a follow-up routed with that ticket found no lead by that name. Once
+        it creates the ticket's task it is doing that ticket's work, so it
+        takes the name -- on the record and on its tab.
+        """
+        helm_root = self._helm_root("route-inherit-root")
+        coordinator, project = self._project_root(helm_root, "route-inherit")
+        lead_task = coordinator.create_foreman_task(project["id"])
+        herdr = FakeHerdr()
+        adapter = HerdrAdapter(coordinator, herdr)
+        lead = adapter.launch_task(lead_task["id"], [sys.executable, "-c", ""], wait=False)
+        data = coordinator.store.load()
+        self.assertEqual(task_name(data["tasks"][lead_task["id"]]), lead_task["id"])
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}), \
+             mock.patch("helm.cli.HerdrAdapter", lambda c, *a, **k: HerdrAdapter(c, herdr)), \
+             contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--root", str(helm_root), "task", "create", "--project", project["id"],
+                "--brief", "find why the mic goes silent", "--ticket", "TICKET-31",
+                "--read-only",
+            ])
+        self.assertEqual(code, 0, out.getvalue())
+        data = coordinator.store.load()
+        self.assertEqual(task_name(data["tasks"][lead_task["id"]]), "TICKET-31")
+        self.assertEqual(coordinator.driver_named(project["id"], "TICKET-31")["id"], lead["id"])
+        self.assertIn("lead TICKET-31", [label for _, label in herdr.renamed])
+
+        # A lead already named for its work keeps that name.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}), \
+             mock.patch("helm.cli.HerdrAdapter", lambda c, *a, **k: HerdrAdapter(c, herdr)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            cli.main([
+                "--root", str(helm_root), "task", "create", "--project", project["id"],
+                "--brief", "a side look", "--ticket", "TICKET-32", "--read-only",
+            ])
+        data = coordinator.store.load()
+        self.assertEqual(task_name(data["tasks"][lead_task["id"]]), "TICKET-31")
+
+    def test_a_lead_appointed_beside_a_ticketed_run_is_named_for_it(self) -> None:
+        # `helm run` appoints a lead with no request; the task it is appointed
+        # beside is the only thing that says what it is for.
+        helm_root = self._helm_root("route-run-root")
+        coordinator, project = self._project_root(helm_root, "route-run")
+        command = shlex.join([sys.executable, "-c", ""])
+        real_start = cli._start_foreman
+
+        def start_foreman(coordinator_, project_id, **kwargs):
+            # `run` appoints with no command of its own; give it a harmless one.
+            kwargs["command"] = command
+            return real_start(coordinator_, project_id, **kwargs)
+
+        out = io.StringIO()
+        with mock.patch.object(cli, "_start_foreman", start_foreman), \
+             contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--root", str(helm_root), "run", project["id"], "fix the export",
+                "--ticket", "TICKET-44", "--no-herdr", "--async",
+                "--command", shlex.join([sys.executable, "-c", ""]),
+            ])
+        self.assertEqual(code, 0, out.getvalue())
+        lead = coordinator.foreman_for(project["id"])
+        self.assertIsNotNone(lead)
+        data = coordinator.store.load()
+        self.assertEqual(task_name(data["tasks"][lead["task_id"]]), "TICKET-44")
+
+    def test_an_unnamed_lead_takes_the_ticket_its_gate_pair_is_spent_on(self) -> None:
+        helm_root = self._helm_root("route-gate-root")
+        coordinator, project = self._project_root(helm_root, "route-gate")
+        lead_task = coordinator.create_foreman_task(project["id"])
+        coordinator.launch_worker(lead_task["id"], [sys.executable, "-c", ""], wait=False)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HELM_WORKER_ID", None)
+            for gate_type in ("requirement", "solution"):
+                coordinator.propose_gate(lead_task["id"], gate_type, f"the {gate_type}")
+                coordinator.decide_gate(lead_task["id"], gate_type, confirm=True, skip=False)
+            task = coordinator.create_task(project["id"], "fix the export", ticket="TICKET-66")
+        data = coordinator.store.load()
+        lead_record = data["tasks"][lead_task["id"]]
+        self.assertEqual((lead_record.get("gates") or {}).get("bound_task_id"), task["id"])
+        self.assertEqual(task_name(lead_record), "TICKET-66")
+
+    def test_a_lead_appointed_to_adopt_one_tickets_work_is_named_for_it(self) -> None:
+        # The watchdog appoints a lead for orphaned work with a request that
+        # names only task ids. When that work is one ticket, that is its name.
+        from helm import watchdog
+
+        helm_root = self._helm_root("route-adopt-root")
+        coordinator, project = self._project_root(helm_root, "route-adopt")
+        orphan = coordinator.create_task(project["id"], "fix the export", ticket="TICKET-55")
+        worker = coordinator.launch_worker(
+            orphan["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+
+        def stop() -> None:
+            with contextlib.suppress(HelmError):
+                coordinator.stop_worker(worker["id"], "test over")
+
+        self.addCleanup(stop)
+        appointed: list[dict] = []
+
+        def start_foreman(coordinator_, project_id, **kwargs):
+            appointed.append(kwargs)
+            return {"task": {}, "worker": {"id": "w-adopter"}}
+
+        with mock.patch.object(cli, "_start_foreman", start_foreman):
+            watchdog.heal_pass(helm_root, Path(self.temp.name) / "heal-memory.json")
+        self.assertEqual(len(appointed), 1)
+        self.assertEqual(appointed[0].get("ticket"), "TICKET-55")
+
     def test_without_new_a_second_route_still_reuses_the_existing_driver(self) -> None:
         """The default is unchanged, and that is the point of it being opt-in.
 

@@ -152,6 +152,45 @@ class ForemenMixin:
         return None
 
     @staticmethod
+    def _lead_inherits_ticket(data: dict[str, Any], task: dict[str, Any]) -> list[str]:
+        """Name an unnamed lead after the ticketed task it just took on. Call under lock.
+
+        A lead appointed with no ticket -- by `helm run`, a launch, a heal, or
+        a request that named none -- is called by its task id, and its tab
+        reads `lead t-...`. The moment it creates a worker task for a ticket,
+        or spends its gate pair on one, it is doing that ticket's work, and
+        that is what a human calls it. It also makes the next `route --ticket`
+        for that work find this lead rather than appoint a second one.
+
+        Only a lead with no ticket of its own: a lead already named for one
+        unit of work is not renamed by the next task it creates. Returns the
+        task ids of the leads that took the name.
+        """
+        if task.get("role") != "worker":
+            return []
+        ticket = ticket_of(task)
+        if not ticket:
+            return []
+        tasks = data.get("tasks", {})
+        candidates = []
+        creator = data.get("workers", {}).get(str(task.get("created_by") or "")) or {}
+        if creator:
+            candidates.append(tasks.get(creator.get("task_id")))
+        candidates.extend(
+            candidate for candidate in tasks.values()
+            if (candidate.get("gates") or {}).get("bound_task_id") == task["id"]
+        )
+        named: list[str] = []
+        for lead in candidates:
+            if not lead or lead.get("role") != "foreman" or lead.get("ticket"):
+                continue
+            if lead.get("project_id") != task.get("project_id"):
+                continue
+            lead["ticket"] = ticket
+            named.append(lead["id"])
+        return named
+
+    @staticmethod
     def _live_foreman_task_in(data: dict[str, Any], project_id: str) -> dict[str, Any] | None:
         """The task record of the project's running foreman, from state in hand.
 
