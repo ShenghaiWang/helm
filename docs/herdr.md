@@ -19,7 +19,11 @@ keeps a tab of its own. Helm finds a ticket's tab through its own layout
 record, never by its title, and a reviewer belongs to the ticket of the work
 it checks. Closing an agent closes its pane; the ticket's tab closes with its
 last pane. A lead appointed before its ticket was known has a tab of its own
-until it takes the ticket on, and then that tab becomes the ticket's.
+until it takes the ticket on, and then that tab becomes the ticket's -- before
+`helm run` launches the ticket's task, so that task opens beside it. Placing a
+pane, adopting a tab and closing a tab's last pane each happen under one
+layout lock (`state/herdr-layout.lock`), so a close never takes a pane that a
+launch elsewhere has just split in.
 There is no separate coordinator workspace; a legacy one recorded by an older
 version can be closed with `helm herdr cleanup-coordinator`.
 
@@ -57,8 +61,10 @@ runtime's own integration reports.
 In both modes the runner reports display metadata: the tokens `$ticket` and
 `$role`, and a display name of `<runtime> · <role>`. The metadata carries a
 six-hour TTL and is refreshed hourly, so a long-lived worker keeps its labels
-and a dead one loses them. Every report is best effort; a Herdr that cannot
-be reached never fails a launch or a turn.
+and a dead one loses them. Each refresh reads the ticket from the task record
+as it is then, and a lead that takes a ticket after launch has it reported the
+moment its tab becomes the ticket's. Every report is best effort; a Herdr that
+cannot be reached never fails a launch or a turn.
 
 The default sidebar rows already show the tab (the ticket) and the agent
 (its display name, with the role). To show the tokens explicitly, set the

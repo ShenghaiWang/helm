@@ -2552,6 +2552,27 @@ def _detach_runner() -> None:
         os.close(devnull)
 
 
+def _presence_ticket_source(config: dict[str, Any]) -> Any:
+    """Read this worker's ticket from the task record as it is now.
+
+    For the runner's presence, which reports it to Herdr's agents view on
+    every refresh: the ticket given at launch goes stale when a lead takes
+    one later. Read-only and best effort -- it opens the store without
+    repairing or locking anything, and any failure keeps the last ticket.
+    """
+    state_dir = str(config.get("state_dir") or "")
+    task_id = str((config.get("worker_env") or {}).get("HELM_TASK_ID") or "")
+    if not state_dir or not task_id:
+        return None
+
+    def current() -> str:
+        data = StateStore(state_dir, read_only=True).load()
+        task = (data.get("tasks") or {}).get(task_id)
+        return HerdrAdapter._ticket_for(task, data) if task else ""
+
+    return current
+
+
 def _worker_runner(config_path: str, presence: dict[str, str] | None = None) -> int:
     """Run a worker and write an exit record; not part of the public API."""
     try:
@@ -2656,6 +2677,7 @@ def _worker_runner(config_path: str, presence: dict[str, str] | None = None) -> 
                 role=presence.get("role", ""),
                 ticket=presence.get("ticket", ""),
                 report_state=bool(config.get("turns")),
+                ticket_source=_presence_ticket_source(config),
             )
             if presence
             else None
@@ -3568,6 +3590,12 @@ def _cmd_run(ctx: _Context, args: argparse.Namespace) -> int | None:
         ticket=args.ticket,
         no_domain=args.no_domain,
     )
+    # Before the launch, not after: the lead that just took this ticket
+    # turns its tab into the ticket's tab here, and the worker launched next
+    # looks for exactly that tab. Relabelled afterwards, the worker had
+    # already opened a tab of its own, and the lead's could no longer become
+    # the ticket's -- one ticket, two tabs.
+    _relabel_leads_named_by(coordinator, task)
     if args.herdr:
         worker = HerdrAdapter(coordinator).launch_task(
             task["id"], args.worker_command_text, wait=not args.asynchronous
@@ -3582,7 +3610,6 @@ def _cmd_run(ctx: _Context, args: argparse.Namespace) -> int | None:
             task["id"], args.worker_command_text, wait=not args.asynchronous
         )
         mode = "process (--no-herdr)"
-    _relabel_leads_named_by(coordinator, task)
     _ensure_foreman(
         coordinator, project["id"], herdr=args.herdr, ticket=ticket_of(task) or None
     )

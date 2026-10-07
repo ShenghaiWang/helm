@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import io
+import json
 import os
 import shlex
 import shutil
@@ -24,7 +25,7 @@ from unittest import mock
 
 from helm import cli
 from helm.core import Coordinator, HelmError, StateStore
-from helm.herdr import HerdrAdapter
+from helm.herdr import HerdrAdapter, PanePresence
 from helm.naming import task_name
 
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT
@@ -461,6 +462,96 @@ class RouteCommandTests(HelmTestCase):
         self.assertIsNotNone(lead)
         data = coordinator.store.load()
         self.assertEqual(task_name(data["tasks"][lead["task_id"]]), "TICKET-44")
+
+    def test_a_run_launches_its_task_into_the_tab_its_lead_just_took(self) -> None:
+        """The lead's tab was made the ticket's only after the child launched.
+
+        So the child opened a tab of its own, and the relabel that followed
+        then refused to adopt the lead's tab because the ticket already had
+        one: one ticket, two tabs.
+        """
+        helm_root = self._helm_root("route-runtab-root")
+        coordinator, project = self._project_root(helm_root, "route-runtab")
+        lead_task = coordinator.create_foreman_task(project["id"])
+        herdr = FakeHerdr()
+        lead = HerdrAdapter(coordinator, herdr).launch_task(
+            lead_task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HELM_WORKER_ID", None)
+            for gate_type in ("requirement", "solution"):
+                coordinator.propose_gate(lead_task["id"], gate_type, f"the {gate_type}")
+                coordinator.decide_gate(lead_task["id"], gate_type, confirm=True, skip=False)
+            out = io.StringIO()
+            with mock.patch("helm.cli.HerdrAdapter", lambda c, *a, **k: HerdrAdapter(c, herdr)), \
+                 contextlib.redirect_stdout(out):
+                code = cli.main([
+                    "--root", str(helm_root), "run", project["id"], "fix the export",
+                    "--ticket", "TICKET-77", "--async",
+                    "--command", shlex.join([sys.executable, "-c", ""]),
+                ])
+        self.assertEqual(code, 0, out.getvalue())
+        data = coordinator.store.load()
+        layouts = data["integrations"]["herdr"]["workers"]
+        child = next(
+            w for w in data["workers"].values()
+            if data["tasks"][w["task_id"]].get("ticket") == "TICKET-77"
+            and data["tasks"][w["task_id"]].get("role") == "worker"
+        )
+        self.assertEqual(layouts[lead["id"]]["ticket"], "TICKET-77")
+        self.assertEqual(layouts[child["id"]]["tab_id"], layouts[lead["id"]]["tab_id"])
+        self.assertEqual([tab for tab in herdr.tabs if tab[1] == "TICKET-77"], [])
+        self.assertEqual(len(herdr.splits), 1)
+
+    def _lead_takes_ticket(self, name: str, ticket: str) -> tuple[Coordinator, FakeHerdr, dict, callable]:
+        helm_root = self._helm_root(f"{name}-root")
+        coordinator, project = self._project_root(helm_root, name)
+        lead_task = coordinator.create_foreman_task(project["id"])
+        herdr = FakeHerdr()
+        lead = HerdrAdapter(coordinator, herdr).launch_task(
+            lead_task["id"], [sys.executable, "-c", ""], wait=False
+        )
+
+        def take() -> None:
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}), \
+                 mock.patch("helm.cli.HerdrAdapter", lambda c, *a, **k: HerdrAdapter(c, herdr)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                cli.main([
+                    "--root", str(helm_root), "task", "create", "--project", project["id"],
+                    "--brief", "find why the mic goes silent", "--ticket", ticket,
+                    "--read-only",
+                ])
+
+        return coordinator, herdr, lead, take
+
+    def test_a_lead_that_takes_a_ticket_tells_the_agents_view_at_once(self) -> None:
+        """The agents view kept the ticket the runner was launched with, for good.
+
+        A lead appointed with none took one later, and Herdr never heard of it.
+        """
+        coordinator, herdr, lead, take = self._lead_takes_ticket("route-presence", "TICKET-93")
+        take()
+        lead_pane = coordinator.store.load()["integrations"]["herdr"]["workers"][lead["id"]]["pane_id"]
+        told = [kw["tokens"] for pane, kw in herdr.metadata if pane == lead_pane]
+        self.assertIn({"role": "lead", "ticket": "TICKET-93"}, told)
+
+    def test_a_runners_presence_refresh_reads_the_ticket_from_the_task_record(self) -> None:
+        coordinator, herdr, lead, take = self._lead_takes_ticket("route-refresh", "TICKET-94")
+        config = json.loads(Path(lead["config_file"]).read_text(encoding="utf-8"))
+        client = mock.Mock()
+        presence = PanePresence(
+            client, "p-lead", agent="claude", role="lead",
+            ticket_source=cli._presence_ticket_source(config),
+        )
+        presence.start()
+        self.addCleanup(presence.close)
+        self.assertNotIn("ticket", client.pane_report_metadata.call_args_list[0].kwargs["tokens"])
+
+        take()
+        presence.refresh()
+
+        latest = client.pane_report_metadata.call_args_list[-1].kwargs["tokens"]
+        self.assertEqual(latest, {"role": "lead", "ticket": "TICKET-94"})
 
     def test_an_unnamed_lead_takes_the_ticket_its_gate_pair_is_spent_on(self) -> None:
         helm_root = self._helm_root("route-gate-root")

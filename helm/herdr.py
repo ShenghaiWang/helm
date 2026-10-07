@@ -18,7 +18,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from .naming import task_name, ticket_of
 from .values import SAFE_TEXT_LIMIT, shape_check, shape_policy
@@ -338,6 +338,7 @@ class PanePresence:
         role: str,
         ticket: str = "",
         report_state: bool = True,
+        ticket_source: Callable[[], str] | None = None,
     ) -> None:
         self.client = client
         self.pane_id = pane_id
@@ -345,6 +346,10 @@ class PanePresence:
         self.role = role
         self.ticket = ticket
         self.report_state = report_state
+        #: Where the current ticket is read from on every report. The launch
+        #: value goes stale: a lead appointed with no ticket takes one when it
+        #: takes on the work, long after its runner started.
+        self.ticket_source = ticket_source
         self._state: str | None = None
         self._seq = 0
         self._lock = threading.Lock()
@@ -353,7 +358,13 @@ class PanePresence:
 
     @classmethod
     def from_environment(
-        cls, *, agent: str, role: str, ticket: str = "", report_state: bool = True
+        cls,
+        *,
+        agent: str,
+        role: str,
+        ticket: str = "",
+        report_state: bool = True,
+        ticket_source: Callable[[], str] | None = None,
     ) -> PanePresence | None:
         """The presence for the Herdr pane this process runs in, or None outside one."""
         pane_id = os.environ.get("HERDR_PANE_ID", "")
@@ -361,8 +372,18 @@ class PanePresence:
         if not pane_id or not role or not client.available():
             return None
         return cls(
-            client, pane_id, agent=agent, role=role, ticket=ticket, report_state=report_state
+            client, pane_id, agent=agent, role=role, ticket=ticket,
+            report_state=report_state, ticket_source=ticket_source,
         )
+
+    def _current_ticket(self) -> str:
+        """The ticket the task is called by now; the last known one when unreadable."""
+        if self.ticket_source is not None:
+            with contextlib.suppress(Exception):
+                current = str(self.ticket_source() or "").strip()
+                if current:
+                    self.ticket = current
+        return self.ticket
 
     def _next_seq(self) -> int:
         # One increasing sequence for this source, so a refresh racing a state
@@ -376,8 +397,9 @@ class PanePresence:
 
     def _report_metadata(self) -> None:
         tokens = {"role": self.role}
-        if self.ticket:
-            tokens["ticket"] = self.ticket
+        ticket = self._current_ticket()
+        if ticket:
+            tokens["ticket"] = ticket
         self._quietly(
             self.client.pane_report_metadata,
             self.pane_id,
@@ -2410,6 +2432,33 @@ class HerdrAdapter:
         the work it took on. Only a tab Helm recorded is touched; True when
         the rename was sent.
         """
+        # Adopting a tab for a ticket is a layout change like a placement:
+        # decided and recorded under the same lock, so two of them cannot
+        # both find the ticket without a tab.
+        with self._layout_lock():
+            return self._relabel_worker_locked(worker_id)
+
+    def _report_presence(
+        self, worker: dict[str, Any], task: dict[str, Any], layout: dict[str, Any], ticket: str
+    ) -> None:
+        """Tell Herdr's agents view this worker's current ticket and role. Best effort."""
+        report = getattr(self.client, "pane_report_metadata", None)
+        pane_id = layout.get("pane_id")
+        if report is None or not pane_id or not ticket:
+            return
+        role = self._presence_role(task)
+        agent = str(worker.get("agent_id") or worker.get("agent") or "agent")
+        with contextlib.suppress(HelmError, OSError, subprocess.SubprocessError, ValueError):
+            report(
+                pane_id,
+                source=PanePresence.SOURCE,
+                seq=time.time_ns(),
+                tokens={"role": role, "ticket": ticket},
+                display_agent=f"{agent} · {role}",
+                ttl_ms=PanePresence.METADATA_TTL_MS,
+            )
+
+    def _relabel_worker_locked(self, worker_id: str) -> bool:
         data = self.coordinator.store.load()
         workers = self._herdr_state(data).get("workers", {})
         layout = dict(workers.get(worker_id) or {})
@@ -2441,6 +2490,9 @@ class HerdrAdapter:
             self._rename_worker_surface(layout, label)
         except HerdrUnavailable:
             return False
+        # The agents view too, now: the runner's own presence reads the ticket
+        # again on its next refresh, but that can be an hour away.
+        self._report_presence(worker, task, layout, ticket)
         with self.coordinator.store.locked() as live:
             entry = self._herdr_state(live).get("workers", {}).get(worker_id)
             if entry is not None:

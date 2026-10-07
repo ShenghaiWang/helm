@@ -70,6 +70,8 @@ class FakeHerdr:
         self.closed_panes: list[str] = []
         self.renamed_panes: list[tuple[str, str]] = []
         self.renamed: list[tuple[str, str]] = []
+        # What Helm reported to Herdr's agents view, per pane.
+        self.metadata: list[tuple[str, dict[str, object]]] = []
         self.sent_text: list[tuple[str, str]] = []
         self.sent_keys: list[tuple[str, str]] = []
         # What the runtime hook reported for a pane; unset reads as unknown.
@@ -170,6 +172,10 @@ class FakeHerdr:
 
     def pane_close(self, pane_id: str) -> dict[str, object]:
         self.closed_panes.append(pane_id)
+        return {}
+
+    def pane_report_metadata(self, pane_id: str, **kwargs: object) -> dict[str, object]:
+        self.metadata.append((pane_id, kwargs))
         return {}
 
     def pane_rename(self, pane_id: str, label: str) -> dict[str, object]:
