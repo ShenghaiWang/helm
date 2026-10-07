@@ -629,26 +629,101 @@ class ProtectionMixin:
         The review loop names the commit it built the diff from. A reviewer
         created any other way reviews the branch as it stands at creation --
         still a commit fixed before the reviewer reads anything, which is the
-        property that matters.
+        property that matters. Naming a commit other than the branch's is the
+        review loop's alone: the root's, or the lead's driving the reviewed
+        task -- never the author's.
         """
         if review_tip is not None:
             review_tip = str(review_tip).strip().lower()
             if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", review_tip):
                 raise HelmError("a review tip must be a full commit id")
+            self._require_review_driver(
+                data, reviewed_id, "naming the commit a reviewer judges"
+            )
             return review_tip
         reviewed = data.get("tasks", {}).get(reviewed_id)
         return self._branch_tip(data, reviewed) if reviewed else None
 
-    def set_review_tip(self, reviewer_task_id: str, review_tip: str) -> None:
-        """Move a live reviewer task to the commit its next round reviews."""
+    def _require_review_driver(
+        self, data: dict[str, Any], reviewed_id: str, action: str
+    ) -> str:
+        """Refuse anyone but the root or the lead driving `reviewed_id`.
+
+        Naming the commit a reviewer is judging decides which bytes its
+        verdict approves. An author that could name it could have a genuine
+        approval of A recorded against its own unreviewed B, so only the side
+        that runs the review loop may: the root, or the lead that drives the
+        reviewed task. Returns who did it, for the record.
+        """
+        identity = self.caller_identity()
+        if identity["role"] == "root":
+            return "root"
+        caller = data.get("workers", {}).get(identity.get("worker_id") or "") or {}
+        driver = (
+            self.driver_of_task(reviewed_id, data=data)
+            if identity["role"] == "foreman" else None
+        )
+        if driver is not None and caller.get("task_id") and driver.get("task_id") == caller.get("task_id"):
+            return str(identity["worker_id"])
+        raise SafetyError(
+            f"{action} refused: only the root or the lead driving task {reviewed_id} "
+            "names the commit its reviewer judges. This caller was identified as "
+            f"{identity['role']} {identity.get('worker_id') or ''} by {identity['evidence']}."
+        )
+
+    @staticmethod
+    def _current_review_round(task: dict[str, Any]) -> dict[str, Any] | None:
+        """The review round this reviewer task was last handed, or None."""
+        rounds = task.get("review_rounds") or []
+        return rounds[-1] if rounds else None
+
+    def _open_review_round(self, reviewer_task_id: str, review_tip: str) -> dict[str, Any]:
+        """Hand a kept reviewer its next round: one new, immutable commit.
+
+        Only the review loop calls this, between a round's verdict and the
+        message that asks for the next one, and only for the root or the lead
+        driving the reviewed task. A round already handed off is never moved:
+        while it has no verdict, the verdict it is about to produce belongs to
+        the commit it was handed, so a new round cannot open over it. Each
+        round is appended, never edited, and a result is recorded against the
+        round current when it lands.
+        """
         review_tip = str(review_tip).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", review_tip):
             raise HelmError("a review tip must be a full commit id")
         with self.store.locked() as data:
             task = self._task(data, reviewer_task_id)
-            if task.get("role") != "reviewer":
+            if task.get("role") != "reviewer" or not task.get("reviews"):
                 raise HelmError(f"task {reviewer_task_id} is not a reviewer task")
+            opened_by = self._require_review_driver(
+                data, str(task["reviews"]), "moving a reviewer to a new commit"
+            )
+            rounds = task.setdefault("review_rounds", [])
+            if not rounds and task.get("review_tip"):
+                # A reviewer created before rounds were recorded: its first
+                # round is the commit it was pinned to at creation.
+                rounds.append({
+                    "round": 1, "tip": task["review_tip"],
+                    "handed_off_at": task.get("created_at"), "opened_by": None,
+                    "result": None,
+                })
+            current = self._current_review_round(task)
+            if current is not None and not current.get("result"):
+                raise SafetyError(
+                    f"reviewer task {reviewer_task_id} was handed round "
+                    f"{current['round']} at {str(current.get('tip'))[:12]} and has not "
+                    "given its verdict; that round's commit cannot be moved"
+                )
+            episode = {
+                "round": len(rounds) + 1,
+                "tip": review_tip,
+                "handed_off_at": now(),
+                "opened_by": opened_by,
+                "result": None,
+            }
+            rounds.append(episode)
             task["review_tip"] = review_tip
+            return dict(episode)
 
     def _review_verdicts(
         self, data: dict[str, Any], task: dict[str, Any]

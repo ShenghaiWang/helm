@@ -875,6 +875,17 @@ class LifecycleMixin:
                         },
                         "workspace_removed": False,
                     }
+                    if task["review_tip"]:
+                        # A reviewer's first round is handed off by its own
+                        # brief, at creation. Later rounds are appended by
+                        # `_open_review_round`; none is ever edited.
+                        task["review_rounds"] = [{
+                            "round": 1,
+                            "tip": task["review_tip"],
+                            "handed_off_at": task["created_at"],
+                            "opened_by": creator_id or "root",
+                            "result": None,
+                        }]
                     data["tasks"][task_id] = task
                     # After the gates above are spent, so a pair bound to this
                     # task counts as the lead taking it on.

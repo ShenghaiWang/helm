@@ -496,13 +496,26 @@ class Coordinator(
             # lands, which may hold a commit the author added after the
             # reviewer stopped reading. A reviewer with no pinned commit
             # approves nothing a push gate will accept.
+            #
+            # The round current when the result lands is the one the reviewer
+            # was last handed: rounds are appended only after a verdict, and
+            # never edited, so this is the commit that round's brief named.
+            review_round = self._current_review_round(task)
             payload = {
                 **(payload or {}),
-                "reviewed_tip": task.get("review_tip") or None,
+                "reviewed_tip": (
+                    review_round.get("tip") if review_round is not None
+                    else task.get("review_tip")
+                ) or None,
+                "review_round": review_round.get("round") if review_round is not None else None,
             }
+        else:
+            review_round = None
         message = self._message(
             data, project, task, worker, kind, text, payload, status=requested_status
         )
+        if review_round is not None and not review_round.get("result"):
+            review_round["result"] = message["id"]
         receipts = self._receipts(payload)
         hold_event = ""
         if kind == "artifact":

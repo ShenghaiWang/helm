@@ -1795,7 +1795,7 @@ class HerdrAdapter:
                 # verdict this round produces is attached to this commit.
                 review_tip = self._review_round_tip(task)
                 self._precomputed_diff(task, review_base, review_tip)
-                self.coordinator.set_review_tip(review_task["id"], review_tip)
+                self.coordinator._open_review_round(review_task["id"], review_tip)
                 self.answer_worker(
                     reviewer_worker["id"],
                     f"The author has pushed changes for round {round_number}. Re-read the "

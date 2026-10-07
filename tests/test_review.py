@@ -7,6 +7,7 @@ import inspect
 import io
 import itertools
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1593,6 +1594,114 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
         patch = (self.state.directory / "reviews" / task["id"] / "diff.patch").read_text()
         self.assertIn("second round", patch)
         self.assertNotIn("third, unread", patch)
+
+    # ---------- only the review loop's driver moves a reviewer's commit ----------
+
+    def _reviewed_task(self, name: str):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "write the code")
+        author = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "reviewed A")
+        return project, task, author, self._rev(task["workspace"])
+
+    def _reviewer_for(self, project: dict, task: dict) -> tuple[dict, dict]:
+        review = self.coordinator.create_task(
+            project["id"], "review it", role="reviewer", reviews=task["id"], read_only=True
+        )
+        reviewer = self.coordinator.prepare_external_worker(
+            review["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        return review, reviewer
+
+    def _result(self, review_task_id: str) -> dict:
+        return [
+            m for m in self.coordinator.inspect_task(review_task_id)["messages"]
+            if m["kind"] == "result"
+        ][-1]
+
+    def test_an_author_cannot_move_its_reviewer_to_an_unreviewed_commit(self) -> None:
+        project, task, author, a = self._reviewed_task("repinauthor")
+        review, reviewer = self._reviewer_for(project, task)
+        self.commit_on_task_branch(task, "unreviewed B")
+        b = self._rev(task["workspace"])
+
+        # Every core entry that moves a reviewer's commit, as the author.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": author["id"]}):
+            for name in ("set_review_tip", "_open_review_round"):
+                move = getattr(self.coordinator, name, None)
+                if move is None:
+                    continue
+                with contextlib.suppress(HelmError):
+                    move(review["id"], b)
+
+        self.coordinator.record_worker_message(reviewer["id"], "result", "APPROVED of A")
+        self.assertEqual(self._result(review["id"])["payload"]["reviewed_tip"], a)
+        data = self.coordinator.store.load()
+        reviewed = data["tasks"][task["id"]]
+        self.assertFalse(self.coordinator._review_passed(data, reviewed, b))
+        self.assertIsNotNone(self.coordinator._review_refusal(data, reviewed, b, "push"))
+        self.assertTrue(self.coordinator._review_passed(data, reviewed, a))
+
+        # Nor by creating a reviewer pinned to the commit it wants approved.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": author["id"]}):
+            with self.assertRaisesRegex(HelmError, r"names the commit its reviewer judges"):
+                self.coordinator.create_task(
+                    project["id"], "review it", role="reviewer", reviews=task["id"],
+                    read_only=True, review_tip=b,
+                )
+
+    def test_only_the_driving_lead_opens_a_reviewers_next_round_once_it_has_answered(self) -> None:
+        root = self.repo("repinlead")
+        project = self.coordinator.register_project("Repinlead", str(root), project_id="repinlead")
+        leads = []
+        for label in ("driving", "other"):
+            lead_task = self.coordinator.create_task(
+                project["id"], f"drive the {label} work", no_domain=True,
+                role="foreman", new=True, ticket=f"LEAD-{len(leads) + 1}",
+            )
+            leads.append(self.coordinator.prepare_external_worker(
+                lead_task["id"], [sys.executable, "-c", ""], execution="external"
+            ))
+        driving, other = leads
+        task = self.coordinator.create_task(project["id"], "write the code")
+        with self.coordinator.store.locked() as data:
+            # As if the driving lead had created it, past its gates.
+            data["tasks"][task["id"]]["created_by"] = driving["id"]
+            data["tasks"][task["id"]]["created_by_task"] = driving["task_id"]
+        self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "reviewed A")
+        a = self._rev(task["workspace"])
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": driving["id"]}):
+            review = self.coordinator.create_task(
+                project["id"], "review it", role="reviewer", reviews=task["id"],
+                read_only=True, review_tip=a,
+            )
+        reviewer = self.coordinator.prepare_external_worker(
+            review["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "B")
+        b = self._rev(task["workspace"])
+
+        # The round it was handed has no verdict yet: nobody may move it.
+        with self.assertRaisesRegex(HelmError, r"has not given its verdict"):
+            self.coordinator._open_review_round(review["id"], b)
+        self.coordinator.record_worker_message(reviewer["id"], "result", "CHANGES-REQUESTED x")
+
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": other["id"]}):
+            with self.assertRaisesRegex(HelmError, r"only the root or the lead driving"):
+                self.coordinator._open_review_round(review["id"], b)
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": driving["id"]}):
+            opened = self.coordinator._open_review_round(review["id"], b)
+        self.assertEqual((opened["round"], opened["tip"]), (2, b))
+        rounds = self.coordinator.inspect_task(review["id"])["task"]["review_rounds"]
+        self.assertEqual([(r["round"], r["tip"]) for r in rounds], [(1, a), (2, b)])
+        self.assertTrue(rounds[0]["result"])
+        self.assertEqual(rounds[1]["opened_by"], driving["id"])
 
 
 class ReviewerTicketTests(HelmTestCase):
