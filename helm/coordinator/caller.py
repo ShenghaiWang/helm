@@ -30,7 +30,10 @@ class CallerMixin:
         edit: `env -u HELM_WORKER_ID` used to be enough to be read as the root.
         So the second is process ancestry -- a worker cannot make itself not be
         a descendant of the runner Helm started for it, and a command it spawns
-        inherits that lineage whatever it does to its environment.
+        inherits that lineage whatever it does to its environment. Where
+        lineage proves a worker it decides: a marker naming a different one is
+        refused, never accepted as the more privileged reading. Only where no
+        recorded process is in the lineage does the marker speak alone.
 
         Returns the role, the worker id it was attributed to, and which signal
         decided it, so a refusal can say what identified the caller.
@@ -47,28 +50,50 @@ class CallerMixin:
             return "foreman" if (task or {}).get("role") == "foreman" else "worker"
 
         marked = os.environ.get("HELM_WORKER_ID", "").strip()
+        proven = self._worker_by_lineage(data)
+        if marked and proven and proven != marked:
+            # The marker is the signal an agent can edit, so it never outranks
+            # the one it cannot. An author that sets the variable to its lead's
+            # id still runs under its own runner: naming somebody else is not a
+            # lesser identity to fall back to, it is a forgery, and every
+            # command it reaches -- protected or not -- refuses it.
+            raise SafetyError(
+                f"this command's environment names worker {marked}, but it runs "
+                f"under worker {proven}'s process. An agent is identified by the "
+                "process Helm started for it, not by a variable it can set; "
+                "refusing rather than acting as either."
+            )
         if marked:
             return {"role": role_for(marked), "worker_id": marked, "evidence": "marker"}
+        if proven:
+            return {"role": role_for(proven), "worker_id": proven, "evidence": "ancestry"}
+        return {"role": "root", "worker_id": "", "evidence": "unmarked"}
+
+    @staticmethod
+    def _worker_by_lineage(data: dict[str, Any]) -> str:
+        """The worker whose recorded process this command runs under, or "".
+
+        The nearest recorded ancestor wins: a worker's own runner sits closer
+        than any process that started it, so a worker launched from inside a
+        lead's command is that worker, not the lead. The process group comes
+        last, as the weakest of the three witnesses.
+        """
         recorded = {
             worker["pid"]: worker_id
             for worker_id, worker in data.get("workers", {}).items()
             if isinstance(worker.get("pid"), int)
         }
-        if recorded:
+        if not recorded:
             # Only pay for the process table when there is something to match:
             # a root with no launched worker cannot be one.
-            lineage = {os.getpid(), *_process_parents(os.getpid())}
-            with contextlib.suppress(OSError):
-                lineage.add(os.getpgid(0))
-            for pid in lineage:
-                if pid in recorded:
-                    worker_id = recorded[pid]
-                    return {
-                        "role": role_for(worker_id),
-                        "worker_id": worker_id,
-                        "evidence": "ancestry",
-                    }
-        return {"role": "root", "worker_id": "", "evidence": "unmarked"}
+            return ""
+        lineage = [os.getpid(), *_process_parents(os.getpid())]
+        with contextlib.suppress(OSError):
+            lineage.append(os.getpgid(0))
+        for pid in lineage:
+            if pid in recorded:
+                return recorded[pid]
+        return ""
 
     def require_same_project(self, worker_id: str, action: str) -> None:
         """Refuse an agent addressing a worker outside its own project.

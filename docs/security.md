@@ -49,7 +49,7 @@ and a speed bump for a defector.
 
 | Check | Where | What it establishes |
 | --- | --- | --- |
-| Caller identity | `caller_identity` | the marker `HELM_WORKER_ID`, else a recorded worker pid in the process ancestry, else the root's session |
+| Caller identity | `caller_identity` | a recorded worker pid in the process ancestry (nearest wins), refusing a `HELM_WORKER_ID` marker that names a different worker; the marker alone where no recorded process is in the lineage; else the root's session |
 | Root-only operations | `Coordinator.authority()` | refuses a non-root caller; with a capability configured, also requires it in `HELM_AUTHORITY` |
 | Approval snapshot | `protection.py` | content digests of revision, tree, index, diff, untracked files and artifacts; re-taken at release and at `action-start`; single use |
 | Grants | `approval grant` / `check` | checked against the task's project at the moment of use; revocation is honoured immediately |

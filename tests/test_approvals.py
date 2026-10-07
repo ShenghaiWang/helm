@@ -547,6 +547,17 @@ class ApprovalTests(HelmTestCase):
             with self.assertRaisesRegex(SafetyError, r"may withdraw its approval request"):
                 self.coordinator.withdraw_task_hold(worker["id"])
 
+        # Nor by naming the session that asked while running under another's
+        # process: the lineage the stranger cannot shed decides, not the marker.
+        with self.coordinator.store.locked() as data:
+            data["workers"][stranger["id"]]["pid"] = os.getpid()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+            with self.assertRaisesRegex(SafetyError, rf"under worker {stranger['id']}"):
+                self.coordinator.withdraw_task_hold(worker["id"])
+        self.assertEqual(self._hold(task["id"])["status"], "waiting")
+        with self.coordinator.store.locked() as data:
+            data["workers"][stranger["id"]]["pid"] = None
+
         # An in-flight hold is reported, not withdrawn: the action may already
         # have happened, and abandoning the record would hide it.
         self.coordinator.release_task_hold(task["id"], action="publish", confirm=True)

@@ -17,6 +17,7 @@ from unittest import mock
 
 from helm.core import (
     HelmError,
+    SafetyError,
     base_after_merges,
     inside,
 )
@@ -1702,6 +1703,61 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
         self.assertEqual([(r["round"], r["tip"]) for r in rounds], [(1, a), (2, b)])
         self.assertTrue(rounds[0]["result"])
         self.assertEqual(rounds[1]["opened_by"], driving["id"])
+
+    def test_an_author_naming_its_lead_in_the_environment_is_not_read_as_the_lead(self) -> None:
+        root = self.repo("forgedlead")
+        project = self.coordinator.register_project("Forgedlead", str(root), project_id="forgedlead")
+        lead_task = self.coordinator.create_task(
+            project["id"], "drive the work", no_domain=True, role="foreman", new=True,
+            ticket="LEAD-1",
+        )
+        lead = self.coordinator.prepare_external_worker(
+            lead_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["created_by"] = lead["id"]
+            data["tasks"][task["id"]]["created_by_task"] = lead["task_id"]
+        author = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "unreviewed B")
+        b = self._rev(task["workspace"])
+
+        def run_as(worker_id: str):
+            # This very process is the named worker's recorded runner: the
+            # lineage evidence a worker cannot shed.
+            with self.coordinator.store.locked() as data:
+                for record in data["workers"].values():
+                    record["pid"] = os.getpid() if record["id"] == worker_id else None
+            return mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]})
+
+        with run_as(author["id"]):
+            with self.assertRaisesRegex(SafetyError, rf"names worker {lead['id']}.*under worker {author['id']}"):
+                self.coordinator.create_task(
+                    project["id"], "review it", role="reviewer", reviews=task["id"],
+                    read_only=True, review_tip=b,
+                )
+        self.assertFalse([
+            t for t in self.coordinator.store.load()["tasks"].values()
+            if t.get("role") == "reviewer"
+        ])
+
+        # The real lead, under its own process and marker, still drives.
+        with run_as(lead["id"]):
+            review = self.coordinator.create_task(
+                project["id"], "review it", role="reviewer", reviews=task["id"],
+                read_only=True, review_tip=b,
+            )
+        self.assertEqual(review["review_tip"], b)
+
+        # And the root -- no marker, no worker in its lineage -- is the root.
+        with self.coordinator.store.locked() as data:
+            for record in data["workers"].values():
+                record["pid"] = None
+        environment = {k: v for k, v in os.environ.items() if k != "HELM_WORKER_ID"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(self.coordinator.caller_identity()["role"], "root")
 
     def test_a_reviewer_task_is_not_continued_with_a_free_form_round(self) -> None:
         project, task, author, a = self._reviewed_task("reviewercontinue")
