@@ -149,6 +149,47 @@ class WatchdogTests(HelmTestCase):
         self.assertEqual(appointed, [project["id"]])
         self.assertIn("appointed w-new-driver", reports[0])
 
+    def test_an_orphan_handed_to_a_new_lead_is_not_handed_on_again(self) -> None:
+        """The appointment is recorded on the orphan, so the next pass sees a driver.
+
+        Without it the orphan still named its dead creator, read as driverless
+        on every pass, and every pass appointed it another lead.
+        """
+        import sys
+
+        root = self.repo("adopted")
+        project = self.coordinator.register_project("Adopted", str(root), project_id="adopted")
+        dying_task = self.coordinator.create_foreman_task(project["id"])
+        dying = self.coordinator.prepare_external_worker(
+            dying_task["id"], [sys.executable, "-c", ""]
+        )
+        with mock.patch.dict("os.environ", {"HELM_WORKER_ID": dying["id"]}):
+            task = self.coordinator.create_task(project["id"], "a look", read_only=True)
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.coordinator.stop_worker(dying["id"], reason="its session ended")
+        self.assertIsNone(self.coordinator.driver_of_task(task["id"]))
+
+        appointed: list[str] = []
+        from helm import cli
+
+        def appoint(coordinator, project_id, **kwargs):
+            lead_task = coordinator.create_foreman_task(project_id)
+            lead = coordinator.prepare_external_worker(
+                lead_task["id"], [sys.executable, "-c", ""]
+            )
+            appointed.append(lead["id"])
+            return {"task": lead_task, "worker": lead}
+
+        memory = Path(self.temp.name) / "adopted.json"
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
+             mock.patch.object(cli, "_start_foreman", side_effect=appoint), \
+             mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
+             mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
+            watchdog.heal_pass(None, memory)
+            watchdog.heal_pass(None, memory)
+        self.assertEqual(len(appointed), 1)
+        self.assertEqual(self.coordinator.driver_of_task(task["id"])["id"], appointed[0])
+
     def test_a_project_with_running_workers_and_no_foreman_is_re_driven(self) -> None:
         import sys
 

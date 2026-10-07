@@ -33,7 +33,7 @@ class ForemenMixin:
         pushed to its driver, and a report delivered to the WRONG driver is
         read as news about work that driver never started.
 
-        Ownership is already in the state and needs no new field. A driver
+        A gate binding is one piece of evidence of ownership. A driver
         spends its confirmed gate pair on the task it creates, which records
         that task under `gates.bound_task_id` and, once the pair is
         re-proposed, under `gates.spent`. So the driver that spent a pair on
@@ -44,14 +44,67 @@ class ForemenMixin:
         would report a dead driver's orphaned work as covered, which is how a
         finished task sits unadvanced while every component reports correctly.
 
-        A task with NO binding anywhere is a different case -- the root
+        A gate binding is not the only evidence, and on its own it missed the
+        commonest task of all: a reviewer is created read-only, spends no
+        gate, and so fell through to "the project's driver" -- the FIRST
+        running lead in the project. Review verdicts for one ticket were
+        delivered into another ticket's lead while the lead that asked for
+        the review sat idle with nothing queued. So, in order: the agent that
+        created the task, recorded at creation as `created_by`; for a
+        reviewer, the driver of the task it reviews; then the gate binding.
+        Whichever names a driver decides, live or not -- a known driver that
+        is gone has no stand-in.
+
+        A task with no evidence at all is a different case -- the root
         created it, or it predates the mechanism -- and for that the project's
-        driver is the honest answer.
+        driver is the honest answer; `driver_resolution` says when that is
+        the answer given.
+        """
+        return self.driver_resolution(task_id, data=data)[0]
+
+    def driver_resolution(
+        self, task_id: str, *, data: dict[str, Any] | None = None, _depth: int = 0
+    ) -> tuple[dict[str, Any] | None, str]:
+        """`driver_of_task`, plus which evidence named it.
+
+        The second value is `adopted`, `creator`, `reviewed`, `gate`,
+        `project` (no evidence: the project's first live driver, a guess the
+        caller should record) or `none`.
         """
         data = data if data is not None else self.store.load()
         task = data.get("tasks", {}).get(task_id)
         if task is None:
-            return None
+            return None, "none"
+        workers = data.get("workers", {})
+        # A lead appointed to take this task over is its driver from then on,
+        # whatever created it: the watchdog records the hand-over, and
+        # without the record the same orphan read as driverless again on
+        # every pass and was handed to a new lead each time.
+        adopter_id = str(task.get("adopted_by") or "")
+        if adopter_id:
+            adopter = workers.get(adopter_id) or {}
+            live = adopter.get("status") == "running"
+            return (dict(adopter) if live else None), "adopted"
+        creator_id = str(task.get("created_by") or "")
+        if creator_id and creator_id in workers:
+            creator = workers[creator_id]
+            creator_task = data.get("tasks", {}).get(creator.get("task_id")) or {}
+            # A lead that created the task drives it. A plain worker that
+            # created one is not a driver; its own driver is, one hop up.
+            if creator_task.get("role") == "foreman":
+                live = creator.get("status") == "running"
+                return (dict(creator) if live else None), "creator"
+            if _depth < 3 and creator_task.get("id") and creator_task.get("id") != task_id:
+                driver, how = self.driver_resolution(
+                    creator_task["id"], data=data, _depth=_depth + 1
+                )
+                if how != "project":
+                    return driver, "creator"
+        reviewed = str(task.get("reviews") or "")
+        if reviewed and reviewed != task_id and _depth < 3:
+            driver, how = self.driver_resolution(reviewed, data=data, _depth=_depth + 1)
+            if how != "project":
+                return driver, "reviewed"
         project_id = task.get("project_id")
         bound = False
         for candidate in data.get("tasks", {}).values():
@@ -61,12 +114,13 @@ class ForemenMixin:
             if gates.get("bound_task_id") != task_id and task_id not in (gates.get("spent") or {}):
                 continue
             bound = True
-            for worker in data.get("workers", {}).values():
+            for worker in workers.values():
                 if worker.get("task_id") == candidate.get("id") and worker.get("status") == "running":
-                    return dict(worker)
+                    return dict(worker), "gate"
         if bound:
-            return None
-        return self.foreman_for(project_id or "", data=data)
+            return None, "gate"
+        fallback = self.foreman_for(project_id or "", data=data)
+        return fallback, ("project" if fallback is not None else "none")
 
     def driver_named(
         self, project_id: str, name: str, *, data: dict[str, Any] | None = None

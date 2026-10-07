@@ -281,6 +281,16 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
                 ),
             )
             if appointed:
+                # Hand the orphans to the new lead on the record. Without it
+                # they still name their dead driver, read as orphaned on the
+                # next pass, and get yet another lead.
+                adopter = str((appointed.get("worker") or {}).get("id") or "")
+                if adopter:
+                    with coordinator.store.locked() as current_state:
+                        for worker in running:
+                            orphan = current_state.get("tasks", {}).get(worker.get("task_id"))
+                            if orphan is not None:
+                                orphan["adopted_by"] = adopter
                 reports.append(
                     f"helm watchdog: {project_id} had {len(running)} running worker(s) with "
                     f"no driver; appointed {appointed['worker']['id']}"

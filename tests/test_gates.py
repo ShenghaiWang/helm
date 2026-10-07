@@ -969,6 +969,27 @@ class GateDecisionDeliveryTests(HelmTestCase):
             msg="that advice is for a live session; there is none",
         )
 
+    def test_a_decision_opens_the_next_turn_of_an_idle_turns_lead(self) -> None:
+        """A lead between turns has no pane to type into; the decision is its prompt."""
+        foreman_task, worker = self._foreman_task("turnslead")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": worker["id"]}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.main(["--state-dir", str(self.state.directory), "gate", "propose",
+                          foreman_task["id"], "--type", "requirement", "--text", "goal: x"])
+        with self.state.locked() as data:
+            data["workers"][worker["id"]]["execution_mode"] = "turns"
+
+        from helm.herdr import HerdrAdapter
+        with mock.patch.object(HerdrAdapter, "ensure_turns_runner", return_value=True) as runner:
+            output = self._decide(foreman_task["id"])
+
+        self.assertNotIn("NOT DELIVERED", output)
+        runner.assert_called_once_with(worker["id"])
+        queued = json.loads(
+            (self.coordinator.turns_dir(worker["id"]) / "next.json").read_text()
+        )
+        self.assertIn("confirmed your requirement gate", queued[-1]["text"])
+
 
 class GatePairOwnershipTests(GateTests):
     def test_roots_task_spends_the_pair_so_the_foreman_cannot_respawn_it(self) -> None:

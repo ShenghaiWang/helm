@@ -1544,7 +1544,7 @@ class HerdrAdapter:
         # delegated -- harmless with one driver per project, because then the
         # two are the same record, and the wrong kind of wrong once a project
         # runs several.
-        foreman = self.coordinator.driver_of_task(
+        foreman, resolved_by = self.coordinator.driver_resolution(
             str(worker.get("task_id") or ""), data=data
         )
         if foreman is None or foreman["id"] == worker_id:
@@ -1576,6 +1576,18 @@ class HerdrAdapter:
             f"{kind}. It is yours to act on -- {nudge}. Message: "
             f"{_safe_text(latest.get('text', ''))[:600]}"
         )
+        if resolved_by == "project":
+            # Nothing on the record names this task's driver, so the
+            # project's first live lead is a guess. Say so where the next
+            # reader looks, so a report landing with the wrong lead is
+            # traceable to the task that carried no driver.
+            with contextlib.suppress(HelmError, OSError):
+                self.coordinator.record_task_progress_summary(
+                    str(task_id),
+                    f"no driver is recorded for this task; its {kind} went to "
+                    f"the project's lead {foreman['id']}",
+                    source="Helm",
+                )
         with contextlib.suppress(HelmError, HerdrUnavailable, OSError):
             return bool(self.answer_worker(foreman["id"], text))
         return False

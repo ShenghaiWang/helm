@@ -767,6 +767,12 @@ class LifecycleMixin:
                         # and a project's foreman, or two foremen -- each
                         # start one and neither can see the other's.
                         "reviews": reviews,
+                        # The agent whose command created this task, or None
+                        # for the root. It is who gets told the task's
+                        # outcome: a read-only task or a reviewer spends no
+                        # gate, so nothing else names the lead that asked
+                        # for it; see `driver_of_task`.
+                        "created_by": self.caller_identity()["worker_id"] or None,
                         # The tracker id this task implements, if any.
                         # Recorded as well as put in the branch so a reader
                         # does not have to parse it back out of a ref.

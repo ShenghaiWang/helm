@@ -516,6 +516,103 @@ class WorkerProtocolTests(HelmTestCase):
         self.assertEqual(delivered[-1][0], second["id"])
         self.assertNotEqual(delivered[-1][0], first["id"])
 
+    def _two_gated_leads(self, name: str) -> tuple[dict, list[tuple[dict, dict]]]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        drivers = []
+        for label in ("one", "two"):
+            driving = self.coordinator.create_foreman_task(project["id"])
+            driver = self.coordinator.prepare_external_worker(
+                driving["id"], [sys.executable, "-c", ""], execution="external"
+            )
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": driver["id"]}):
+                for kind, text in (
+                    ("requirement", f"goal: unit {label}; Done means: X; Out of scope: Y"),
+                    ("solution", f"approach: {label}; verification: tests"),
+                ):
+                    self.coordinator.propose_gate(driving["id"], kind, text)
+                    with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
+                        self.coordinator.decide_gate(
+                            driving["id"], kind, confirm=True, skip=False
+                        )
+                task = self.coordinator.create_task(project["id"], f"unit {label}")
+            drivers.append((driver, task))
+        return project, drivers
+
+    def _delivered_to(self, worker_id: str) -> list[tuple[str, str]]:
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        delivered: list[tuple[str, str]] = []
+        with mock.patch.object(
+            adapter, "answer_worker", side_effect=lambda w, t: delivered.append((w, t)) or True
+        ):
+            adapter.notify_foreman(worker_id)
+        return delivered
+
+    def test_a_review_verdict_reaches_the_lead_whose_work_was_reviewed(self) -> None:
+        """A reviewer spends no gate, so the gate binding cannot name its lead.
+
+        It fell through to the project's FIRST running lead: verdicts for one
+        ticket landed in another ticket's lead while the lead that asked for
+        the review sat idle with nothing queued.
+        """
+        project, ((first, _), (second, second_task)) = self._two_gated_leads("reviewroute")
+        # Started by the root, as `helm review` from the coordinator is.
+        review_task = self.coordinator.create_task(
+            project["id"], "review unit two", role="reviewer",
+            reviews=second_task["id"],
+        )
+        reviewer = self.coordinator.prepare_external_worker(
+            review_task["id"], [sys.executable, "-c", ""]
+        )
+        self.coordinator.record_worker_message(
+            reviewer["id"], "result", "APPROVED -- unit two is fine"
+        )
+
+        delivered = self._delivered_to(reviewer["id"])
+
+        self.assertEqual([w for w, _ in delivered], [second["id"]])
+        self.assertEqual(
+            self.coordinator.driver_resolution(review_task["id"])[1], "reviewed"
+        )
+
+    def test_a_task_a_lead_created_reports_to_that_lead_and_no_other(self) -> None:
+        """Read-only work spends no gate either; its creator is its driver.
+
+        And a known driver that is gone has no stand-in: handing its work to
+        the project's other lead is the misdelivery, not a recovery from it.
+        """
+        project, ((first, _), (second, _)) = self._two_gated_leads("creatorroute")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": second["id"]}):
+            look = self.coordinator.create_task(
+                project["id"], "investigate the flake", read_only=True
+            )
+        self.assertEqual(look["created_by"], second["id"])
+        coder = self.coordinator.prepare_external_worker(
+            look["id"], [sys.executable, "-c", ""]
+        )
+        self.coordinator.record_worker_message(coder["id"], "result", "found it")
+
+        self.assertEqual([w for w, _ in self._delivered_to(coder["id"])], [second["id"]])
+
+        self.coordinator.stop_worker(second["id"], reason="its session ended")
+        self.assertEqual(self._delivered_to(coder["id"]), [])
+        self.assertIsNone(self.coordinator.driver_of_task(look["id"]))
+
+    def test_a_task_with_no_recorded_driver_says_where_its_report_went(self) -> None:
+        project, _drivers = self._two_gated_leads("guessroute")
+        stray = self.coordinator.create_task(project["id"], "root's own", read_only=True)
+        coder = self.coordinator.prepare_external_worker(
+            stray["id"], [sys.executable, "-c", ""]
+        )
+        self.coordinator.record_worker_message(coder["id"], "result", "done")
+        guess = self.coordinator.foreman_for(project["id"])
+
+        self.assertEqual([w for w, _ in self._delivered_to(coder["id"])], [guess["id"]])
+        status = self.coordinator.project_status(project["id"])
+        self.assertTrue(any(
+            "no driver is recorded" in entry["text"] for entry in status["situation"]
+        ))
+
     def test_a_lead_cannot_finish_while_its_own_work_is_still_running(self) -> None:
         """A lead IS its unit of work, so standing down orphans it.
 
