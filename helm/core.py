@@ -866,8 +866,35 @@ class Coordinator(
     #: new instruction to a worker minutes later is still ordinary work.
     ANSWER_RACE_SECONDS = 120.0
 
-    def recent_answer(self, worker_id: str) -> dict[str, Any] | None:
-        """The answer this worker was sent moments ago, if it was sent one.
+    #: The `via` a `helm worker answer` record carries. Other paths write
+    #: `answer`-kind records too -- a routed request, an approval release, a
+    #: repair or cleanup notice -- and each says where it came from, because
+    #: only a driver answering by hand can be a second driver. A separate key
+    #: from `source`, which already means "an automated notice nobody has to
+    #: act on" to the unread-request check, and a routed request or a release
+    #: is not that.
+    ANSWER_VIA_DRIVER = "worker-answer"
+
+    @classmethod
+    def _answer_is_a_drivers(cls, message: dict[str, Any]) -> bool:
+        """Whether this `answer` record was a driver answering by hand.
+
+        Untagged records count, because they were written before the tag
+        existed and most came from this path -- refusing a real race is the
+        safe side to err on. The exception is a record whose payload already
+        names another path (a cleanup `source`, a `repair`), which no driver
+        ever wrote.
+        """
+        payload = message.get("payload") or {}
+        via = payload.get("via")
+        if via is None:
+            return "source" not in payload and "repair" not in payload
+        return via == cls.ANSWER_VIA_DRIVER
+
+    def recent_answer(
+        self, worker_id: str, *, sender: str | None = None
+    ) -> dict[str, Any] | None:
+        """The answer another driver sent this worker moments ago, if any.
 
         One worker must have one driver.  Prose said so and nothing enforced
         it, so a root and a project's task lead both answered the same question
@@ -883,6 +910,12 @@ class Coordinator(
         driver also pushes fresh instructions to a worker that asked nothing --
         and refusing those would break the ordinary case to prevent the rare
         one.  What is never ordinary is two answers inside two minutes.
+
+        Only a hand-written answer counts (see `_answer_is_a_drivers`): a
+        routed request or an approval release landing a minute earlier made
+        the next genuine answer read as a second driver, and the refusal then
+        quoted that unrelated text as "already sent". And `sender`, when given,
+        is the caller: its own earlier answer is a follow-up, not a race.
         """
         cutoff = _dt.datetime.now(_dt.timezone.utc).timestamp() - self.ANSWER_RACE_SECONDS
         data = self.store.load()
@@ -893,8 +926,22 @@ class Coordinator(
             try:
                 when = _dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
             except ValueError:
+                continue
+            if when.timestamp() < cutoff:
+                # The log is append-ordered: everything further back is older.
                 return None
-            return message if when.timestamp() >= cutoff else None
+            if not self._answer_is_a_drivers(message):
+                continue
+            if sender is not None and (message.get("payload") or {}).get("sender") == sender:
+                continue
+            return message
+        return None
+
+    def latest_answer(self, worker_id: str) -> dict[str, Any] | None:
+        """The newest `answer` record for this worker, whatever wrote it."""
+        for message in reversed(self.store.load().get("messages", [])):
+            if message.get("worker_id") == worker_id and message.get("kind") == "answer":
+                return message
         return None
 
     def _record_turn(

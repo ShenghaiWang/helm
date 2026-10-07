@@ -4210,11 +4210,19 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
         # and --force must not buy past it -- it exists for a
         # deliberate follow-up to your OWN worker, not for a boundary.
         coordinator.require_same_project(args.worker_id, "worker answer")
-        racing = None if args.force else coordinator.recent_answer(args.worker_id)
+        # Who is answering, recorded on the answer itself: the same driver
+        # following up is not a second driver, and a refusal has to say who
+        # the other one was.
+        sender = coordinator.caller_identity().get("worker_id") or "root"
+        racing = (
+            None if args.force
+            else coordinator.recent_answer(args.worker_id, sender=sender)
+        )
         if racing is not None:
+            other = (racing.get("payload") or {}).get("sender") or "an unrecorded sender"
             print(
                 f"Refusing: worker {args.worker_id} was already answered at "
-                f"{racing.get('created_at')}, which is inside Helm's "
+                f"{racing.get('created_at')} by {other}, which is inside Helm's "
                 f"{int(Coordinator.ANSWER_RACE_SECONDS)}s window."
             )
             print(
@@ -4227,10 +4235,13 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
             return 1
         # Record first: the answer is part of the task's audit trail
         # whether or not a presentation surface can deliver it.
-        task = coordinator.record_worker_message(args.worker_id, "answer", args.text)
+        task = coordinator.record_worker_message(
+            args.worker_id, "answer", args.text,
+            payload={"via": Coordinator.ANSWER_VIA_DRIVER, "sender": sender},
+        )
         # The inbox note IS the delivery; the pane is only a wake. Its
         # id is the recorded message's id, so the two are one record.
-        recorded = coordinator.recent_answer(args.worker_id) or {}
+        recorded = coordinator.latest_answer(args.worker_id) or {}
         note = coordinator.leave_inbox_note(
             args.worker_id, args.text, note_id=recorded.get("id")
         )
@@ -5177,7 +5188,9 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
     # "recorded". Recording first closes that gap: the request
     # survives in the durable record regardless of what
     # reachability turns out to be.
-    task = coordinator.record_worker_message(foreman["id"], "answer", args.text)
+    task = coordinator.record_worker_message(
+        foreman["id"], "answer", args.text, payload={"via": "route"}
+    )
     # Reachability is checked after recording, and is unaffected by
     # having just recorded: `session_reachable` asks whether there
     # is a live Herdr pane, with a provider that confirms it, for
@@ -5392,7 +5405,10 @@ def _cmd_approval(ctx: _Context, args: argparse.Namespace) -> int | None:
             # Recorded only when it actually arrived, so the escalation
             # stays open while nobody has been told.
             with contextlib.suppress(HelmError, OSError):
-                coordinator.record_worker_message(worker_id, "answer", message)
+                coordinator.record_worker_message(
+                    worker_id, "answer", message,
+                    payload={"via": "approval-release"},
+                )
             with contextlib.suppress(HelmError, OSError):
                 coordinator.mark_hold_delivered(args.task_id, delivered=True)
         # SAY WHICH IT WAS. "delivered" was doing two jobs: it read as "the

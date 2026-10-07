@@ -1644,6 +1644,76 @@ class OneDriverPerWorkerTests(HelmTestCase):
         worker = self._running_worker("fresh")
         self.assertIsNone(self.coordinator.recent_answer(worker["id"]))
 
+    def _answer(self, worker_id: str, text: str, *, as_worker: str = "") -> tuple[int, str]:
+        """Run the real `helm worker answer`, as the root or as a named agent."""
+        env = {"HELM_WORKER_ID": as_worker} if as_worker else {}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(
+                 cli, "HerdrAdapter",
+                 lambda coordinator: HerdrAdapter(coordinator, FakeHerdr()),
+             ), \
+             contextlib.redirect_stdout(out):
+            if not as_worker:
+                os.environ.pop("HELM_WORKER_ID", None)
+            code = cli.main([
+                "--state-dir", str(self.state.directory),
+                "worker", "answer", worker_id, "--text", text,
+            ])
+        return code, out.getvalue()
+
+    def test_a_routed_request_or_release_is_not_a_second_driver(self) -> None:
+        # Route and approval release write `answer` records too. Read as a
+        # driver's answer, either one made the next genuine answer inside two
+        # minutes look like a race -- and the refusal quoted that unrelated
+        # text back as "already sent".
+        worker = self._running_worker("routed")
+        self.coordinator.record_worker_message(
+            worker["id"], "answer", "routed request text", payload={"via": "route"}
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "answer", "release text", payload={"via": "approval-release"}
+        )
+        code, out = self._answer(worker["id"], "the genuine answer")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Refusing", out)
+        self.assertNotIn("routed request text", out)
+        self.assertIsNone(self.coordinator.recent_answer(worker["id"], sender="root"))
+
+    def test_the_same_driver_following_up_is_not_a_race(self) -> None:
+        worker = self._running_worker("followup")
+        code, out = self._answer(worker["id"], "first answer")
+        self.assertEqual(code, 0, out)
+        code, out = self._answer(worker["id"], "and one more thing")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Refusing", out)
+
+    def test_a_different_driver_inside_the_window_is_refused_and_named(self) -> None:
+        worker = self._running_worker("twodrivers")
+        code, _ = self._answer(worker["id"], "the root's answer")
+        self.assertEqual(code, 0)
+        first = [
+            m for m in self.coordinator.store.load()["messages"]
+            if m.get("worker_id") == worker["id"] and m.get("kind") == "answer"
+        ][-1]
+        self.assertEqual((first.get("payload") or {}).get("sender"), "root")
+        lead_task = self.coordinator.create_foreman_task(worker["project_id"])
+        lead = self.coordinator.launch_worker(
+            lead_task["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
+        )
+        code, out = self._answer(worker["id"], "the lead's answer", as_worker=lead["id"])
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"at {first['created_at']} by root", out)
+        self.assertIn("Already sent: the root's answer", out)
+
+    def test_an_untagged_answer_still_counts_as_a_driver(self) -> None:
+        # Records written before the tag existed are read on the safe side.
+        worker = self._running_worker("legacy")
+        self.coordinator.record_worker_message(worker["id"], "answer", "legacy answer")
+        racing = self.coordinator.recent_answer(worker["id"], sender="root")
+        self.assertIsNotNone(racing)
+        self.assertEqual(racing["text"], "legacy answer")
+
     def test_the_cli_exposes_a_force_escape_hatch(self) -> None:
         parser = cli._build_parser()
         parsed = parser.parse_args(["worker", "answer", "w-1", "--text", "x", "--force"])
