@@ -904,8 +904,15 @@ class PrecomputedReviewDiffTests(HelmTestCase):
         missing = dict(task, workspace=None)
         self.assertEqual(adapter._precomputed_diff(missing, "HEAD"), ("", ""))
 
-    def test_an_empty_diff_hands_over_nothing_rather_than_an_empty_file(self) -> None:
-        """An empty patch would read as 'nothing changed', which is a lie."""
+    def test_an_empty_diff_is_handed_over_as_empty_and_says_so(self) -> None:
+        """An empty patch from a git that succeeded is the truth: nothing changed.
+
+        It used to hand over nothing, because a failed git also read as empty
+        and an empty file would then have claimed 'nothing changed' falsely.
+        Git failure is now told apart (see the test above), and handing over
+        nothing on a real empty diff left the previous round's patch on disk
+        for a kept reviewer to judge as this commit.
+        """
         root = self.repo("nochange")
         project = self.coordinator.register_project(
             "Nochange", str(root), project_id="nochange"
@@ -916,7 +923,10 @@ class PrecomputedReviewDiffTests(HelmTestCase):
         )
         adapter = HerdrAdapter(self.coordinator, client=FakeHerdr())
         base = _git(Path(task["workspace"]), "rev-parse", task["base_branch"]).strip()
-        self.assertEqual(adapter._precomputed_diff(task, base), ("", ""))
+        fragment, path = adapter._precomputed_diff(task, base)
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "")
+        self.assertIn("THE DIFF FOR THIS COMMIT IS EMPTY", fragment)
+        self.assertIn("DO NOT RUN `git diff`", fragment)
 
 
 class AnswerDeliveryIsConfirmedTests(HelmTestCase):

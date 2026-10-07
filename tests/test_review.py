@@ -1703,6 +1703,111 @@ class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
         self.assertTrue(rounds[0]["result"])
         self.assertEqual(rounds[1]["opened_by"], driving["id"])
 
+    # ---------- a round's diff file always holds that round's commit ----------
+
+    def _revert_to_base(self, task: dict) -> None:
+        workspace = task["workspace"]
+        subprocess.run(["git", "-C", workspace, "rm", "-q", "change.txt"], check=True)
+        subprocess.run(["git", "-C", workspace, "commit", "-qm", "revert"], check=True)
+
+    def test_an_empty_diff_is_written_as_empty_never_left_stale(self) -> None:
+        project, task, author, a = self._reviewed_task("emptydiff")
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        base = adapter._review_target(project, self.coordinator.inspect_task(task["id"])["task"])
+        fragment, path = adapter._precomputed_diff(task, base, a)
+        self.assertIn("reviewed A", Path(path).read_text())
+        self._revert_to_base(task)
+        b = self._rev(task["workspace"])
+
+        fragment, path = adapter._precomputed_diff(task, base, b)
+        self.assertTrue(path)
+        self.assertEqual(Path(path).read_text(), "")
+        self.assertIn("EMPTY", fragment)
+
+        # A git failure is not an empty diff: nothing is handed over, and the
+        # earlier round's file is gone rather than standing in for this one.
+        adapter._precomputed_diff(task, base, a)
+        self.assertEqual(adapter._precomputed_diff(task, "0" * 40, b), ("", ""))
+        self.assertFalse((self.state.directory / "reviews" / task["id"] / "diff.patch").exists())
+
+    def _kept_review(self, name: str, *, author_change, flaky_diff: bool = False):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "write the code")
+        author = self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.commit_on_task_branch(task, "first round")
+        first = self._rev(task["workspace"])
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        original_launch = adapter.launch_task
+        original_diff = adapter._precomputed_diff
+        reviewer_ids: list[str] = []
+        told: list[str] = []
+        diff_calls: list[int] = []
+
+        def fake_launch(review_task_id, command, wait=False):
+            worker = original_launch(review_task_id, command, wait=wait)
+            reviewer_ids.append(worker["id"])
+            verdict = "CHANGES-REQUESTED x" if len(reviewer_ids) == 1 else "APPROVED fresh"
+            self.coordinator.record_worker_message(worker["id"], "result", verdict)
+            return worker
+
+        def fake_answer(worker_id, text):
+            if worker_id == author["id"]:
+                author_change(task)
+                self.coordinator.record_worker_message(worker_id, "result", "addressed")
+            else:
+                told.append(text)
+                self.coordinator.record_worker_message(worker_id, "result", "APPROVED kept")
+            return True
+
+        def diff(task_arg, base, tip=None):
+            diff_calls.append(1)
+            if flaky_diff and len(diff_calls) == 2:
+                base = "0" * 40  # git cannot diff against it
+            return original_diff(task_arg, base, tip)
+
+        with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
+             mock.patch.object(adapter, "answer_worker", side_effect=fake_answer), \
+             mock.patch.object(adapter, "_precomputed_diff", side_effect=diff), \
+             mock.patch.object(self.coordinator, "pick_reviewer_agent", return_value={
+                 "agent": "codex",
+                 "command": [sys.executable, "-c", "import time; time.sleep(60)"],
+                 "independence": "different-runtime", "reason": "test",
+             }):
+            outcome = adapter.run_review_cycle(task["id"], rounds=2, timeout=1.0)
+        data = self.coordinator.store.load()
+        review_tasks = [data["workers"][w]["task_id"] for w in reviewer_ids]
+        return task, outcome, first, review_tasks, told
+
+    def test_a_kept_reviewer_is_told_its_next_round_diff_is_empty(self) -> None:
+        task, outcome, first, review_tasks, told = self._kept_review(
+            "keptempty", author_change=self._revert_to_base
+        )
+        self.assertEqual(outcome["verdict"], "approved")
+        self.assertEqual(len(review_tasks), 1)
+        second = self._rev(task["workspace"])
+        self.assertIn("it is empty", told[-1])
+        patch = (self.state.directory / "reviews" / task["id"] / "diff.patch").read_text()
+        self.assertEqual(patch, "")
+        self.assertEqual(self._result(review_tasks[0])["payload"]["reviewed_tip"], second)
+
+    def test_a_kept_reviewer_whose_diff_cannot_be_rewritten_is_never_moved(self) -> None:
+        task, outcome, first, review_tasks, told = self._kept_review(
+            "keptfails",
+            author_change=lambda t: self.commit_on_task_branch(t, "second round"),
+            flaky_diff=True,
+        )
+        second = self._rev(task["workspace"])
+        # Never told a stale file was rewritten, and never moved to a commit
+        # it was not handed: a fresh reviewer takes the round.
+        self.assertEqual(told, [])
+        kept = self.coordinator.inspect_task(review_tasks[0])["task"]
+        self.assertEqual(kept["review_tip"], first)
+        self.assertEqual([r["tip"] for r in kept["review_rounds"]], [first])
+        self.assertEqual(len(review_tasks), 2)
+        self.assertEqual(outcome["verdict"], "approved")
+        self.assertEqual(self._result(review_tasks[1])["payload"]["reviewed_tip"], second)
+
 
 class ReviewerTicketTests(HelmTestCase):
     def test_a_reviewer_task_inherits_the_reviewed_tickets_ticket(self) -> None:

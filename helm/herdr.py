@@ -1683,13 +1683,38 @@ class HerdrAdapter:
         while round_number < rounds_budget:
             round_number += 1
             before = self._message_count()
-            # Taken before the reviewer is asked anything, so recovery reads
-            # only what this round produced.
-            mark = 0 if reviewer_worker is None else self._output_mark(reviewer_worker["id"])
             reviewer_is_running = False
             if reviewer_worker is not None:
                 current = self.coordinator.store.load().get("workers", {}).get(reviewer_worker["id"])
                 reviewer_is_running = bool(current and current.get("status") == "running")
+            kept_round: tuple[str, str] | None = None
+            if reviewer_worker is not None and reviewer_is_running:
+                kept_round = self._prepare_kept_review_round(
+                    task, review_base, review_task["id"]
+                )
+                if kept_round is None:
+                    # The kept reviewer cannot be handed this round: its diff
+                    # could not be rewritten, or its round could not be opened.
+                    # Telling it to re-read a file that still holds the last
+                    # round would have it judge those bytes as this commit, so
+                    # it is stood down and a fresh reviewer gets a fresh brief.
+                    with contextlib.suppress(HelmError, OSError):
+                        self.coordinator.stop_worker(
+                            reviewer_worker["id"],
+                            reason="the next review round could not be prepared for it",
+                        )
+                    with contextlib.suppress(HelmError, OSError):
+                        self.coordinator.record_task_progress_summary(
+                            task_id,
+                            f"review round {round_number}: the kept reviewer could not be "
+                            "handed this round's diff; starting a fresh reviewer",
+                            source="Review loop",
+                        )
+                    reviewer_worker = None
+                    reviewer_is_running = False
+            # Taken before the reviewer is asked anything, so recovery reads
+            # only what this round produced.
+            mark = 0 if reviewer_worker is None else self._output_mark(reviewer_worker["id"])
             if reviewer_worker is None or not reviewer_is_running:
                 # Read at brief time rather than from the snapshot above: the
                 # author may have reported an artifact since this loop started,
@@ -1789,19 +1814,17 @@ class HerdrAdapter:
                     review_task["id"], choice["command"], wait=False
                 )
             else:
-                # A new round reviews a new commit: pin it, rewrite the diff
-                # file the reviewer was told to read, and move the reviewer
-                # task's record to it before the reviewer is asked, so the
-                # verdict this round produces is attached to this commit.
-                review_tip = self._review_round_tip(task)
-                self._precomputed_diff(task, review_base, review_tip)
-                self.coordinator._open_review_round(review_task["id"], review_tip)
+                # Prepared above: the commit is pinned, the diff file the
+                # reviewer was told to read holds exactly it, and the round is
+                # open on the record, so the verdict is attached to it.
+                review_tip, emptiness = kept_round
                 self.answer_worker(
                     reviewer_worker["id"],
                     f"The author has pushed changes for round {round_number}. Re-read the "
                     f"diff on {task['branch']} at commit {review_tip} (the diff file you "
-                    "were given has been rewritten for it) and reply again with APPROVED or "
-                    "CHANGES-REQUESTED as the first word of a result message.",
+                    f"were given has been rewritten for it{emptiness}) and reply again "
+                    "with APPROVED or CHANGES-REQUESTED as the first word of a result "
+                    "message.",
                 )
             outcome = self._await_terminal(
                 reviewer_worker["id"],
@@ -2874,6 +2897,37 @@ class HerdrAdapter:
             )
         return tip
 
+    def _prepare_kept_review_round(
+        self, task: dict[str, Any], review_base: str, reviewer_task_id: str
+    ) -> tuple[str, str] | None:
+        """Pin, diff and open the next round for a kept reviewer, or None.
+
+        In that order, and all or nothing as far as the reviewer can see: the
+        round is opened on the record only once its diff file holds exactly
+        the pinned commit. Returns the commit and a note for the message when
+        its diff is empty; None when the round cannot be handed to this
+        reviewer, with nothing moved.
+        """
+        try:
+            review_tip = self._review_round_tip(task)
+        except HelmError:
+            return None
+        _fragment, diff_path = self._precomputed_diff(task, review_base, review_tip)
+        if not diff_path:
+            return None
+        try:
+            self.coordinator._open_review_round(reviewer_task_id, review_tip)
+        except HelmError:
+            return None
+        try:
+            empty = not Path(diff_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            empty = False
+        return review_tip, (
+            " -- it is empty: at this commit the branch makes no change against "
+            "the review base" if empty else ""
+        )
+
     def _precomputed_diff(
         self, task: dict[str, Any], review_base: str, review_tip: str | None = None
     ) -> tuple[str, str]:
@@ -2893,9 +2947,13 @@ class HerdrAdapter:
         removes the honest reason to re-run it -- an incremental reader that
         lost its place had nothing else to go back to.
 
-        Returns (brief_fragment, path). On any failure the fragment is empty and
-        the reviewer falls back to reading the repository itself: a diff Helm
-        could not compute must not become a review that cannot happen.
+        Returns (brief_fragment, path). On any failure both are empty, any
+        earlier round's file is removed so nothing can read it as this round's,
+        and the reviewer falls back to reading the repository itself: a diff
+        Helm could not compute must not become a review that cannot happen. An
+        empty diff is not a failure: the file is written empty and the brief
+        says so, because a stale patch left in its place would be judged as
+        this commit.
         """
         workspace = task.get("workspace")
         branch = task.get("branch")
@@ -2906,21 +2964,29 @@ class HerdrAdapter:
         head = review_tip or branch
         directory = self.coordinator.store.directory / "reviews" / task["id"]
         target = directory / "diff.patch"
+        stat_target = directory / "diff.stat"
         try:
             directory.mkdir(parents=True, exist_ok=True)
-            patch = _git(
-                Path(workspace), "diff", f"{review_base}...{head}", check=False
-            )
-            stat = _git(
-                Path(workspace), "diff", "--stat", f"{review_base}...{head}", check=False
-            )
-            if not patch.strip():
-                return "", ""
+            # Checked, so a git failure is told apart from an empty diff: the
+            # first leaves nothing to hand over, the second is a real answer.
+            patch = _git(Path(workspace), "diff", f"{review_base}...{head}")
+            stat = _git(Path(workspace), "diff", "--stat", f"{review_base}...{head}")
             target.write_text(patch, encoding="utf-8")
-            stat_target = directory / "diff.stat"
             stat_target.write_text(stat, encoding="utf-8")
         except (OSError, HelmError):
+            for stale in (target, stat_target):
+                with contextlib.suppress(OSError):
+                    stale.unlink()
             return "", ""
+        if not patch.strip():
+            return (
+                "\n\nTHE DIFF FOR THIS COMMIT IS EMPTY:\n"
+                f"  {target}\n"
+                f"At {head} the branch makes no change against the base commit "
+                "named above; the file is empty on purpose. There is nothing to "
+                "judge beyond confirming that, so DO NOT RUN `git diff`.\n\n",
+                str(target),
+            )
         # Bounded. The whole stat went inline, ahead of the evidence and the
         # artifact sections, so a change touching a few hundred files pushed
         # everything after it off the end of the brief. The list is in a file
