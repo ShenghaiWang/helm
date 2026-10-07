@@ -90,6 +90,31 @@ class CliStatusTests(HelmTestCase):
             sum(1 for line in printed.splitlines() if worker["id"] in line), 1
         )
 
+    def test_needs_you_leaves_out_a_request_the_commander_already_released(self) -> None:
+        """Released and delivered, it waits on the worker, not on the commander."""
+        root = self.repo("released-cli")
+        project = self.coordinator.register_project("Released", str(root), project_id="released-cli")
+        task = self.coordinator.create_task(project["id"], "write it and push it")
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "the change")
+        self.pass_review(task)
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready to push", payload={"action": "push"},
+        )
+        self.coordinator.release_task_hold(task["id"], action="push", confirm=True)
+        self.coordinator.mark_hold_delivered(task["id"], delivered=True)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_status(self.coordinator, project["id"])
+        printed = output.getvalue()
+        self.assertNotIn("Needs you", printed)
+        self.assertNotIn("Authorize or refuse", printed)
+        self.assertIn("Already authorized, waiting on the worker (1)", printed)
+        self.assertIn(f"task {task['id']}: waiting on worker {worker['id']} since", printed)
+
     def test_all_palette_colours_map_to_unique_nonempty_glyphs(self) -> None:
         # Several projects report into one session and a line without its
         # project is ambiguous, so the glyph is the separator. The palette held

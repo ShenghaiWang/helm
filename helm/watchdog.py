@@ -244,6 +244,15 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
             current[entry["worker_id"]] = first
     with _quiet():
         memory.write_text(json.dumps(current), encoding="utf-8")
+    # An authorization only the asking session can spend, and that session
+    # is gone -- settled above, or ended some other way. Left open, the task
+    # sat in approval-needed and the commander saw it as waiting on them.
+    with _quiet():
+        for task_id in coordinator.abandon_unreachable_authorizations():
+            reports.append(
+                f"helm watchdog: task {task_id}'s authorization was abandoned; "
+                "the session that asked for it has ended"
+            )
     data = store.load()
     for project in data.get("projects", {}).values():
         project_id = project["id"]

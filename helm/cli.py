@@ -925,6 +925,9 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
     # First, because it is the only part nobody else can act on. Everything
     # below is what Helm is doing; this is what it is waiting on a human for.
     escalations = coordinator.open_escalations(project_id)
+    # Released and delivered: the worker's move, not an ask of the commander.
+    authorized = [item for item in escalations if item.get("authorized_at")]
+    escalations = [item for item in escalations if not item.get("authorized_at")]
     if escalations:
         print(f"Needs you ({len(escalations)}):")
         for item in escalations:
@@ -939,6 +942,15 @@ def _print_status(coordinator: Coordinator, project_id: str | None) -> None:
             print(
                 f"  {glyph} {item['kind']:15} {item['role']:8} {item['worker_id']}  "
                 f"{first[:88]}{mark}"
+            )
+        print()
+    if authorized:
+        print(f"Already authorized, waiting on the worker ({len(authorized)}):")
+        for item in authorized:
+            glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
+            print(
+                f"  {glyph} task {item['task_id']}: waiting on worker {item['worker_id']} "
+                f"since {_age_label(item['authorized_at']).strip()}"
             )
         print()
     # A worker result nobody merged is not an escalation -- no agent is stuck
@@ -4629,11 +4641,30 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
     # carry all three -- a 2-tuple here crashes the whole command,
     # which is the one command that must never fail silently.
     entries: list[tuple[str, str, str]] = []
+    # Released and delivered, so the next move is the worker's action-start,
+    # not the commander's. Listed apart from the asks and never counted as
+    # one: an authorization the commander already gave, shown for hours as
+    # waiting on them, is the list crying wolf.
+    authorized: list[tuple[str, str, str]] = []
     for item in coordinator.open_escalations(None):
         glyph = _glyph_for(coordinator, item["project_id"]) if item["project_id"] else " "
         first = next(
             (line.strip() for line in item["text"].splitlines() if line.strip()), ""
         )
+        if item.get("authorized_at"):
+            stamp = str(item["authorized_at"])
+            line = (
+                f"{glyph} {item['project_id']} authorized, waiting on worker "
+                f"{item['worker_id']} since {_age_label(stamp).strip()} "
+                f"(task {item['task_id']}): {first[:80]}"
+            )
+            authorized.append((
+                stamp,
+                f"{_when_label(stamp)} {line}",
+                f"{glyph} {item['project_id']} authorized, waiting on worker "
+                f"{item['worker_id']} (task {item['task_id']}): {first}",
+            ))
+            continue
         stamp = str(item.get("at") or item.get("created_at") or "")
         # The NAME, not the generated key. A line reading "w-z04ead74c431
         # paused on push" makes the reader resolve an id before it means
@@ -4766,6 +4797,9 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
     for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
         if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
             continue
+        # Said once already, above, as the worker's move.
+        if entry["verdict"] == "authorized-unspent" and authorized:
+            continue
         # --heal acts only on the one verdict that is EVIDENCE rather
         # than inference: the process is gone. A stalled worker may be
         # thinking and an erroring one may recover; killing either on
@@ -4815,7 +4849,9 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
             entries.append((stamp, f"{_when_label(stamp)} {line}", line))
     ordered = sorted(entries, key=lambda e: e[0], reverse=True)
     lines = [text for _at, text, _identity in ordered]
+    authorized.sort(key=lambda e: e[0], reverse=True)
     if args.changes:
+        ordered = ordered + authorized
         # Only what is NEW since the last --changes call. An unattended
         # watch that re-prints the whole list every poll buries the one
         # new line under things already read, and trains its reader to
@@ -4858,12 +4894,15 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
         for line in fresh:
             print(line.strip())
         return 0
-    if not entries:
-        return 0
-    print(f"Commander, for your attention ({len(lines)}):")
-    for line in lines:
-        print(f"  {line}")
-    print("  (helm status for detail; helm ack <project> once relayed)")
+    if entries:
+        print(f"Commander, for your attention ({len(lines)}):")
+        for line in lines:
+            print(f"  {line}")
+        print("  (helm status for detail; helm ack <project> once relayed)")
+    if authorized:
+        print(f"Already authorized, waiting on the worker ({len(authorized)}):")
+        for _at, text, _identity in authorized:
+            print(f"  {text}")
     return 0
 
 

@@ -1941,3 +1941,117 @@ class NoBranchLeavesUnreviewedTests(HelmTestCase):
         pushed = self.coordinator.publish_task_branch(task["id"], confirm=True)
         self.assertEqual(pushed["branch"], task["branch"])
         self.assertIn(task["branch"], self._run_git(remote, "branch", "--list"))
+
+
+class AReleasedHoldIsTheWorkersMoveTests(HelmTestCase):
+    """After release, an open hold waits on the worker, and a gone worker ends it.
+
+    A released hold stays open until the asking session runs action-start.
+    `helm pending` listed it as the commander's ask for hours meanwhile, and
+    when the push went another way or the session died, nothing ever closed
+    it: the task stayed in approval-needed.
+    """
+
+    def _asking(self, name: str, action: str = "push", *, status: str = "") -> tuple[Path, dict, dict]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name, str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "write it and push it")
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "the change")
+        self.pass_review(task)
+        if status:
+            with self.state.locked() as data:
+                data["tasks"][task["id"]]["status"] = status
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", f"ready to {action} the branch",
+            payload={"action": action},
+        )
+        return root, task, worker
+
+    def _released(self, name: str, action: str = "push", *, status: str = "") -> tuple[Path, dict, dict]:
+        root, task, worker = self._asking(name, action, status=status)
+        self.coordinator.release_task_hold(task["id"], action=action, confirm=True)
+        self.coordinator.mark_hold_delivered(task["id"], delivered=True)
+        return root, task, worker
+
+    def _hold(self, task_id: str) -> dict:
+        return self.coordinator.latest_hold(self.coordinator.inspect_task(task_id)["task"])
+
+    def _pending(self) -> str:
+        buffer = io.StringIO()
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
+             contextlib.redirect_stdout(buffer):
+            cli.main(["--state-dir", str(self.state.directory), "pending"])
+        return buffer.getvalue()
+
+    def test_a_released_and_delivered_hold_is_the_workers_move_not_an_ask(self) -> None:
+        _root, task, worker = self._released("workersmove")
+        entry = next(
+            e for e in self.coordinator.open_escalations() if e["task_id"] == task["id"]
+        )
+        self.assertTrue(entry.get("authorized_at"))
+
+        printed = self._pending()
+        asks, _sep, authorized = printed.partition("Already authorized, waiting on the worker")
+        # Neither the escalation nor the report that raised it is still an ask.
+        self.assertNotIn("ready to push", asks)
+        self.assertIn(f"authorized, waiting on worker {worker['id']} since", authorized)
+
+    def test_a_request_still_waiting_on_the_commander_stays_an_ask(self) -> None:
+        _root, _task, worker = self._asking("stillasks")
+        printed = self._pending()
+        self.assertIn(f"approval-needed {worker['id']}: ready to push", printed)
+        self.assertNotIn("authorized, waiting", printed)
+
+    def test_the_root_pushing_the_branch_closes_the_request_it_made_moot(self) -> None:
+        root, task, _worker = self._released("overtaken")
+        remote = Path(self.temp.name) / "overtaken-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(remote)], check=True)
+
+        self.coordinator.publish_task_branch(task["id"], confirm=True)
+
+        self.assertEqual(self._hold(task["id"])["status"], "closed")
+        record = self.coordinator.inspect_task(task["id"])["task"]
+        self.assertNotEqual(record["status"], "approval-needed")
+        self.assertNotIn(
+            task["id"], {e["task_id"] for e in self.coordinator.open_escalations()}
+        )
+
+    def test_an_authorization_whose_session_ended_is_abandoned(self) -> None:
+        _root, task, worker = self._released("sessiongone", action="publish")
+        self.coordinator.stop_worker(worker["id"], reason="its session ended")
+        # Stopping keeps the hold for repair; nothing has abandoned it yet.
+        self.assertEqual(self._hold(task["id"])["status"], "authorized-pending-delivery")
+
+        self.assertEqual(self.coordinator.abandon_unreachable_authorizations(), [task["id"]])
+
+        self.assertEqual(self._hold(task["id"])["status"], "abandoned")
+        record = self.coordinator.inspect_task(task["id"])["task"]
+        self.assertNotEqual(record["status"], "approval-needed")
+        self.assertNotIn(
+            task["id"], {e["task_id"] for e in self.coordinator.open_escalations()}
+        )
+        self.assertEqual(self.coordinator.abandon_unreachable_authorizations(), [])
+
+    def test_a_finished_task_overtaken_by_the_roots_push_goes_back_to_finished(self) -> None:
+        root, task, worker = self._released("finished", status="completed")
+        self.assertEqual(self._hold(task["id"])["prior_status"], "completed")
+        self.coordinator.stop_worker(worker["id"], reason="its session ended")
+        remote = Path(self.temp.name) / "finished-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(remote)], check=True)
+
+        self.coordinator.publish_task_branch(task["id"], confirm=True)
+
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["status"], "completed"
+        )
+
+    def test_a_request_not_yet_decided_is_left_for_repair(self) -> None:
+        _root, task, worker = self._asking("leftforrepair")
+        self.coordinator.stop_worker(worker["id"], reason="its session ended")
+        self.assertEqual(self.coordinator.abandon_unreachable_authorizations(), [])
+        self.assertEqual(self._hold(task["id"])["status"], "waiting")

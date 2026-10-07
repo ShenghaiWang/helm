@@ -1876,6 +1876,10 @@ class Coordinator(
           hold at all, and treating that as resolving the escalation would
           hide a still-open protected-action decision.
 
+          An entry whose hold the commander has already released, and whose
+          authorization reached the session, carries `authorized_at`: it is
+          open, but it is the worker's move, not the commander's ask.
+
         `question` and `blocker` treat a later `answer` to the same worker as
         resolving it, same as before; `approval-needed` does not, per above.
         Only the newest pending ask *of each kind* per worker is considered --
@@ -2045,6 +2049,19 @@ class Coordinator(
                     else str(hold.get("text") or "")
                 ),
             }
+            delivery = hold.get("delivery") or {}
+            if hold.get("status") == "authorized-pending-delivery" and delivery.get("delivered_at"):
+                # DECIDED AND DELIVERED. What remains is the worker's
+                # `action-start`, not anything the commander can do -- yet
+                # this listed it as their ask for hours, beside the requests
+                # that really were waiting on them. Kept in the list, since
+                # the hold is still open, and marked so a reader can say it
+                # as what it is.
+                entry["authorized_at"] = str(
+                    delivery.get("delivered_at")
+                    or (hold.get("authorization") or {}).get("authorized_at")
+                    or ""
+                )
             if message is None:
                 entry["diagnostic"] = (
                     "this hold's own escalation message could not be found or "

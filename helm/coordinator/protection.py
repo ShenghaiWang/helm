@@ -32,6 +32,7 @@ from ..paths import _file_digest, canonical
 from ..values import (
     DELIVERED_TASK_STATES,
     HOLD_OPEN_STATUSES,
+    HOLD_RESTORABLE_STATUSES,
     HOLD_TASK_STATUS,
     HOLD_TRANSITIONS,
     PROTECTED_ACTIONS,
@@ -418,7 +419,101 @@ class ProtectionMixin:
             # `approval-needed` with no answerable hold is residue: cleanup
             # refuses it and no round can reopen it. Failed is the honest,
             # cleanable, retryable state, and its log is still the evidence.
+            # Not the status it asked from: that depends on whether the exit
+            # or the request was recorded first, and the two orders must end
+            # in the same place.
             task["status"] = "failed"
+
+    @staticmethod
+    def _status_after_hold(hold: dict[str, Any]) -> str | None:
+        """The settled status a task asked from, if it had one."""
+        prior = hold.get("prior_status")
+        return prior if prior in HOLD_RESTORABLE_STATUSES else None
+
+    def _fulfil_branch_holds(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        *,
+        branch: str,
+        remote: str,
+    ) -> list[tuple[str, str]]:
+        """Close every unspent push or publish request for a branch that just landed.
+
+        A request released and then overtaken -- the root pushed the branch
+        itself -- stayed `authorized-pending-delivery` for good, since only
+        the asking session's action-start moves it, and that session had no
+        reason to run it. `helm pending` kept it on the commander's list for
+        hours, and the task sat in `approval-needed`.
+
+        Matches the task's own hold and any lead's hold whose subject is this
+        task. An in-flight hold is left alone: its worker is acting now.
+        """
+        closed: list[tuple[str, str]] = []
+        for holder in data.get("tasks", {}).values():
+            if holder.get("project_id") != project["id"]:
+                continue
+            hold = self.task_hold(holder)
+            if hold is None or hold.get("action") not in self._BRANCH_ACTIONS:
+                continue
+            if hold.get("status") not in {"waiting", "authorized-pending-delivery"}:
+                continue
+            about = hold.get("subject_task_id") or holder["id"]
+            if about != task["id"]:
+                continue
+            self._move_hold(
+                data, project, holder, hold, "fulfil",
+                detail=(
+                    f"Approval request closed: {branch} was pushed to {remote} by "
+                    "the root, so there is nothing left to authorize"
+                ),
+                message_kind="status",
+            )
+            if holder.get("status") == "approval-needed":
+                # A session still live goes on working; one that has ended
+                # leaves finished work, which the push just published.
+                asker = data.get("workers", {}).get(str(hold.get("worker_id") or "")) or {}
+                holder["status"] = (
+                    "running" if asker.get("status") == "running"
+                    else self._status_after_hold(hold) or "completed"
+                )
+            closed.append((holder["id"], hold["id"]))
+        return closed
+
+    def abandon_unreachable_authorizations(self) -> list[str]:
+        """Abandon released holds whose asking session has ended. Returns task ids.
+
+        An authorization is spent only by the session that asked, at
+        `action-start`. Once that session is gone nothing can spend it, and
+        the hold sat open with the task in `approval-needed` indefinitely. A
+        hold still `waiting` is left for `helm approval repair`: the decision
+        is still the commander's to make. Run by the watchdog.
+        """
+        abandoned: list[tuple[str, str, str]] = []
+        with self.store.locked() as data:
+            for task in data.get("tasks", {}).values():
+                hold = self.task_hold(task)
+                if hold is None or hold.get("status") != "authorized-pending-delivery":
+                    continue
+                worker = data.get("workers", {}).get(str(hold.get("worker_id") or ""))
+                if worker is not None and worker.get("status") == "running":
+                    continue
+                project = data.get("projects", {}).get(task.get("project_id"))
+                if project is None:
+                    continue
+                self._abandon_open_hold(
+                    data, project, task,
+                    f"its session ({hold.get('worker_id')}) ended before it used the "
+                    f"{hold.get('action')} authorization",
+                )
+                abandoned.append((project["id"], task["id"], hold["id"]))
+        # The commander's item for each, closed once the decision is recorded.
+        for project_id, task_id, hold_id in abandoned:
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_project_action_items(project_id, hold_id)
+            self._settle_request_report(project_id, task_id, "abandoned")
+        return [task_id for _project_id, task_id, _hold_id in abandoned]
     def withdraw_task_hold(self, worker_id: str, *, reason: str = "") -> dict[str, Any]:
         """Let a session take back its own unspent approval request.
 
@@ -647,6 +742,12 @@ class ProtectionMixin:
             if refusal is not None:
                 raise SafetyError(refusal)
         open_hold = self.task_hold(task)
+        # What the task was before it paused, so a hold that ends without
+        # failing the work can hand it back. A request superseding an earlier
+        # one inherits that one's, since the task was already paused.
+        prior_status = task.get("status")
+        if prior_status == "approval-needed":
+            prior_status = (self.latest_hold(task) or {}).get("prior_status")
         if open_hold is not None:
             if open_hold["status"] != "waiting" or open_hold["action"] != action:
                 raise HelmError(
@@ -683,6 +784,7 @@ class ProtectionMixin:
             "message_id": message["id"],
             "text": _safe_text(message.get("text", ""))[:900],
             "requested_at": now(),
+            "prior_status": prior_status,
             # The exact state being asked about. Bound now, compared later, and
             # never silently replaced: this is what the commander is deciding.
             "snapshot": snapshot,
@@ -1145,7 +1247,32 @@ class ProtectionMixin:
                     f"(awaiting delivery to {released['hold']['worker_id']})"
                     + (f": {_safe_text(note).strip()[:200]}" if note else ""),
                 )
+            # Deciding the request is the commander acting on it, so neither
+            # the report that raised it nor its "Authorize or refuse" item is
+            # still owed to them.
+            self._settle_request_report(project["id"], task_id, "release")
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_project_action_items(project["id"], released["hold"]["id"])
         return released
+
+    def _settle_request_report(self, project_id: str, task_id: str, by: str) -> None:
+        """Mark a task's owed "Approval request" report as dealt with.
+
+        That report is owed until acknowledged, and nothing acknowledged it on
+        release: `helm pending` kept the request on the commander's list
+        after they had answered it.
+        """
+        with contextlib.suppress(HelmError, OSError):
+            with self._status_transaction(project_id) as status:
+                for entry in status.get("situation", []):
+                    if (
+                        entry.get("task_id") == task_id
+                        and entry.get("surface")
+                        and not entry.get("acknowledged_at")
+                        and str(entry.get("text", "")).startswith("Approval request")
+                    ):
+                        entry["acknowledged_at"] = now()
+                        entry["acknowledged_by"] = by
     def mark_hold_delivered(self, task_id: str, *, delivered: bool) -> dict[str, Any]:
         """Record whether the authorization actually reached the worker's session.
 
@@ -1736,6 +1863,13 @@ class ProtectionMixin:
                 f"Pushed {branch} to {remote} for review",
                 {"remote": remote, "branch": branch, "grant_id": grant_id},
             )
+            fulfilled = self._fulfil_branch_holds(
+                live, live_project, live_task, branch=branch, remote=remote
+            )
+        for holder_id, hold_id in fulfilled:
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_project_action_items(project["id"], hold_id)
+            self._settle_request_report(project["id"], holder_id, "fulfilled")
         return {
             "task_id": task_id,
             "branch": branch,

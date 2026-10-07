@@ -935,7 +935,18 @@ HOLD_TRANSITIONS: dict[tuple[str, str], str] = {
     ("in-flight", "abandon"): "abandoned",
     # A repeat of the same unanswered request is the worker restating itself.
     ("waiting", "restate"): "waiting",
+    # The thing asked for was done another way -- the root pushed the same
+    # branch itself -- so there is nothing left to authorize or to spend.
+    ("waiting", "fulfil"): "closed",
+    ("authorized-pending-delivery", "fulfil"): "closed",
 }
+
+
+#: The task statuses a hold may hand a task back to once what it asked for
+#: was done another way. A task asks from one of these when its work is finished and
+#: only the protected step remained; anything else -- a worker that asked
+#: mid-run -- has no settled state to go back to.
+HOLD_RESTORABLE_STATUSES = frozenset({"completed", "approved", "pr-open"})
 
 
 #: The task status each open hold state implies. A paused task is paused in one

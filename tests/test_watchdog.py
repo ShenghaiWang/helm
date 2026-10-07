@@ -149,6 +149,39 @@ class WatchdogTests(HelmTestCase):
         self.assertEqual(appointed, [project["id"]])
         self.assertIn("appointed w-new-driver", reports[0])
 
+    def test_an_authorization_nobody_can_spend_is_abandoned_by_the_watchdog(self) -> None:
+        """Only the asking session spends an authorization; once it is gone, nothing can.
+
+        The hold sat open and the task in approval-needed, listed as waiting
+        on the commander, until somebody noticed by hand.
+        """
+        import sys
+
+        root = self.repo("unspendable")
+        project = self.coordinator.register_project("Unspendable", str(root), project_id="unspendable")
+        task = self.coordinator.create_task(project["id"], "write it and push it")
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "the change")
+        self.pass_review(task)
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready to push", payload={"action": "push"},
+        )
+        self.coordinator.release_task_hold(task["id"], action="push", confirm=True)
+        self.coordinator.stop_worker(worker["id"], reason="its session ended")
+
+        memory = Path(self.temp.name) / "unspendable.json"
+        with mock.patch.object(type(self.coordinator), "worker_health", return_value=[]), \
+             mock.patch("helm.core.Coordinator", return_value=self.coordinator), \
+             mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
+            reports = watchdog.heal_pass(None, memory)
+
+        self.assertTrue(any(task["id"] in line and "abandoned" in line for line in reports), reports)
+        record = self.coordinator.inspect_task(task["id"])["task"]
+        self.assertNotEqual(record["status"], "approval-needed")
+        self.assertEqual(self.coordinator.latest_hold(record)["status"], "abandoned")
+
     def test_an_orphan_handed_to_a_new_lead_is_not_handed_on_again(self) -> None:
         """The appointment is recorded on the orphan, so the next pass sees a driver.
 
