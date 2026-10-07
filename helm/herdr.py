@@ -8,6 +8,7 @@ focus, or workspace order is performed.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import re
 import os
@@ -522,6 +523,43 @@ class HerdrAdapter:
     def __init__(self, coordinator: Coordinator, client: HerdrClient | None = None):
         self.coordinator = coordinator
         self.client = client or SubprocessHerdrClient()
+        self._layout_depth = threading.local()
+
+    @contextlib.contextmanager
+    def _layout_lock(self) -> Any:
+        """Hold the root's one Herdr layout lock, across processes.
+
+        Placing a worker beside its ticket's panes and closing a ticket tab
+        with its last pane each read the layout record, call Herdr, and write
+        the record back. Done unlocked, a close that had just found itself the
+        last pane in a tab closed it after a launch elsewhere split a new
+        worker into that same tab -- killing a worker that had only just
+        started. So the read, the Herdr call and the record write happen as
+        one step under this lock, in every process.
+
+        Its own file, beside the state lock and never inside it: Herdr calls
+        are slow, and holding the state lock across one would stall every
+        worker's report. The order is always this lock first, then the state
+        lock. Re-entrant within one thread, so a locked step may call another.
+        """
+        depth = getattr(self._layout_depth, "value", 0)
+        if depth:
+            self._layout_depth.value = depth + 1
+            try:
+                yield
+            finally:
+                self._layout_depth.value -= 1
+            return
+        path = self.coordinator.store.directory / "herdr-layout.lock"
+        with path.open("a+", encoding="utf-8") as lock:
+            os.chmod(path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            self._layout_depth.value = 1
+            try:
+                yield
+            finally:
+                self._layout_depth.value = 0
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _project_label(project: dict[str, Any]) -> str:
@@ -1188,15 +1226,21 @@ class HerdrAdapter:
         worker_layout: dict[str, Any] | None = None
         place: dict[str, Any] | None = None
         try:
-            place = self._place_worker(project_layout, ticket, tab_label, worker["workspace"])
-            if place.get("ticket"):
-                worker_label = self._worker_pane_label(task, worker)
-            else:
-                worker_label = self._worker_tab_label(task, worker, snapshot)
-                if place.get("new_tab") and worker_label != tab_label:
-                    with contextlib.suppress(HerdrUnavailable):
-                        self.client.tab_rename(place["tab_id"], worker_label)
-            worker_layout = self._record_worker_layout(worker, project_layout, place, worker_label)
+            # Choosing the tab, splitting into it and recording the pane are
+            # one step under the layout lock, so a close deciding a ticket
+            # tab is empty cannot interleave with a split into it.
+            with self._layout_lock():
+                place = self._place_worker(project_layout, ticket, tab_label, worker["workspace"])
+                if place.get("ticket"):
+                    worker_label = self._worker_pane_label(task, worker)
+                else:
+                    worker_label = self._worker_tab_label(task, worker, snapshot)
+                    if place.get("new_tab") and worker_label != tab_label:
+                        with contextlib.suppress(HerdrUnavailable):
+                            self.client.tab_rename(place["tab_id"], worker_label)
+                worker_layout = self._record_worker_layout(
+                    worker, project_layout, place, worker_label
+                )
             if place.get("ticket"):
                 # The tab says the ticket; the pane says which agent this is.
                 with contextlib.suppress(HerdrUnavailable):
@@ -1208,10 +1252,11 @@ class HerdrAdapter:
             # only the pane when it was split into a ticket tab other agents
             # are still working in.
             if worker_layout is not None:
-                with contextlib.suppress(HerdrUnavailable):
-                    self._close_worker_surface(worker["id"])
-                with self.coordinator.store.locked() as current:
-                    self._herdr_state(current)["workers"].pop(worker["id"], None)
+                with self._layout_lock():
+                    with contextlib.suppress(HerdrUnavailable):
+                        self._close_worker_surface(worker["id"])
+                    with self.coordinator.store.locked() as current:
+                        self._herdr_state(current)["workers"].pop(worker["id"], None)
             elif place is not None:
                 with contextlib.suppress(HerdrUnavailable):
                     if place.get("new_tab"):
@@ -2139,17 +2184,20 @@ class HerdrAdapter:
         tab_id = layout.get("tab_id")
         stopped["tab_closed"] = False
         if tab_id:
-            try:
-                self._close_worker_surface(worker_id)
-                stopped["tab_closed"] = True
-            except HerdrNotFound:
-                stopped["tab_closed"] = True
-            except HerdrUnavailable:
-                # The record is already settled; a pane Helm cannot reach is a
-                # presentation problem, not an unstoppable worker.
-                return stopped
-            with self.coordinator.store.locked() as live:
-                self._herdr_state(live).get("workers", {}).pop(worker_id, None)
+            # The close decision and the record removal are one step under the
+            # layout lock: see `_layout_lock`.
+            with self._layout_lock():
+                try:
+                    self._close_worker_surface(worker_id)
+                    stopped["tab_closed"] = True
+                except HerdrNotFound:
+                    stopped["tab_closed"] = True
+                except HerdrUnavailable:
+                    # The record is already settled; a pane Helm cannot reach is a
+                    # presentation problem, not an unstoppable worker.
+                    return stopped
+                with self.coordinator.store.locked() as live:
+                    self._herdr_state(live).get("workers", {}).pop(worker_id, None)
         return stopped
 
     @staticmethod
@@ -2286,18 +2334,20 @@ class HerdrAdapter:
                     self.coordinator.stop_turns(worker_id)
                     continue
                 self.coordinator._let_turns_finish(worker)
-            try:
-                self._close_worker_surface(worker_id)
-                closed.append(worker_id)
-            except HerdrNotFound:
-                closed.append(worker_id)
-            except HerdrUnavailable:
-                continue
-            # Dropped now, not after the sweep: the next worker in the same
-            # ticket tab decides between closing its pane and closing the tab
-            # by who is still recorded there.
-            with self.coordinator.store.locked() as live:
-                self._herdr_state(live).get("workers", {}).pop(worker_id, None)
+            with self._layout_lock():
+                try:
+                    self._close_worker_surface(worker_id)
+                    closed.append(worker_id)
+                except HerdrNotFound:
+                    closed.append(worker_id)
+                except HerdrUnavailable:
+                    continue
+                # Dropped now, not after the sweep, and under the same lock as
+                # the close: the next worker in the same ticket tab decides
+                # between closing its pane and closing the tab by who is still
+                # recorded there.
+                with self.coordinator.store.locked() as live:
+                    self._herdr_state(live).get("workers", {}).pop(worker_id, None)
             # Closing the tab is not the whole job. An interactive agent that
             # reported a result keeps its session, so the runner never writes
             # an exit record, and `_session_still_live` reads a worker without
@@ -3753,19 +3803,20 @@ class HerdrAdapter:
         for worker in task_workers:
             if worker.get("owned") is not True:
                 continue
-            try:
-                self._close_worker_surface(worker["worker_id"])
-            except HerdrNotFound:
-                # A tab Herdr no longer has is a tab that needs no closing, and
-                # the record of it is the only thing left to clean. Raising here
-                # left that record behind forever: the next cleanup found the
-                # same absent tab, raised again, and the orphan outlived every
-                # attempt to remove it. `stop_worker` already treats this as
-                # closed; cleanup must agree, or the two disagree about the same
-                # fact.
-                pass
-            with self.coordinator.store.locked() as current:
-                self._herdr_state(current)["workers"].pop(worker["worker_id"], None)
+            with self._layout_lock():
+                try:
+                    self._close_worker_surface(worker["worker_id"])
+                except HerdrNotFound:
+                    # A tab Herdr no longer has is a tab that needs no closing, and
+                    # the record of it is the only thing left to clean. Raising here
+                    # left that record behind forever: the next cleanup found the
+                    # same absent tab, raised again, and the orphan outlived every
+                    # attempt to remove it. `stop_worker` already treats this as
+                    # closed; cleanup must agree, or the two disagree about the same
+                    # fact.
+                    pass
+                with self.coordinator.store.locked() as current:
+                    self._herdr_state(current)["workers"].pop(worker["worker_id"], None)
             cleaned = True
         return cleaned
 

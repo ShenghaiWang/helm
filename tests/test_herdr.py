@@ -8,6 +8,7 @@ import os
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -1474,6 +1475,51 @@ class OneTabPerTicketTests(HelmTestCase):
         self.assertEqual(sorted(released), sorted([first["id"], second["id"]]))
         self.assertEqual(herdr.closed_tabs, [tab_id])
         self.assertEqual(len(herdr.closed_panes), 1)
+
+    def test_closing_a_last_pane_cannot_close_a_tab_a_new_worker_just_joined(self) -> None:
+        """The close decided from a snapshot while a launch split into the same tab.
+
+        The stopping worker found itself the last pane and closed the tab --
+        after a new worker on the same ticket had been split into it.
+        """
+        project, herdr, adapter = self._project("close-race")
+        first = self._launch(adapter, self.coordinator.create_task(
+            project["id"], "one", ticket="TICKET-6", new=True,
+        ))
+        tab_id = self._layout(first)["tab_id"]
+        second_task = self.coordinator.create_task(project["id"], "two", ticket="TICKET-6", new=True)
+        closing, placed = threading.Event(), threading.Event()
+        original_close = herdr.tab_close
+
+        def slow_close(closed_tab: str) -> dict[str, object]:
+            # The close has decided; give a concurrent launch its chance.
+            closing.set()
+            placed.wait(timeout=1.5)
+            return original_close(closed_tab)
+
+        herdr.tab_close = slow_close  # type: ignore[method-assign]
+        launched: list[dict[str, Any]] = []
+        errors: list[BaseException] = []
+
+        def launch_second() -> None:
+            try:
+                closing.wait(timeout=5)
+                launched.append(self._launch(adapter, second_task))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+            finally:
+                placed.set()
+
+        thread = threading.Thread(target=launch_second)
+        thread.start()
+        adapter.stop_worker(first["id"], "done with it")
+        thread.join(timeout=30)
+
+        self.assertFalse(errors, errors)
+        self.assertEqual(herdr.closed_tabs, [tab_id])
+        second_layout = self._layout(launched[0])
+        self.assertNotEqual(second_layout["tab_id"], tab_id)
+        self.assertNotIn(second_layout["tab_id"], herdr.closed_tabs)
 
     def test_a_failed_launch_into_a_ticket_tab_closes_only_its_own_pane(self) -> None:
         project, herdr, adapter = self._project("split-fail")
