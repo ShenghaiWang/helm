@@ -489,6 +489,15 @@ class Coordinator(
                     "result once it is done, or say it needs standing down and "
                     "the root will do it.]"
                 )
+        if kind == "result" and task.get("role") == "reviewer" and task.get("reviews"):
+            # The tip this verdict is about, read from git as the result lands
+            # -- never from the reviewer's own payload -- so a push gate can
+            # tell an approval of this commit from an approval of an older one.
+            reviewed = data.get("tasks", {}).get(task["reviews"])
+            payload = {
+                **(payload or {}),
+                "reviewed_tip": self._branch_tip(data, reviewed) if reviewed else None,
+            }
         message = self._message(
             data, project, task, worker, kind, text, payload, status=requested_status
         )

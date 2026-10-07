@@ -250,6 +250,25 @@ class HelmTestCase(unittest.TestCase):
             ["git", "-C", str(workspace), "commit", "-qm", text], check=True
         )
 
+    def pass_review(self, task: dict, verdict: str = "APPROVED -- reads correctly") -> dict:
+        """Record an independent reviewer's verdict on a task's current tip.
+
+        A standard or critical branch may not be pushed or published until a
+        reviewer has APPROVED its exact tip, so a test that exercises a push
+        gives it one -- the same record `helm review` leaves: a reviewer task
+        linked by `reviews`, and its result, whose reviewed tip Helm reads
+        from git when the result lands.
+        """
+        review = self.coordinator.create_task(
+            task["project_id"], "review it", role="reviewer", reviews=task["id"],
+            read_only=True,
+        )
+        reviewer = self.coordinator.prepare_external_worker(
+            review["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.coordinator.record_worker_message(reviewer["id"], "result", verdict)
+        return reviewer
+
     def _run_git(self, root: Path, *args: str) -> str:
         proc = subprocess.run(
             ["git", "-C", str(root), *args],

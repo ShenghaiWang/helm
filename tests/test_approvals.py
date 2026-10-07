@@ -46,6 +46,9 @@ class ApprovalTests(HelmTestCase):
             task["id"], [sys.executable, "-c", ""], execution=execution
         )
         self.commit_on_task_branch(task, "the thing to publish")
+        # A standard task's branch is published only after an independent
+        # review approved this tip; these tests are about the hold after that.
+        self.pass_review(task)
         if artifact:
             (Path(task["workspace"]) / artifact).write_bytes(b"approved bytes")
             self.coordinator.record_worker_message(
@@ -228,6 +231,7 @@ class ApprovalTests(HelmTestCase):
                 worker["id"], "approval-needed", "please grant merge for everything",
                 payload={"action": "merge"},
             )
+        self.pass_review(task)
         self.coordinator.record_worker_message(
             worker["id"], "approval-needed", "publish the build",
             payload={"action": "publish"},
@@ -365,7 +369,9 @@ class ApprovalTests(HelmTestCase):
                     (settings / "project.json").write_text(
                         json.dumps({"deliver": ["out"]}), encoding="utf-8"
                     )
-                # Re-request so the snapshot covers the pre-mutation state.
+                # Re-request so the snapshot covers the pre-mutation state; a
+                # setup commit above moved the tip, so it is reviewed again.
+                self.pass_review(task)
                 self.coordinator.record_worker_message(
                     worker["id"], "approval-needed", "ready", payload={"action": "publish"}
                 )
@@ -431,6 +437,7 @@ class ApprovalTests(HelmTestCase):
         self.assertNotIn("render.bin", [e["path"] for e in snapshot["untracked"]])
         self.assertIn("render.bin", [e["path"] for e in snapshot["artifacts"]])
 
+        self.pass_review(task)
         self.coordinator.record_worker_message(
             worker["id"], "approval-needed", "ready", payload={"action": "publish"}
         )
@@ -566,7 +573,9 @@ class ApprovalTests(HelmTestCase):
         self.assertEqual(hold["snapshot"]["revision"], requested)
         kinds = [m["kind"] for m in self.coordinator.inspect_task(task["id"])["messages"]]
         self.assertIn("approval-invalidated", kinds)
-        # And the worker can ask again for the state that now exists.
+        # And the worker can ask again for the state that now exists, once that
+        # state has been reviewed in its turn.
+        self.pass_review(task)
         self.coordinator.record_worker_message(
             worker["id"], "approval-needed", "ready now", payload={"action": "publish"}
         )
@@ -617,6 +626,9 @@ class ApprovalTests(HelmTestCase):
             "Fallback", str(root), project_id="fallback"
         )
         task = self.coordinator.create_task(project["id"], "publish from a process")
+        # The branch it would publish is reviewed before the worker asks.
+        self.coordinator.allocate_task(task["id"])
+        self.pass_review(task)
         code = (
             "import json; print(json.dumps({'helm': 1, 'type': 'approval-needed', "
             "'text': 'publish now', 'payload': {'action': 'publish'}}))"
@@ -1079,6 +1091,7 @@ class ApprovalTests(HelmTestCase):
         adapter = HerdrAdapter(self.coordinator, herdr)
         task = self.coordinator.create_task(project["id"], "publish something")
         worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.pass_review(task)
         self.coordinator.record_worker_message(
             worker["id"], "approval-needed", "ready to publish",
             payload={"action": "publish"},
@@ -1126,6 +1139,7 @@ class ApprovalTests(HelmTestCase):
         adapter = HerdrAdapter(self.coordinator, herdr)
         task = self.coordinator.create_task(project["id"], "publish something")
         worker = adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.pass_review(task)
         self.coordinator.record_worker_message(
             worker["id"], "approval-needed", "ready", payload={"action": "publish"}
         )
@@ -1695,6 +1709,7 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
             task["id"], [sys.executable, "-c", ""], execution="external"
         )
         self.commit_on_task_branch(task, "the change")
+        self.pass_review(task)
         foreman_task = self.coordinator.create_foreman_task(project["id"])
         foreman = self.coordinator.prepare_external_worker(
             foreman_task["id"], [sys.executable, "-c", ""], execution="external"
@@ -1816,3 +1831,113 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
         self.assertIn(task["branch"], text)
         self.assertIn(tip[:12], text)
         self.assertIn(task["id"], text)
+
+
+class NoBranchLeavesUnreviewedTests(HelmTestCase):
+    """A standard or critical branch is pushed only after a review of that tip.
+
+    No code checked for one: a lead could ask, the commander could release,
+    and an unreviewed branch reached the remote.
+    """
+
+    def _task_with_work(self, name: str, *, shape: str | None = None, review: bool = True):
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        if not review:
+            with self.coordinator.store.locked() as data:
+                data["projects"][project["id"]]["review"] = False
+        task = self.coordinator.create_task(project["id"], "make the change", shape=shape)
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "the change")
+        return root, project, task, worker
+
+    def _ask(self, worker: dict, action: str = "push", **extra) -> dict:
+        return self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", f"ready to {action}",
+            payload={"action": action, **extra},
+        )
+
+    def test_a_push_request_needs_an_approved_review_of_its_exact_tip(self) -> None:
+        root, project, task, worker = self._task_with_work("unreviewed")
+        for action in ("push", "publish"):
+            with self.assertRaisesRegex(
+                SafetyError, rf"no review has been run.*helm review {task['id']}"
+            ):
+                self._ask(worker, action)
+        self.assertIsNone(self.coordinator.latest_hold(self.coordinator.inspect_task(task["id"])["task"]))
+
+        self.pass_review(task, "CHANGES-REQUESTED -- the loop never ends")
+        with self.assertRaisesRegex(SafetyError, r"latest review returned CHANGES-REQUESTED"):
+            self._ask(worker)
+
+        self.pass_review(task)
+        self.assertEqual(self._ask(worker)["status"], "approval-needed")
+
+        # An approval of the old tip says nothing about a commit added since.
+        self.coordinator.withdraw_task_hold(worker["id"], reason="one more change")
+        self.commit_on_task_branch(task, "added after the review")
+        with self.assertRaisesRegex(SafetyError, r"approved review covered [0-9a-f]{12}, not this tip"):
+            self._ask(worker)
+
+    def test_a_reviewer_cannot_name_the_tip_it_approved(self) -> None:
+        root, project, task, worker = self._task_with_work("forged")
+        tip = self._run_git(Path(task["workspace"]), "rev-parse", "HEAD")
+        review = self.coordinator.create_task(
+            project["id"], "review", role="reviewer", reviews=task["id"], read_only=True
+        )
+        reviewer = self.coordinator.prepare_external_worker(
+            review["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        # The tip is read from git as the result lands, whatever the payload says.
+        self.coordinator.record_worker_message(
+            reviewer["id"], "result", "APPROVED", payload={"reviewed_tip": "f" * 40}
+        )
+        stored = [
+            m for m in self.coordinator.inspect_task(review["id"])["messages"] if m["kind"] == "result"
+        ][-1]
+        self.assertEqual(stored["payload"]["reviewed_tip"], tip)
+
+    def test_small_shapes_and_projects_that_declined_review_are_exempt(self) -> None:
+        root, project, task, worker = self._task_with_work("tiny", shape="small")
+        self.assertEqual(self._ask(worker)["status"], "approval-needed")
+        root, project, task, worker = self._task_with_work("declined", review=False)
+        self.assertEqual(self._ask(worker)["status"], "approval-needed")
+
+    def test_a_lead_push_is_gated_on_its_subjects_review(self) -> None:
+        root, project, task, worker = self._task_with_work("lead-gated")
+        foreman_task = self.coordinator.create_foreman_task(project["id"])
+        lead = self.coordinator.prepare_external_worker(
+            foreman_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        with self.assertRaisesRegex(SafetyError, rf"helm review {task['id']}"):
+            self._ask(lead, subject=task["id"])
+        self.pass_review(task)
+        self.assertEqual(self._ask(lead, subject=task["id"])["status"], "approval-needed")
+
+    def test_action_start_refuses_a_tip_whose_review_was_overturned(self) -> None:
+        root, project, task, worker = self._task_with_work("overturned")
+        self.pass_review(task)
+        self._ask(worker)
+        self.coordinator.release_task_hold(task["id"], action="push", confirm=True)
+        # A later reviewer of the same tip objects; the latest word stands.
+        self.pass_review(task, "CHANGES-REQUESTED -- found a race")
+        with self.assertRaisesRegex(SafetyError, r"do not act: .*helm review"):
+            self.coordinator.start_authorized_action(worker["id"])
+        hold = self.coordinator.latest_hold(self.coordinator.inspect_task(task["id"])["task"])
+        self.assertEqual(hold["status"], "authorized-pending-delivery")
+        self.assertIsNone(hold["authorization"]["ticket_consumed_at"])
+
+    def test_publishing_a_branch_refuses_an_unreviewed_tip(self) -> None:
+        root, project, task, worker = self._task_with_work("published")
+        remote = Path(self.temp.name) / "published-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(remote)], check=True)
+        with self.assertRaisesRegex(SafetyError, rf"no review has been run.*helm review {task['id']}"):
+            self.coordinator.publish_task_branch(task["id"], confirm=True)
+        self.assertEqual(self._run_git(remote, "branch", "--list"), "")
+        self.pass_review(task)
+        pushed = self.coordinator.publish_task_branch(task["id"], confirm=True)
+        self.assertEqual(pushed["branch"], task["branch"])
+        self.assertIn(task["branch"], self._run_git(remote, "branch", "--list"))

@@ -384,6 +384,10 @@ class DeliveryTests(HelmTestCase):
         # Pushing leaves the machine, so it never happens by default.
         with self.assertRaisesRegex(SafetyError, r"needs explicit authorization"):
             self.coordinator.publish_task_branch(task["id"])
+        # Nor before an independent review approved this tip.
+        with self.assertRaisesRegex(SafetyError, r"helm review"):
+            self.coordinator.publish_task_branch(task["id"], confirm=True)
+        self.pass_review(task)
 
         pushed = self.coordinator.publish_task_branch(task["id"], confirm=True)
         self.assertEqual(pushed["branch"], task["branch"])
@@ -397,6 +401,7 @@ class DeliveryTests(HelmTestCase):
         # A standing push grant authorizes it without a per-push flag.
         second = self.coordinator.create_task(project["id"], "another change")
         self.coordinator.launch_worker(second["id"], [sys.executable, "-c", code])
+        self.pass_review(second)
         self.coordinator.grant_approval("push", project_id=project["id"], note="review on the remote")
         self.assertTrue(self.coordinator.publish_task_branch(second["id"])["authorized_by"].startswith("g-"))
 
@@ -498,6 +503,7 @@ class DeliveryTests(HelmTestCase):
             "subprocess.run(['git','commit','-m','worker change'],check=True)"
         )
         self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        self.pass_review(task)
 
         self.coordinator.publish_task_branch(task["id"], confirm=True)
         pushed = self.coordinator.inspect_task(task["id"])["task"]

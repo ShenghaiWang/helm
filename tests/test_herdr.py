@@ -415,6 +415,7 @@ class HerdrTests(HelmTestCase):
 
     def test_work_awaiting_a_human_holds_its_space_with_or_without_a_pane(self) -> None:
         project, herdr, adapter, worker = self._finished_project("awaiting")
+        self.pass_review(self.coordinator.inspect_task(worker["task_id"])["task"])
         self.coordinator.record_worker_message(
             worker["id"],
             "approval-needed",

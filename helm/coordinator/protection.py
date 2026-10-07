@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,11 @@ from ..values import (
     shape_policy,
     task_owns_branch,
 )
+
+
+#: A reviewer's verdict word, read the way the review loop reads it: the first
+#: word of its result, past any markdown a model puts in front of it.
+_REVIEW_VERDICT = re.compile(r"^[\s>*#\-•]*(APPROVED|CHANGES-REQUESTED)(?=\s|$)")
 
 
 def _stamp_epoch(value: Any) -> float | None:
@@ -481,6 +487,85 @@ class ProtectionMixin:
                 "task_status": task["status"],
             }
 
+    def _branch_tip(self, data: dict[str, Any], task: dict[str, Any]) -> str | None:
+        """The commit a task's own branch points at now, or None."""
+        branch = task.get("branch")
+        project = data.get("projects", {}).get(task.get("project_id"))
+        if not branch or project is None:
+            return None
+        tip = _git(
+            canonical(project["root"]), "rev-parse", "--verify", "--quiet",
+            f"refs/heads/{branch}", check=False,
+        ).strip()
+        return tip or None
+
+    def _review_verdicts(
+        self, data: dict[str, Any], task: dict[str, Any]
+    ) -> list[tuple[str, str | None]]:
+        """Every reviewer result for this task, oldest first, as (verdict, reviewed tip)."""
+        reviewers = {
+            other["id"]
+            for other in data.get("tasks", {}).values()
+            if other.get("role") == "reviewer" and other.get("reviews") == task["id"]
+        }
+        verdicts = []
+        for message in data.get("messages", []):
+            if message.get("task_id") not in reviewers or message.get("kind") != "result":
+                continue
+            match = _REVIEW_VERDICT.match(str(message.get("text") or "").strip().upper())
+            verdicts.append((
+                match.group(1) if match else "NO-VERDICT",
+                (message.get("payload") or {}).get("reviewed_tip"),
+            ))
+        return verdicts
+
+    def _review_passed(
+        self, data: dict[str, Any], task: dict[str, Any], tip: str | None
+    ) -> bool:
+        """Whether the latest review of exactly this tip said APPROVED."""
+        if not tip:
+            return False
+        at_tip = [
+            verdict for verdict, reviewed in self._review_verdicts(data, task)
+            if reviewed == tip
+        ]
+        return bool(at_tip) and at_tip[-1] == "APPROVED"
+
+    def _review_refusal(
+        self, data: dict[str, Any], task: dict[str, Any], tip: str | None, action: str
+    ) -> str | None:
+        """Why this task's branch may not leave the machine unreviewed, or None.
+
+        Nothing in code checked for a review before a push: a lead could ask,
+        the commander could release, and the branch reached the remote with no
+        independent reader. The shape already says whether a review is owed
+        (`small` is exempt), and a project that declined review declines it
+        here too. The review must cover the tip being sent -- an approval of an
+        earlier commit says nothing about the ones added since.
+        """
+        if not shape_policy(task).get("review_required"):
+            return None
+        project = data.get("projects", {}).get(task.get("project_id"))
+        if project is None or not self._project_wants_review(project):
+            return None
+        if self._review_passed(data, task, tip):
+            return None
+        verdicts = self._review_verdicts(data, task)
+        shown = (tip or "")[:12] or "(no branch tip)"
+        if not verdicts:
+            missing = "no review has been run on it"
+        elif verdicts[-1][0] != "APPROVED":
+            missing = f"its latest review returned {verdicts[-1][0]}"
+        elif verdicts[-1][1]:
+            missing = f"its approved review covered {verdicts[-1][1][:12]}, not this tip"
+        else:
+            missing = "its approved review recorded no tip, so it covers none"
+        return (
+            f"task {task['id']} is shaped {task.get('shape') or 'standard'}, so its "
+            f"branch needs an independent APPROVED review of tip {shown} before a "
+            f"{action}; {missing}. Run: helm review {task['id']}"
+        )
+
     #: Protected actions that send a branch somewhere. From a role with no
     #: branch of its own they are always about another task's.
     _BRANCH_ACTIONS = frozenset({"push", "publish"})
@@ -552,6 +637,15 @@ class ProtectionMixin:
                     "and tip"
                 )
         snapshot = self._snapshot(data, project, task, subject_task_id=subject_task_id)
+        if action in self._BRANCH_ACTIONS:
+            # Asked before the commander is: a release they cannot safely give
+            # should not reach them as a question at all.
+            reviewed = data["tasks"][subject_task_id] if subject_task_id else task
+            refusal = self._review_refusal(
+                data, reviewed, snapshot.get("branch_tip"), action
+            )
+            if refusal is not None:
+                raise SafetyError(refusal)
         open_hold = self.task_hold(task)
         if open_hold is not None:
             if open_hold["status"] != "waiting" or open_hold["action"] != action:
@@ -1164,6 +1258,17 @@ class ProtectionMixin:
                     f"do not act: {moved} changed since the commander approved it, "
                     "so the authorization was invalidated and must be given again"
                 )
+            if hold["action"] in self._BRANCH_ACTIONS:
+                # Re-checked where the authorization is spent: a release given
+                # before this gate existed, or a review superseded since, must
+                # not send an unreviewed tip. Nothing is spent by refusing.
+                subject_id = hold.get("subject_task_id")
+                reviewed = data["tasks"].get(subject_id) if subject_id else task
+                refusal = self._review_refusal(
+                    data, reviewed or task, current.get("branch_tip"), hold["action"]
+                )
+                if refusal is not None:
+                    raise SafetyError(f"do not act: {refusal}")
             authorization["ticket_consumed_at"] = now()
             hold["delivery"]["acknowledged_at"] = now()
             hold["outcome"]["started_at"] = now()
@@ -1585,6 +1690,9 @@ class ProtectionMixin:
             raise SafetyError(
                 "worktree has uncommitted changes; commit them or the push omits them"
             )
+        refusal = self._review_refusal(data, task, self._branch_tip(data, task), "push")
+        if refusal is not None:
+            raise SafetyError(refusal)
         root = canonical(project["root"])
         remotes = _git(root, "remote", check=False).split()
         if remote not in remotes:

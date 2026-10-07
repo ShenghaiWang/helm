@@ -46,6 +46,10 @@ class WorkerLifecycleConvergenceTests(HelmTestCase):
         worker = self.coordinator.prepare_external_worker(
             task["id"], [sys.executable, "-c", ""]
         )
+        # Several orderings here ask to publish; a standard branch may only
+        # be published once a review approved its tip, and these tests are
+        # about what happens to the hold after that.
+        self.pass_review(task)
         return project, task, worker
 
     def _local_worker(self, name: str) -> tuple[dict, dict, dict]:

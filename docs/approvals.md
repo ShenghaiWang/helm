@@ -129,6 +129,15 @@ pairs authorized exactly one task, that task is the subject; otherwise the
 request is refused until `--subject` names one, because the project root's
 HEAD says nothing about the branch being pushed.
 
+A `push` or `publish` of a `standard` or `critical` task's branch also needs an
+independent review that approved that exact tip. Each reviewer result records
+the reviewed branch's tip, read from git when the result lands; the latest
+review of the current tip must begin `APPROVED`. The request is refused
+without one (`helm review <task>` runs it), `helm worker action-start`
+re-checks it before the authorization is spent, and so does `helm task pr`.
+`small` tasks are exempt, and so is a project that declined review
+(`"review": false`).
+
 Then the decision, and the two steps that follow it:
 
 ```sh
