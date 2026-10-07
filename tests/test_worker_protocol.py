@@ -598,6 +598,38 @@ class WorkerProtocolTests(HelmTestCase):
         self.assertEqual(self._delivered_to(coder["id"]), [])
         self.assertIsNone(self.coordinator.driver_of_task(look["id"]))
 
+    def test_a_lead_task_continued_in_a_new_session_still_drives_its_work(self) -> None:
+        """The creator was read as one session, not the lead task it ran.
+
+        Continued with a replacement session, the same lead lost every task it
+        had created: they resolved to no driver, and their reports went nowhere.
+        """
+        project, ((first, _), (second, _)) = self._two_gated_leads("continuedlead")
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": second["id"]}):
+            look = self.coordinator.create_task(
+                project["id"], "investigate the flake", read_only=True
+            )
+        coder = self.coordinator.prepare_external_worker(
+            look["id"], [sys.executable, "-c", ""]
+        )
+        self.coordinator.stop_worker(second["id"], reason="its session ended")
+        self.coordinator.reopen_task(second["task_id"], "its session ended; carry on")
+        self.coordinator.continue_task(second["task_id"], "carry on driving", read_only=True)
+        replacement = self.coordinator.prepare_external_worker(
+            second["task_id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.assertNotEqual(replacement["id"], second["id"])
+        self.coordinator.record_worker_message(coder["id"], "result", "found it")
+
+        self.assertEqual(self.coordinator.driver_of_task(look["id"])["id"], replacement["id"])
+        self.assertEqual([w for w, _ in self._delivered_to(coder["id"])], [replacement["id"]])
+
+        # Still never another ticket's lead: with no live session on its own
+        # lead task, the work has no driver.
+        self.coordinator.stop_worker(replacement["id"], reason="its session ended")
+        self.assertIsNone(self.coordinator.driver_of_task(look["id"]))
+        self.assertEqual(look["created_by_task"], second["task_id"])
+
     def test_a_task_with_no_recorded_driver_says_where_its_report_went(self) -> None:
         project, _drivers = self._two_gated_leads("guessroute")
         stray = self.coordinator.create_task(project["id"], "root's own", read_only=True)

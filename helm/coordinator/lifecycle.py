@@ -748,6 +748,7 @@ class LifecycleMixin:
                         branch = task_branch_name(project_id, task_id, ticket)
                         workspace_name = f"{ticket}-{task_id}" if ticket else task_id
                         workspace = self.store.directory / "worktrees" / project_id / workspace_name
+                    creator_id = self.caller_identity()["worker_id"] or None
                     task = {
                         "id": task_id,
                         "project_id": project_id,
@@ -788,7 +789,14 @@ class LifecycleMixin:
                         # outcome: a read-only task or a reviewer spends no
                         # gate, so nothing else names the lead that asked
                         # for it; see `driver_of_task`.
-                        "created_by": self.caller_identity()["worker_id"] or None,
+                        "created_by": creator_id,
+                        # And the task that agent was running. A lead task can
+                        # be continued in a new session, and the work it
+                        # created stays its own; see `driver_resolution`.
+                        "created_by_task": (
+                            (data.get("workers", {}).get(creator_id) or {}).get("task_id")
+                            if creator_id else None
+                        ),
                         # The tracker id this task implements, if any.
                         # Recorded as well as put in the branch so a reader
                         # does not have to parse it back out of a ref.

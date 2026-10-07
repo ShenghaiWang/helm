@@ -83,17 +83,20 @@ class ForemenMixin:
         adopter_id = str(task.get("adopted_by") or "")
         if adopter_id:
             adopter = workers.get(adopter_id) or {}
-            live = adopter.get("status") == "running"
-            return (dict(adopter) if live else None), "adopted"
+            return self._live_session_of(data, adopter, adopter.get("task_id")), "adopted"
         creator_id = str(task.get("created_by") or "")
-        if creator_id and creator_id in workers:
-            creator = workers[creator_id]
-            creator_task = data.get("tasks", {}).get(creator.get("task_id")) or {}
+        creator = workers.get(creator_id) or {}
+        # The lead TASK that created this one, not only the session it was in.
+        # A lead task continued with a replacement session is the same lead,
+        # and its children are still its own; reading only the first session
+        # left every one of them with no driver the moment it was replaced.
+        creator_task_id = str(task.get("created_by_task") or creator.get("task_id") or "")
+        if creator_task_id:
+            creator_task = data.get("tasks", {}).get(creator_task_id) or {}
             # A lead that created the task drives it. A plain worker that
             # created one is not a driver; its own driver is, one hop up.
             if creator_task.get("role") == "foreman":
-                live = creator.get("status") == "running"
-                return (dict(creator) if live else None), "creator"
+                return self._live_session_of(data, creator, creator_task_id), "creator"
             if _depth < 3 and creator_task.get("id") and creator_task.get("id") != task_id:
                 driver, how = self.driver_resolution(
                     creator_task["id"], data=data, _depth=_depth + 1
@@ -121,6 +124,29 @@ class ForemenMixin:
             return None, "gate"
         fallback = self.foreman_for(project_id or "", data=data)
         return fallback, ("project" if fallback is not None else "none")
+
+    @staticmethod
+    def _live_session_of(
+        data: dict[str, Any], worker: dict[str, Any], task_id: Any
+    ) -> dict[str, Any] | None:
+        """The live session of the task `worker` ran, or None.
+
+        That worker while it still runs; otherwise whichever session that same
+        task runs in now -- the replacement a continued task was given. Never
+        another task's session: a lead whose task has no live session has no
+        stand-in.
+        """
+        if worker.get("status") == "running" and (not task_id or worker.get("task_id") == task_id):
+            return dict(worker)
+        if not task_id:
+            return None
+        live = [
+            other for other in data.get("workers", {}).values()
+            if other.get("task_id") == task_id and other.get("status") == "running"
+        ]
+        if not live:
+            return None
+        return dict(max(live, key=lambda other: str(other.get("started_at") or other.get("created_at") or "")))
 
     def driver_named(
         self, project_id: str, name: str, *, data: dict[str, Any] | None = None
@@ -174,8 +200,9 @@ class ForemenMixin:
         tasks = data.get("tasks", {})
         candidates = []
         creator = data.get("workers", {}).get(str(task.get("created_by") or "")) or {}
-        if creator:
-            candidates.append(tasks.get(creator.get("task_id")))
+        creator_task_id = task.get("created_by_task") or creator.get("task_id")
+        if creator_task_id:
+            candidates.append(tasks.get(creator_task_id))
         candidates.extend(
             candidate for candidate in tasks.values()
             if (candidate.get("gates") or {}).get("bound_task_id") == task["id"]
