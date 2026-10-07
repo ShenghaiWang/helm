@@ -2152,20 +2152,28 @@ class ProtectionMixin:
         base_ref = f"refs/heads/{task['base_branch']}"
         if _git(root, "rev-parse", "--verify", "--quiet", base_ref, check=False):
             elsewhere.append(base_ref)
+        # A merged PR is the forge holding its commits: a squash merge leaves
+        # the branch's own commits unreachable from main, and the forge deletes
+        # the head branch after merging, so no remote ref may name them -- yet
+        # the pull request keeps them. But only the commits it merged. The
+        # merged flag alone once covered the whole local branch, so a
+        # follow-up commit made after the merge -- on no remote, in no PR --
+        # was deleted with it. So the head the forge confirmed it merged is
+        # what counts as delivered, and only what that head reaches.
+        merged_head = self._merged_pr_head(root, task)
+        if merged_head:
+            elsewhere.append(merged_head)
         only_here = _git(
             root, "rev-list", "--count", branch, "--not", *elsewhere, check=False
         ).strip()
         unpushed = int(only_here) if only_here.isdigit() else None
-        # A PR recorded as merged is the forge holding them: a squash merge
-        # leaves the branch's own commits unreachable from main, and the forge
-        # deletes the head branch after merging, so no remote ref may name them
-        # -- yet the change landed and the pull request keeps them.
-        landed = (task.get("delivery") or {}).get("state") == "pr-merged"
-        if unpushed != 0 and not landed:
+        if unpushed != 0:
             task["branch_removed"] = False
             detail = (
-                f"{unpushed} commit(s) on it are not on any remote or on "
-                f"{task['base_branch']}, so this branch is their only copy"
+                f"{unpushed} commit(s) on it are not on any remote, on "
+                f"{task['base_branch']}"
+                + (f", or in the merged pull request (head {merged_head[:12]})" if merged_head else "")
+                + ", so this branch is their only copy"
                 if unpushed
                 else "whether its commits exist anywhere else could not be determined"
             )
@@ -2202,6 +2210,19 @@ class ProtectionMixin:
             else f"Task branch {branch} could not be deleted; it may be checked out elsewhere",
             {"branch": branch, "unmerged": unmerged},
         )
+    def _merged_pr_head(self, root: Path, task: dict[str, Any]) -> str | None:
+        """The PR head commit the forge confirmed it merged, if this checkout has it."""
+        delivery = task.get("delivery") or {}
+        if delivery.get("state") != "pr-merged":
+            return None
+        head = str(delivery.get("merged_head") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+            return None
+        found = _git(
+            root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False
+        ).strip()
+        return head if found == head else None
+
     def _live_work_refusal(self, task: dict[str, Any]) -> str | None:
         """Why cleanup must not touch this task whatever its status says, or None.
 

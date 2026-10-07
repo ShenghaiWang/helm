@@ -43,7 +43,7 @@ class PullRequestsMixin:
         if shutil.which("gh") is None:
             raise HelmError("gh is not installed; record PR observations with helm task pr-status")
         result = subprocess.run(
-            ["gh", "pr", "view", url, "--json", "url,state,reviewDecision,mergeStateStatus,mergeCommit,comments,body"],
+            ["gh", "pr", "view", url, "--json", "url,state,reviewDecision,mergeStateStatus,mergeCommit,headRefOid,comments,body"],
             cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=60,
         )
         if result.returncode != 0:
@@ -80,6 +80,9 @@ class PullRequestsMixin:
             checks=str(payload.get("mergeStateStatus") or ""),
             review_decision=str(payload.get("reviewDecision") or ""),
             merge_commit=str(merge_commit or ""),
+            # What the forge says the PR's head was: with a merge, the commit
+            # cleanup treats as delivered, and nothing beyond it.
+            head_commit=str(payload.get("headRefOid") or ""),
         )
 
     def _note_provenance(self, task_id: str, project: dict[str, Any], body: str) -> None:

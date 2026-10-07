@@ -1682,8 +1682,17 @@ class Coordinator(
         checks: str = "",
         review_decision: str = "",
         merge_commit: str = "",
+        head_commit: str = "",
     ) -> dict[str, Any]:
-        """Record the observed state of an open PR, including the terminal merge."""
+        """Record the observed state of an open PR, including the terminal merge.
+
+        `head_commit` is the PR's head as the forge reports it. Recorded with a
+        merge, it is the one commit cleanup treats as delivered: everything it
+        reaches landed, and anything on the local branch beyond it did not.
+        """
+        head_commit = _safe_text(head_commit).strip().lower()
+        if head_commit and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head_commit):
+            raise HelmError("a PR head commit must be a full commit id")
         observed = _safe_text(state).strip().lower()
         if observed not in {"open", "merged", "closed"}:
             raise HelmError("PR state must be open, merged, or closed")
@@ -1712,6 +1721,7 @@ class Coordinator(
                 "checks": _safe_text(checks).strip(),
                 "review_decision": _safe_text(review_decision).strip(),
                 "merge_commit": _safe_text(merge_commit).strip(),
+                "head_commit": head_commit,
             }
             delivery.setdefault("events", []).append(event)
             if event["url"]:
@@ -1727,6 +1737,8 @@ class Coordinator(
                 delivery["merged_at"] = event["at"]
                 if event["merge_commit"]:
                     delivery["merge_commit"] = event["merge_commit"]
+                if head_commit:
+                    delivery["merged_head"] = head_commit
                 kind = "pr-merged"
                 text = f"Pull request merged: {delivery.get('url', '')}".strip()
             elif observed == "closed":

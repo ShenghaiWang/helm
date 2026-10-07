@@ -1471,8 +1471,13 @@ class DeliveryTests(HelmTestCase):
         )
         task = self.coordinator.create_task(project["id"], "make a PR change")
         self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", task["branch"]],
+            check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
         self.coordinator.record_pr_status(
-            task["id"], state="merged", url="https://example.invalid/pull/1"
+            task["id"], state="merged", url="https://example.invalid/pull/1",
+            head_commit=head,
         )
         self.assertEqual(len(self._finalizations(project["id"])), 1)
 
@@ -1520,6 +1525,88 @@ class DeliveryTests(HelmTestCase):
         # open alongside; what must survive is the note Helm cannot judge.
         self.assertNotIn(DELIVERY_DECISION_KIND, [item["kind"] for item in remaining])
         self.assertIn(FOLLOW_UP_ACTION_KIND, [item["kind"] for item in remaining])
+
+
+class AMergedPullRequestCoversOnlyItsHeadTests(HelmTestCase):
+    """A merged PR delivered the commits its head reaches, and no others.
+
+    The merged flag alone let cleanup delete the whole local branch, so a
+    follow-up commit made after the merge -- on no remote, in no PR -- went
+    with it.
+    """
+
+    _COMMIT = (
+        "from pathlib import Path; import subprocess; "
+        "Path('change.txt').write_text('the merged change'); "
+        "subprocess.run(['git','add','change.txt'],check=True); "
+        "subprocess.run(['git','commit','-qm','the merged change'],check=True)"
+    )
+
+    def _merged_pr_task(self, name: str, *, head: bool = True) -> tuple[Path, dict, str]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(
+            name.title(), str(root), project_id=name, delivery_policy="pr"
+        )
+        task = self.coordinator.create_task(project["id"], "make a PR change")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", self._COMMIT])
+        merged = self._rev(root, task["branch"])
+        self.coordinator.record_pr_status(
+            task["id"], state="merged", url="https://example.invalid/pull/2",
+            head_commit=merged if head else "",
+        )
+        return root, task, merged
+
+    def _rev(self, root: Path, ref: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", ref],
+            text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    def test_a_follow_up_commit_past_the_merged_head_survives_cleanup(self) -> None:
+        root, task, merged = self._merged_pr_task("followup")
+        self.commit_on_task_branch(task, "a follow-up nobody has pushed")
+        follow_up = self._rev(root, task["branch"])
+
+        self.coordinator.cleanup_task(task["id"], delete_branch=True)
+
+        self.assertEqual(self._rev(root, f"refs/heads/{task['branch']}"), follow_up)
+        kept = [
+            m for m in self.coordinator.inspect_task(task["id"])["messages"]
+            if m["kind"] == "cleanup" and "kept" in m["text"]
+        ]
+        self.assertTrue(kept, "cleanup must say why it kept the branch")
+        self.assertIn("merged pull request", kept[-1]["text"])
+
+    def test_the_merged_head_itself_is_delivered_and_its_branch_goes(self) -> None:
+        root, task, merged = self._merged_pr_task("mergedonly")
+        self.coordinator.cleanup_task(task["id"], delete_branch=True)
+        self.assertEqual(self._rev(root, f"refs/heads/{task['branch']}"), "")
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["delivery"]["merged_head"], merged
+        )
+
+    def test_a_merge_with_no_confirmed_head_delivers_nothing_local(self) -> None:
+        root, task, merged = self._merged_pr_task("nohead", head=False)
+        self.coordinator.cleanup_task(task["id"], delete_branch=True)
+        self.assertEqual(self._rev(root, f"refs/heads/{task['branch']}"), merged)
+
+    def test_pr_sync_records_the_forges_head(self) -> None:
+        root = self.repo("synchead")
+        project = self.coordinator.register_project(
+            "Synchead", str(root), project_id="synchead", delivery_policy="pr"
+        )
+        task = self.coordinator.create_task(project["id"], "ship it")
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", self._COMMIT])
+        self.coordinator.record_pr_status(task["id"], state="open", url="https://example.test/pull/3")
+        head = self._rev(root, task["branch"])
+        with mock.patch.object(type(self.coordinator), "read_pull_request", return_value={
+            "url": "https://example.test/pull/3", "state": "MERGED",
+            "mergeCommit": {"oid": "f" * 40}, "headRefOid": head, "comments": [],
+        }):
+            self.coordinator.sync_pull_request(task["id"])
+        self.assertEqual(
+            self.coordinator.inspect_task(task["id"])["task"]["delivery"]["merged_head"], head
+        )
 
 
 class ApprovalAfterAFailedRoundTests(HelmTestCase):

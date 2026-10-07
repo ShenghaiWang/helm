@@ -1566,6 +1566,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pr_status.add_argument("--checks", default="")
     pr_status.add_argument("--review-decision", default="")
     pr_status.add_argument("--merge-commit", default="")
+    pr_status.add_argument(
+        "--head-commit", default="",
+        help="the PR head commit the forge merged; cleanup treats only what it reaches as delivered",
+    )
     pr_sync = task_commands.add_parser(
         "pr-sync", help="read the recorded PR with gh and update Helm's PR status"
     )
@@ -3791,6 +3795,7 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
             checks=args.checks,
             review_decision=args.review_decision,
             merge_commit=args.merge_commit,
+            head_commit=args.head_commit,
         )
         delivery = task.get("delivery") or {}
         print(
