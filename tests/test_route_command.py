@@ -813,10 +813,12 @@ class RouteCommandTests(HelmTestCase):
         coordinator, project, worker = self._live_herdr_foreman(helm_root, "route-driving", herdr)
         # Give it an open hold, as a foreman mid-drive waiting on its own
         # worker's approval request would have -- a state `worker_health`
-        # reports as something other than a bare "healthy" verdict.
+        # reports as something other than a bare "healthy" verdict. The action
+        # is incidental; `external` needs no subject task, where a lead's
+        # `push` must name the branch it is about.
         coordinator.record_worker_message(
-            worker["id"], "approval-needed", "need to push a branch",
-            payload={"action": "push"},
+            worker["id"], "approval-needed", "need to call an external service",
+            payload={"action": "external"},
         )
 
         code, output = self._route(helm_root, project["id"], "keep going", herdr=herdr)

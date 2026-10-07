@@ -481,6 +481,23 @@ class ProtectionMixin:
                 "task_status": task["status"],
             }
 
+    #: Protected actions that send a branch somewhere. From a role with no
+    #: branch of its own they are always about another task's.
+    _BRANCH_ACTIONS = frozenset({"push", "publish"})
+
+    @staticmethod
+    def _only_authorized_task(task: dict[str, Any]) -> str | None:
+        """The one task a lead's gate pairs authorized, or None when not exactly one.
+
+        A lead that drove exactly one state-changing task can only mean that
+        task's branch. Two or more is a question Helm does not answer for it.
+        """
+        gates = task.get("gates") or {}
+        authorized = set(gates.get("spent") or {})
+        if gates.get("bound_task_id"):
+            authorized.add(gates["bound_task_id"])
+        return next(iter(authorized)) if len(authorized) == 1 else None
+
     def _hold_request(
         self,
         data: dict[str, Any],
@@ -518,6 +535,22 @@ class ProtectionMixin:
         subject_task_id = payload.get("subject") or None
         if subject_task_id is not None and not isinstance(subject_task_id, str):
             raise HelmError("--subject names one task id")
+        if (
+            task.get("role") in WORKTREELESS_ROLES
+            and action in self._BRANCH_ACTIONS
+            and subject_task_id is None
+        ):
+            subject_task_id = self._only_authorized_task(task)
+            if subject_task_id is None:
+                # Binding to the project root's HEAD bound nothing about the
+                # branch actually pushed: the release then covered whatever
+                # branch the lead went on to push.
+                raise HelmError(
+                    f"a {action} from a {task.get('role')} is about another task's "
+                    "branch, and this role has none of its own: name that task with "
+                    "--subject <task-id> so the authorization binds to its branch "
+                    "and tip"
+                )
         snapshot = self._snapshot(data, project, task, subject_task_id=subject_task_id)
         open_hold = self.task_hold(task)
         if open_hold is not None:

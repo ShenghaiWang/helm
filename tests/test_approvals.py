@@ -1684,7 +1684,10 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
     commander had just approved, for a revision the request never mentioned.
     """
 
-    def _foreman_asking_to_push(self, name: str, *, subject: bool):
+    def _foreman_asking_to_push(
+        self, name: str, *, subject: bool, action: str = "push",
+        gates_bound_to: list[str] | None = None, ask: bool = True,
+    ):
         root = self.repo(name)
         project = self.coordinator.register_project(name.title(), str(root), project_id=name)
         task = self.coordinator.create_task(project["id"], "make the change")
@@ -1696,13 +1699,27 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
         foreman = self.coordinator.prepare_external_worker(
             foreman_task["id"], [sys.executable, "-c", ""], execution="external"
         )
-        payload = {"action": "push"}
-        if subject:
-            payload["subject"] = task["id"]
-        self.coordinator.record_worker_message(
-            foreman["id"], "approval-needed", "push the worker's branch", payload=payload
-        )
+        if gates_bound_to is not None:
+            # What spending a confirmed pair leaves on the lead's record: the
+            # one task it authorized, and any spent before it.
+            bound = [task["id"] if entry == "task" else entry for entry in gates_bound_to]
+            with self.coordinator.store.locked() as data:
+                gates = data["tasks"][foreman_task["id"]].setdefault("gates", {})
+                gates["bound_task_id"] = bound[-1] if bound else None
+                gates["spent"] = {entry: {} for entry in bound[:-1]}
+        if ask:
+            payload = {"action": action}
+            if subject:
+                payload["subject"] = task["id"]
+            self.coordinator.record_worker_message(
+                foreman["id"], "approval-needed", "push the worker's branch", payload=payload
+            )
         return root, project, task, foreman_task
+
+    def _lead_worker(self, foreman_task: dict) -> dict:
+        return next(
+            w for w in self.state.load()["workers"].values() if w["task_id"] == foreman_task["id"]
+        )
 
     def _move_project_root_head(self, root: Path) -> None:
         (root / "elsewhere.txt").write_text("the commander fetched something\n")
@@ -1740,8 +1757,62 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
                 payload={"action": "push", "subject": other_task["id"]},
             )
 
-    def test_without_a_subject_the_root_binding_is_unchanged(self) -> None:
-        root, project, task, foreman_task = self._foreman_asking_to_push("unsubjected", subject=False)
-        self._move_project_root_head(root)
+    def test_a_lead_push_without_a_subject_is_refused_rather_than_bound_to_nothing(self) -> None:
+        """The project root's HEAD says nothing about the branch being pushed.
+
+        A lead asking for push with no subject was bound to the commander's own
+        checkout, so the release authorized a push of whatever branch the lead
+        then chose. With no subject and no single task its gates authorized,
+        there is nothing honest to bind, so the request is refused.
+        """
+        for bound in (None, ["t-000000000001", "task"]):
+            with self.subTest(gates_bound_to=bound):
+                name = "unsubjected" if bound is None else "ambiguous"
+                root, project, task, foreman_task = self._foreman_asking_to_push(
+                    name, subject=False, gates_bound_to=bound, ask=False
+                )
+                for action in ("push", "publish"):
+                    with self.assertRaisesRegex(HelmError, r"--subject"):
+                        self.coordinator.record_worker_message(
+                            self._lead_worker(foreman_task)["id"], "approval-needed",
+                            "push it", payload={"action": action},
+                        )
+                record = self.coordinator.inspect_task(foreman_task["id"])["task"]
+                self.assertIsNone(self.coordinator.latest_hold(record))
+
+    def test_a_lead_push_infers_the_one_task_its_gates_authorized(self) -> None:
+        root, project, task, foreman_task = self._foreman_asking_to_push(
+            "inferred", subject=False, gates_bound_to=["task"]
+        )
+        hold = self.coordinator.latest_hold(self.coordinator.inspect_task(foreman_task["id"])["task"])
+        self.assertEqual(hold["subject_task_id"], task["id"])
+        self.assertEqual(hold["snapshot"]["scope"], "subject")
+        self.assertEqual(hold["snapshot"]["branch"], task["branch"])
+        self.commit_on_task_branch(task, "one more commit nobody was shown")
         with self.assertRaisesRegex(SafetyError, r"changed after it asked"):
             self.coordinator.release_task_hold(foreman_task["id"], action="push", confirm=True)
+
+    def test_a_leads_other_protected_actions_keep_the_project_binding(self) -> None:
+        root, project, task, foreman_task = self._foreman_asking_to_push(
+            "external", subject=False, action="external"
+        )
+        hold = self.coordinator.latest_hold(self.coordinator.inspect_task(foreman_task["id"])["task"])
+        self.assertEqual(hold["snapshot"]["scope"], "project")
+        self._move_project_root_head(root)
+        with self.assertRaisesRegex(SafetyError, r"changed after it asked"):
+            self.coordinator.release_task_hold(foreman_task["id"], action="external", confirm=True)
+
+    def test_release_names_the_subjects_branch_and_tip(self) -> None:
+        root, project, task, foreman_task = self._foreman_asking_to_push("printed", subject=True)
+        tip = self._run_git(Path(task["workspace"]), "rev-parse", "HEAD")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli.main([
+                "--state-dir", str(self.state.directory), "approval", "release",
+                foreman_task["id"], "--action", "push", "--confirm",
+            ])
+        text = output.getvalue()
+        self.assertNotIn("No worktree to bind", text)
+        self.assertIn(task["branch"], text)
+        self.assertIn(tip[:12], text)
+        self.assertIn(task["id"], text)

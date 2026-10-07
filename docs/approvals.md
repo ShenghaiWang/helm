@@ -123,7 +123,11 @@ A task lead asking for a protected action on a worker's branch names that task:
 `--type approval-needed --action push --subject <task-id>`. The authorization
 then binds to the worker's branch and tree, not to the project root's own
 checkout — a fetch or checkout in the commander's working copy no longer
-invalidates a push they just approved.
+invalidates a push they just approved. A `push` or `publish` from a task lead
+(or any role without a branch of its own) must have a subject: when its gate
+pairs authorized exactly one task, that task is the subject; otherwise the
+request is refused until `--subject` names one, because the project root's
+HEAD says nothing about the branch being pushed.
 
 Then the decision, and the two steps that follow it:
 

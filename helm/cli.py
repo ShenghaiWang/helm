@@ -5378,8 +5378,23 @@ def _cmd_approval(ctx: _Context, args: argparse.Namespace) -> int | None:
                 "file(s); any change to those refuses at action-start. Filing an "
                 "artifact does not."
             )
+        elif snapshot.get("scope") == "subject":
+            # A lead's request bound to the task it is about. Saying "no
+            # worktree to bind" here told the commander the push was unbound
+            # when it was bound to exactly the branch being pushed.
+            print(
+                f"  Bound to task {snapshot.get('subject_task_id')}'s "
+                f"{snapshot.get('branch')} @ {(snapshot.get('branch_tip') or '')[:12]} "
+                f"plus its index, working tree and "
+                f"{len(snapshot.get('untracked', []))} untracked file(s); any "
+                "change to those refuses at action-start."
+            )
         else:
-            print("  No worktree to bind: this task holds no branch of its own")
+            print(
+                "  No worktree to bind: this task holds no branch of its own, so "
+                "only the project root's HEAD "
+                f"{(snapshot.get('revision') or '')[:12]} is bound"
+            )
         if delivered:
             print(
                 "  The task stays paused until the worker spends it with "
