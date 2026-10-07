@@ -417,7 +417,12 @@ class RouteCommandTests(HelmTestCase):
         data = coordinator.store.load()
         self.assertEqual(task_name(data["tasks"][lead_task["id"]]), "TICKET-31")
         self.assertEqual(coordinator.driver_named(project["id"], "TICKET-31")["id"], lead["id"])
-        self.assertIn("lead TICKET-31", [label for _, label in herdr.renamed])
+        # Its tab becomes the ticket's tab, and its pane says it is the lead,
+        # so the workers it launches for the ticket open beside it.
+        self.assertIn("TICKET-31", [label for _, label in herdr.renamed])
+        self.assertIn("lead", [label for _, label in herdr.renamed_panes])
+        layout = coordinator.store.load()["integrations"]["herdr"]["workers"][lead["id"]]
+        self.assertEqual(layout["ticket"], "TICKET-31")
 
         # A lead already named for its work keeps that name.
         with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}), \

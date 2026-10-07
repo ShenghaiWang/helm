@@ -14,11 +14,12 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
-from .naming import task_name
+from .naming import task_name, ticket_of
 from .values import SAFE_TEXT_LIMIT, shape_check, shape_policy
 from .core import (
     Coordinator,
@@ -89,6 +90,10 @@ class HerdrClient(Protocol):
 
     def workspace_close(self, workspace_id: str) -> dict[str, Any]: ...
 
+    # Optional: a client without these keeps one tab per worker.
+    #   pane_split(pane_id, direction, cwd) -> {"result": {"pane": {...}}}
+    #   pane_close(pane_id); pane_rename(pane_id, label)
+
 
 class SubprocessHerdrClient:
     """Use the installed Herdr CLI without making it part of Helm's core path."""
@@ -102,7 +107,7 @@ class SubprocessHerdrClient:
         # than risk touching an ambient/default session.
         return os.environ.get("HERDR_ENV") == "1" and shutil.which(self.executable[0]) is not None
 
-    def _call(self, args: Sequence[str]) -> dict[str, Any]:
+    def _call(self, args: Sequence[str], *, timeout: float | None = None) -> dict[str, Any]:
         if not self.available():
             raise HerdrUnavailable("Herdr is unavailable; using Helm's terminal worker path")
         # Herdr's socket CLI already answers with one JSON object per call, and
@@ -116,7 +121,10 @@ class SubprocessHerdrClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise HerdrUnavailable(f"Herdr did not answer within {timeout}s") from exc
         except OSError as exc:
             raise HerdrUnavailable(f"could not invoke Herdr: {exc}") from exc
         if proc.returncode != 0:
@@ -215,8 +223,236 @@ class SubprocessHerdrClient:
     def tab_close(self, tab_id: str) -> dict[str, Any]:
         return self._call(["tab", "close", tab_id])
 
+    def pane_split(self, pane_id: str, direction: str, cwd: str) -> dict[str, Any]:
+        """Open a new pane beside `pane_id` without moving the user's focus.
+
+        Herdr answers with the new pane as `.result.pane`. The environment is
+        the one a worker tab gets, for the same reason: the shell in the new
+        pane is typed into.
+        """
+        command = [
+            "pane", "split", pane_id, "--direction", direction, "--cwd", cwd, "--no-focus",
+        ]
+        for key, value in self.TAB_ENVIRONMENT:
+            command += ["--env", f"{key}={value}"]
+        return self._call(command)
+
+    def pane_close(self, pane_id: str) -> dict[str, Any]:
+        return self._call(["pane", "close", pane_id])
+
+    def pane_rename(self, pane_id: str, label: str) -> dict[str, Any]:
+        return self._call(["pane", "rename", pane_id, label])
+
+    #: Presence reports run inside a worker's turn loop. A Herdr server that
+    #: hangs must cost a turn seconds, never the turn.
+    REPORT_TIMEOUT = 5.0
+
+    def pane_report_agent(
+        self, pane_id: str, *, source: str, agent: str, state: str, seq: int
+    ) -> dict[str, Any]:
+        return self._call(
+            [
+                "pane", "report-agent", pane_id, "--source", source, "--agent", agent,
+                "--state", state, "--seq", str(seq),
+            ],
+            timeout=self.REPORT_TIMEOUT,
+        )
+
+    def pane_release_agent(
+        self, pane_id: str, *, source: str, agent: str, seq: int
+    ) -> dict[str, Any]:
+        return self._call(
+            [
+                "pane", "release-agent", pane_id, "--source", source, "--agent", agent,
+                "--seq", str(seq),
+            ],
+            timeout=self.REPORT_TIMEOUT,
+        )
+
+    def pane_report_metadata(
+        self,
+        pane_id: str,
+        *,
+        source: str,
+        seq: int,
+        tokens: dict[str, str] | None = None,
+        clear_tokens: Sequence[str] = (),
+        display_agent: str | None = None,
+        ttl_ms: int | None = None,
+    ) -> dict[str, Any]:
+        command = ["pane", "report-metadata", pane_id, "--source", source, "--seq", str(seq)]
+        for name, value in (tokens or {}).items():
+            command += ["--token", f"{name}={value}"]
+        for name in clear_tokens:
+            command += ["--clear-token", name]
+        # None leaves the display name alone; "" clears it.
+        if display_agent:
+            command += ["--display-agent", display_agent]
+        elif display_agent is not None:
+            command += ["--clear-display-agent"]
+        if ttl_ms is not None:
+            command += ["--ttl-ms", str(ttl_ms)]
+        return self._call(command, timeout=self.REPORT_TIMEOUT)
+
     def workspace_close(self, workspace_id: str) -> dict[str, Any]:
         return self._call(["workspace", "close", workspace_id])
+
+
+class PanePresence:
+    """Keep one Herdr worker listed in Herdr's agents view, with its ticket and role.
+
+    Herdr's agents view lists a pane while it holds an agent. Its own
+    detection finds an interactive agent by its process, but a turns-mode
+    worker runs its agent only during a turn: between turns the pane holds
+    Helm's runner and nothing else, so the worker vanished from the view for
+    exactly the stretch a human most wants to see it -- waiting on them.
+
+    So the runner reports for itself, under its own source: `idle` between
+    turns, `working` during one, and a release when it exits. It reports
+    only in turns mode. An interactive agent is Herdr's to detect, and a
+    second authority claiming `idle` over it would hide the `blocked` its
+    own integration reports. During a turn Helm's `working` and any report
+    from the runtime's own integration agree, and each source's sequence
+    numbers are its own, so neither has to win.
+
+    Metadata -- `$ticket` and `$role` tokens and a display name carrying the
+    role -- is reported in both modes, with a TTL refreshed well inside it,
+    so a long-lived worker never drops its labels and a dead one never keeps
+    them for more than a few hours.
+
+    Every call is best effort. Presence is presentation: a Herdr that cannot
+    be reached never fails a launch or a turn.
+    """
+
+    SOURCE = "helm"
+    METADATA_TTL_MS = 6 * 3600 * 1000
+    REFRESH_SECONDS = 3600.0
+
+    def __init__(
+        self,
+        client: Any,
+        pane_id: str,
+        *,
+        agent: str,
+        role: str,
+        ticket: str = "",
+        report_state: bool = True,
+    ) -> None:
+        self.client = client
+        self.pane_id = pane_id
+        self.agent = agent or "agent"
+        self.role = role
+        self.ticket = ticket
+        self.report_state = report_state
+        self._state: str | None = None
+        self._seq = 0
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._refresher: threading.Thread | None = None
+
+    @classmethod
+    def from_environment(
+        cls, *, agent: str, role: str, ticket: str = "", report_state: bool = True
+    ) -> PanePresence | None:
+        """The presence for the Herdr pane this process runs in, or None outside one."""
+        pane_id = os.environ.get("HERDR_PANE_ID", "")
+        client = SubprocessHerdrClient()
+        if not pane_id or not role or not client.available():
+            return None
+        return cls(
+            client, pane_id, agent=agent, role=role, ticket=ticket, report_state=report_state
+        )
+
+    def _next_seq(self) -> int:
+        # One increasing sequence for this source, so a refresh racing a state
+        # change can never land after it and be taken as newer.
+        self._seq = max(self._seq + 1, time.time_ns())
+        return self._seq
+
+    def _quietly(self, call: Any, *args: Any, **kwargs: Any) -> None:
+        with contextlib.suppress(HelmError, OSError, subprocess.SubprocessError, ValueError):
+            call(*args, **kwargs)
+
+    def _report_metadata(self) -> None:
+        tokens = {"role": self.role}
+        if self.ticket:
+            tokens["ticket"] = self.ticket
+        self._quietly(
+            self.client.pane_report_metadata,
+            self.pane_id,
+            source=self.SOURCE,
+            seq=self._next_seq(),
+            tokens=tokens,
+            display_agent=f"{self.agent} · {self.role}",
+            ttl_ms=self.METADATA_TTL_MS,
+        )
+
+    def _report_state(self, state: str) -> None:
+        self._quietly(
+            self.client.pane_report_agent,
+            self.pane_id,
+            source=self.SOURCE,
+            agent=self.agent,
+            state=state,
+            seq=self._next_seq(),
+        )
+
+    def start(self) -> None:
+        with self._lock:
+            self._report_metadata()
+            if self.report_state:
+                self._state = "idle"
+                self._report_state("idle")
+        self._refresher = threading.Thread(
+            target=self._refresh_until_stopped, name="helm-herdr-presence", daemon=True
+        )
+        self._refresher.start()
+
+    def _refresh_until_stopped(self) -> None:
+        while not self._stopped.wait(self.REFRESH_SECONDS):
+            self.refresh()
+
+    def refresh(self) -> None:
+        with self._lock:
+            if self._stopped.is_set():
+                return
+            self._report_metadata()
+            if self._state is not None:
+                self._report_state(self._state)
+
+    def working(self) -> None:
+        self._set("working")
+
+    def idle(self) -> None:
+        self._set("idle")
+
+    def _set(self, state: str) -> None:
+        if not self.report_state:
+            return
+        with self._lock:
+            self._state = state
+            self._report_state(state)
+
+    def close(self) -> None:
+        self._stopped.set()
+        with self._lock:
+            if self.report_state:
+                self._quietly(
+                    self.client.pane_release_agent,
+                    self.pane_id,
+                    source=self.SOURCE,
+                    agent=self.agent,
+                    seq=self._next_seq(),
+                )
+                self._state = None
+            self._quietly(
+                self.client.pane_report_metadata,
+                self.pane_id,
+                source=self.SOURCE,
+                seq=self._next_seq(),
+                clear_tokens=("role", "ticket"),
+                display_agent="",
+            )
 
 
 def _paint_command(color: str, text: str) -> str:
@@ -387,6 +623,48 @@ class HerdrAdapter:
         # checks, and _reviewed_marker above is the only honest source for it.
         subject = "" if purpose == "reviewer" else cls._brief_subject(task)
         return f"{subject} {label}" if subject else label
+
+    @classmethod
+    def _worker_pane_label(cls, task: dict[str, Any], worker: dict[str, Any]) -> str:
+        """A worker's label inside its ticket's tab: its role, not the ticket.
+
+        The tab already says the ticket, so repeating it on every pane is the
+        noise the purpose label replaced. What the pane has to say is which
+        agent this is -- the lead, the author, the reviewer -- and, for a
+        lead kept as evidence, that it is no longer driving.
+        """
+        if (task or {}).get("role") == "foreman":
+            state = (task or {}).get("status")
+            return f"lead ({state})" if state in _EVIDENCE_TASK_STATES else "lead"
+        suffix = str(worker["id"]).replace("w-", "")[:4]
+        return f"{cls._worker_purpose(task)} {suffix}"
+
+    @classmethod
+    def _worker_label(
+        cls,
+        task: dict[str, Any],
+        worker: dict[str, Any],
+        data: dict[str, Any] | None,
+        layout: dict[str, Any] | None,
+    ) -> str:
+        """The label for the surface this worker owns: its pane in a ticket tab, else its tab."""
+        if (layout or {}).get("ticket"):
+            return cls._worker_pane_label(task, worker)
+        return cls._worker_tab_label(task, worker, data)
+
+    @staticmethod
+    def _ticket_for(task: dict[str, Any] | None, data: dict[str, Any]) -> str:
+        """The ticket whose tab this task's worker belongs in, or "" for a tab of its own.
+
+        A reviewer's brief is the harness's preamble and rarely names the
+        ticket, but it checks the work of the task it `reviews`, and that
+        work's ticket is the one it belongs beside.
+        """
+        ticket = ticket_of(task)
+        if ticket:
+            return ticket
+        reviewed = (data.get("tasks") or {}).get(str((task or {}).get("reviews") or ""))
+        return ticket_of(reviewed) if reviewed else ""
 
     @classmethod
     def _reviewed_marker(cls, task: dict[str, Any] | None, data: dict[str, Any]) -> str:
@@ -618,7 +896,7 @@ class HerdrAdapter:
         self,
         worker: dict[str, Any],
         project_layout: dict[str, Any],
-        tab: dict[str, Any],
+        place: dict[str, Any],
         label: str,
     ) -> dict[str, Any]:
         record = {
@@ -626,8 +904,12 @@ class HerdrAdapter:
             "task_id": worker["task_id"],
             "project_id": worker["project_id"],
             "workspace_id": project_layout["workspace_id"],
-            "tab_id": _resource_id(tab, "tab", "tab_id"),
-            "pane_id": _resource_id(tab, "root_pane", "pane_id", "root_pane_id"),
+            "tab_id": place["tab_id"],
+            "pane_id": place["pane_id"],
+            # The ticket whose tab this pane sits in; None for a tab of its own.
+            # This record, not the tab's title, is how the next worker on the
+            # same ticket finds the tab.
+            "ticket": place.get("ticket") or None,
             "cwd": worker["workspace"],
             "label": label,
             "owned": True,
@@ -638,8 +920,121 @@ class HerdrAdapter:
             self._herdr_state(data)["workers"][worker["id"]] = record
         return record
 
-    @staticmethod
-    def _runner_command(worker: dict[str, Any]) -> str:
+    def _ticket_panes(self, project_layout: dict[str, Any], ticket: str) -> list[dict[str, Any]]:
+        """Recorded worker panes in this project's tab for `ticket`, newest first."""
+        data = self.coordinator.store.load()
+        layouts = [
+            layout
+            for layout in self._herdr_state(data)["workers"].values()
+            if layout.get("owned") is True
+            and layout.get("ticket") == ticket
+            and layout.get("project_id") == project_layout["project_id"]
+            and layout.get("workspace_id") == project_layout["workspace_id"]
+            and layout.get("tab_id")
+            and layout.get("pane_id")
+        ]
+        return list(reversed(layouts))
+
+    def _place_worker(
+        self,
+        project_layout: dict[str, Any],
+        ticket: str,
+        tab_label: str,
+        cwd: str,
+    ) -> dict[str, Any]:
+        """Open the pane a worker runs in: beside its ticket's workers, or in a new tab.
+
+        Work on one ticket shares one tab, one pane per agent, so Herdr's
+        agents view lists them together under the ticket; work on another
+        ticket, or on none, gets a tab of its own. The tab is found through
+        Helm's own layout record -- a tab Helm did not record is never split.
+        A recorded pane the user has since closed is skipped; when none is
+        left the ticket gets a fresh tab. Nothing here takes focus.
+        """
+        split = getattr(self.client, "pane_split", None)
+        if ticket and split is not None:
+            candidates = self._ticket_panes(project_layout, ticket)
+            for anchor in candidates:
+                panes_in_tab = sum(1 for c in candidates if c["tab_id"] == anchor["tab_id"])
+                # Alternate the split direction so a third agent does not
+                # squeeze a column the second one already halved.
+                direction = "right" if panes_in_tab % 2 else "down"
+                try:
+                    response = split(anchor["pane_id"], direction, cwd)
+                except HerdrNotFound:
+                    continue
+                pane_id = self._optional_resource_id(response, "pane", "pane_id")
+                if pane_id is None:
+                    raise HerdrUnavailable("Herdr did not return a pane ID")
+                return {
+                    "tab_id": anchor["tab_id"], "pane_id": pane_id,
+                    "ticket": ticket, "new_tab": False,
+                }
+        tab = self.client.tab_create(project_layout["workspace_id"], tab_label, cwd)
+        try:
+            place = {
+                "tab_id": _resource_id(tab, "tab", "tab_id"),
+                "pane_id": _resource_id(tab, "root_pane", "pane_id", "root_pane_id"),
+                # A client that cannot split cannot share the tab either, so
+                # the worker's tab is its own and is labelled as one.
+                "ticket": ticket if split is not None else "",
+                "new_tab": True,
+            }
+        except HerdrUnavailable:
+            self._compensate_response(tab)
+            raise
+        return place
+
+    def _close_worker_surface(self, worker_id: str) -> None:
+        """Close what one worker occupies: its pane, or its tab when nothing else is in it.
+
+        A ticket's tab holds one pane per agent working on that ticket, so
+        closing one agent closes only its pane, and the tab goes with its
+        last. A worker in a tab of its own closes the tab, as it always did.
+        Raises what the close raises; the caller decides what not-found means.
+        """
+        data = self.coordinator.store.load()
+        workers = self._herdr_state(data).get("workers", {})
+        layout = workers.get(worker_id) or {}
+        tab_id = layout.get("tab_id")
+        if not tab_id:
+            return
+        neighbours = [
+            other_id
+            for other_id, other in workers.items()
+            if other_id != worker_id
+            and other.get("tab_id") == tab_id
+            and not self._pane_gone(other.get("pane_id"))
+        ]
+        close_pane = getattr(self.client, "pane_close", None)
+        if neighbours and layout.get("pane_id") and close_pane is not None:
+            close_pane(layout["pane_id"])
+            return
+        self.client.tab_close(tab_id)
+
+    def _pane_gone(self, pane_id: str | None) -> bool:
+        """Only Herdr saying not-found makes a recorded pane gone; anything else is kept."""
+        status = getattr(self.client, "pane_status", None)
+        if not pane_id or status is None:
+            return not pane_id
+        try:
+            status(pane_id)
+        except HerdrNotFound:
+            return True
+        except HerdrUnavailable:
+            return False
+        return False
+
+    def _rename_worker_surface(self, layout: dict[str, Any], label: str) -> None:
+        """Rename the pane of a worker in a ticket tab, or the tab it has to itself."""
+        if layout.get("ticket"):
+            rename_pane = getattr(self.client, "pane_rename", None)
+            if rename_pane is not None and layout.get("pane_id"):
+                rename_pane(layout["pane_id"], label)
+            return
+        self.client.tab_rename(layout["tab_id"], label)
+
+    def _runner_command(self, worker: dict[str, Any]) -> str:
         # The runner mirrors worker output into the Herdr tab and into Helm's
         # bounded log, behind a banner marking it as worker output.  A silent
         # tab looked identical to a dead worker, which is worse than the risk
@@ -649,7 +1044,23 @@ class HerdrAdapter:
             f"PYTHONPATH={worker['runner_pythonpath']}",
             *worker["runner_command"],
         ]
+        # What the runner reports to Herdr's agents view about its pane: the
+        # runtime, the role and the ticket. Presentation only; the runner's
+        # authority still comes from its config alone.
+        data = self.coordinator.store.load()
+        task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+        command += [
+            "--presence-agent", str(worker.get("agent_id") or worker.get("agent") or ""),
+            "--presence-role", self._presence_role(task),
+        ]
+        ticket = self._ticket_for(task, data)
+        if ticket:
+            command += ["--presence-ticket", ticket]
         return shlex.join(command)
+
+    @classmethod
+    def _presence_role(cls, task: dict[str, Any]) -> str:
+        return "lead" if task.get("role") == "foreman" else cls._worker_purpose(task)
 
     def _route_messages(self, worker: dict[str, Any]) -> None:
         data = self.coordinator.store.load()
@@ -735,7 +1146,11 @@ class HerdrAdapter:
         domain: str | None = None,
         agent: str | None = None,
     ) -> dict[str, Any]:
-        """Launch one Helm worker in one Herdr tab, or use the core fallback."""
+        """Launch one Helm worker in one Herdr pane, or use the core fallback.
+
+        The pane is in its ticket's tab, or in a tab of its own when the work
+        names no ticket.
+        """
         if not self.client.available():
             return self._fallback(task_id, command, wait, domain=domain, agent=agent)
 
@@ -767,28 +1182,42 @@ class HerdrAdapter:
             domain=domain,
             agent=agent,
         )
-        worker_label = self._worker_tab_label(task, worker, self.coordinator.store.load())
+        snapshot = self.coordinator.store.load()
+        ticket = self._ticket_for(task, snapshot)
+        tab_label = ticket or self._worker_tab_label(task, worker, snapshot)
         worker_layout: dict[str, Any] | None = None
-        tab: dict[str, Any] | None = None
+        place: dict[str, Any] | None = None
         try:
-            tab = self.client.tab_create(
-                project_layout["workspace_id"], worker_label, worker["workspace"]
-            )
-            worker_layout = self._record_worker_layout(worker, project_layout, tab, worker_label)
+            place = self._place_worker(project_layout, ticket, tab_label, worker["workspace"])
+            if place.get("ticket"):
+                worker_label = self._worker_pane_label(task, worker)
+            else:
+                worker_label = self._worker_tab_label(task, worker, snapshot)
+                if place.get("new_tab") and worker_label != tab_label:
+                    with contextlib.suppress(HerdrUnavailable):
+                        self.client.tab_rename(place["tab_id"], worker_label)
+            worker_layout = self._record_worker_layout(worker, project_layout, place, worker_label)
+            if place.get("ticket"):
+                # The tab says the ticket; the pane says which agent this is.
+                with contextlib.suppress(HerdrUnavailable):
+                    self._rename_worker_surface(worker_layout, worker_label)
             self.client.pane_run(worker_layout["pane_id"], self._runner_command(worker))
         except HerdrUnavailable as exc:
             # A tab/pane created before a later provider failure is still Helm's
-            # responsibility.  Close it before leaving the failed assignment.
+            # responsibility.  Close it before leaving the failed assignment --
+            # only the pane when it was split into a ticket tab other agents
+            # are still working in.
             if worker_layout is not None:
                 with contextlib.suppress(HerdrUnavailable):
-                    self.client.tab_close(worker_layout["tab_id"])
+                    self._close_worker_surface(worker["id"])
                 with self.coordinator.store.locked() as current:
                     self._herdr_state(current)["workers"].pop(worker["id"], None)
-            elif tab is not None:
-                tab_id = self._optional_resource_id(tab, "tab", "tab_id")
-                if tab_id:
-                    with contextlib.suppress(HerdrUnavailable):
-                        self.client.tab_close(tab_id)
+            elif place is not None:
+                with contextlib.suppress(HerdrUnavailable):
+                    if place.get("new_tab"):
+                        self.client.tab_close(place["tab_id"])
+                    else:
+                        self.client.pane_close(place["pane_id"])
             # The assignment is deliberately not silently converted to a
             # process worker after it is persisted.  It remains auditable and
             # cannot accidentally run twice in two execution surfaces.
@@ -1690,7 +2119,7 @@ class HerdrAdapter:
         stopped["tab_closed"] = False
         if tab_id:
             try:
-                self.client.tab_close(tab_id)
+                self._close_worker_surface(worker_id)
                 stopped["tab_closed"] = True
             except HerdrNotFound:
                 stopped["tab_closed"] = True
@@ -1795,10 +2224,10 @@ class HerdrAdapter:
                 # Kept as evidence -- but say so on the tab. A retained pane
                 # looks exactly like a working one in the panel, which is how a
                 # stopped foreman gets mistaken for a second live driver.
-                retained = self._worker_tab_label(task, worker, data)
+                retained = self._worker_label(task, worker, data, layout)
                 if retained != layout.get("label"):
                     with contextlib.suppress(HerdrUnavailable, HerdrNotFound):
-                        self.client.tab_rename(tab_id, retained)
+                        self._rename_worker_surface(layout, retained)
                         with self.coordinator.store.locked() as live:
                             entry = self._herdr_state(live)["workers"].get(worker_id)
                             if entry is not None:
@@ -1837,12 +2266,17 @@ class HerdrAdapter:
                     continue
                 self.coordinator._let_turns_finish(worker)
             try:
-                self.client.tab_close(tab_id)
+                self._close_worker_surface(worker_id)
                 closed.append(worker_id)
             except HerdrNotFound:
                 closed.append(worker_id)
             except HerdrUnavailable:
                 continue
+            # Dropped now, not after the sweep: the next worker in the same
+            # ticket tab decides between closing its pane and closing the tab
+            # by who is still recorded there.
+            with self.coordinator.store.locked() as live:
+                self._herdr_state(live).get("workers", {}).pop(worker_id, None)
             # Closing the tab is not the whole job. An interactive agent that
             # reported a result keeps its session, so the runner never writes
             # an exit record, and `_session_still_live` reads a worker without
@@ -1853,11 +2287,6 @@ class HerdrAdapter:
                 self.coordinator.stop_worker(
                     worker_id, "session released after a clean finish"
                 )
-        if closed:
-            with self.coordinator.store.locked() as live:
-                live_state = self._herdr_state(live)
-                for worker_id in closed:
-                    live_state.get("workers", {}).pop(worker_id, None)
         self._reconcile_paneless_sessions()
         return closed
 
@@ -1913,18 +2342,27 @@ class HerdrAdapter:
                 renamed.append({"kind": "workspace", "id": workspace_id, "label": label})
             except HerdrUnavailable as exc:
                 renamed.append({"kind": "workspace", "id": workspace_id, "error": str(exc)})
+        ticket_tabs: set[str] = set()
         for worker_id, layout in state.get("workers", {}).items():
             tab_id = layout.get("tab_id")
             worker = data.get("workers", {}).get(worker_id)
             if not tab_id or worker is None:
                 continue
             task = data.get("tasks", {}).get(worker.get("task_id"))
-            label = self._worker_tab_label(task or {}, worker, data)
+            label = self._worker_label(task or {}, worker, data, layout)
+            kind, target = ("pane", layout.get("pane_id")) if layout.get("ticket") else ("tab", tab_id)
+            if layout.get("ticket") and tab_id not in ticket_tabs:
+                ticket_tabs.add(tab_id)
+                try:
+                    self.client.tab_rename(tab_id, str(layout["ticket"]))
+                    renamed.append({"kind": "tab", "id": tab_id, "label": layout["ticket"]})
+                except HerdrUnavailable as exc:
+                    renamed.append({"kind": "tab", "id": tab_id, "error": str(exc)})
             try:
-                self.client.tab_rename(tab_id, label)
-                renamed.append({"kind": "tab", "id": tab_id, "label": label})
+                self._rename_worker_surface(layout, label)
+                renamed.append({"kind": kind, "id": target, "label": label})
             except HerdrUnavailable as exc:
-                renamed.append({"kind": "tab", "id": tab_id, "error": str(exc)})
+                renamed.append({"kind": kind, "id": target, "error": str(exc)})
         return renamed
 
     def relabel_worker(self, worker_id: str) -> bool:
@@ -1935,15 +2373,41 @@ class HerdrAdapter:
         the rename was sent.
         """
         data = self.coordinator.store.load()
-        tab_id = (self._herdr_state(data).get("workers", {}).get(worker_id) or {}).get("tab_id")
+        workers = self._herdr_state(data).get("workers", {})
+        layout = dict(workers.get(worker_id) or {})
+        tab_id = layout.get("tab_id")
         worker = data.get("workers", {}).get(worker_id)
         if not tab_id or worker is None:
             return False
         task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+        ticket = self._ticket_for(task, data)
+        adopt = (
+            bool(ticket)
+            and not layout.get("ticket")
+            and getattr(self.client, "pane_split", None) is not None
+            # Alone in its tab, and no other tab is already that ticket's.
+            and not any(o.get("tab_id") == tab_id for k, o in workers.items() if k != worker_id)
+            and not any(
+                o.get("ticket") == ticket and o.get("project_id") == layout.get("project_id")
+                for o in workers.values()
+            )
+        )
         try:
-            self.client.tab_rename(tab_id, self._worker_tab_label(task, worker, data))
+            if adopt:
+                # A lead appointed before its ticket was known has a tab of its
+                # own. Now that it names the ticket, that tab becomes the
+                # ticket's, so the workers it launches open beside it.
+                self.client.tab_rename(tab_id, ticket)
+                layout["ticket"] = ticket
+            label = self._worker_label(task, worker, data, layout)
+            self._rename_worker_surface(layout, label)
         except HerdrUnavailable:
             return False
+        with self.coordinator.store.locked() as live:
+            entry = self._herdr_state(live).get("workers", {}).get(worker_id)
+            if entry is not None:
+                entry["ticket"] = layout.get("ticket")
+                entry["label"] = label
         return True
 
     @staticmethod
@@ -3239,7 +3703,7 @@ class HerdrAdapter:
             if worker.get("owned") is not True:
                 continue
             try:
-                self.client.tab_close(worker["tab_id"])
+                self._close_worker_surface(worker["worker_id"])
             except HerdrNotFound:
                 # A tab Herdr no longer has is a tab that needs no closing, and
                 # the record of it is the only thing left to clean. Raising here
@@ -3276,10 +3740,13 @@ class HerdrAdapter:
         # a failure -- and after a human closes the space by hand, every one of
         # these is gone. Raising here would make the stale records permanent,
         # which is the opposite of cleaning up.
-        for worker in workers:
-            if worker.get("owned") is True:
-                with contextlib.suppress(HerdrNotFound):
-                    self.client.tab_close(worker["tab_id"])
+        # Several workers on one ticket share a tab; close each tab once.
+        for tab_id in dict.fromkeys(
+            worker["tab_id"] for worker in workers
+            if worker.get("owned") is True and worker.get("tab_id")
+        ):
+            with contextlib.suppress(HerdrNotFound):
+                self.client.tab_close(tab_id)
         with contextlib.suppress(HerdrNotFound):
             self.client.workspace_close(project["workspace_id"])
         with self.coordinator.store.locked() as current:

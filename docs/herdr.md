@@ -11,7 +11,15 @@ owns only when it created them. Adapter conventions are in
 
 Inside a verified Herdr-managed environment (`HERDR_ENV=1` plus a `herdr`
 executable) the adapter presents one workspace per project, holding one tab
-per worker plus the overview pane that project's routed messages print into.
+per ticket plus the overview pane that project's routed messages print into.
+Every agent working on a ticket — its lead, author, reviewer, scout — runs in
+its own pane of that ticket's tab, split in unfocused. Work on a different
+ticket gets its own tab, and work with no ticket is grouped with nothing: it
+keeps a tab of its own. Helm finds a ticket's tab through its own layout
+record, never by its title, and a reviewer belongs to the ticket of the work
+it checks. Closing an agent closes its pane; the ticket's tab closes with its
+last pane. A lead appointed before its ticket was known has a tab of its own
+until it takes the ticket on, and then that tab becomes the ticket's.
 There is no separate coordinator workspace; a legacy one recorded by an older
 version can be closed with `helm herdr cleanup-coordinator`.
 
@@ -29,17 +37,48 @@ looking at.
 Labels are display only: Helm identifies every resource by opaque ID and
 never looks one up by label. A Herdr panel shows only the first few
 characters, so labels are short and front-loaded — a workspace is the
-project's glyph and ID, a tab is a slug of its task plus four characters of
-the worker ID. `helm herdr relabel` applies the scheme to spaces and tabs
-that already exist.
+project's glyph and ID, a ticket's tab is the ticket, and each pane in it is
+the agent's role (`lead`, `author 7ded`, `reviewer 3fa1`). A tab with no
+ticket is named for its work and role plus four characters of the worker ID.
+`helm herdr relabel` applies the scheme to spaces, tabs and panes that
+already exist.
+
+## The agents view
+
+Herdr's agents sidebar lists every pane holding an agent. Its own detection
+finds an interactive agent by its process, but a turns-mode worker runs its
+agent only during a turn, so between turns its pane holds Helm's runner and
+nothing more. The runner therefore reports the pane itself, under the source
+`helm`: `idle` between turns, `working` during one, and a release when it
+exits. It does not report state for an interactive agent, which Herdr already
+detects — a second authority saying `idle` would hide the `blocked` the
+runtime's own integration reports.
+
+In both modes the runner reports display metadata: the tokens `$ticket` and
+`$role`, and a display name of `<runtime> · <role>`. The metadata carries a
+six-hour TTL and is refreshed hourly, so a long-lived worker keeps its labels
+and a dead one loses them. Every report is best effort; a Herdr that cannot
+be reached never fails a launch or a turn.
+
+The default sidebar rows already show the tab (the ticket) and the agent
+(its display name, with the role). To show the tokens explicitly, set the
+rows in your own Herdr config, for example:
+
+```toml
+[ui.sidebar.agents]
+rows = [["state_icon", "workspace", "$ticket"], ["agent", "$role"]]
+```
+
+Herdr's own "grouped" ordering (`ui.agent_panel_sort = "spaces"`) groups by
+workspace, which is the project; the grouping by ticket comes from the tab.
 
 Lines routed into a project's pane are plain text carrying the project's name
 and ID; escape codes do not survive `pane run`, so per-project colour is
 delivered in the Helm session's own output rather than in panes. In a pane
-the runner gives the worker a real terminal and mirrors it to both the tab
+the runner gives the worker a real terminal and mirrors it to both the pane
 and Helm's log, so an interactive agent renders its session and stays usable
-instead of showing a blank pane. Each tab is started with automatic shell
-updates disabled, because an update prompt in a fresh shell ate the launch
+instead of showing a blank pane. Each tab and pane is started with automatic
+shell updates disabled, because an update prompt in a fresh shell ate the launch
 keystrokes and left a worker that never started.
 
 ## When a space closes

@@ -51,6 +51,7 @@ from .herdr import (
     DEFAULT_WAIT_TIMEOUT,
     HerdrAdapter,
     HerdrUnavailable,
+    PanePresence,
     SubprocessHerdrClient,
 )
 
@@ -2547,7 +2548,7 @@ def _detach_runner() -> None:
         os.close(devnull)
 
 
-def _worker_runner(config_path: str) -> int:
+def _worker_runner(config_path: str, presence: dict[str, str] | None = None) -> int:
     """Run a worker and write an exit record; not part of the public API."""
     try:
         _private_file(Path(config_path))
@@ -2643,6 +2644,20 @@ def _worker_runner(config_path: str) -> int:
         # that window (a note from the launcher, or a test's fixture) would
         # be erased by a truncating open.
         fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        # Keeps this worker listed in Herdr's agents view with its ticket and
+        # role, between turns too. None outside a Herdr pane.
+        pane_presence = (
+            PanePresence.from_environment(
+                agent=presence.get("agent", ""),
+                role=presence.get("role", ""),
+                ticket=presence.get("ticket", ""),
+                report_state=bool(config.get("turns")),
+            )
+            if presence
+            else None
+        )
+        if pane_presence is not None:
+            pane_presence.start()
         with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as log:
             try:
                 # Mirror worker output to this runner's own stdout as well as
@@ -2658,7 +2673,7 @@ def _worker_runner(config_path: str) -> int:
                 if config.get("turns"):
                     # Turn-based execution: the pane displays and is never
                     # typed into; each prompt is one non-interactive run.
-                    return_code = _run_turns(config, cwd, env, log)
+                    return_code = _run_turns(config, cwd, env, log, presence=pane_presence)
                 elif sys.stdout.isatty():
                     # In a Herdr pane, give the worker a real terminal so an
                     # interactive agent renders its session and the user can
@@ -2685,6 +2700,9 @@ def _worker_runner(config_path: str) -> int:
                     return_code = process.wait()
             except OSError as exc:
                 log.write(f"worker launch failed: {exc}\n")
+            finally:
+                if pane_presence is not None:
+                    pane_presence.close()
         os.chmod(log_path, 0o600)
     except OSError as exc:
         return _runner_failure(config_path, str(exc))
@@ -2703,7 +2721,14 @@ TURN_POLL_SECONDS = 2.0
 TURN_IDLE_LIMIT_SECONDS = 12 * 3600
 
 
-def _run_turns(config: dict[str, Any], cwd: str, env: dict[str, str], log: Any) -> int:
+def _run_turns(
+    config: dict[str, Any],
+    cwd: str,
+    env: dict[str, str],
+    log: Any,
+    *,
+    presence: Any = None,
+) -> int:
     """Run a worker as turns: one non-interactive invocation per prompt, one session.
 
     The pane shows each turn's streamed output; the log keeps every byte;
@@ -2799,6 +2824,8 @@ def _run_turns(config: dict[str, Any], cwd: str, env: dict[str, str], log: Any) 
         started = time.time()
         print(f"[helm] turn {turn_number} starts ({'resumed session' if resumable else 'new session'})", flush=True)
         captured: list[str] = []
+        if presence is not None:
+            presence.working()
         try:
             child = subprocess.Popen(
                 argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -2821,6 +2848,9 @@ def _run_turns(config: dict[str, Any], cwd: str, env: dict[str, str], log: Any) 
             return_code = 127
         finally:
             child = None
+            if presence is not None:
+                # Back to waiting: the worker stays listed between turns.
+                presence.idle()
         parsed = _runtimes.parse_turn_output("".join(captured))
         if parsed.get("session_id") and config.get("session_style") != _runtimes.SESSION_PRESET:
             state["session_id"] = parsed["session_id"]
@@ -5794,10 +5824,21 @@ def main(argv: list[str] | None = None) -> int:
         runner_parser = argparse.ArgumentParser(prog="helm _worker-runner")
         runner_parser.add_argument("--config", required=True)
         runner_parser.add_argument("--detach", action="store_true")
+        # What a runner in a Herdr pane reports to Herdr's agents view.
+        runner_parser.add_argument("--presence-agent", default="")
+        runner_parser.add_argument("--presence-role", default="")
+        runner_parser.add_argument("--presence-ticket", default="")
         runner_args = runner_parser.parse_args(raw_argv[1:])
         if runner_args.detach:
             _detach_runner()
-        return _worker_runner(runner_args.config)
+        return _worker_runner(
+            runner_args.config,
+            presence={
+                "agent": runner_args.presence_agent,
+                "role": runner_args.presence_role,
+                "ticket": runner_args.presence_ticket,
+            },
+        )
     parser = _build_parser()
     args = parser.parse_args(raw_argv)
     try:

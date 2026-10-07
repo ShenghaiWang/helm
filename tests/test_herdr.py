@@ -8,6 +8,7 @@ import os
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -17,7 +18,13 @@ from helm.core import (
     SafetyError,
     _git,
 )
-from helm.herdr import HerdrAdapter, HerdrNotFound, SubprocessHerdrClient
+from helm.herdr import (
+    HerdrAdapter,
+    HerdrNotFound,
+    HerdrUnavailable,
+    PanePresence,
+    SubprocessHerdrClient,
+)
 
 from tests.support import FakeHerdr, HelmTestCase, REPO_ROOT, SHIPPED_DOMAINS
 
@@ -1372,3 +1379,245 @@ class AGarbledBriefIsNotAVerdictTests(HelmTestCase):
         recovered = adapter._verdict_from_output(worker["id"], 0, self.BRIEF)
         self.assertIsNotNone(recovered)
         self.assertTrue(recovered["text"].startswith("APPROVED -- the deletion"))
+
+
+class OneTabPerTicketTests(HelmTestCase):
+    """Agents on one ticket share its tab, a pane each; anything else has its own."""
+
+    def _project(self, name: str) -> tuple[dict[str, Any], FakeHerdr, HerdrAdapter]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        herdr = FakeHerdr()
+        return project, herdr, HerdrAdapter(self.coordinator, herdr)
+
+    def _launch(self, adapter: HerdrAdapter, task: dict[str, Any]) -> dict[str, Any]:
+        return adapter.launch_task(task["id"], [sys.executable, "-c", ""], wait=False)
+
+    def _layout(self, worker: dict[str, Any]) -> dict[str, Any]:
+        return self.coordinator.store.load()["integrations"]["herdr"]["workers"][worker["id"]]
+
+    def test_agents_on_one_ticket_share_its_tab_and_another_ticket_gets_its_own(self) -> None:
+        project, herdr, adapter = self._project("grouped")
+        lead = self._launch(adapter, self.coordinator.create_foreman_task(project["id"], ticket="TICKET-7"))
+        author_task = self.coordinator.create_task(project["id"], "fix the thing", ticket="TICKET-7")
+        author = self._launch(adapter, author_task)
+        # A reviewer's brief does not name the ticket; the work it checks does.
+        reviewer = self._launch(adapter, self.coordinator.create_task(
+            project["id"], "Run every git command in the worktree", role="reviewer",
+            reviews=author_task["id"], read_only=True,
+        ))
+        other = self._launch(adapter, self.coordinator.create_task(
+            project["id"], "another piece of work", ticket="TICKET-8",
+        ))
+
+        # TICKET-7 is one tab, named for the ticket, holding three panes.
+        ticket_tabs = [tab for tab in herdr.tabs if tab[1] == "TICKET-7"]
+        self.assertEqual(len(ticket_tabs), 1)
+        tab_id = ticket_tabs[0][3]
+        for worker in (lead, author, reviewer):
+            self.assertEqual(self._layout(worker)["tab_id"], tab_id)
+            self.assertEqual(self._layout(worker)["ticket"], "TICKET-7")
+        self.assertEqual(len({self._layout(w)["pane_id"] for w in (lead, author, reviewer)}), 3)
+        self.assertEqual(len(herdr.splits), 2)
+        # Panes carry the role; the ticket is on the tab.
+        pane_labels = dict(herdr.renamed_panes)
+        self.assertEqual(pane_labels[self._layout(lead)["pane_id"]], "lead")
+        self.assertTrue(pane_labels[self._layout(author)["pane_id"]].startswith("author "))
+        self.assertTrue(pane_labels[self._layout(reviewer)["pane_id"]].startswith("reviewer "))
+        # A different ticket is a different listing.
+        self.assertNotEqual(self._layout(other)["tab_id"], tab_id)
+        self.assertEqual(
+            [tab[1] for tab in herdr.tabs if tab[3] == self._layout(other)["tab_id"]], ["TICKET-8"]
+        )
+        # Every worker's runner is told who it is, to report to the agents view.
+        runs = dict(herdr.runs)
+        self.assertIn("--presence-ticket TICKET-7", runs[self._layout(reviewer)["pane_id"]])
+        self.assertIn("--presence-role reviewer", runs[self._layout(reviewer)["pane_id"]])
+        self.assertIn("--presence-role lead", runs[self._layout(lead)["pane_id"]])
+
+    def test_work_with_no_ticket_keeps_a_tab_of_its_own(self) -> None:
+        project, herdr, adapter = self._project("loose")
+        first = self._launch(adapter, self.coordinator.create_task(project["id"], "tidy the readme"))
+        second = self._launch(adapter, self.coordinator.create_task(project["id"], "tidy the readme"))
+        self.assertEqual(herdr.splits, [])
+        self.assertNotEqual(self._layout(first)["tab_id"], self._layout(second)["tab_id"])
+        self.assertIsNone(self._layout(first)["ticket"])
+        self.assertNotIn("--presence-ticket", dict(herdr.runs)[self._layout(first)["pane_id"]])
+
+    def test_stopping_one_agent_closes_its_pane_and_keeps_the_ticket_tab(self) -> None:
+        project, herdr, adapter = self._project("pane-close")
+        first = self._launch(adapter, self.coordinator.create_task(project["id"], "one", ticket="TICKET-9", new=True))
+        second = self._launch(adapter, self.coordinator.create_task(project["id"], "two", ticket="TICKET-9", new=True))
+        tab_id = self._layout(first)["tab_id"]
+        first_pane = self._layout(first)["pane_id"]
+
+        adapter.stop_worker(first["id"], "done with it")
+
+        self.assertEqual(herdr.closed_panes, [first_pane])
+        self.assertNotIn(tab_id, herdr.closed_tabs)
+        # The tab is still the ticket's: the next agent opens beside the one left.
+        third = self._launch(adapter, self.coordinator.create_task(project["id"], "three", ticket="TICKET-9", new=True))
+        self.assertEqual(self._layout(third)["tab_id"], tab_id)
+        self.assertEqual(herdr.splits[-1][0], self._layout(second)["pane_id"])
+
+    def test_the_last_agent_on_a_ticket_closes_its_tab(self) -> None:
+        project, herdr, adapter = self._project("last-pane")
+        first = self._launch(adapter, self.coordinator.create_task(project["id"], "one", ticket="TICKET-4", new=True))
+        second = self._launch(adapter, self.coordinator.create_task(project["id"], "two", ticket="TICKET-4", new=True))
+        tab_id = self._layout(first)["tab_id"]
+        for worker in (first, second):
+            self.coordinator.record_worker_message(worker["id"], "result", "done")
+            self.coordinator.settle_reported_worker(worker["id"])
+
+        released = adapter.release_finished_tabs()
+
+        self.assertEqual(sorted(released), sorted([first["id"], second["id"]]))
+        self.assertEqual(herdr.closed_tabs, [tab_id])
+        self.assertEqual(len(herdr.closed_panes), 1)
+
+    def test_a_failed_launch_into_a_ticket_tab_closes_only_its_own_pane(self) -> None:
+        project, herdr, adapter = self._project("split-fail")
+        first = self._launch(adapter, self.coordinator.create_task(project["id"], "one", ticket="TICKET-5", new=True))
+        tab_id = self._layout(first)["tab_id"]
+        original_run = herdr.pane_run
+
+        def refuse(pane_id: str, command: str) -> dict[str, object]:
+            raise HerdrUnavailable("pane went away")
+
+        herdr.pane_run = refuse  # type: ignore[method-assign]
+        with self.assertRaises(HerdrUnavailable):
+            self._launch(adapter, self.coordinator.create_task(project["id"], "two", ticket="TICKET-5", new=True))
+        herdr.pane_run = original_run  # type: ignore[method-assign]
+        self.assertEqual(herdr.closed_panes, [herdr.splits[-1][3]])
+        self.assertNotIn(tab_id, herdr.closed_tabs)
+
+
+class PanePresenceTests(HelmTestCase):
+    """A Helm worker stays in Herdr's agents view between turns, with its ticket and role."""
+
+    class _Client:
+        def __init__(self, fail: bool = False) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+            self.fail = fail
+
+        def _record(self, name: str, **kwargs: Any) -> dict[str, object]:
+            self.calls.append((name, kwargs))
+            if self.fail:
+                raise HerdrUnavailable("herdr is gone")
+            return {}
+
+        def pane_report_agent(self, pane_id: str, **kwargs: Any) -> dict[str, object]:
+            return self._record("agent", pane=pane_id, **kwargs)
+
+        def pane_release_agent(self, pane_id: str, **kwargs: Any) -> dict[str, object]:
+            return self._record("release", pane=pane_id, **kwargs)
+
+        def pane_report_metadata(self, pane_id: str, **kwargs: Any) -> dict[str, object]:
+            return self._record("metadata", pane=pane_id, **kwargs)
+
+    def test_turns_report_working_during_a_turn_and_idle_between(self) -> None:
+        client = self._Client()
+        presence = PanePresence(client, "p-1", agent="claude", role="author", ticket="TICKET-2")
+        turns_dir = Path(self.temp.name) / "turns"
+        marker = Path(self.temp.name) / "turn-ran"
+        seen: list[tuple[str, bool]] = []
+
+        class Watching:
+            def working(self) -> None:
+                presence.working()
+                seen.append(("working", marker.exists()))
+
+            def idle(self) -> None:
+                presence.idle()
+                seen.append(("idle", marker.exists()))
+                # One turn is enough; stop the runner at its next check.
+                (turns_dir / "stop").write_text("", encoding="utf-8")
+
+        presence.start()
+        config = {
+            "turns_dir": str(turns_dir),
+            "initial_prompt": "go",
+            "turn_start": [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"],
+            "turn_resume": [],
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli._run_turns(
+                config, self.temp.name, dict(os.environ), io.StringIO(), presence=Watching()
+            )
+        presence.close()
+
+        # Working while the agent ran, idle before and after it.
+        self.assertEqual(seen, [("working", False), ("idle", True)])
+        states = [kwargs["state"] for name, kwargs in client.calls if name == "agent"]
+        self.assertEqual(states, ["idle", "working", "idle"])
+        self.assertEqual(client.calls[-2][0], "release")
+        start_metadata = client.calls[0][1]
+        self.assertEqual(start_metadata["tokens"], {"role": "author", "ticket": "TICKET-2"})
+        self.assertIn("author", start_metadata["display_agent"])
+        self.assertTrue(0 < start_metadata["ttl_ms"] <= 86_400_000)
+        # Every report carries a higher sequence than the one before it.
+        seqs = [kwargs["seq"] for _, kwargs in client.calls]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(set(seqs)), len(seqs))
+        # Leaving clears the labels it set.
+        self.assertEqual(client.calls[-1][1]["clear_tokens"], ("role", "ticket"))
+
+    def test_an_interactive_agent_gets_labels_but_no_state_of_helms(self) -> None:
+        client = self._Client()
+        presence = PanePresence(client, "p-1", agent="claude", role="lead", report_state=False)
+        presence.start()
+        presence.working()
+        presence.refresh()
+        presence.close()
+        self.assertEqual({name for name, _ in client.calls}, {"metadata"})
+
+    def test_metadata_is_refreshed_before_it_lapses(self) -> None:
+        client = self._Client()
+        presence = PanePresence(client, "p-1", agent="claude", role="author")
+        presence.REFRESH_SECONDS = 0.05
+        presence.start()
+        time.sleep(0.4)
+        presence.close()
+        refreshes = [k for name, k in client.calls if name == "metadata" and k.get("tokens")]
+        self.assertGreater(len(refreshes), 1)
+        self.assertLess(PanePresence.REFRESH_SECONDS * 1000, PanePresence.METADATA_TTL_MS)
+
+    def test_a_herdr_failure_never_reaches_the_worker(self) -> None:
+        presence = PanePresence(self._Client(fail=True), "p-1", agent="claude", role="author")
+        presence.start()
+        presence.working()
+        presence.idle()
+        presence.close()
+
+    def test_outside_a_herdr_pane_there_is_no_presence(self) -> None:
+        with mock.patch.dict(os.environ, {"HERDR_ENV": "0", "HERDR_PANE_ID": "p-1"}):
+            self.assertIsNone(PanePresence.from_environment(agent="claude", role="author"))
+
+    def test_the_cli_sends_the_documented_report_flags(self) -> None:
+        client = SubprocessHerdrClient("herdr")
+        sent: list[list[str]] = []
+
+        def record(args: Any, **_: Any) -> dict[str, object]:
+            sent.append(list(args))
+            return {}
+
+        with mock.patch.object(client, "_call", side_effect=record):
+            client.pane_report_agent("p-1", source="helm", agent="claude", state="idle", seq=3)
+            client.pane_release_agent("p-1", source="helm", agent="claude", seq=4)
+            client.pane_report_metadata(
+                "p-1", source="helm", seq=5, tokens={"ticket": "T-1"}, display_agent="x", ttl_ms=10,
+            )
+            client.pane_split("p-1", "right", "/tmp")
+        self.assertEqual(sent[0], [
+            "pane", "report-agent", "p-1", "--source", "helm", "--agent", "claude",
+            "--state", "idle", "--seq", "3",
+        ])
+        self.assertEqual(sent[1], [
+            "pane", "release-agent", "p-1", "--source", "helm", "--agent", "claude", "--seq", "4",
+        ])
+        self.assertEqual(sent[2], [
+            "pane", "report-metadata", "p-1", "--source", "helm", "--seq", "5",
+            "--token", "ticket=T-1", "--display-agent", "x", "--ttl-ms", "10",
+        ])
+        self.assertEqual(sent[3][:7], ["pane", "split", "p-1", "--direction", "right", "--cwd", "/tmp"])
+        self.assertIn("--no-focus", sent[3])

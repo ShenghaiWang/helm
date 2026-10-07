@@ -169,9 +169,10 @@ a worker agent the coordinator spawns for that task.
   [docs/delegation.md](docs/delegation.md#the-requirement-and-solution-gates).
 - **Put the worker in the project's one Helm-owned Herdr space, reusing what
   already exists.** A project gets exactly one workspace, holding one tab per
-  worker plus the overview pane its routed messages print into — there is no
-  separate coordinator workspace. Helm records those IDs as opaque provider
-  IDs; reuse a recorded space, and create one only when Herdr no longer has it.
+  ticket — a pane for each agent working on that ticket — one tab for each
+  piece of work with no ticket, and the overview pane its routed messages
+  print into; there is no separate coordinator workspace. Helm records those
+  IDs as opaque provider IDs; reuse a recorded space, and create one only when Herdr no longer has it.
   Never adopt, retitle, or lifecycle-manage a space Helm did not create, and
   never start, stop, focus, restart, or delete a user resource. **Spawning is
   silent**: spaces are created unfocused and Helm never switches focus, not even

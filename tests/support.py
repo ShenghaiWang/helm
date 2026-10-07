@@ -65,6 +65,10 @@ class FakeHerdr:
         self.runs: list[tuple[str, str]] = []
         self.closed_tabs: list[str] = []
         self.closed_workspaces: list[str] = []
+        # Work on one ticket shares a tab: each further worker is a split.
+        self.splits: list[tuple[str, str, str, str]] = []
+        self.closed_panes: list[str] = []
+        self.renamed_panes: list[tuple[str, str]] = []
         self.renamed: list[tuple[str, str]] = []
         self.sent_text: list[tuple[str, str]] = []
         self.sent_keys: list[tuple[str, str]] = []
@@ -76,6 +80,8 @@ class FakeHerdr:
     def pane_status(self, pane_id: str) -> dict[str, object]:
         if self.unreachable:
             raise HerdrUnavailable("herdr server unreachable")
+        if pane_id in self.missing:
+            raise HerdrNotFound("pane_not_found")
         pane: dict[str, object] = {
             "pane_id": pane_id,
             "agent_status": self.agent_status.get(pane_id, "unknown"),
@@ -152,6 +158,23 @@ class FakeHerdr:
     def tab_close(self, tab_id: str) -> dict[str, object]:
         self.closed_tabs.append(tab_id)
         return {}
+
+    def pane_split(self, pane_id: str, direction: str, cwd: str) -> dict[str, object]:
+        if self.unreachable:
+            raise HerdrUnavailable("herdr server unreachable")
+        if pane_id in self.missing or pane_id in self.closed_panes:
+            raise HerdrNotFound("pane_not_found")
+        new_pane = self._id("pane")
+        self.splits.append((pane_id, direction, cwd, new_pane))
+        return {"result": {"pane": {"pane_id": new_pane}}}
+
+    def pane_close(self, pane_id: str) -> dict[str, object]:
+        self.closed_panes.append(pane_id)
+        return {}
+
+    def pane_rename(self, pane_id: str, label: str) -> dict[str, object]:
+        self.renamed_panes.append((pane_id, label))
+        return {"result": {"type": "ok"}}
 
     def workspace_close(self, workspace_id: str) -> dict[str, object]:
         self.closed_workspaces.append(workspace_id)

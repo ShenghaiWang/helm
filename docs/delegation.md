@@ -10,7 +10,8 @@ The agent started in the Helm root is the **coordinator**. It does not edit,
 build, test, or commit project files, and it does not do the research,
 writing, or production a request asks for. Every substantive request is done
 by a worker agent spawned for that task — one worker per task, in that
-project's one Helm-owned Herdr space, reusing the workspace and worker tabs
+project's one Helm-owned Herdr space, in a pane of its ticket's tab (or a tab
+of its own when the work has no ticket), reusing the workspace and tabs
 recorded in Helm state and creating only what Herdr no longer has. The
 coordinator then drives that worker and relays its protocol messages.
 
