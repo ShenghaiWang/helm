@@ -1630,8 +1630,17 @@ class HerdrAdapter:
                 review_data = self.coordinator.store.load()
                 artifact_handoff = self._artifact_handoff(review_data, task_id)
                 full_suite_evidence = self._full_suite_evidence(review_data, task_id)
-                diff_handoff, _diff_path = self._precomputed_diff(task, review_base)
-                shape_handoff = self._shape_handoff(task, review_base)
+                # The exact commit this round reviews, taken once, here, before
+                # the reviewer is asked anything. The diff is built against
+                # it, the reviewer task records it, and the verdict is
+                # attached to it -- never to whatever the branch points at
+                # when the verdict lands, which is a commit the author may
+                # have added after the reviewer stopped reading.
+                review_tip = self._review_round_tip(task)
+                diff_handoff, _diff_path = self._precomputed_diff(
+                    task, review_base, review_tip
+                )
+                shape_handoff = self._shape_handoff(task, review_base, review_tip)
                 contract_handoff = self._contract_handoff(review_data, task_id)
                 # Terminal protocol results settle workers even when their
                 # interactive pane remains open. Do not reopen a completed
@@ -1683,9 +1692,12 @@ class HerdrAdapter:
                         "published a review it had to caveat as static-only. That is "
                         "the gap this paragraph closes, without reopening the door to a "
                         "second full run of a suite the author already ran.\n\n"
-                        f"Review the change on branch {task['branch']} against "
+                        f"Review the change on branch {task['branch']} at commit "
+                        f"{review_tip} against "
                         f"{review_base}, following the code-review domain in "
-                        "your context. Diff against that commit exactly, not against "
+                        "your context. Your verdict is recorded against commit "
+                        f"{review_tip} and no other: a commit the author adds after "
+                        "it is not covered by it. Diff against that base exactly, not against "
                         f"{task['base_branch']}: the base branch has moved since this "
                         "work started, and measuring against a different tree turns a "
                         "correct figure into a finding. Finish with one result message "
@@ -1726,6 +1738,7 @@ class HerdrAdapter:
                     # What this reviewer reviews, so a second driver can see it
                     # exists before starting another.
                     reviews=task_id,
+                    review_tip=review_tip,
                     # A reviewer reads a diff; it never writes one. It needs the
                     # branch and the base commit, both of which are in the brief
                     # above, not a checkout of its own -- and a checkout of its
@@ -1742,10 +1755,18 @@ class HerdrAdapter:
                     review_task["id"], choice["command"], wait=False
                 )
             else:
+                # A new round reviews a new commit: pin it, rewrite the diff
+                # file the reviewer was told to read, and move the reviewer
+                # task's record to it before the reviewer is asked, so the
+                # verdict this round produces is attached to this commit.
+                review_tip = self._review_round_tip(task)
+                self._precomputed_diff(task, review_base, review_tip)
+                self.coordinator.set_review_tip(review_task["id"], review_tip)
                 self.answer_worker(
                     reviewer_worker["id"],
                     f"The author has pushed changes for round {round_number}. Re-read the "
-                    f"diff on {task['branch']} and reply again with APPROVED or "
+                    f"diff on {task['branch']} at commit {review_tip} (the diff file you "
+                    "were given has been rewritten for it) and reply again with APPROVED or "
                     "CHANGES-REQUESTED as the first word of a result message.",
                 )
             outcome = self._await_terminal(
@@ -2589,7 +2610,9 @@ class HerdrAdapter:
             return f"{entry} {fragment}{marker}"
         return f"{entry} {cls._ARTIFACT_DESCRIPTION_OMITTED}"
 
-    def _shape_handoff(self, task: dict[str, Any], review_base: str) -> str:
+    def _shape_handoff(
+        self, task: dict[str, Any], review_base: str, review_tip: str | None = None
+    ) -> str:
         """Check the declared shape against the diff, record it, tell the reviewer.
 
         The shape is the foreman's word, and it switched rounds, effort and
@@ -2601,7 +2624,7 @@ class HerdrAdapter:
         if not workspace or not branch:
             return ""
         try:
-            numstat = _git(Path(workspace), "diff", "--numstat", f"{review_base}...{branch}", check=False)
+            numstat = _git(Path(workspace), "diff", "--numstat", f"{review_base}...{review_tip or branch}", check=False)
         except (OSError, HelmError):
             return ""
         check = shape_check(task, numstat)
@@ -2676,7 +2699,32 @@ class HerdrAdapter:
             overflow -= len(section) - len(sections[index])
         return head + "".join(sections)
 
-    def _precomputed_diff(self, task: dict[str, Any], review_base: str) -> tuple[str, str]:
+    def _review_round_tip(self, task: dict[str, Any]) -> str:
+        """The full commit id the task branch points at now, for one review round.
+
+        Refused rather than guessed when it cannot be read: a round with no
+        pinned commit would have to infer what it reviewed later, which is the
+        inference this exists to remove.
+        """
+        tip = ""
+        workspace = task.get("workspace")
+        branch = task.get("branch")
+        if workspace and branch:
+            with contextlib.suppress(OSError, HelmError):
+                tip = _git(
+                    Path(workspace), "rev-parse", "--verify", "--quiet",
+                    f"refs/heads/{branch}^{{commit}}", check=False,
+                ).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tip):
+            raise HelmError(
+                f"cannot read the commit task {task['id']}'s branch {branch} points at; "
+                "a review must be pinned to one exact commit"
+            )
+        return tip
+
+    def _precomputed_diff(
+        self, task: dict[str, Any], review_base: str, review_tip: str | None = None
+    ) -> tuple[str, str]:
         """Write the diff to a file so the reviewer never has to run `git diff`.
 
         Five consecutive reviewers on one project died the same way: read the
@@ -2701,15 +2749,18 @@ class HerdrAdapter:
         branch = task.get("branch")
         if not workspace or not branch:
             return "", ""
+        # The pinned commit when the round has one, so the file is the diff of
+        # exactly what the verdict will be recorded against.
+        head = review_tip or branch
         directory = self.coordinator.store.directory / "reviews" / task["id"]
         target = directory / "diff.patch"
         try:
             directory.mkdir(parents=True, exist_ok=True)
             patch = _git(
-                Path(workspace), "diff", f"{review_base}...{branch}", check=False
+                Path(workspace), "diff", f"{review_base}...{head}", check=False
             )
             stat = _git(
-                Path(workspace), "diff", "--stat", f"{review_base}...{branch}", check=False
+                Path(workspace), "diff", "--stat", f"{review_base}...{head}", check=False
             )
             if not patch.strip():
                 return "", ""

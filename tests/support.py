@@ -279,8 +279,8 @@ class HelmTestCase(unittest.TestCase):
         A standard or critical branch may not be pushed or published until a
         reviewer has APPROVED its exact tip, so a test that exercises a push
         gives it one -- the same record `helm review` leaves: a reviewer task
-        linked by `reviews`, and its result, whose reviewed tip Helm reads
-        from git when the result lands.
+        linked by `reviews` and pinned to the tip it was created against, and
+        its result, which is recorded against that pinned tip.
         """
         review = self.coordinator.create_task(
             task["project_id"], "review it", role="reviewer", reviews=task["id"],

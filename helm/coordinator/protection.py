@@ -73,6 +73,26 @@ class ProtectionMixin:
         project = self._project(data, task["project_id"])
         return self._snapshot(data, project, task)
 
+    def _authorization_target(
+        self, data: dict[str, Any], task: dict[str, Any], snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The one task an authorization is about: the task its snapshot binds.
+
+        Read from the binding itself, so the review policy and the bytes an
+        authorization covers can never be two different tasks. A snapshot
+        scoped to a subject is that subject's branch; any other is the asking
+        task's own.
+        """
+        if snapshot.get("scope") == "subject":
+            subject_id = snapshot.get("subject_task_id")
+            subject = data.get("tasks", {}).get(subject_id) if subject_id else None
+            if subject is None:
+                raise SafetyError(
+                    f"the authorization is bound to task {subject_id}, which no longer exists"
+                )
+            return subject
+        return task
+
     def _snapshot(
         self,
         data: dict[str, Any],
@@ -438,6 +458,7 @@ class ProtectionMixin:
         *,
         branch: str,
         remote: str,
+        tip: str | None = None,
     ) -> list[tuple[str, str]]:
         """Close every unspent push or publish request for a branch that just landed.
 
@@ -448,7 +469,10 @@ class ProtectionMixin:
         hours, and the task sat in `approval-needed`.
 
         Matches the task's own hold and any lead's hold whose subject is this
-        task. An in-flight hold is left alone: its worker is acting now.
+        task, and only when the commit pushed is the one the request was
+        about: a request bound to another commit asked about work this push
+        did not deliver. An in-flight hold is left alone: its worker is acting
+        now.
         """
         closed: list[tuple[str, str]] = []
         for holder in data.get("tasks", {}).values():
@@ -461,6 +485,9 @@ class ProtectionMixin:
                 continue
             about = hold.get("subject_task_id") or holder["id"]
             if about != task["id"]:
+                continue
+            asked_tip = (hold.get("snapshot") or {}).get("branch_tip")
+            if tip and asked_tip and asked_tip != tip:
                 continue
             self._move_hold(
                 data, project, holder, hold, "fulfil",
@@ -594,6 +621,35 @@ class ProtectionMixin:
         ).strip()
         return tip or None
 
+    def _pinned_review_tip(
+        self, data: dict[str, Any], reviewed_id: str, review_tip: str | None
+    ) -> str | None:
+        """The commit a new reviewer task reviews: the one named, or the branch now.
+
+        The review loop names the commit it built the diff from. A reviewer
+        created any other way reviews the branch as it stands at creation --
+        still a commit fixed before the reviewer reads anything, which is the
+        property that matters.
+        """
+        if review_tip is not None:
+            review_tip = str(review_tip).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", review_tip):
+                raise HelmError("a review tip must be a full commit id")
+            return review_tip
+        reviewed = data.get("tasks", {}).get(reviewed_id)
+        return self._branch_tip(data, reviewed) if reviewed else None
+
+    def set_review_tip(self, reviewer_task_id: str, review_tip: str) -> None:
+        """Move a live reviewer task to the commit its next round reviews."""
+        review_tip = str(review_tip).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", review_tip):
+            raise HelmError("a review tip must be a full commit id")
+        with self.store.locked() as data:
+            task = self._task(data, reviewer_task_id)
+            if task.get("role") != "reviewer":
+                raise HelmError(f"task {reviewer_task_id} is not a reviewer task")
+            task["review_tip"] = review_tip
+
     def _review_verdicts(
         self, data: dict[str, Any], task: dict[str, Any]
     ) -> list[tuple[str, str | None]]:
@@ -715,6 +771,19 @@ class ProtectionMixin:
         subject_task_id = payload.get("subject") or None
         if subject_task_id is not None and not isinstance(subject_task_id, str):
             raise HelmError("--subject names one task id")
+        if task.get("role") not in WORKTREELESS_ROLES and subject_task_id is not None:
+            # A task with a branch of its own is only ever asking about that
+            # branch: its snapshot binds its own checkout, whatever it names.
+            # Accepting another task here let the review check read the
+            # subject while the authorization bound this task's bytes -- so
+            # naming an exempt small task waved through an unreviewed branch.
+            if subject_task_id != task["id"]:
+                raise HelmError(
+                    f"--subject is for a lead asking about another task's branch; a "
+                    f"{task.get('role') or 'worker'} task's request is about its own "
+                    f"branch only, so drop --subject {subject_task_id}"
+                )
+            subject_task_id = None
         if (
             task.get("role") in WORKTREELESS_ROLES
             and action in self._BRANCH_ACTIONS
@@ -735,9 +804,9 @@ class ProtectionMixin:
         if action in self._BRANCH_ACTIONS:
             # Asked before the commander is: a release they cannot safely give
             # should not reach them as a question at all.
-            reviewed = data["tasks"][subject_task_id] if subject_task_id else task
             refusal = self._review_refusal(
-                data, reviewed, snapshot.get("branch_tip"), action
+                data, self._authorization_target(data, task, snapshot),
+                snapshot.get("branch_tip"), action,
             )
             if refusal is not None:
                 raise SafetyError(refusal)
@@ -1389,10 +1458,9 @@ class ProtectionMixin:
                 # Re-checked where the authorization is spent: a release given
                 # before this gate existed, or a review superseded since, must
                 # not send an unreviewed tip. Nothing is spent by refusing.
-                subject_id = hold.get("subject_task_id")
-                reviewed = data["tasks"].get(subject_id) if subject_id else task
                 refusal = self._review_refusal(
-                    data, reviewed or task, current.get("branch_tip"), hold["action"]
+                    data, self._authorization_target(data, task, current),
+                    current.get("branch_tip"), hold["action"],
                 )
                 if refusal is not None:
                     raise SafetyError(f"do not act: {refusal}")
@@ -1817,7 +1885,13 @@ class ProtectionMixin:
             raise SafetyError(
                 "worktree has uncommitted changes; commit them or the push omits them"
             )
-        refusal = self._review_refusal(data, task, self._branch_tip(data, task), "push")
+        # Read once, and this commit -- not the branch name -- is what gets
+        # pushed. Checking the tip and then pushing the name let a commit
+        # added in between reach the remote with nobody having reviewed it.
+        tip = self._branch_tip(data, task)
+        if not tip:
+            raise HelmError(f"cannot read the commit {task['branch']} points at; nothing to push")
+        refusal = self._review_refusal(data, task, tip, "push")
         if refusal is not None:
             raise SafetyError(refusal)
         root = canonical(project["root"])
@@ -1827,7 +1901,14 @@ class ProtectionMixin:
                 f"project {project['id']} has no '{remote}' remote; add one or pass --remote"
             )
         branch = task["branch"]
-        _git(workspace, "push", "--set-upstream", remote, branch)
+        _git(workspace, "push", remote, f"{tip}:refs/heads/{branch}")
+        # A pushed commit id cannot set an upstream by itself; the branch is
+        # pointed at the remote-tracking ref the push just updated, which is
+        # a local convenience and never a reason to fail a push that landed.
+        _git(
+            workspace, "branch", f"--set-upstream-to={remote}/{branch}", branch,
+            check=False,
+        )
         url = _git(root, "remote", "get-url", remote, check=False).strip()
         with self.store.locked() as live:
             live_task = self._task(live, task_id)
@@ -1845,6 +1926,8 @@ class ProtectionMixin:
                 "remote": remote,
                 "remote_url": url,
                 "branch": branch,
+                # The exact commit that left the machine: the reviewed one.
+                "pushed_tip": tip,
             })
             delivery.setdefault("events", []).append({
                 "at": delivery["last_pushed_at"],
@@ -1852,6 +1935,7 @@ class ProtectionMixin:
                 "remote": remote,
                 "remote_url": url,
                 "branch": branch,
+                "tip": tip,
                 "grant_id": grant_id,
             })
             self._message(
@@ -1860,11 +1944,11 @@ class ProtectionMixin:
                 live_task,
                 None,
                 "status",
-                f"Pushed {branch} to {remote} for review",
-                {"remote": remote, "branch": branch, "grant_id": grant_id},
+                f"Pushed {branch} at {tip[:12]} to {remote} for review",
+                {"remote": remote, "branch": branch, "tip": tip, "grant_id": grant_id},
             )
             fulfilled = self._fulfil_branch_holds(
-                live, live_project, live_task, branch=branch, remote=remote
+                live, live_project, live_task, branch=branch, remote=remote, tip=tip
             )
         for holder_id, hold_id in fulfilled:
             with contextlib.suppress(HelmError, OSError):
@@ -1873,6 +1957,7 @@ class ProtectionMixin:
         return {
             "task_id": task_id,
             "branch": branch,
+            "tip": tip,
             "remote": remote,
             "remote_url": url,
             "base_branch": task["base_branch"],

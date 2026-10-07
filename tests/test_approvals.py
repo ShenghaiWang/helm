@@ -1899,6 +1899,38 @@ class NoBranchLeavesUnreviewedTests(HelmTestCase):
         ][-1]
         self.assertEqual(stored["payload"]["reviewed_tip"], tip)
 
+    def test_a_worker_cannot_borrow_a_small_tasks_exemption_with_subject(self) -> None:
+        """--subject on a worker's own request named the review policy, not the bytes.
+
+        The snapshot bound the worker's own checkout while the review check
+        read the named task, so naming an exempt small task waved an
+        unreviewed standard branch through.
+        """
+        root, project, task, worker = self._task_with_work("borrowed")
+        small = self.coordinator.create_task(project["id"], "a tiny thing", shape="small")
+        with self.assertRaisesRegex(HelmError, r"--subject is for a lead"):
+            self._ask(worker, subject=small["id"])
+        self.assertIsNone(
+            self.coordinator.latest_hold(self.coordinator.inspect_task(task["id"])["task"])
+        )
+        # Naming itself is harmless and binds the same thing.
+        with self.assertRaisesRegex(SafetyError, r"no review has been run"):
+            self._ask(worker, subject=task["id"])
+
+    def test_action_start_reviews_the_task_the_authorization_binds(self) -> None:
+        root, project, task, worker = self._task_with_work("boundstart")
+        small = self.coordinator.create_task(project["id"], "a tiny thing", shape="small")
+        self.pass_review(task)
+        self._ask(worker)
+        self.coordinator.release_task_hold(task["id"], action="push", confirm=True)
+        # A hold carrying a subject it does not bind (as an older request
+        # could), and a review of the bound tip overturned since.
+        with self.coordinator.store.locked() as data:
+            self.coordinator.task_hold(data["tasks"][task["id"]])["subject_task_id"] = small["id"]
+        self.pass_review(task, "CHANGES-REQUESTED -- found a race")
+        with self.assertRaisesRegex(SafetyError, r"do not act: .*helm review"):
+            self.coordinator.start_authorized_action(worker["id"])
+
     def test_small_shapes_and_projects_that_declined_review_are_exempt(self) -> None:
         root, project, task, worker = self._task_with_work("tiny", shape="small")
         self.assertEqual(self._ask(worker)["status"], "approval-needed")
@@ -2019,6 +2051,46 @@ class AReleasedHoldIsTheWorkersMoveTests(HelmTestCase):
         self.assertNotIn(
             task["id"], {e["task_id"] for e in self.coordinator.open_escalations()}
         )
+
+    def _origin(self, root: Path, name: str) -> Path:
+        remote = Path(self.temp.name) / f"{name}-remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", str(remote)], check=True)
+        return remote
+
+    def test_the_root_push_sends_the_reviewed_commit_not_a_later_one(self) -> None:
+        """The tip was checked, then the branch NAME pushed.
+
+        A commit landing between the two went to the remote unreviewed.
+        """
+        root, task, _worker = self._released("pinnedpush")
+        remote = self._origin(root, "pinnedpush")
+        reviewed = self._run_git(Path(task["workspace"]), "rev-parse", "HEAD")
+        original = self.coordinator._review_refusal
+
+        def then_commit(*args, **kwargs):
+            refusal = original(*args, **kwargs)
+            self.commit_on_task_branch(task, "slipped in after the check")
+            return refusal
+
+        with mock.patch.object(self.coordinator, "_review_refusal", side_effect=then_commit):
+            pushed = self.coordinator.publish_task_branch(task["id"], confirm=True)
+
+        self.assertEqual(self._run_git(remote, "rev-parse", f"refs/heads/{task['branch']}"), reviewed)
+        self.assertEqual(pushed["tip"], reviewed)
+        record = self.coordinator.inspect_task(task["id"])["task"]
+        self.assertEqual(record["delivery"]["pushed_tip"], reviewed)
+        self.assertEqual(record["delivery"]["events"][-1]["tip"], reviewed)
+
+    def test_a_push_of_another_commit_leaves_a_request_about_this_one_open(self) -> None:
+        root, task, _worker = self._released("othertip")
+        self._origin(root, "othertip")
+        self.commit_on_task_branch(task, "a newer, separately reviewed commit")
+        self.pass_review(task)
+
+        self.coordinator.publish_task_branch(task["id"], confirm=True)
+
+        self.assertEqual(self._hold(task["id"])["status"], "authorized-pending-delivery")
 
     def test_an_authorization_whose_session_ended_is_abandoned(self) -> None:
         _root, task, worker = self._released("sessiongone", action="publish")

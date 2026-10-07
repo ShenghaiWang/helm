@@ -1451,6 +1451,109 @@ class ReviewTests(HelmTestCase):
         )
 
 
+class AVerdictIsPinnedToTheCommitReviewedTests(HelmTestCase):
+    """A verdict covers the commit the reviewer was handed, not a later one.
+
+    The tip used to be read off the branch when the verdict landed. An author
+    that committed again while the reviewer was reading got that new commit
+    recorded as approved, though nobody had read it.
+    """
+
+    def _rev(self, workspace: str) -> str:
+        return subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "HEAD"],
+            check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    def test_a_commit_added_during_the_review_is_not_recorded_as_approved(self) -> None:
+        root = self.repo("pinnedtip")
+        project = self.coordinator.register_project("Pinned", str(root), project_id="pinnedtip")
+        task = self.coordinator.create_task(project["id"], "write the code")
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.commit_on_task_branch(task, "the reviewed line")
+        reviewed = self._rev(task["workspace"])
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        reviewers: list[dict] = []
+
+        def fake_launch(review_task_id, command, wait=False):
+            worker = self.coordinator.launch_worker(
+                review_task_id, [sys.executable, "-c", ""], wait=False
+            )
+            reviewers.append(worker)
+            # The author commits again while the reviewer is still reading.
+            self.commit_on_task_branch(task, "an unreviewed line")
+            self.coordinator.record_worker_message(worker["id"], "result", "APPROVED fine")
+            return worker
+
+        with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
+             mock.patch.object(self.coordinator, "pick_reviewer_agent", return_value={
+                 "agent": "codex", "command": None,
+                 "independence": "different-runtime", "reason": "test",
+             }):
+            outcome = adapter.run_review_cycle(task["id"], rounds=1, timeout=1.0)
+
+        self.assertEqual(outcome["verdict"], "approved")
+        later = self._rev(task["workspace"])
+        self.assertNotEqual(later, reviewed)
+        review_task = self.coordinator.inspect_task(reviewers[0]["task_id"])
+        result = [m for m in review_task["messages"] if m["kind"] == "result"][-1]
+        self.assertEqual(result["payload"]["reviewed_tip"], reviewed)
+        self.assertEqual(review_task["task"].get("review_tip"), reviewed)
+        self.assertIn(reviewed, review_task["task"]["brief"])
+        patch = (self.state.directory / "reviews" / task["id"] / "diff.patch").read_text()
+        self.assertIn("the reviewed line", patch)
+        self.assertNotIn("an unreviewed line", patch)
+
+    def test_a_kept_reviewer_is_moved_to_each_rounds_commit(self) -> None:
+        root = self.repo("pinnedrounds")
+        project = self.coordinator.register_project("Rounds", str(root), project_id="pinnedrounds")
+        task = self.coordinator.create_task(project["id"], "write the code")
+        author = self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        self.commit_on_task_branch(task, "first round")
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        original_launch = adapter.launch_task
+        reviewer_ids: list[str] = []
+        tips: dict[str, str] = {}
+
+        def fake_launch(review_task_id, command, wait=False):
+            worker = original_launch(review_task_id, command, wait=wait)
+            reviewer_ids.append(worker["id"])
+            self.coordinator.record_worker_message(worker["id"], "result", "CHANGES-REQUESTED x")
+            return worker
+
+        def fake_answer(worker_id, text):
+            if worker_id == author["id"]:
+                self.commit_on_task_branch(task, "second round")
+                tips["second"] = self._rev(task["workspace"])
+                self.coordinator.record_worker_message(worker_id, "result", "addressed")
+            else:
+                # Committed after round two was pinned: not what it read.
+                self.commit_on_task_branch(task, "third, unread")
+                self.coordinator.record_worker_message(worker_id, "result", "APPROVED ok")
+            return True
+
+        with mock.patch.object(adapter, "launch_task", side_effect=fake_launch), \
+             mock.patch.object(adapter, "answer_worker", side_effect=fake_answer), \
+             mock.patch.object(self.coordinator, "pick_reviewer_agent", return_value={
+                 "agent": "codex",
+                 "command": [sys.executable, "-c", "import time; time.sleep(60)"],
+                 "independence": "different-runtime", "reason": "test",
+             }):
+            outcome = adapter.run_review_cycle(task["id"], rounds=2, timeout=1.0)
+
+        self.assertEqual(outcome["verdict"], "approved")
+        self.assertEqual(len(reviewer_ids), 1)
+        reviewer_task_id = self.coordinator.store.load()["workers"][reviewer_ids[0]]["task_id"]
+        results = [
+            m for m in self.coordinator.inspect_task(reviewer_task_id)["messages"]
+            if m["kind"] == "result"
+        ]
+        self.assertEqual(results[-1]["payload"]["reviewed_tip"], tips["second"])
+        patch = (self.state.directory / "reviews" / task["id"] / "diff.patch").read_text()
+        self.assertIn("second round", patch)
+        self.assertNotIn("third, unread", patch)
+
+
 class ReviewerTicketTests(HelmTestCase):
     def test_a_reviewer_task_inherits_the_reviewed_tickets_ticket(self) -> None:
         """The reviewer serves the same ticket as the change it reviews, so its

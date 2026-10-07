@@ -127,11 +127,15 @@ invalidates a push they just approved. A `push` or `publish` from a task lead
 (or any role without a branch of its own) must have a subject: when its gate
 pairs authorized exactly one task, that task is the subject; otherwise the
 request is refused until `--subject` names one, because the project root's
-HEAD says nothing about the branch being pushed.
+HEAD says nothing about the branch being pushed. A task with a branch of its
+own may not name a different subject: its request always binds, and is
+reviewed as, its own branch.
 
 A `push` or `publish` of a `standard` or `critical` task's branch also needs an
-independent review that approved that exact tip. Each reviewer result records
-the reviewed branch's tip, read from git when the result lands; the latest
+independent review that approved that exact tip. Each reviewer task is pinned
+to the exact commit it was handed before it read anything -- the commit its
+diff was built from -- and its result is recorded against that commit, never
+against whatever the branch points at when the verdict lands; the latest
 review of the current tip must begin `APPROVED`. The request is refused
 without one (`helm review <task>` runs it), `helm worker action-start`
 re-checks it before the authorization is spent, and so does `helm task pr`.

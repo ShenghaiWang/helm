@@ -490,13 +490,15 @@ class Coordinator(
                     "the root will do it.]"
                 )
         if kind == "result" and task.get("role") == "reviewer" and task.get("reviews"):
-            # The tip this verdict is about, read from git as the result lands
-            # -- never from the reviewer's own payload -- so a push gate can
-            # tell an approval of this commit from an approval of an older one.
-            reviewed = data.get("tasks", {}).get(task["reviews"])
+            # The tip this verdict is about: the commit pinned on the reviewer
+            # task before it read anything -- never the reviewer's own
+            # payload, and never the branch as it stands when the result
+            # lands, which may hold a commit the author added after the
+            # reviewer stopped reading. A reviewer with no pinned commit
+            # approves nothing a push gate will accept.
             payload = {
                 **(payload or {}),
-                "reviewed_tip": self._branch_tip(data, reviewed) if reviewed else None,
+                "reviewed_tip": task.get("review_tip") or None,
             }
         message = self._message(
             data, project, task, worker, kind, text, payload, status=requested_status

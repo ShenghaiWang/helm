@@ -524,6 +524,7 @@ class LifecycleMixin:
         no_domain: bool = False,
         role: str = "worker",
         reviews: str | None = None,
+        review_tip: str | None = None,
         ticket: str | None = None,
         title: str | None = None,
         read_only: bool = False,
@@ -772,6 +773,16 @@ class LifecycleMixin:
                         # and a project's foreman, or two foremen -- each
                         # start one and neither can see the other's.
                         "reviews": reviews,
+                        # For a reviewer task, the exact commit it was asked
+                        # to review: the one its diff was built from, and the
+                        # one its verdict is recorded against. Pinned here,
+                        # never read off the branch when the verdict lands --
+                        # the author may have committed again by then.
+                        "review_tip": (
+                            self._pinned_review_tip(data, reviews, review_tip)
+                            if role == "reviewer" and reviews
+                            else None
+                        ),
                         # The agent whose command created this task, or None
                         # for the root. It is who gets told the task's
                         # outcome: a read-only task or a reviewer spends no
