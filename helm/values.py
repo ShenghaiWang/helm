@@ -10,6 +10,7 @@ import datetime as _dt
 import hashlib
 import re
 import subprocess
+import sys
 import uuid
 from typing import Any, Sequence
 
@@ -81,6 +82,32 @@ def _safe_text(value: Any, default: str = "") -> str:
         limit=SAFE_TEXT_LIMIT, dropped=len(text) - SAFE_TEXT_LIMIT
     )
     return text[: SAFE_TEXT_LIMIT - len(notice)] + notice
+
+
+def _bounded_brief(value: Any) -> tuple[str, dict[str, int] | None]:
+    """A brief bounded like any field, plus a record of the cut when there was one.
+
+    The marker `_safe_text` leaves tells the agent reading the brief. Nobody
+    told the caller who wrote it, and nothing on the task said so: a
+    reviewer's acceptance contract fell off the end of its brief and the
+    review went ahead without anyone knowing it had. The record is for the
+    task, so `helm inspect` shows it; the caller prints the warning.
+    """
+    text = str(value if value is not None else "").strip()
+    bounded = _safe_text(text).strip()
+    if bounded == text:
+        return bounded, None
+    return bounded, {"chars": len(text), "limit": SAFE_TEXT_LIMIT}
+
+
+def _warn_brief_truncated(task_id: str, cut: dict[str, int]) -> None:
+    print(
+        f"WARNING: the brief for task {task_id} was {cut['chars']} characters and "
+        f"was cut to the {cut['limit']}-character limit; everything past it is "
+        "missing from what the agent reads. Recorded on the task as brief_truncated. "
+        "Put long material in a file in the worktree and name the path in the brief.",
+        file=sys.stderr,
+    )
 
 
 def _validate_protected_action(action: Any) -> str:

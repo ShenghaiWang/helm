@@ -1174,6 +1174,12 @@ def _print_inspect(report: dict[str, Any]) -> None:
         )
     )
     print(f"  brief: {task['brief']}")
+    if task.get("brief_truncated"):
+        cut = task["brief_truncated"]
+        print(
+            f"  BRIEF TRUNCATED: {cut.get('chars')} characters cut to {cut.get('limit')}; "
+            "the agent never saw the rest"
+        )
     if task.get("shape"):
         print(
             f"  shape: {task['shape']}"

@@ -1041,6 +1041,96 @@ class ReviewTests(HelmTestCase):
         self.assertLess(brief.index("FIRST WORD"), brief.index("ARTIFACTS THE AUTHOR"))
         self.assertLess(len(brief), 20_000)
 
+    def _gated_task(self, name: str) -> tuple[dict, dict]:
+        """A task a lead created by spending a confirmed gate pair."""
+        import os
+
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        lead_task = self.coordinator.create_foreman_task(project["id"])
+        lead = self.coordinator.prepare_external_worker(
+            lead_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            for kind, text in (
+                ("requirement", "goal: cache the rate table. Done means: one fetch per hour. Out of scope: the UI"),
+                ("solution", "approach: a TTL dict in rates.py; verification: unit tests"),
+            ):
+                self.coordinator.propose_gate(lead_task["id"], kind, text)
+                with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
+                    self.coordinator.decide_gate(lead_task["id"], kind, confirm=True, skip=False)
+            task = self.coordinator.create_task(project["id"], "cache the rate table")
+        worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        return task, worker
+
+    def _commit_many_files(self, task: dict, count: int) -> None:
+        workspace = Path(task["workspace"])
+        directory = workspace / ("generated/" + "deeply/nested/" * 4)
+        directory.mkdir(parents=True)
+        for index in range(count):
+            (directory / f"module_with_a_long_name_{index:04d}.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", str(workspace), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "many"], check=True)
+
+    def test_the_reviewer_brief_opens_with_the_confirmed_contract(self) -> None:
+        """The reviewer judged the diff with no idea what was asked for.
+
+        The commander's confirmed requirement never reached it, so a correct
+        change that was not the change asked for read as APPROVED.
+        """
+        task, _worker = self._gated_task("contract")
+        self.commit_on_task_branch(task)
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertTrue(brief.startswith("THE CONFIRMED CONTRACT"), brief[:200])
+        self.assertIn("Done means: one fetch per hour", brief)
+        self.assertIn("a TTL dict in rates.py", brief)
+
+    def test_a_long_change_cannot_push_the_evidence_or_contract_off_the_brief(self) -> None:
+        """The whole diffstat went inline ahead of the evidence.
+
+        A change touching a few hundred files filled the brief with file names
+        and the 20,000-character cut fell on the evidence and the artifacts.
+        """
+        task, worker = self._gated_task("widechange")
+        self._commit_many_files(task, 400)
+        self.coordinator.record_worker_message(
+            worker["id"], "status", "ready for review",
+            payload={"summary": True, "full_suite": "pytest -q: 9 passed, exit 0"},
+        )
+        workspace = Path(task["workspace"])
+        for index in range(60):
+            name = f"note-{index:03d}.md"
+            (workspace / name).write_text("x", encoding="utf-8")
+            self.coordinator.record_worker_message(
+                worker["id"], "artifact", "notes",
+                payload={"path": name, "description": "z" * 1000},
+            )
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertLessEqual(len(brief), 20_000)
+        self.assertTrue(brief.startswith("THE CONFIRMED CONTRACT"))
+        self.assertIn("AUTHOR'S FULL-SUITE EVIDENCE", brief)
+        self.assertIn("pytest -q: 9 passed, exit 0", brief)
+        self.assertIn("360 more files", brief)
+        self.assertIn("diff.stat", brief)
+        self.assertIn("400 files changed", brief)
+
+    def test_a_brief_cut_at_the_limit_is_recorded_and_announced(self) -> None:
+        root = self.repo("longbrief")
+        project = self.coordinator.register_project("Long", str(root), project_id="longbrief")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            task = self.coordinator.create_task(project["id"], "y" * 25_000)
+        self.assertEqual(task["brief_truncated"], {"chars": 25_000, "limit": 20_000})
+        self.assertIn("WARNING", stderr.getvalue())
+        self.assertIn("25000 characters", stderr.getvalue())
+
+        short = self.coordinator.create_task(project["id"], "a normal brief")
+        self.assertIsNone(short["brief_truncated"])
+
     def test_a_review_refuses_an_empty_branch_instead_of_approving_it(self) -> None:
         """An empty target is the one input that makes a review actively harmful.
 

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 from .naming import task_name
-from .values import shape_check, shape_policy
+from .values import SAFE_TEXT_LIMIT, shape_check, shape_policy
 from .core import (
     Coordinator,
     HelmError,
@@ -1203,6 +1203,7 @@ class HerdrAdapter:
                 full_suite_evidence = self._full_suite_evidence(review_data, task_id)
                 diff_handoff, _diff_path = self._precomputed_diff(task, review_base)
                 shape_handoff = self._shape_handoff(task, review_base)
+                contract_handoff = self._contract_handoff(review_data, task_id)
                 # Terminal protocol results settle workers even when their
                 # interactive pane remains open. Do not reopen a completed
                 # worker for another review round; launch a fresh reviewer task.
@@ -1214,8 +1215,16 @@ class HerdrAdapter:
                     # domain's, attached below and composed into this task's
                     # context. Restating it here would be a second copy free to
                     # drift from the one that is versioned and reviewable.
-                    (
-                        f"Run every git command in {task['workspace']} -- that is the "
+                    #
+                    # Fitted to the brief limit here rather than cut at it by
+                    # `create_task`: that cut fell wherever the characters ran
+                    # out, which was the evidence and the artifacts behind a
+                    # long diff summary. The confirmed contract and the
+                    # instructions are kept whole; the sections after them
+                    # give way from the last one back.
+                    self._fit_review_brief(
+                        contract_handoff
+                        + f"Run every git command in {task['workspace']} -- that is the "
                         "author's checkout of this branch, and it is the only "
                         "repository you have. Your own workspace is deliberately empty: "
                         "you are reading a diff, not building one, so you were given no "
@@ -1253,25 +1262,19 @@ class HerdrAdapter:
                         "correct figure into a finding. Finish with one result message "
                         "whose FIRST WORD is APPROVED or CHANGES-REQUESTED -- Helm reads "
                         "that word to decide whether the loop continues -- followed by "
-                        "your findings."
-                        # Before the author's text and before the evidence
-                        # block: this is the instruction that keeps the
-                        # reviewer alive, so nothing may crowd it off the end
-                        # of a brief truncated at 20,000 characters.
-                        f"{diff_handoff}"
-                        f"{shape_handoff}"
-                        # Mandatory and Helm's own, so it precedes the author's
-                        # untrusted text below for the same reason the rest of
-                        # this brief does: nothing the author writes may crowd
-                        # it off the end of a brief truncated at 20,000
-                        # characters.
-                        f"{full_suite_evidence}"
-                        # Last on purpose. Everything above is Helm's and is
-                        # mandatory; what follows is the author's own text, and
-                        # nothing the author writes may sit in front of an
-                        # instruction to its reviewer or crowd one off the end
-                        # of a brief that gets truncated at 20,000 characters.
-                        f"{artifact_handoff}"
+                        "your findings.",
+                        [
+                            # The pointer that keeps the reviewer off `git
+                            # diff`, so it is the last to give way.
+                            diff_handoff,
+                            shape_handoff,
+                            # Helm's own, so it precedes the author's text.
+                            full_suite_evidence,
+                            # Last on purpose: the author's own text, which
+                            # must never sit in front of an instruction to its
+                            # reviewer, and the first to give way.
+                            artifact_handoff,
+                        ],
                     ),
                     domain="code-review",
                     agent=choice["agent"],
@@ -2136,6 +2139,60 @@ class HerdrAdapter:
             f"{lines}\n{advice}"
         )
 
+    def _contract_handoff(self, data: dict[str, Any], task_id: str) -> str:
+        """The commander's confirmed contract for the reviewed task, for its reviewer.
+
+        A reviewer was never shown it. It judged the diff against the brief
+        it could reconstruct from the code, so a change that was correct and
+        not what was asked for read as APPROVED. The requirement is what the
+        commander confirmed the work must do; the solution, when confirmed,
+        is the approach they agreed to. First in the brief, and never cut.
+        """
+        contract = self.coordinator.confirmed_contract_for(task_id, data=data)
+        if not contract.get("requirement"):
+            return ""
+        parts = [
+            "THE CONFIRMED CONTRACT. The commander confirmed this requirement for "
+            "the change you are reviewing. Judge the change against it: work that "
+            "is correct but does not meet it, or does more than it, is a finding.\n"
+            f"Requirement: {contract['requirement'].strip()}\n"
+        ]
+        if contract.get("solution"):
+            parts.append(f"Confirmed approach: {contract['solution'].strip()}\n")
+        return "".join(parts) + "\n"
+
+    #: Shown where a section of a reviewer's brief was cut to fit.
+    _REVIEW_SECTION_CUT = (
+        "\n[...this section was cut by Helm to keep the brief within "
+        "{limit} characters; {dropped} characters are missing. Ask the author "
+        "for what you need, or read it from the checkout.]\n"
+    )
+
+    @classmethod
+    def _fit_review_brief(cls, head: str, sections: list[str]) -> str:
+        """`head` whole, then as much of each section as the brief limit allows.
+
+        Sections give way from the last back, so the author's own text goes
+        before Helm's evidence, and the diff pointer goes last. A cut section
+        says so, with how much is missing.
+        """
+        sections = list(sections)
+        overflow = len(head) + sum(len(section) for section in sections) - SAFE_TEXT_LIMIT
+        for index in range(len(sections) - 1, -1, -1):
+            if overflow <= 0:
+                break
+            section = sections[index]
+            if not section:
+                continue
+            # Sized with the widest count it could print, so the real one fits.
+            widest = cls._REVIEW_SECTION_CUT.format(limit=SAFE_TEXT_LIMIT, dropped=len(section))
+            keep = max(0, len(section) - overflow - len(widest))
+            sections[index] = section[:keep] + cls._REVIEW_SECTION_CUT.format(
+                limit=SAFE_TEXT_LIMIT, dropped=len(section) - keep
+            )
+            overflow -= len(section) - len(sections[index])
+        return head + "".join(sections)
+
     def _precomputed_diff(self, task: dict[str, Any], review_base: str) -> tuple[str, str]:
         """Write the diff to a file so the reviewer never has to run `git diff`.
 
@@ -2174,8 +2231,24 @@ class HerdrAdapter:
             if not patch.strip():
                 return "", ""
             target.write_text(patch, encoding="utf-8")
+            stat_target = directory / "diff.stat"
+            stat_target.write_text(stat, encoding="utf-8")
         except (OSError, HelmError):
             return "", ""
+        # Bounded. The whole stat went inline, ahead of the evidence and the
+        # artifact sections, so a change touching a few hundred files pushed
+        # everything after it off the end of the brief. The list is in a file
+        # beside the diff; the brief carries its head and the totals line.
+        stat_lines = stat.strip().splitlines()
+        limit = self.REVIEW_DIFFSTAT_LINES
+        if len(stat_lines) > limit + 1:
+            files, totals = stat_lines[:-1], stat_lines[-1]
+            stat_lines = [
+                *files[:limit],
+                f" ... and {len(files) - limit} more files; the whole list is in {stat_target}",
+                totals,
+            ]
+        summary = "\n".join(stat_lines)
         return (
             "\n\nTHE COMPLETE DIFF HAS ALREADY BEEN COMPUTED FOR YOU:\n"
             f"  {target}\n"
@@ -2188,7 +2261,7 @@ class HerdrAdapter:
             "already worked out. If you lose your place, re-read the FILE. You "
             "may still run the type checker, the linter and focused tests, and "
             "you may read individual files for context.\n"
-            f"Summary of what changed:\n{stat.strip()}\n\n",
+            f"Summary of what changed:\n{summary}\n\n",
             str(target),
         )
 
@@ -2658,6 +2731,8 @@ class HerdrAdapter:
         return closed
 
     ANSWER_SETTLE_SECONDS = 1.5
+    #: Files listed inline in a reviewer's brief; the rest are in `diff.stat`.
+    REVIEW_DIFFSTAT_LINES = 40
     #: Above this, a message is handed over as a file instead of typed into the
     #: pane. Chosen to keep ordinary answers -- "yes", "use main", a sentence of
     #: direction -- inline and instant, while the long routed briefs that

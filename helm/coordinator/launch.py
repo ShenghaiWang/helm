@@ -41,7 +41,9 @@ from ..values import (
     WORKTREELESS_ROLES,
     shape_policy,
     _TERMINAL_WORKER_TASK_STATES,
+    _bounded_brief,
     _safe_text,
+    _warn_brief_truncated,
     _validate_agent_id,
     _validate_effort,
     new_id,
@@ -1423,7 +1425,7 @@ class LaunchMixin:
         foreman is driving is refused the same way a fresh worker task is,
         until the requirement and solution gates are decided.
         """
-        brief = _safe_text(brief).strip()
+        brief, brief_cut = _bounded_brief(brief)
         if not brief:
             raise HelmError("a round needs its own brief")
         with self.store.locked() as data:
@@ -1475,8 +1477,12 @@ class LaunchMixin:
             project = self._project(data, task["project_id"])
             was_read_only = bool(task.get("read_only"))
             rounds = task.setdefault("rounds", [])
-            rounds.append({"brief": task["brief"], "ended_at": now()})
+            rounds.append({
+                "brief": task["brief"], "ended_at": now(),
+                "brief_truncated": task.get("brief_truncated"),
+            })
             task["brief"] = brief
+            task["brief_truncated"] = brief_cut
             task["status"] = "allocated"
             task["read_only"] = bool(read_only)
             # Stated per round, because a rebase or an evidence run rarely
@@ -1507,6 +1513,8 @@ class LaunchMixin:
             )
             workspace = canonical(task["workspace"])
             result = dict(task)
+        if brief_cut:
+            _warn_brief_truncated(task_id, brief_cut)
         # The lock/unlock touches the filesystem and must not hold the state
         # lock while it walks a potentially large worktree.
         if read_only and not was_read_only:

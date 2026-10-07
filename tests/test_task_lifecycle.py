@@ -372,6 +372,28 @@ class TaskLifecycleTests(HelmTestCase):
 
         self.assertIsNone(reopened["approval"])
 
+    def test_a_round_brief_cut_at_the_limit_is_recorded_and_announced(self) -> None:
+        """The cut was silent to whoever wrote the brief, and left no record."""
+        root = self.repo("roundcut")
+        project = self.coordinator.register_project("RoundCut", str(root), project_id="roundcut")
+        task = self.coordinator.create_task(project["id"], "write it")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "result", "done", requested_status="completed"
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            reopened = self.coordinator.continue_task(task["id"], "z" * 30_000)
+
+        self.assertEqual(reopened["brief_truncated"], {"chars": 30_000, "limit": 20_000})
+        self.assertIn(f"brief for task {task['id']} was 30000 characters", stderr.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_inspect(self.coordinator.inspect_task(task["id"]))
+        self.assertIn("BRIEF TRUNCATED", output.getvalue())
+
     def test_a_round_never_reopens_a_task_a_human_still_has_to_read(self) -> None:
         """Failed, blocked, and approval-needed need a person, not a retry."""
         root = self.repo("roundguard")

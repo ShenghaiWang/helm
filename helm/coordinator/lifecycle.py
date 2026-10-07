@@ -45,7 +45,9 @@ from ..values import (
     WORKTREELESS_ROLES,
     _ROLE_DIRECTORY,
     _color_for,
+    _bounded_brief,
     _safe_text,
+    _warn_brief_truncated,
     _validate_agent_id,
     _validate_branch_name,
     _validate_effort,
@@ -531,7 +533,7 @@ class LifecycleMixin:
         shape_reason: str | None = None,
         blocked_by: list[str] | None = None,
     ) -> dict[str, Any]:
-        brief = _safe_text(brief).strip()
+        brief, brief_cut = _bounded_brief(brief)
         if not brief:
             raise HelmError("task brief is required")
         if role not in TASK_ROLES:
@@ -750,6 +752,9 @@ class LifecycleMixin:
                         "project_id": project_id,
                         "role": role,
                         "brief": brief,
+                        # Set when the brief arrived over the limit and was
+                        # cut: its size and the limit. See `_bounded_brief`.
+                        "brief_truncated": brief_cut,
                         "delivery_policy": policy,
                         "domain": selected_domain,
                         "domain_selection": domain_reason,
@@ -861,6 +866,8 @@ class LifecycleMixin:
                         "Task created",
                         {"status": "created"},
                     )
+                    if brief_cut:
+                        _warn_brief_truncated(task_id, brief_cut)
                     return task
             except _StaleBaseResolution:
                 continue

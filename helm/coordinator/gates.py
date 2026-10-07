@@ -20,6 +20,36 @@ from ..values import (
 
 
 class GatesMixin:
+    def confirmed_contract_for(
+        self, task_id: str, *, data: dict[str, Any] | None = None
+    ) -> dict[str, str]:
+        """The confirmed requirement and solution text that authorized a task.
+
+        Read from the gate pair the task spent: the live slot while it is still
+        bound, the `spent` archive once the lead has moved on. Only confirmed
+        gates count -- a skipped one is a decision not to have a contract.
+        Empty when the task spent no pair.
+        """
+        data = data if data is not None else self.store.load()
+        task = data.get("tasks", {}).get(task_id) or {}
+        for candidate in data.get("tasks", {}).values():
+            if candidate.get("role") != "foreman" or candidate.get("project_id") != task.get("project_id"):
+                continue
+            gates = candidate.get("gates") or {}
+            if gates.get("bound_task_id") == task_id:
+                pair = gates
+            elif task_id in (gates.get("spent") or {}):
+                pair = gates["spent"][task_id]
+            else:
+                continue
+            contract = {}
+            for gate_type in ("requirement", "solution"):
+                gate = pair.get(gate_type) or {}
+                if gate.get("confirmed_at") and not gate.get("skipped") and gate.get("text"):
+                    contract[gate_type] = str(gate["text"])
+            return contract
+        return {}
+
     def _inherited_gates(self, data: dict[str, Any], project_id: str) -> dict[str, Any]:
         """Carry an UNSPENT gate decision onto a project's next foreman task.
 
