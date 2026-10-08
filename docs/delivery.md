@@ -172,11 +172,22 @@ once the fix is on the remote. A red check the change did not cause is
 reported, not fixed.
 
 The owning lead is found the way `helm route --ticket` finds one: the lead the
-record names for the task, else the live lead named for its ticket, else a new
-lead appointed for that ticket with the event as its request. An event is
+record names for the task, else the live lead named for its ticket. Only an
+event with something to fix -- a failed check, a new thread or comment,
+`CHANGES_REQUESTED` -- on a PR that is still open appoints a new lead for the
+ticket when none is live, and at most two are appointed per pass; the rest
+wait, queued, for the next. A green check, an approval, a merge or a close
+with no live lead is recorded on the task and starts nobody. An event is
 delivered once; several changes in one pass are one message; the same state
-read twice sends nothing. A gh that is missing or logged out is recorded on
-the task and shown once in `helm pending`; an unreachable forge stays quiet.
+read twice sends nothing. Concurrent passes claim each PR read and each queued
+event under the state lock, so only one of them reads or delivers it. A gh
+that is missing or logged out is recorded on the task and shown once in
+`helm pending`; an unreachable forge stays quiet; a rate limit stops the pass
+and every PR read for fifteen minutes.
+
+Known limits: the watch reads the first 100 review threads of a PR, and
+remembers the last 500 comment and review ids. A PR beyond either can have an
+old thread or comment reported again as new.
 
 The pass runs inside `helm watch`, the watchdog, and `helm pending --changes`
 (the monitor loop a session arms), and on its own as:

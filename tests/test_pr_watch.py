@@ -338,3 +338,150 @@ class PullRequestWatchTests(HelmTestCase):
         self.assertEqual(code, 0, out.getvalue())
         self.assertIn("PR watch", out.getvalue())
         self.assertEqual(len(self._watch_messages(lead["id"])), 1)
+
+    # -- what an independent review found wrong with the first cut ---------
+
+    def _no_appointment(self, *_a, **_k):
+        raise AssertionError("no lead may be appointed for this event")
+
+    def _appointing(self, appointed: list):
+        def start_foreman(coordinator, project_id, *, herdr=True, request=None, ticket=None, **_kw):
+            lead_task = coordinator.create_foreman_task(project_id, request=request, ticket=ticket)
+            worker = coordinator.launch_worker(lead_task["id"], _IDLE, wait=False)
+            self.addCleanup(self._stop, worker["id"])
+            appointed.append(ticket)
+            return {"task": lead_task, "worker": worker}
+        return start_foreman
+
+    def test_a_quiet_event_with_no_live_lead_starts_nobody(self) -> None:
+        _project, task, _ = self._pr_task("quietnolead", lead=False)
+        synced = self._pass(_payload(checks=[_check("build")]), at=time.time() + 130)
+        self.assertEqual(len(synced["events"]), 1)
+        with mock.patch.object(cli, "_start_foreman", self._no_appointment):
+            (line,) = self._deliver(synced)
+        self.assertIn("none appointed", line)
+        self.assertIsNone(self.state.load()["tasks"][task["id"]]["delivery"]["watch"].get("outbox"))
+
+    def test_a_merged_pr_never_gets_a_lead_appointed_even_with_comments(self) -> None:
+        _project, task, _ = self._pr_task("mergednolead", lead=False)
+        merged = _payload(
+            state="MERGED", checks=[_check("build")], mergeCommit={"oid": "c" * 40},
+            comments=[{"id": "C9", "author": {"login": "reviewer"}, "body": "late nit"}],
+        )
+        synced = self._pass(merged, at=time.time() + 130)
+        self.assertEqual(self.state.load()["tasks"][task["id"]]["status"], "pr-merged")
+        self.assertTrue(synced["events"][0]["actionable"])
+        with mock.patch.object(cli, "_start_foreman", self._no_appointment):
+            self._deliver(synced)
+
+    def test_appointments_are_capped_per_pass_and_the_rest_wait(self) -> None:
+        tasks = [self._pr_task(f"cap{n}", ticket=f"TICKET-{n}", lead=False)[1] for n in (1, 2, 3)]
+        appointed: list[str] = []
+        start = time.time()
+        synced = self._pass(_payload(checks=[_check("build", "FAILURE")]), at=start + 130)
+        self.assertEqual(len(synced["events"]), 3)
+        with mock.patch.object(cli, "_start_foreman", self._appointing(appointed)):
+            self._deliver(synced)
+        self.assertEqual(len(appointed), 2)
+        queued = [
+            t["id"] for t in tasks
+            if self.state.load()["tasks"][t["id"]]["delivery"]["watch"].get("outbox")
+        ]
+        self.assertEqual(len(queued), 1)
+        # The next pass delivers the one that waited, without reading any PR.
+        with mock.patch.object(Coordinator, "read_pull_request", side_effect=AssertionError("not due")):
+            later = self.coordinator.sync_open_pull_requests(now_epoch=start + 140)
+        self.assertEqual([e["task_id"] for e in later["events"]], queued)
+        with mock.patch.object(cli, "_start_foreman", self._appointing(appointed)):
+            self._deliver(later)
+        self.assertEqual(sorted(appointed), ["TICKET-1", "TICKET-2", "TICKET-3"])
+
+    def test_two_passes_at_once_read_once_and_deliver_once(self) -> None:
+        _project, _task, lead = self._pr_task("double")
+        at = time.time() + 130
+        red = _payload(checks=[_check("build", "FAILURE")])
+        with mock.patch.object(Coordinator, "read_pull_request", return_value=red) as read, \
+                mock.patch.object(Coordinator, "read_review_threads", return_value=[]):
+            first = self.coordinator.sync_open_pull_requests(now_epoch=at)
+            second = self.coordinator.sync_open_pull_requests(now_epoch=at)
+        self.assertEqual(read.call_count, 1, "the second pass found the PR already claimed")
+        self.assertEqual(second["watched"], [])
+        # Both passes try to deliver the same queued event; one gets it.
+        self._deliver(first)
+        self._deliver(first)
+        self.assertEqual(len(self._watch_messages(lead["id"])), 1)
+
+    def test_an_event_another_pass_is_delivering_is_left_alone(self) -> None:
+        _project, task, lead = self._pr_task("claimed")
+        synced = self._pass(_payload(checks=[_check("build", "FAILURE")]), at=time.time() + 130)
+        self.assertIsNotNone(self.coordinator.claim_pr_watch_event(task["id"]))
+        self.assertEqual(self._deliver(synced), [])
+        self.assertEqual(self._watch_messages(lead["id"]), [])
+
+    def test_delivering_an_event_removes_only_what_it_carried(self) -> None:
+        _project, task, lead = self._pr_task("partial")
+        self._pass(_payload(checks=[_check("build", "FAILURE")]), [], at=time.time() + 130)
+        claimed = self.coordinator.claim_pr_watch_event(task["id"])
+        # A thread arrives while the first event is being delivered.
+        self._pass(
+            _payload(checks=[_check("build", "FAILURE")]),
+            [_thread("T1", "reviewer", "one more thing")],
+            at=time.time() + 260,
+        )
+        self.coordinator.mark_pr_watch_event(
+            task["id"], claimed["change_ids"], lead_id=lead["id"], outcome="typed"
+        )
+        left = self.coordinator.pr_watch_event(task["id"])
+        self.assertEqual(len(left["changes"]), 1)
+        self.assertIn("one more thing", left["changes"][0])
+        self.assertNotIn("CI failed", left["text"])
+
+    def test_a_watch_that_began_as_an_error_note_starts_from_a_silent_baseline(self) -> None:
+        _project, task, _lead = self._pr_task("errnote")
+        data = self.state.load()
+        data["tasks"][task["id"]]["delivery"].pop("watch")
+        self.state.save(data)
+        offline = HelmError("error connecting to api.github.com")
+        with mock.patch.object(Coordinator, "read_pull_request", side_effect=offline):
+            self.coordinator.sync_open_pull_requests(now_epoch=time.time() + 130)
+        self.coordinator.record_pr_status(task["id"], state="open", url=URL)
+        self.assertFalse(self.state.load()["tasks"][task["id"]]["delivery"]["watch"].get("registered"))
+        synced = self._pass(_payload(checks=[_check("build", "FAILURE")]), at=time.time() + 400)
+        self.assertEqual(synced["events"], [])
+
+    def test_owner_and_name_reach_gh_as_literal_strings(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="{}")
+        with mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=completed) as run:
+            self.coordinator.read_review_threads("https://github.com/@owner/@repo/pull/12", cwd=Path("."))
+        command = run.call_args[0][0]
+        self.assertEqual(command[command.index("owner=@owner") - 1], "-f")
+        self.assertEqual(command[command.index("name=@repo") - 1], "-f")
+        self.assertEqual(command[command.index("number=12") - 1], "-F")
+
+    def test_a_url_that_is_not_one_never_reaches_gh(self) -> None:
+        with mock.patch("helm.coordinator.pull_requests.subprocess.run") as run:
+            for bad in ("--repo=evil", "-x", "not a url"):
+                with self.assertRaises(HelmError):
+                    self.coordinator.read_pull_request(bad, cwd=Path("."))
+        run.assert_not_called()
+        completed = mock.Mock(returncode=0, stdout="{}")
+        with mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=completed) as run:
+            self.coordinator.read_pull_request(URL, cwd=Path("."))
+        self.assertEqual(run.call_args[0][0][-2:], ["--", URL])
+
+    def test_a_rate_limit_stops_the_pass_and_backs_off(self) -> None:
+        self._pr_task("limitone", ticket="TICKET-1")
+        self._pr_task("limittwo", ticket="TICKET-2")
+        start = time.time()
+        limited = HelmError("GraphQL: API rate limit exceeded for user ID 1.")
+        with mock.patch.object(Coordinator, "read_pull_request", side_effect=limited) as read:
+            outcome = self.coordinator.sync_open_pull_requests(now_epoch=start + 130)
+            self.assertEqual(read.call_count, 1, "one rate-limited read stops the pass")
+            self.assertTrue(outcome["rate_limited"])
+            self.assertEqual(len(outcome["skipped"]), 2)
+            self.coordinator.sync_open_pull_requests(now_epoch=start + 400)
+            self.assertEqual(read.call_count, 1, "nothing is read while backing off")
+        with mock.patch.object(Coordinator, "read_pull_request", return_value=_payload()) as read, \
+                mock.patch.object(Coordinator, "read_review_threads", return_value=[]):
+            self.coordinator.sync_open_pull_requests(now_epoch=start + 1200)
+            self.assertEqual(read.call_count, 2)

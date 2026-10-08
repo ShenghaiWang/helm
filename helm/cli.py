@@ -515,18 +515,34 @@ def _sync_pull_request_status(coordinator: Coordinator, task_id: str) -> dict[st
     return coordinator.sync_pull_request(task_id)
 
 
+#: At most this many leads are appointed by one PR watch pass. A root with
+#: many leaderless PRs that all went red at once gets its leads over a few
+#: passes rather than a burst of agents in one; the rest wait, queued.
+PR_WATCH_APPOINTMENTS_PER_PASS = 2
+
+
 def _pr_event_lead(
-    coordinator: Coordinator, event: dict[str, Any], *, herdr: bool = True
+    coordinator: Coordinator,
+    event: dict[str, Any],
+    *,
+    herdr: bool = True,
+    may_appoint: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
-    """The task lead that owns this PR's work, appointing one if none is live.
+    """The task lead that owns this PR's work, appointing one only when there is work.
 
     The same order `helm route` uses, starting from the task itself: the
     driver the record names for this task (the lead that created it, adopted
     it, or spent its gates on it); else the live lead named for the task's
-    ticket; else, for a ticketed task, a new lead appointed for that ticket
-    with the event as its request -- never another ticket's lead. A task with
-    no ticket goes to the project's lead, as an unticketed route does. Every
-    candidate is of the task's own project; nothing here looks wider.
+    ticket. A task with no ticket goes to the project's lead, as an unticketed
+    route does. Every candidate is of the task's own project.
+
+    Only then, and only for an event with something to fix on a PR that is
+    still open, a new lead is appointed for the ticket with the event as its
+    request -- never another ticket's lead. A green check, an approval, a
+    merge or a close is news, and news is not worth starting an agent for:
+    those come back as `(None, "quiet")`. `(None, "deferred")` is an
+    appointment this pass has no room for; `(None, "declined")` a project
+    that runs without leads.
     """
     data = coordinator.store.load()
     task = data["tasks"][event["task_id"]]
@@ -541,8 +557,12 @@ def _pr_event_lead(
             return named, "named"
     elif driver is not None:
         return driver, how
+    if not event.get("actionable") or task.get("status") != "pr-open":
+        return None, "quiet"
     if not coordinator.project_wants_foreman(project_id):
         return None, "declined"
+    if not may_appoint:
+        return None, "deferred"
     started = _start_foreman(
         coordinator, project_id, herdr=herdr, request=event["text"], ticket=ticket or None,
     )
@@ -550,15 +570,21 @@ def _pr_event_lead(
 
 
 def _deliver_pr_watch_events(
-    coordinator: Coordinator, events: list[dict[str, Any]], *, herdr: bool = True
+    coordinator: Coordinator,
+    events: list[dict[str, Any]],
+    *,
+    herdr: bool = True,
+    max_appointments: int = PR_WATCH_APPOINTMENTS_PER_PASS,
 ) -> list[str]:
     """Hand each PR watch event to its task's lead, the way an answer is handed.
 
-    Recorded as an `answer` on the lead, written to its inbox, and woken with
-    `answer_worker` -- under turns that makes the event the prompt its next
-    turn opens with, and starts the runner. A lead appointed for the event
-    carries it in its brief instead. One event, one lead, one project: an
-    event is never offered to a lead of any other project.
+    Each event is claimed under the store lock first, so when two loops run
+    a pass at once only one delivers it. Delivery is recorded as an `answer`
+    on the lead, written to its inbox, and woken with `answer_worker` --
+    under turns that makes the event the prompt its next turn opens with, and
+    starts the runner. A lead appointed for the event carries it in its brief
+    instead. One event, one lead, one project: an event is never offered to a
+    lead of any other project.
 
     Returns one line per event for whoever ran the pass. Root only: a lead
     running `helm watch` reads its PRs but does not deliver into itself or a
@@ -567,24 +593,42 @@ def _deliver_pr_watch_events(
     lines: list[str] = []
     if not events or coordinator.caller_role() != "root":
         return lines
-    for event in events:
+    appointed = 0
+    for queued in events:
+        event = coordinator.claim_pr_watch_event(queued["task_id"])
+        if event is None:
+            continue
         task_id = event["task_id"]
+        ids = event["change_ids"]
         project_id = str(event.get("project_id") or "")
         glyph = _glyph_for(coordinator, project_id)
         headline = (event.get("changes") or [""])[0][:100]
         try:
-            lead, how = _pr_event_lead(coordinator, event, herdr=herdr)
+            lead, how = _pr_event_lead(
+                coordinator, event, herdr=herdr, may_appoint=appointed < max_appointments,
+            )
             if lead is None:
-                # The project declined a lead: the commander is the only
-                # reader left, so the event goes on the project's record.
-                coordinator.record_situation(
-                    project_id,
-                    f"PR watch for task {task_id}: {headline} ({event.get('url')}); "
-                    "this project has no task lead to act on it",
-                    surface=True, task_id=task_id,
-                )
-                coordinator.mark_pr_watch_event(task_id, event["fingerprint"], outcome="recorded")
-                lines.append(f"{glyph} {project_id} PR watch: task {task_id}: {headline} [no task lead; recorded]")
+                if how == "deferred":
+                    coordinator.mark_pr_watch_event(task_id, ids, result="deferred")
+                    lines.append(
+                        f"{glyph} {project_id} PR watch: task {task_id}: {headline} "
+                        "[waiting for a lead; appointed on a later pass]"
+                    )
+                    continue
+                if how == "declined":
+                    # The project runs without leads: the commander is the
+                    # only reader left for work that needs doing.
+                    coordinator.record_situation(
+                        project_id,
+                        f"PR watch for task {task_id}: {headline} ({event.get('url')}); "
+                        "this project has no task lead to act on it",
+                        surface=True, task_id=task_id,
+                    )
+                    outcome = "recorded for the commander"
+                else:
+                    outcome = "no live lead; nothing to fix, so none appointed"
+                coordinator.mark_pr_watch_event(task_id, ids, outcome=outcome)
+                lines.append(f"{glyph} {project_id} PR watch: task {task_id}: {headline} [{outcome}]")
                 continue
             if lead.get("project_id") != project_id:
                 raise SafetyError(
@@ -595,6 +639,7 @@ def _deliver_pr_watch_events(
                 payload={"via": "pr-watch", "task_id": task_id, "url": event.get("url")},
             )
             if how == "appointed":
+                appointed += 1
                 outcome = "appointed"
             else:
                 recorded = coordinator.latest_answer(lead["id"]) or {}
@@ -607,14 +652,10 @@ def _deliver_pr_watch_events(
                     adapter.answer_worker(lead["id"], event["text"], note=note)
                     outcome = adapter.last_wake_outcome
         except (HelmError, SafetyError, OSError) as exc:
-            coordinator.mark_pr_watch_event(
-                task_id, event["fingerprint"], outcome=str(exc), delivered=False
-            )
+            coordinator.mark_pr_watch_event(task_id, ids, result="failed", outcome=str(exc))
             lines.append(f"{glyph} {project_id} PR watch: task {task_id}: could not reach a lead: {exc}")
             continue
-        coordinator.mark_pr_watch_event(
-            task_id, event["fingerprint"], lead_id=lead["id"], outcome=outcome
-        )
+        coordinator.mark_pr_watch_event(task_id, ids, lead_id=lead["id"], outcome=outcome)
         lines.append(
             f"{glyph} {project_id} PR watch: task {task_id} -> "
             f"{'newly appointed ' if how == 'appointed' else ''}task lead "

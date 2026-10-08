@@ -175,7 +175,10 @@ def _start_pr_watch(delivery: dict[str, Any], url: str) -> None:
 
     watch = delivery.get("watch")
     if not isinstance(watch, dict) or (watch.get("url") and not same(str(watch["url"]), url)):
-        delivery["watch"] = {"since": now(), "url": url}
+        # `registered`: this PR's first read is news. A watch that already
+        # exists without a snapshot -- an older record -- is not marked, and
+        # its first read is a silent baseline.
+        delivery["watch"] = {"since": now(), "url": url, "registered": True}
     elif "since" not in watch:
         watch["since"] = now()
         watch["url"] = url

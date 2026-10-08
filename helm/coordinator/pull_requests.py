@@ -52,6 +52,17 @@ PR_WATCH_INTERVAL_SECONDS = 120.0
 _WATCH_MAX_CHANGES = 20
 _WATCH_MAX_DELIVERED = 10
 
+#: How long one pass holds a queued event while it delivers it. Another pass
+#: that finds the claim younger than this leaves the event alone, so two
+#: loops running side by side deliver it once.
+PR_WATCH_CLAIM_SECONDS = 300.0
+
+#: How long every PR read stops after the forge says Helm is asking too often.
+PR_WATCH_RATE_LIMIT_BACKOFF_SECONDS = 900.0
+
+#: A web address, before anything is handed to gh.
+_PR_URL = re.compile(r"https?://[^\s/]+/\S+$")
+
 
 def _epoch(stamp: Any) -> float:
     if not isinstance(stamp, str) or not stamp:
@@ -62,15 +73,25 @@ def _epoch(stamp: Any) -> float:
         return 0.0
 
 
+def _stamp(epoch: float) -> str:
+    return _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class PullRequestsMixin:
     def read_pull_request(self, url: str, *, cwd: Path, fields: str = "") -> dict[str, Any]:
         """What the forge says about a PR, through gh. Raises when it cannot say."""
+        url = str(url or "").strip()
+        if not _PR_URL.match(url):
+            # A recorded URL is data. One that is not a web address must never
+            # reach gh, where a leading dash would be read as an option.
+            raise HelmError(f"not a pull request URL gh can read: {url[:80]!r}")
         if shutil.which("gh") is None:
             raise HelmError("gh is not installed; record PR observations with helm task pr-status")
         result = subprocess.run(
             [
-                "gh", "pr", "view", url, "--json",
+                "gh", "pr", "view", "--json",
                 fields or "url,state,reviewDecision,mergeStateStatus,mergeCommit,headRefOid,comments,body",
+                "--", url,
             ],
             cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=60,
         )
@@ -96,9 +117,12 @@ class PullRequestsMixin:
         command = ["gh", "api", "graphql"]
         if host.lower() != "github.com":
             command += ["--hostname", host]
+        # `-f` is a literal string. `-F` would read `@path` as a file and
+        # coerce the value's type, so it is kept for the one field that is a
+        # number and the regex has already proved to be digits.
         command += [
             "-f", f"query={REVIEW_THREADS_QUERY}",
-            "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={number}",
+            "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={number}",
         ]
         try:
             result = subprocess.run(
@@ -184,67 +208,92 @@ class PullRequestsMixin:
         Two clocks, one read. The PR WATCH reads each open PR at most every
         `watch_interval_seconds` -- checks, review decision, review threads,
         comments -- and when what it sees changed in a way a lead has to know
-        about, keeps ONE coalesced event on the task for the caller to
-        deliver to the task's lead (`events` in the result). Under turns a
-        lead only exists inside a turn, so nothing else would wake it when CI
-        goes red or a reviewer writes. The SYNC records the merge state
-        through `record_pr_status` every `min_interval_seconds`, or at once
-        when the watch sees the PR merged or closed; a merge is recorded
-        exactly as `helm task pr-sync` records it, which raises the cleanup
-        decision and lets the project's space close.
+        about, queues the change on the task for the caller to deliver to the
+        task's lead (`events` in the result). Under turns a lead only exists
+        inside a turn, so nothing else would wake it when CI goes red or a
+        reviewer writes. The SYNC records the merge state through
+        `record_pr_status` every `min_interval_seconds`, or at once when the
+        watch sees the PR merged or closed; a merge is recorded exactly as
+        `helm task pr-sync` records it, which raises the cleanup decision and
+        lets the project's space close.
+
+        Several loops run this side by side -- the watchdog, `pending
+        --changes`, `helm watch` -- so a PR is CLAIMED under the store lock
+        before it is read: the pass that claims it is the only one that reads
+        it this interval. Delivery claims the queued event the same way.
 
         Quiet by design: a PR that cannot be read now -- no network, a URL
         the forge rejects -- is listed as skipped and tried again next
         interval. gh missing or logged out is recorded on the task and
         surfaced to the commander once, because that one does not mend
-        itself. An event that could not be delivered stays on the task and
-        comes back in `events` once the watch interval has passed again.
+        itself. A rate limit stops the whole pass and every read for a while,
+        because asking again is what makes it worse.
         """
         import time
 
         current = time.time() if now_epoch is None else now_epoch
-        stamp = _dt.datetime.fromtimestamp(current, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        data = self.store.load()
-        due: list[tuple[str, bool]] = []
+        stamp = _stamp(current)
+        due: list[tuple[str, bool, str, str]] = []
         waiting: list[str] = []
-        for task_id, task in data.get("tasks", {}).items():
-            if task.get("status") != "pr-open":
-                continue
-            delivery = task.get("delivery") or {}
-            if not str(delivery.get("url") or "").strip():
-                continue
-            watch = delivery.get("watch") or {}
-            sync_due = current - _epoch(delivery.get("last_checked_at")) >= min_interval_seconds
-            last_look = max(_epoch(watch.get("last_polled_at")), _epoch(watch.get("since")))
-            if sync_due or current - last_look >= watch_interval_seconds:
-                due.append((task_id, sync_due))
-            elif watch.get("outbox") and (
-                current - _epoch(watch["outbox"].get("attempted_at")) >= watch_interval_seconds
-            ):
-                waiting.append(task_id)
         outcome: dict[str, Any] = {
             "checked": [], "merged": [], "closed": [], "skipped": [], "watched": [], "events": [],
+            "rate_limited": False,
         }
-        for task_id in sorted(waiting):
+        with self.store.locked() as data:
+            limit = (data.get("integrations") or {}).get("pr_watch") or {}
+            backing_off = current < _epoch(limit.get("backoff_until"))
+            outcome["rate_limited"] = backing_off
+            for task_id, task in sorted(data.get("tasks", {}).items()):
+                if task.get("status") != "pr-open":
+                    continue
+                delivery = task.get("delivery") or {}
+                url = str(delivery.get("url") or "").strip()
+                if not url:
+                    continue
+                watch = delivery.get("watch") or {}
+                sync_due = current - _epoch(delivery.get("last_checked_at")) >= min_interval_seconds
+                last_look = max(_epoch(watch.get("last_polled_at")), _epoch(watch.get("since")))
+                if not backing_off and (sync_due or current - last_look >= watch_interval_seconds):
+                    # The claim: whichever pass writes this first reads the PR.
+                    claimed = delivery.setdefault("watch", {})
+                    claimed["last_polled_at"] = stamp
+                    if sync_due:
+                        delivery["last_checked_at"] = stamp
+                    project = data.get("projects", {}).get(task.get("project_id")) or {}
+                    due.append((task_id, sync_due, url, str(project.get("root") or ".")))
+                    continue
+                outbox = watch.get("outbox") or {}
+                if (
+                    outbox.get("items")
+                    and current - _epoch(outbox.get("claimed_at")) >= PR_WATCH_CLAIM_SECONDS
+                    and current - _epoch(outbox.get("attempted_at")) >= watch_interval_seconds
+                ):
+                    waiting.append(task_id)
+        for task_id in waiting:
             event = self.pr_watch_event(task_id)
             if event is not None:
                 outcome["events"].append(event)
         if due and shutil.which("gh") is None:
-            for task_id, _sync_due in due:
+            for task_id, _sync_due, _url, _root in due:
                 self._note_pr_watch_error(task_id, "gh is not installed", stamp)
-            outcome["skipped"] = [{"task_id": t, "reason": "gh is not installed"} for t, _s in due]
+            outcome["skipped"] = [{"task_id": t, "reason": "gh is not installed"} for t, *_ in due]
             return outcome
-        for task_id, sync_due in sorted(due):
-            task = data["tasks"][task_id]
-            url = str((task.get("delivery") or {}).get("url") or "").strip()
-            project = data.get("projects", {}).get(task.get("project_id")) or {}
-            cwd = Path(project.get("root") or ".")
+        for index, (task_id, sync_due, url, root) in enumerate(due):
+            cwd = Path(root)
             try:
                 payload = self.read_pull_request(url, cwd=cwd, fields=PR_WATCH_FIELDS)
             except (HelmError, SafetyError, OSError, subprocess.SubprocessError) as exc:
                 reason = str(exc)[:200]
                 self._note_pr_watch_error(task_id, reason, stamp)
                 outcome["skipped"].append({"task_id": task_id, "reason": reason})
+                if watch_error_kind(reason) == "rate-limited":
+                    self._back_off_pr_reads(reason, current)
+                    outcome["rate_limited"] = True
+                    outcome["skipped"].extend(
+                        {"task_id": rest, "reason": "not read: the forge is rate-limiting gh"}
+                        for rest, *_ in due[index + 1:]
+                    )
+                    break
                 continue
             threads = self.read_review_threads(url, cwd=cwd)
             event = self._observe_pull_request(task_id, payload, threads, stamp)
@@ -261,9 +310,21 @@ class PullRequestsMixin:
                         outcome["merged"].append(task_id)
                     elif (synced.get("delivery") or {}).get("state") == "pr-closed":
                         outcome["closed"].append(task_id)
+                    if event is not None:
+                        # Composed again: the task's status moved, and whether
+                        # a lead may be appointed for it depends on that.
+                        event = self.pr_watch_event(task_id)
             if event is not None:
                 outcome["events"].append(event)
         return outcome
+
+    def _back_off_pr_reads(self, reason: str, current: float) -> None:
+        """Stop every PR read until the forge has had time to forgive us."""
+        with self.store.locked() as data:
+            data.setdefault("integrations", {})["pr_watch"] = {
+                "backoff_until": _stamp(current + PR_WATCH_RATE_LIMIT_BACKOFF_SECONDS),
+                "reason": reason[:200],
+            }
 
     def _observe_pull_request(
         self,
@@ -272,17 +333,19 @@ class PullRequestsMixin:
         threads: list[dict[str, Any]] | None,
         stamp: str,
     ) -> dict[str, Any] | None:
-        """Store what the watch saw; return the task's undelivered event, if any.
+        """Store what the watch saw; return the task's queued event, if any.
 
         Debounced on the fingerprint: an unchanged PR changes nothing, and a
         fingerprint already delivered is never queued again. Changes seen
-        while an earlier event is still undelivered join that event, so the
-        lead gets one message, not a backlog.
+        while an earlier event is still queued join it, each with its own id,
+        so delivering the earlier part removes exactly what was delivered.
 
-        A PR registered before the watch existed has no `since`. It is read
-        once silently, as a baseline: what it said before was somebody's to
-        read already, and waking a lead for every old PR at once on upgrade
-        would be a burst nobody asked for.
+        The first read is news only for a PR registered while the watch
+        existed (`registered`, set by `_start_pr_watch`). Any other watch with
+        no snapshot yet -- a PR recorded before this, or a watch that began
+        life as an error note -- is read once silently, as a baseline: what it
+        said before was somebody's to read already, and waking a lead for
+        every old PR at once on upgrade is a burst nobody asked for.
         """
         with self.store.locked() as data:
             task = data.get("tasks", {}).get(task_id)
@@ -290,10 +353,11 @@ class PullRequestsMixin:
                 return None
             delivery = task.setdefault("delivery", {})
             watch = delivery.setdefault("watch", {})
-            baseline_only = "since" not in watch
-            snapshot, changes, kinds = pr_watch_changes(watch.get("snapshot"), payload, threads)
+            baseline_only = watch.get("snapshot") is None and not watch.get("registered")
+            snapshot, changes, _kinds = pr_watch_changes(watch.get("snapshot"), payload, threads)
             fingerprint = pr_watch_fingerprint(snapshot)
             watch["last_polled_at"] = stamp
+            watch.setdefault("since", stamp)
             for key in ("error", "error_kind", "error_at"):
                 watch.pop(key, None)
             if fingerprint != watch.get("fingerprint"):
@@ -301,52 +365,86 @@ class PullRequestsMixin:
                 watch["fingerprint"] = fingerprint
                 delivered = {entry.get("fingerprint") for entry in watch.get("delivered") or []}
                 if changes and not baseline_only and fingerprint not in delivered:
-                    outbox = watch.get("outbox") or {"since": stamp, "changes": [], "kinds": []}
-                    outbox["changes"] = (list(outbox.get("changes") or []) + changes)[-_WATCH_MAX_CHANGES:]
-                    outbox["kinds"] = sorted(set(outbox.get("kinds") or []) | kinds)
+                    outbox = watch.get("outbox") or {"since": stamp, "next": 1, "items": []}
+                    items = list(outbox.get("items") or [])
+                    for change in changes:
+                        items.append({"id": int(outbox.get("next") or 1), **change})
+                        outbox["next"] = int(outbox.get("next") or 1) + 1
+                    outbox["items"] = items[-_WATCH_MAX_CHANGES:]
                     outbox["fingerprint"] = fingerprint
                     outbox.pop("attempted_at", None)
                     watch["outbox"] = outbox
-            if baseline_only:
-                watch["since"] = stamp
         return self.pr_watch_event(task_id)
 
-    def pr_watch_event(self, task_id: str) -> dict[str, Any] | None:
-        """The task's queued PR event, composed as the message its lead receives."""
-        data = self.store.load()
-        task = data.get("tasks", {}).get(task_id)
-        if task is None:
-            return None
+    @staticmethod
+    def _compose_pr_event(task: dict[str, Any]) -> dict[str, Any] | None:
         delivery = task.get("delivery") or {}
-        outbox = (delivery.get("watch") or {}).get("outbox")
-        if not outbox or not outbox.get("changes"):
+        outbox = (delivery.get("watch") or {}).get("outbox") or {}
+        items = [item for item in outbox.get("items") or [] if isinstance(item, dict)]
+        if not items:
             return None
         url = str(delivery.get("url") or "")
-        kinds = set(outbox.get("kinds") or [])
-        name = task_name(task, fallback=task_id)
-        lines = [f"{name}: pull request {url} changed (task {task_id}, seen by Helm's PR watch):"]
-        lines += [f"- {change}" for change in outbox["changes"]]
-        lines.append(PR_WATCH_INSTRUCTIONS if kinds & ACTIONABLE_KINDS else PR_WATCH_QUIET_INSTRUCTIONS)
+        kinds = {str(item.get("kind") or "") for item in items}
+        actionable = bool(kinds & ACTIONABLE_KINDS)
+        name = task_name(task, fallback=task["id"])
+        lines = [f"{name}: pull request {url} changed (task {task['id']}, seen by Helm's PR watch):"]
+        lines += [f"- {item.get('text')}" for item in items]
+        lines.append(PR_WATCH_INSTRUCTIONS if actionable else PR_WATCH_QUIET_INSTRUCTIONS)
         return {
-            "task_id": task_id,
+            "task_id": task["id"],
             "project_id": task.get("project_id"),
+            "task_status": task.get("status"),
             "url": url,
             "fingerprint": outbox.get("fingerprint"),
             "kinds": sorted(kinds),
-            "changes": list(outbox["changes"]),
+            "actionable": actionable,
+            "changes": [str(item.get("text")) for item in items],
+            "change_ids": [item.get("id") for item in items],
             "text": "\n".join(lines),
         }
+
+    def pr_watch_event(self, task_id: str) -> dict[str, Any] | None:
+        """The task's queued PR event, composed as the message its lead receives."""
+        task = self.store.load().get("tasks", {}).get(task_id)
+        return None if task is None else self._compose_pr_event(task)
+
+    def claim_pr_watch_event(self, task_id: str) -> dict[str, Any] | None:
+        """Take the task's queued event for delivery, or None if another pass holds it.
+
+        Read and claimed under one lock, so of two passes delivering at once
+        exactly one gets the event. The claim lapses after
+        `PR_WATCH_CLAIM_SECONDS`, so a pass that died mid-delivery does not
+        hold it forever.
+        """
+        import time
+
+        with self.store.locked() as data:
+            task = data.get("tasks", {}).get(task_id)
+            if task is None:
+                return None
+            event = self._compose_pr_event(task)
+            if event is None:
+                return None
+            outbox = task["delivery"]["watch"]["outbox"]
+            if time.time() - _epoch(outbox.get("claimed_at")) < PR_WATCH_CLAIM_SECONDS:
+                return None
+            outbox["claimed_at"] = now()
+            return event
 
     def mark_pr_watch_event(
         self,
         task_id: str,
-        fingerprint: str,
+        change_ids: list[Any],
         *,
+        result: str = "delivered",
         lead_id: str = "",
         outcome: str = "",
-        delivered: bool = True,
     ) -> None:
-        """Record what became of a PR event: delivered (cleared) or attempted (retried later)."""
+        """Settle a claimed event: `delivered`, `failed` (retry later) or `deferred`.
+
+        Delivered removes exactly the changes that went out; anything that
+        arrived while they were being delivered stays queued for next time.
+        """
         with self.store.locked() as data:
             task = data.get("tasks", {}).get(task_id)
             if task is None:
@@ -355,25 +453,34 @@ class PullRequestsMixin:
             if not isinstance(watch, dict):
                 return
             outbox = watch.get("outbox") or {}
-            if not delivered:
+            outbox.pop("claimed_at", None)
+            if result == "deferred":
+                return
+            if result == "failed":
                 if outbox:
                     outbox["attempted_at"] = now()
                     outbox["last_failure"] = str(outcome)[:200]
                 return
-            if outbox.get("fingerprint") == fingerprint:
-                watch.pop("outbox", None)
+            sent = set(change_ids)
+            remaining = [item for item in outbox.get("items") or [] if item.get("id") not in sent]
             history = list(watch.get("delivered") or [])
-            history.append({"at": now(), "fingerprint": fingerprint, "lead": lead_id, "outcome": outcome})
+            history.append({
+                "at": now(), "fingerprint": outbox.get("fingerprint"),
+                "changes": len(sent), "lead": lead_id, "outcome": outcome,
+            })
             watch["delivered"] = history[-_WATCH_MAX_DELIVERED:]
+            if remaining:
+                outbox["items"] = remaining
+            else:
+                watch.pop("outbox", None)
 
     def _note_pr_watch_error(self, task_id: str, reason: str, stamp: str) -> None:
         """Record why the watch could not read a PR; tell the commander once.
 
-        Recorded on the task every time, with the interval clock advanced so a
-        failing read is not retried on every poll. A missing or logged-out gh
-        is surfaced to the commander the first time it is seen, because it
-        does not mend itself and nothing about the PR reaches anyone until it
-        is fixed; a forge that is merely unreachable is an offline laptop and
+        Recorded on the task every time. A missing or logged-out gh is
+        surfaced to the commander the first time it is seen, because it does
+        not mend itself and nothing about the PR reaches anyone until it is
+        fixed; a forge that is merely unreachable is an offline laptop and
         stays quiet.
         """
         kind = watch_error_kind(reason)

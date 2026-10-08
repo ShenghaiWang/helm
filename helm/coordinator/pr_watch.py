@@ -134,11 +134,11 @@ def pr_watch_changes(
     previous: dict[str, Any] | None,
     payload: dict[str, Any],
     threads: list[dict[str, Any]] | None,
-) -> tuple[dict[str, Any], list[str], set[str]]:
+) -> tuple[dict[str, Any], list[dict[str, str]], set[str]]:
     """Compare what the forge says now with what the watch saw last.
 
-    Returns the snapshot to store, the lines worth telling the lead, and the
-    kinds of change among them. `previous` None is a PR the watch has not read
+    Returns the snapshot to store, the changes worth telling the lead (each
+    a `{"kind", "text"}`), and the kinds among them. `previous` None is a PR the watch has not read
     yet: nothing was seen, so a red check or an open thread already there is
     news and a pending check is not. `threads` None means the threads could
     not be read this time; what was known about them is kept as it was.
@@ -151,8 +151,12 @@ def pr_watch_changes(
     state = str(payload.get("state") or "OPEN").upper()
     head = str(payload.get("headRefOid") or "")
     decision = str(payload.get("reviewDecision") or "").upper()
-    lines: list[str] = []
+    changes: list[dict[str, str]] = []
     kinds: set[str] = set()
+
+    def add(kind: str, text: str) -> None:
+        changes.append({"kind": kind, "text": text})
+        kinds.add(kind)
 
     def other(login: str) -> bool:
         return bool(login) and login != author
@@ -167,14 +171,11 @@ def pr_watch_changes(
         if value in FAILED_CHECKS and prev_checks.get(name) != value
     ]
     for name, value, link in failed:
-        lines.append(f"CI failed: {name} [{value}]" + (f" {link}" if link else ""))
-    if failed:
-        kinds.add("failed")
+        add("failed", f"CI failed: {name} [{value}]" + (f" {link}" if link else ""))
     all_green = bool(checks) and all(value in GREEN_CHECKS for value, _ in checks.values())
     was_green = bool(prev_checks) and all(value in GREEN_CHECKS for value in prev_checks.values())
     if all_green and not was_green:
-        lines.append(f"CI green: all {len(checks)} check(s) passed")
-        kinds.add("green")
+        add("green", f"CI green: all {len(checks)} check(s) passed")
 
     prev_threads = dict(prev.get("threads") or {})
     if threads is None:
@@ -193,17 +194,17 @@ def pr_watch_changes(
                 where = f"{where}:{thread['line']}"
             if tid not in prev_threads:
                 if other(str(first.get("author") or "")):
-                    lines.append(
+                    add(
+                        "thread",
                         f"New review thread by {first.get('author')} at {where or 'the PR'}: "
-                        f"\"{excerpt(first.get('body'))}\""
+                        f"\"{excerpt(first.get('body'))}\"",
                     )
-                    kinds.add("thread")
             elif prev_threads[tid] != open_threads[tid] and other(str(last.get("author") or "")):
-                lines.append(
+                add(
+                    "thread",
                     f"New reply by {last.get('author')} on {where or 'a review thread'}: "
-                    f"\"{excerpt(last.get('body'))}\""
+                    f"\"{excerpt(last.get('body'))}\"",
                 )
-                kinds.add("thread")
         open_threads = dict(sorted(open_threads.items())[:_MAX_THREADS])
 
     seen = set(prev.get("seen") or [])
@@ -218,8 +219,7 @@ def pr_watch_changes(
         login = login_of(comment)
         if cid in seen or not other(login) or _is_bot(login):
             continue
-        lines.append(f"New comment by {login}: \"{excerpt(comment.get('body'))}\"")
-        kinds.add("comment")
+        add("comment", f"New comment by {login}: \"{excerpt(comment.get('body'))}\"")
     for review in payload.get("reviews") or []:
         if not isinstance(review, dict):
             continue
@@ -236,25 +236,23 @@ def pr_watch_changes(
         # are reported as threads.
         if not body and verdict not in {"CHANGES_REQUESTED", "APPROVED"}:
             continue
-        lines.append(
+        add(
+            "comment",
             f"New review by {login} [{verdict or 'COMMENTED'}]"
-            + (f": \"{excerpt(body)}\"" if body else "")
+            + (f": \"{excerpt(body)}\"" if body else ""),
         )
-        kinds.add("comment")
 
     prev_decision = str(prev.get("decision") or "")
     if decision != prev_decision and decision in {"CHANGES_REQUESTED", "APPROVED"}:
-        lines.append(
-            f"Review decision: {decision}" + (f" (was {prev_decision})" if prev_decision else "")
+        add(
+            "changes-requested" if decision == "CHANGES_REQUESTED" else "approved",
+            f"Review decision: {decision}" + (f" (was {prev_decision})" if prev_decision else ""),
         )
-        kinds.add("changes-requested" if decision == "CHANGES_REQUESTED" else "approved")
 
     if state == "MERGED" and prev.get("state") != "MERGED":
-        lines.append("Merged.")
-        kinds.add("merged")
+        add("merged", "Merged.")
     elif state == "CLOSED" and prev.get("state") != "CLOSED":
-        lines.append("Closed without merging.")
-        kinds.add("closed")
+        add("closed", "Closed without merging.")
 
     snapshot = {
         "state": state,
@@ -264,7 +262,7 @@ def pr_watch_changes(
         "threads": open_threads,
         "seen": current_ids[-_MAX_SEEN:],
     }
-    return snapshot, lines, kinds
+    return snapshot, changes, kinds
 
 
 def pr_watch_fingerprint(snapshot: dict[str, Any]) -> str:
@@ -273,8 +271,14 @@ def pr_watch_fingerprint(snapshot: dict[str, Any]) -> str:
 
 
 def watch_error_kind(reason: str) -> str:
-    """`missing`, `unauthenticated`, or `unreachable` -- only the last mends itself."""
+    """`missing`, `unauthenticated`, `rate-limited` or `unreachable`.
+
+    Only the last two mend themselves, and a rate limit is the one where
+    asking again makes it worse.
+    """
     lowered = reason.lower()
+    if "rate limit" in lowered or "abuse detection" in lowered:
+        return "rate-limited"
     if "not installed" in lowered:
         return "missing"
     if any(sign in lowered for sign in ("auth login", "not logged", "authentication", "http 401")):
