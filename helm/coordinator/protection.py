@@ -2405,6 +2405,25 @@ class ProtectionMixin:
             # awaiting review, and review reads the branch.
             return f"holds {ahead} unmerged commit(s) on {branch}"
         return None
+    @staticmethod
+    def _escalation_awaiting(data: dict[str, Any], worker_id: str) -> bool:
+        """Has this worker asked something that nothing has answered yet?
+
+        Ordered by position in the message log rather than by timestamp,
+        because two records written inside the same second are ordered by the
+        log and not by their stamps, and the whole question is which came
+        last.
+        """
+        asked = answered = -1
+        for index, message in enumerate(data.get("messages", [])):
+            if message.get("worker_id") != worker_id:
+                continue
+            if message.get("kind") in {"question", "blocker"}:
+                asked = index
+            elif message.get("kind") == "answer":
+                answered = index
+        return asked > answered
+
     def sweep_residue_under_grants(self, *, now_epoch: float | None = None) -> dict[str, Any]:
         """Shed what delivered and stale tasks still hold, where a cleanup grant says so.
 
@@ -2425,7 +2444,8 @@ class ProtectionMixin:
         skipped: list[dict[str, Any]] = []
         without_grant = 0
         for task in sorted(data.get("tasks", {}).values(), key=lambda t: t.get("created_at") or ""):
-            if not self.task_retained_resources(task, data):
+            retained = self.task_retained_resources(task, data)
+            if not retained:
                 continue
             status = task.get("status")
             if status in {"approval-needed", "approved", "pr-open"} or task.get("role") == "foreman":
@@ -2451,6 +2471,28 @@ class ProtectionMixin:
             live = self._live_work_refusal(task)
             if live is not None:
                 skipped.append({"task_id": task["id"], "reason": _safe_text(live)[:160]})
+                continue
+            # A SWEEP THAT CAN SHED NOTHING MUST NOT RUN. A completed but
+            # undelivered task keeps its branch by design -- that is finished
+            # work nobody has decided on -- so once its worktree and worker
+            # directories are gone, the branch is the only thing left and this
+            # pass is forbidden to touch it. Cleanup would run, report the
+            # branch as kept, and leave the task holding exactly what it held
+            # before, which makes it eligible again on the very next pass.
+            #
+            # Unguarded that is not a harmless no-op. Every pass writes a
+            # cleanup record and re-answers the task's own escalation, so one
+            # such task grows the state document without bound -- it reached
+            # two thousand cleanup records and twenty-four megabytes here, and
+            # every command every live worker runs reads and rewrites that
+            # file. Counted structurally, on the same two predicates that put
+            # the branch in the list, rather than by matching its wording.
+            holds_branch = task_owns_branch(task) and not task.get("branch_removed")
+            if not delete_branch and len(retained) - (1 if holds_branch else 0) <= 0:
+                skipped.append({
+                    "task_id": task["id"],
+                    "reason": f"{reason}; only its branch is left and this sweep keeps branches",
+                })
                 continue
             try:
                 self.cleanup_task(task["id"], delete_branch=delete_branch)
@@ -2535,8 +2577,18 @@ class ProtectionMixin:
             # Recorded as an explicit answer rather than by deleting the
             # blocker, so what the worker reported survives in the log and the
             # decision to stop pursuing it is visible beside it.
+            #
+            # Only where an escalation is actually still open. Answering
+            # unconditionally means a second cleanup of the same task writes a
+            # second answer to a question already settled -- and a cleanup that
+            # repeats writes one every time, which is how the same worker
+            # collected eighteen hundred identical answers. The predicate is
+            # the one the health check uses: the last escalation this worker
+            # made is later than the last answer it was given.
             for worker in data.get("workers", {}).values():
                 if worker.get("task_id") != task["id"]:
+                    continue
+                if not self._escalation_awaiting(data, worker["id"]):
                     continue
                 self._message(
                     data, project, task, worker, "answer",

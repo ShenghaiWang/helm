@@ -90,6 +90,71 @@ class CleanupGrantTests(HelmTestCase):
         self.assertFalse(kept["branch_removed"])
         self.assertIn("its task branch", " ".join(self.coordinator.task_retained_resources(kept, data)))
 
+    def test_a_kept_branch_does_not_make_the_task_eligible_forever(self) -> None:
+        """The second sweep of the same task must shed nothing and write nothing.
+
+        A completed but undelivered task keeps its branch by design, so after
+        the first sweep takes its worktree the branch is all it holds -- and
+        this sweep is forbidden to delete branches. Without a guard it stays
+        eligible on every pass, and each pass writes a cleanup record and
+        re-answers the task's escalation. On this root that reached two
+        thousand records in a twenty-four megabyte state file that every
+        command of every live worker reads and rewrites.
+        """
+        root = self.repo("forever")
+        project = self.coordinator.register_project("Forever", str(root), project_id="forever")
+        done = self.coordinator.create_task(project["id"], "done but never merged")
+        code = (
+            "from pathlib import Path; import subprocess; Path('f.txt').write_text('w'); "
+            "subprocess.run(['git','add','f.txt'],check=True); subprocess.run(['git','commit','-qm','f'],check=True)"
+        )
+        self.coordinator.launch_worker(done["id"], [sys.executable, "-c", code])
+        self.coordinator.grant_approval("cleanup", note="sweep old residue", stale_days=7)
+        later = time.time() + 8 * 86400
+
+        first = self.coordinator.sweep_residue_under_grants(now_epoch=later)
+        self.assertEqual([e["task_id"] for e in first["cleaned"]], [done["id"]])
+        data = self.state.load()
+        self.assertFalse(data["tasks"][done["id"]]["branch_removed"])
+        # It still holds its branch, so it is still retaining a resource --
+        # the gate that decides has to be finer than "holds something".
+        self.assertTrue(self.coordinator.task_retained_resources(data["tasks"][done["id"]], data))
+        messages = len(data["messages"])
+
+        second = self.coordinator.sweep_residue_under_grants(now_epoch=later + 60)
+
+        self.assertEqual(second["cleaned"], [])
+        reasons = {e["task_id"]: e["reason"] for e in second["skipped"]}
+        self.assertIn("only its branch is left", reasons[done["id"]])
+        self.assertEqual(len(self.state.load()["messages"]), messages)
+
+    def test_cleanup_answers_an_escalation_once_not_on_every_run(self) -> None:
+        """Answering is for a live escalation; a settled one is already settled."""
+        root = self.repo("asked")
+        project = self.coordinator.register_project("Asked", str(root), project_id="asked")
+        task = self.coordinator.create_task(project["id"], "asks and stops")
+        worker = self.coordinator.launch_worker(
+            task["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(worker["id"], "question", "which way?")
+        # Nothing ever answered it; the worker finished anyway.
+        self.coordinator.record_worker_message(worker["id"], "result", "done without an answer")
+
+        self.coordinator.cleanup_task(task["id"])
+        answers = [
+            m for m in self.state.load()["messages"]
+            if m.get("worker_id") == worker["id"] and m.get("kind") == "answer"
+        ]
+        self.assertEqual(len(answers), 1)
+
+        self.coordinator.cleanup_task(task["id"])
+
+        answers = [
+            m for m in self.state.load()["messages"]
+            if m.get("worker_id") == worker["id"] and m.get("kind") == "answer"
+        ]
+        self.assertEqual(len(answers), 1)
+
     def test_watch_runs_the_sweep_and_archives_what_it_shed(self) -> None:
         root = self.repo("watched")
         project = self.coordinator.register_project("Watched", str(root), project_id="watched")
