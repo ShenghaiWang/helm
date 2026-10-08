@@ -413,8 +413,10 @@ class CliStatusTests(HelmTestCase):
         project = self.coordinator.register_project(
             "Superseded", str(root), project_id="supersededforeman"
         )
+        # Both named for the same unit of work, which is what makes the second
+        # a SUCCESSOR rather than a second lead running something else.
         first = self.coordinator.create_task(
-            project["id"], "drive the project", role="foreman"
+            project["id"], "drive the project", role="foreman", ticket="TCK-2"
         )
         worker = self.coordinator.launch_worker(
             first["id"], [sys.executable, "-c", ""], wait=False
@@ -430,7 +432,7 @@ class CliStatusTests(HelmTestCase):
 
         # The replacement is the answer.
         self.coordinator.create_task(
-            project["id"], "drive the project", role="foreman"
+            project["id"], "drive the project", role="foreman", ticket="TCK-2"
         )
 
         still_owed = [
@@ -438,6 +440,47 @@ class CliStatusTests(HelmTestCase):
             if "cannot proceed" in u["text"]
         ]
         self.assertEqual(still_owed, [])
+
+    def test_an_unrelated_lead_does_not_answer_another_leads_blocker(self) -> None:
+        """Succession is about the WORK, not about the project.
+
+        The check matched any other lead task in the project, which was the
+        same thing only while a project had one lead at a time. With several,
+        a lead running unit B silently answered unit A's escalation: A blocked
+        and unanswered, B busy elsewhere, and A's blocker gone from the
+        attention list because B existed.
+        """
+        import sys
+        root = self.repo("twoleads")
+        project = self.coordinator.register_project(
+            "Two leads", str(root), project_id="twoleads"
+        )
+        blocked = self.coordinator.create_foreman_task(project["id"], ticket="TICKET-1")
+        worker = self.coordinator.launch_worker(
+            blocked["id"], [sys.executable, "-c", ""], wait=False
+        )
+        self.coordinator.record_worker_message(
+            worker["id"], "blocker", "cannot proceed without a decision"
+        )
+
+        def owed():
+            return [
+                u for u in self.coordinator.project_updates_for_watch()
+                if "cannot proceed" in u["text"]
+            ]
+
+        self.assertTrue(owed(), "the blocker should be owed while it stands")
+
+        # A lead on entirely different work. It answers nothing.
+        self.coordinator.create_foreman_task(project["id"], ticket="TICKET-2")
+        self.assertTrue(
+            owed(),
+            "an unrelated lead must not suppress another lead's unanswered blocker",
+        )
+
+        # A successor on the SAME work is the answer, and still supersedes.
+        self.coordinator.create_foreman_task(project["id"], ticket="TICKET-1")
+        self.assertEqual(owed(), [])
 
     def test_an_owed_report_survives_a_read_that_relayed_nothing(self) -> None:
         """Surfaced meant "something read it", which is the wrong property.
@@ -1101,9 +1144,13 @@ class ASupersededForemanBlockerLeavesTheAttentionListTests(HelmTestCase):
     they described had been finished and merged.
     """
 
-    def _blocked_foreman(self, project: dict, note: str) -> dict:
+    def _blocked_foreman(self, project: dict, note: str, ticket: str = "TCK-1") -> dict:
+        # NAMED, because succession is about the WORK. A lead is appointed for
+        # a ticket and named after it, and only a successor carrying that same
+        # name answers its escalation -- an unrelated lead on another unit of
+        # work in the same project does not.
         task = self.coordinator.create_task(
-            project["id"], "drive the project", role="foreman"
+            project["id"], "drive the project", role="foreman", ticket=ticket
         )
         # A LIVE process, not `-c ""`. An immediately-exiting worker races
         # its own blocker: Helm can settle it before the message is recorded,
@@ -1132,7 +1179,9 @@ class ASupersededForemanBlockerLeavesTheAttentionListTests(HelmTestCase):
     def test_a_live_successor_answers_it(self) -> None:
         project = self._project("livesucc")
         self._blocked_foreman(project, "needs a decision beta")
-        self.coordinator.create_task(project["id"], "drive it", role="foreman")
+        self.coordinator.create_task(
+            project["id"], "drive it", role="foreman", ticket="TCK-1"
+        )
         self.assertEqual(self._open("needs a decision beta"), [])
 
     def test_a_successor_THAT_HAS_SINCE_FINISHED_also_answers_it(self) -> None:
@@ -1145,7 +1194,7 @@ class ASupersededForemanBlockerLeavesTheAttentionListTests(HelmTestCase):
         project = self._project("finishedsucc")
         self._blocked_foreman(project, "needs a decision gamma")
         successor = self.coordinator.create_task(
-            project["id"], "drive it", role="foreman"
+            project["id"], "drive it", role="foreman", ticket="TCK-1"
         )
         with self.coordinator.store.locked() as data:
             entry = data["tasks"][successor["id"]]

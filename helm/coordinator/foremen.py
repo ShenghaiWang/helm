@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..naming import task_name, ticket_of
+from ..naming import task_name, ticket_of, title_of
 from ..paths import canonical
 from ..values import FOREMAN_DOMAIN, FOREMAN_RULES, _TERMINAL_WORKER_TASK_STATES, now
 
@@ -293,6 +293,26 @@ class ForemenMixin:
         # test below is kept as well as the timestamp: in the tie that matters
         # -- a replacement appointed moments after the escalation -- the
         # replacement is still running.
+        # A SUCCESSOR IS ON THE SAME WORK, not merely in the same project.
+        # This matched any other lead task in the project, which was the same
+        # thing only while a project had one lead at a time. With several, an
+        # unrelated lead running unit B silently answered unit A's escalation:
+        # lead A blocked and unanswered, lead B busy elsewhere, and A's blocker
+        # vanished from the attention list because B existed. Reproduced by an
+        # independent review.
+        #
+        # The name is what identifies the work -- a lead is appointed for a
+        # ticket or a request and named after it -- so a successor must carry
+        # the same name. A lead with no name supersedes nothing and is
+        # superseded by nothing, which errs toward SHOWING an escalation.
+        # That is the right direction to err: hiding a real blocker costs more
+        # than one line of noise, and over-suppression is the defect here.
+        # Derived WITHOUT the id fallback that `task_name` supplies. The guard
+        # below reads "no name supersedes nothing", and an id satisfies it only
+        # by accident -- every task has a unique one, so `mine` was never empty
+        # and the comparison could never match anything either. Two leads that
+        # genuinely share a unit of work then failed to recognise each other.
+        mine = ticket_of(task) or title_of(task)
         created_at = task.get("created_at") or ""
         for other in data.get("tasks", {}).values():
             if other.get("role") != "foreman":
@@ -300,6 +320,8 @@ class ForemenMixin:
             if other.get("project_id") != task.get("project_id"):
                 continue
             if other.get("id") == task_id:
+                continue
+            if not mine or task_name(other, fallback="") != mine:
                 continue
             if other.get("status") in {"created", "allocated", "running"}:
                 return True
