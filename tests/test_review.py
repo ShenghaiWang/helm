@@ -2133,9 +2133,15 @@ class ReviewerTicketTests(HelmTestCase):
         task = self.coordinator.create_task(project["id"], "write the code")
         self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
 
+        # The tip has to be the one the branch is actually on: evidence that
+        # names an earlier revision is refused now, because that is the shape
+        # that cost three reviews.
+        tip = self.coordinator._evidence_head(
+            self.coordinator.store.load()["tasks"][task["id"]]
+        )
         self.coordinator.record_task_evidence(
             task["id"],
-            tip="abc1234",
+            tip=tip,
             command="pnpm -r test",
             exit_code=0,
             detail={"packages": {"core": {"pass": 12, "fail": 0}}},
@@ -2144,7 +2150,7 @@ class ReviewerTicketTests(HelmTestCase):
         rendered = HerdrAdapter._full_suite_evidence(
             self.coordinator.store.load(), task["id"]
         )
-        self.assertIn("abc1234", rendered)
+        self.assertIn(tip[:10], rendered)
         self.assertIn("pnpm -r test", rendered)
 
     def test_the_evidence_command_is_dispatchable(self) -> None:
@@ -2163,15 +2169,18 @@ class ReviewerTicketTests(HelmTestCase):
         task = self.coordinator.create_task(project["id"], "write the code")
         self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
 
+        tip = self.coordinator._evidence_head(
+            self.coordinator.store.load()["tasks"][task["id"]]
+        )
         out = io.StringIO()
         with _ctx.redirect_stdout(out):
             code = cli.main([
                 "--state-dir", str(self.state.directory),
                 "task", "evidence", task["id"],
-                "--tip", "abc1234", "--command", "pnpm -r test", "--exit", "0",
+                "--tip", tip, "--command", "pnpm -r test", "--exit", "0",
             ])
         self.assertEqual(code, 0)
-        self.assertIn("abc1234", out.getvalue())
+        self.assertIn(tip[:10], out.getvalue())
 
     def test_evidence_refuses_without_the_tip_it_ran_against(self) -> None:
         """Evidence that does not name its tip is what a reviewer cannot

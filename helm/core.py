@@ -813,6 +813,32 @@ class Coordinator(
             seen = True
         return total if seen else None
 
+    @staticmethod
+    def _evidence_head(task: dict[str, Any]) -> str:
+        """The commit the task branch points at, or "" when it cannot be read.
+
+        Read from the branch ref, the same commit a review round pins, rather
+        than from whatever the checkout has out.
+
+        Unreadable is not the same as mismatched. A task whose worktree has
+        been moved or removed still deserves to record what it ran, so the
+        check declines to fire rather than blocking on a repository it cannot
+        see -- an unverifiable claim is weaker evidence, never a refusal.
+        """
+        workspace = task.get("workspace")
+        branch = task.get("branch")
+        if not workspace or not branch:
+            return ""
+        path = Path(str(workspace))
+        if not path.exists():
+            return ""
+        with contextlib.suppress(Exception):
+            return _git(
+                path, "rev-parse", "--verify", "--quiet",
+                f"refs/heads/{branch}^{{commit}}", check=False,
+            ).strip()
+        return ""
+
     def record_task_evidence(
         self,
         task_id: str,
@@ -861,6 +887,30 @@ class Coordinator(
             report.update(detail)
         with self.store.locked() as data:
             task = self._task(data, task_id)
+            # EVIDENCE IS ABOUT A TIP, AND THE TIP MOVES.
+            #
+            # Running the suite and then committing once more is the natural
+            # order of a round -- fix, verify, tidy, commit -- and it silently
+            # produces evidence about a revision nobody is reviewing. Three
+            # reviews were spent on it in one morning across two branches,
+            # each one correctly refusing a green run that described the
+            # commit before the one under review.
+            #
+            # Restating the rule does not fix a reflex. So the comparison
+            # happens here, where it can be made of facts rather than of
+            # memory: the tip the author says the suite ran at, against the
+            # tip the branch is actually on. They differ, it is not evidence
+            # for this review, and the refusal names the revision to re-run
+            # against instead of leaving it to be discovered a round later.
+            head = self._evidence_head(task)
+            claimed = tip.lower()
+            if head and not (head.startswith(claimed) or claimed.startswith(head)):
+                raise HelmError(
+                    f"evidence names {tip[:12]} but {task_id} is on {head[:12]}: "
+                    "the suite ran before the tip under review. Re-run it at the "
+                    f"tip and record that -- git rev-parse HEAD, then the suite, "
+                    "then this command, in that order"
+                )
             workers = sorted(
                 self._task_workers(data, task_id),
                 key=lambda w: (w.get("started_at") or "", w.get("id") or ""),

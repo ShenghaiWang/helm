@@ -384,11 +384,15 @@ class ProjectChecksTests(DoctorTestCase):
         self.assertEqual(self.finding(self.report(helm_root, "alpha"), "project.evidence").severity, doctor.OK)
         task = coordinator.create_task(project["id"], "a change")
         coordinator.launch_worker(task["id"], [sys.executable, "-c", ""])
-        coordinator.record_task_evidence(task["id"], tip="abc123", command="make test", exit_code=0)
+        # Evidence is refused when it names a revision the branch has moved
+        # past, so this fixture records the tip the task is actually on. The
+        # finding under test is about the CASE COUNT, not the revision.
+        tip = coordinator._evidence_head(coordinator.store.load()["tasks"][task["id"]])
+        coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0)
         finding = self.finding(self.report(helm_root, "alpha"), "project.evidence")
         self.assertEqual(finding.severity, doctor.WARNING)
         self.assertIn("say nothing about how many cases ran", finding.message)
-        coordinator.record_task_evidence(task["id"], tip="abc123", command="make test", exit_code=0, cases=0)
+        coordinator.record_task_evidence(task["id"], tip=tip, command="make test", exit_code=0, cases=0)
         finding = self.finding(self.report(helm_root, "alpha"), "project.evidence")
         self.assertEqual(finding.severity, doctor.WARNING)
         self.assertIn("ran 0 cases", finding.message)
