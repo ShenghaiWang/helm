@@ -545,6 +545,9 @@ HOW TO WORK
 - `helm watch` tells you which of your workers is stalled, erroring, or
   awaiting an answer. A worker that has asked and not been answered is blocked
   on you.
+- Once a PR is recorded open, Helm watches it and wakes you with one message
+  when its checks or reviews change. End your turn rather than polling the PR
+  or waiting on your inbox.
 - Escalate to Helm only for: a protected action, missing credentials, a
   decision that changes scope beyond the brief, a contradiction no source
   resolves, or repeated failure. Everything else is yours to decide.
@@ -586,6 +589,24 @@ HOW TO WORK
 # reused; FOREMAN_RULES stays in code because it is the authority boundary,
 # and a domain file is untrusted guidance that must never define one.
 FOREMAN_DOMAIN = "driving-delegated-work"
+
+#: The standing instruction a PR watch event carries when there is work in
+#: it. The craft behind each step is in the `driving-delegated-work` domain;
+#: this is the short form a lead reads at the moment it is woken.
+PR_WATCH_INSTRUCTIONS = (
+    "Fix what your change caused: continue the task's worker to append commits "
+    "(never force-push), get the independent review your project's policy asks "
+    "for, then request approval-needed for the push. Reply to and resolve each "
+    "thread only once the fix is on the remote. A red check your change did not "
+    "cause is reported, not \"fixed\". When you have acted, end your turn; Helm "
+    "wakes you again when the PR changes."
+)
+#: The same, for an event with nothing to fix: green checks, an approval, a
+#: merge or a close.
+PR_WATCH_QUIET_INSTRUCTIONS = (
+    "Nothing here needs a fix. Report it if it moves the work forward, then end "
+    "your turn; Helm wakes you again when the PR changes."
+)
 
 #: The two human confirmation gates a foreman's driving task carries before it
 #: may launch a state-changing worker. `requirement` is the goal/scope/exclusions

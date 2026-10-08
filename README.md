@@ -81,7 +81,9 @@ One request travels like this:
 7. **Decide delivery.** When no driver is left, Helm records a delivery
    decision for the commander: local merge, pull request, another round, or
    cleanup — and then a cleanup decision, because delivery is not
-   finalization.
+   finalization. An open pull request is watched on its own: a red check or
+   a new review thread wakes the task's lead with one message
+   ([delivery](docs/delivery.md#the-pr-watch-wakes-the-lead)).
 
 Every step above is a section of the [documentation map](#documentation-map).
 
@@ -453,6 +455,7 @@ helm doctor [--project PROJECT_ID] [--json] [--probe-runtimes]
 helm status [--project PROJECT_ID] · pending [--changes] [--heal] · ack PROJECT · ask record|show
 helm watch [--silence SECONDS] [--nudge] · watchdog install|run [--notify-command CMD] [--remind-after MIN] [--no-heal] · restart|uninstall
 helm route PROJECT TEXT [--agent A] [--model M] [--no-herdr]
+helm pr watch [--once] [--interval SECONDS]
 helm lead PROJECT [--agent A] [--command CMD] [--no-herdr] [--new] [--ticket T]
 helm gate propose|decide LEAD_TASK --type requirement|solution
 helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async|--wait]

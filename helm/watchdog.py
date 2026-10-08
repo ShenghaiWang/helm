@@ -191,7 +191,11 @@ def sync_pull_requests(root: Path | None) -> dict[str, object]:
 
     store = StateStore(root / "state", helm_root=root) if root else StateStore()
     coordinator = Coordinator(store)
-    synced = coordinator.sync_open_pull_requests()
+    from . import cli
+
+    # The read is also the PR watch: what changed on a PR goes to its lead.
+    synced, delivered = cli._pr_watch_pass(coordinator)
+    synced["delivered"] = delivered
     # Once a day, mine what recurred into proposals, so the knowledge loop
     # feeds itself and the proposals reach `pending` on their own.
     synced["mined"] = _mine_daily(coordinator, root)
@@ -370,6 +374,8 @@ def run(
             synced = sync_pull_requests(root)
             for task_id in synced.get("merged", []):
                 print(f"helm watchdog: pull request merged for task {task_id}", flush=True)
+            for line in synced.get("delivered", []):
+                print(f"helm watchdog: {line}", flush=True)
         except Exception as exc:  # noqa: BLE001 - the sync is a courtesy, never the reason to die
             print(f"helm watchdog: PR sync skipped: {exc}", file=sys.stderr, flush=True)
         try:

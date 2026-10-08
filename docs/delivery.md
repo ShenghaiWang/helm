@@ -149,6 +149,46 @@ once per task every ten minutes and quietly skipping a remote they cannot
 reach, so a merged PR is recorded as `pr-merged` within minutes and its
 cleanup decision raised; `helm task pr-sync` does the same read by hand.
 
+### The PR watch wakes the lead
+
+Under `execution.turns` a task lead exists only inside a turn, so nothing
+would wake it when CI goes red or a reviewer writes. Recording a PR open
+(`helm task pr`, or `pr-status --state open`) therefore starts a watch on it,
+with no further command. The same pass that syncs the merge state reads each
+open PR at most every two minutes with `gh pr view` and the review threads
+with `gh api graphql`, and keeps a small fingerprint on the task: each check's
+conclusion, the review decision, the open threads, and the comment and review
+ids already seen. When that changes in a way a lead must hear about -- a check
+failed, every check passed after one had not, a new unresolved thread or reply,
+a new comment or review from someone other than the PR's author, the decision
+became `CHANGES_REQUESTED` or `APPROVED`, the PR merged or closed -- Helm
+delivers one message to the lead that owns the task, through the same path as
+`helm worker answer`: under turns it is the prompt the lead's next turn opens
+with. It names the PR, what changed (failing checks with their run links,
+thread excerpts with author and `path:line`) and the standing instruction:
+fix what the change caused by appending commits, get the review the project
+asks for, request approval for the push, and reply to and resolve threads only
+once the fix is on the remote. A red check the change did not cause is
+reported, not fixed.
+
+The owning lead is found the way `helm route --ticket` finds one: the lead the
+record names for the task, else the live lead named for its ticket, else a new
+lead appointed for that ticket with the event as its request. An event is
+delivered once; several changes in one pass are one message; the same state
+read twice sends nothing. A gh that is missing or logged out is recorded on
+the task and shown once in `helm pending`; an unreachable forge stays quiet.
+
+The pass runs inside `helm watch`, the watchdog, and `helm pending --changes`
+(the monitor loop a session arms), and on its own as:
+
+```sh
+helm pr watch --once                   # one pass, for a scheduler or a monitor
+helm pr watch [--interval 30]          # keep passing until stopped
+```
+
+Only a root caller delivers. A lead that runs `helm watch` reads its PRs, and
+whatever it queued is delivered on the root's next pass.
+
 ## Delivering build outputs
 
 A merge moves tracked files only, so a rendered video — often the actual

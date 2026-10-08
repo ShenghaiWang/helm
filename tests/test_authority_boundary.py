@@ -40,6 +40,7 @@ CLI_ONLY: dict[tuple[str, str | None], str] = {
     ("eval", None): "the commander's own experiment; it spawns through the gated launch path",
     ("foreman", None): "spawning is refused for any caller that is not the root or a foreman at launch",
     ("route", None): "same launch path",
+    ("pr", None): "delivers only for a root caller, and appoints through the same launch path",
 }
 
 

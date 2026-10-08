@@ -160,6 +160,27 @@ from .coordinator.status import StatusMixin
 
 
 
+def _start_pr_watch(delivery: dict[str, Any], url: str) -> None:
+    """Begin watching a PR the moment it is recorded open; nothing else starts it.
+
+    A different URL is a different PR, so its watch starts over. The watch
+    itself runs in `sync_open_pull_requests`; this only marks when it began,
+    which is also what tells the watch this PR's history is news.
+    """
+    def same(a: str, b: str) -> bool:
+        def key(value: str) -> str:
+            found = re.match(r"https?://([^/]+/[^/]+/[^/]+/pull/\d+)", value.strip())
+            return (found.group(1) if found else value.strip().rstrip("/")).lower()
+        return key(a) == key(b)
+
+    watch = delivery.get("watch")
+    if not isinstance(watch, dict) or (watch.get("url") and not same(str(watch["url"]), url)):
+        delivery["watch"] = {"since": now(), "url": url}
+    elif "since" not in watch:
+        watch["since"] = now()
+        watch["url"] = url
+
+
 class Coordinator(
     ArchiveMixin,
     PullRequestsMixin,
@@ -1817,6 +1838,7 @@ class Coordinator(
                 "url": url,
                 "source": delivery["source"],
             })
+            _start_pr_watch(delivery, url)
             task["status"] = "pr-open"
             self._message(
                 data,
@@ -1908,6 +1930,7 @@ class Coordinator(
             else:
                 task["status"] = "pr-open"
                 delivery["state"] = "pr-open"
+                _start_pr_watch(delivery, delivery.get("url", ""))
                 kind = "pr-status"
                 text = f"Pull request still {observed}: {delivery.get('url', '')}".strip()
             self._message(data, project, task, None, kind, text, event)

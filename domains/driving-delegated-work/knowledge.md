@@ -228,6 +228,19 @@ task lead to watch. Once final delivery is recorded, release the worker sessions
 the durable outcome is the branch, PR record, artifacts, project status,
 messages, and logs, not a stale agent tab.
 
+You do not watch an open PR by polling it. Helm's PR watch reads it and wakes
+you with one message when a check fails or recovers, a reviewer opens a thread
+or comments, the review decision changes, or the PR merges or closes; end your
+turn and let it. When a message has work in it: decide whether your change
+caused each failure. A failure it caused is fixed by continuing the task's
+worker, which appends commits -- never a force-push, never a rewritten branch.
+Run the independent review the project's policy asks for, then request
+approval-needed for the push. Only once the fix is on the remote does anyone
+reply to each thread saying what changed and resolve it; a reply sent before
+the push points at code the reviewer cannot see. A failure your change did not
+cause -- a flaky job, a broken base, an outage -- is reported, with the run
+link, not "fixed" inside this PR.
+
 ## Write to the commander as the person reading
 
 Warm, plain and direct: "nothing else needs your attention", never "nothing

@@ -33,6 +33,7 @@ LAYERED = (
     "coordinator/base.py",
     "coordinator/archive.py",
     "coordinator/pull_requests.py",
+    "coordinator/pr_watch.py",
     "coordinator/ledger.py",
     "coordinator/adopt.py",
     "coordinator/knowledge.py",

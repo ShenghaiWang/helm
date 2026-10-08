@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
+import io
 import json
 import re
 import os
@@ -512,6 +513,120 @@ def _open_pull_request(
 def _sync_pull_request_status(coordinator: Coordinator, task_id: str) -> dict[str, Any]:
     """Read the task's PR with gh and record the observed delivery state."""
     return coordinator.sync_pull_request(task_id)
+
+
+def _pr_event_lead(
+    coordinator: Coordinator, event: dict[str, Any], *, herdr: bool = True
+) -> tuple[dict[str, Any] | None, str]:
+    """The task lead that owns this PR's work, appointing one if none is live.
+
+    The same order `helm route` uses, starting from the task itself: the
+    driver the record names for this task (the lead that created it, adopted
+    it, or spent its gates on it); else the live lead named for the task's
+    ticket; else, for a ticketed task, a new lead appointed for that ticket
+    with the event as its request -- never another ticket's lead. A task with
+    no ticket goes to the project's lead, as an unticketed route does. Every
+    candidate is of the task's own project; nothing here looks wider.
+    """
+    data = coordinator.store.load()
+    task = data["tasks"][event["task_id"]]
+    project_id = task["project_id"]
+    driver, how = coordinator.driver_resolution(task["id"], data=data)
+    if driver is not None and how != "project":
+        return driver, how
+    ticket = ticket_of(task)
+    if ticket:
+        named = coordinator.driver_named(project_id, ticket, data=data)
+        if named is not None:
+            return named, "named"
+    elif driver is not None:
+        return driver, how
+    if not coordinator.project_wants_foreman(project_id):
+        return None, "declined"
+    started = _start_foreman(
+        coordinator, project_id, herdr=herdr, request=event["text"], ticket=ticket or None,
+    )
+    return started["worker"], "appointed"
+
+
+def _deliver_pr_watch_events(
+    coordinator: Coordinator, events: list[dict[str, Any]], *, herdr: bool = True
+) -> list[str]:
+    """Hand each PR watch event to its task's lead, the way an answer is handed.
+
+    Recorded as an `answer` on the lead, written to its inbox, and woken with
+    `answer_worker` -- under turns that makes the event the prompt its next
+    turn opens with, and starts the runner. A lead appointed for the event
+    carries it in its brief instead. One event, one lead, one project: an
+    event is never offered to a lead of any other project.
+
+    Returns one line per event for whoever ran the pass. Root only: a lead
+    running `helm watch` reads its PRs but does not deliver into itself or a
+    sibling, and the next root pass delivers what it left queued.
+    """
+    lines: list[str] = []
+    if not events or coordinator.caller_role() != "root":
+        return lines
+    for event in events:
+        task_id = event["task_id"]
+        project_id = str(event.get("project_id") or "")
+        glyph = _glyph_for(coordinator, project_id)
+        headline = (event.get("changes") or [""])[0][:100]
+        try:
+            lead, how = _pr_event_lead(coordinator, event, herdr=herdr)
+            if lead is None:
+                # The project declined a lead: the commander is the only
+                # reader left, so the event goes on the project's record.
+                coordinator.record_situation(
+                    project_id,
+                    f"PR watch for task {task_id}: {headline} ({event.get('url')}); "
+                    "this project has no task lead to act on it",
+                    surface=True, task_id=task_id,
+                )
+                coordinator.mark_pr_watch_event(task_id, event["fingerprint"], outcome="recorded")
+                lines.append(f"{glyph} {project_id} PR watch: task {task_id}: {headline} [no task lead; recorded]")
+                continue
+            if lead.get("project_id") != project_id:
+                raise SafetyError(
+                    f"lead {lead.get('id')} is not in project {project_id}; a PR event never crosses projects"
+                )
+            coordinator.record_worker_message(
+                lead["id"], "answer", event["text"],
+                payload={"via": "pr-watch", "task_id": task_id, "url": event.get("url")},
+            )
+            if how == "appointed":
+                outcome = "appointed"
+            else:
+                recorded = coordinator.latest_answer(lead["id"]) or {}
+                note = coordinator.leave_inbox_note(
+                    lead["id"], event["text"], note_id=recorded.get("id")
+                )
+                outcome = "unreachable"
+                with contextlib.suppress(HelmError, OSError):
+                    adapter = HerdrAdapter(coordinator)
+                    adapter.answer_worker(lead["id"], event["text"], note=note)
+                    outcome = adapter.last_wake_outcome
+        except (HelmError, SafetyError, OSError) as exc:
+            coordinator.mark_pr_watch_event(
+                task_id, event["fingerprint"], outcome=str(exc), delivered=False
+            )
+            lines.append(f"{glyph} {project_id} PR watch: task {task_id}: could not reach a lead: {exc}")
+            continue
+        coordinator.mark_pr_watch_event(
+            task_id, event["fingerprint"], lead_id=lead["id"], outcome=outcome
+        )
+        lines.append(
+            f"{glyph} {project_id} PR watch: task {task_id} -> "
+            f"{'newly appointed ' if how == 'appointed' else ''}task lead "
+            f"{_lead_label(coordinator, lead)} [{outcome}]: {headline}"
+        )
+    return lines
+
+
+def _pr_watch_pass(coordinator: Coordinator, *, herdr: bool = True) -> tuple[dict[str, Any], list[str]]:
+    """One pass of the PR watch: read what is due, deliver what changed."""
+    synced = coordinator.sync_open_pull_requests()
+    return synced, _deliver_pr_watch_events(coordinator, synced.get("events") or [], herdr=herdr)
 
 
 
@@ -2165,6 +2280,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="ask each silent worker for a status push (once per worker)",
     )
 
+    pr = commands.add_parser(
+        "pr", help="watch open pull requests and wake each one's task lead when it changes"
+    )
+    pr_commands = pr.add_subparsers(dest="pr_command", required=True)
+    pr_watch = pr_commands.add_parser(
+        "watch",
+        help=(
+            "read every open PR that is due a look and deliver what changed to its "
+            "task lead; the same pass helm watch, the watchdog and pending --changes run"
+        ),
+    )
+    pr_watch.add_argument("--once", action="store_true", help="run one pass and exit")
+    pr_watch.add_argument(
+        "--interval", type=float, default=30.0,
+        help="seconds between passes without --once (each PR is still read at most every 120s)",
+    )
+
     foreman = commands.add_parser(
         "lead", aliases=["foreman"],
         help="put a task lead in charge of one unit of work",
@@ -3478,6 +3610,9 @@ _ROOT_ONLY_COMMANDS = frozenset({
     # foreman's own work. A worker or foreman routing on its own behalf
     # would be the second driver this file elsewhere refuses.
     ("route", None),
+    # The PR watch wakes leads and appoints one for a PR nobody is driving,
+    # which is routing by another name.
+    ("pr", None),
 })
 # Delegation is one level deep: a foreman spawns workers, a worker spawns
 # nothing. Everything that starts or drives another agent is therefore the
@@ -4788,6 +4923,14 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
                 continue
             with contextlib.suppress(HelmError, OSError):
                 coordinator.poll_worker(entry["id"])
+    # `--changes` is the loop a session's monitor runs every few seconds, so
+    # it is the beat the PR watch rides on when no watchdog is installed. The
+    # watch bounds itself to one read per PR per interval and delivers to
+    # leads, not here: this command still prints only what needs the
+    # commander, and a gh that cannot read reaches this list as an owed line.
+    if args.changes:
+        with contextlib.suppress(Exception), contextlib.redirect_stdout(io.StringIO()):
+            _pr_watch_pass(coordinator)
 
     # (recency, text): a gate raised two minutes ago must not sit
     # under a blocker from yesterday. The list is read top-down and the
@@ -5123,8 +5266,13 @@ def _cmd_watch(ctx: _Context, args: argparse.Namespace) -> int | None:
     # by hand. Read the remote here, at most once per task per
     # interval, and say what moved; a remote that cannot be reached
     # is skipped quietly, because an offline laptop is not news.
+    #
+    # The same read is the PR watch: a red check, a new review thread or a
+    # changed decision is delivered to the task's lead as one message.
     with contextlib.suppress(HelmError, OSError):
-        synced = coordinator.sync_open_pull_requests()
+        synced, delivered = _pr_watch_pass(coordinator)
+        for line in delivered:
+            print(line)
         if synced["checked"]:
             print(
                 f"PR sync: {len(synced['checked'])} checked"
@@ -5211,6 +5359,29 @@ def _cmd_watch(ctx: _Context, args: argparse.Namespace) -> int | None:
     # A non-zero exit lets a scheduled check page a human without
     # anyone reading the output.
     return 1 if attention else 0
+
+
+def _cmd_pr(ctx: _Context, args: argparse.Namespace) -> int | None:
+    coordinator = ctx.coordinator
+    while True:
+        synced, delivered = _pr_watch_pass(coordinator)
+        for line in delivered:
+            print(line, flush=True)
+        for entry in synced.get("skipped") or []:
+            print(f"  could not read the PR for task {entry['task_id']}: {entry['reason']}", flush=True)
+        for task_id in synced.get("merged") or []:
+            print(f"Pull request merged for task {task_id}", flush=True)
+            with contextlib.suppress(HelmError, OSError):
+                _release_finished_space(coordinator, coordinator.inspect_task(task_id)["task"])
+        if args.once:
+            if not (delivered or synced.get("skipped") or synced.get("merged")):
+                read = len(synced.get("watched") or [])
+                print(
+                    f"Read {read} open pull request(s); nothing changed that a lead needs to hear."
+                    if read else "No open pull request is due a look yet."
+                )
+            return 0
+        time.sleep(max(5.0, args.interval))
 
 
 def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
@@ -5872,6 +6043,7 @@ _COMMANDS: dict[str, Callable[[_Context, argparse.Namespace], int | None]] = {
     "ack": _cmd_ack,
     "watch": _cmd_watch,
     "route": _cmd_route,
+    "pr": _cmd_pr,
     # `lead` is the name; `foreman` is kept for one release so a script, a
     # habit or an older brief does not break on the day the word changed.
     "lead": _cmd_foreman,
