@@ -1835,3 +1835,64 @@ class AProjectsOwnHelmDirectoryIsNotDirtinessTests(HelmTestCase):
         self.assertEqual(merged["status"], "merged")
         self.assertTrue((root / "change.txt").exists())
         self.assertTrue((root / ".helm" / "project.json").exists())
+
+
+class ATaskDeliversHowItActuallyShippedTests(HelmTestCase):
+    """The policy on a task is a plan; a pull request is a fact.
+
+    Three pull requests were opened against tasks a project had registered as
+    locally delivered, and Helm refused every attempt to record them. The
+    refusal was correct about the field and wrong about the world, and it named
+    no way to fix it, so the record of shipped work stayed permanently wrong.
+    """
+
+    def _local_task_with_a_result(self) -> dict:
+        root = self.repo("shipped")
+        project = self.coordinator.register_project(
+            "Shipped", str(root), project_id="shipped", delivery_policy="local"
+        )
+        task = self.coordinator.create_task(project["id"], "fix the thing")
+        code = (
+            "from pathlib import Path; import subprocess; "
+            "Path('change.txt').write_text('worker'); "
+            "subprocess.run(['git','add','change.txt'],check=True); "
+            "subprocess.run(['git','commit','-m','worker change'],check=True)"
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", code])
+        return task
+
+    def test_the_refusal_names_the_command_that_corrects_it(self) -> None:
+        task = self._local_task_with_a_result()
+        with self.assertRaisesRegex(SafetyError, r"helm task delivery \S+ pr"):
+            self.coordinator.record_pr_status(
+                task["id"], state="open", url="https://example.invalid/pull/7"
+            )
+
+    def test_correcting_the_policy_lets_the_pr_be_recorded(self) -> None:
+        task = self._local_task_with_a_result()
+
+        corrected = self.coordinator.set_task_delivery(task["id"], "pr")
+        self.assertEqual(corrected["delivery_policy"], "pr")
+        self.assertEqual(corrected["delivery"]["policy"], "pr")
+
+        opened = self.coordinator.record_pr_status(
+            task["id"], state="open", url="https://example.invalid/pull/7"
+        )
+        self.assertEqual(opened["status"], "pr-open")
+        self.assertEqual(opened["delivery"]["url"], "https://example.invalid/pull/7")
+
+    def test_a_delivered_task_keeps_the_policy_it_delivered_under(self) -> None:
+        """Once it has shipped the policy is history, not a plan."""
+        task = self._local_task_with_a_result()
+        self.coordinator.set_task_delivery(task["id"], "pr")
+        self.coordinator.record_pr_status(
+            task["id"], state="open", url="https://example.invalid/pull/7"
+        )
+
+        with self.assertRaisesRegex(SafetyError, "already delivered"):
+            self.coordinator.set_task_delivery(task["id"], "local")
+
+    def test_an_unknown_policy_is_refused(self) -> None:
+        task = self._local_task_with_a_result()
+        with self.assertRaisesRegex(HelmError, "local, pr"):
+            self.coordinator.set_task_delivery(task["id"], "whatever")

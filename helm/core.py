@@ -1659,6 +1659,59 @@ class Coordinator(
 
 
 
+    def set_task_delivery(self, task_id: str, policy: str) -> dict[str, Any]:
+        """Correct a task's delivery policy to the one its work actually took.
+
+        The policy on a task is a plan, written when the task was created. A
+        pull request is a fact. When the two disagree the fact has to win, or
+        Helm's record of shipped work stays permanently wrong with no command
+        to make it right -- which is exactly what happened to three pull
+        requests opened against tasks a project had registered as locally
+        delivered.
+
+        Root-only, because how a project delivers is the commander's decision.
+        A task that could rewrite its own policy could take itself out of the
+        local merge path, and self-authorization is the shape this whole
+        boundary exists to refuse. Once the task has actually been delivered
+        the policy is history rather than a plan, and nothing may rewrite it.
+        """
+        # The refusal belongs HERE, not in the CLI's root-only list. That list
+        # gates a command name; this gates the operation, and an agent reaches
+        # the operation by importing the coordinator whatever the CLI says.
+        self.authority("correcting a task's delivery policy")
+        wanted = _safe_text(policy).strip().lower()
+        if wanted not in DELIVERY_POLICIES:
+            raise HelmError(
+                "delivery policy must be one of " + ", ".join(sorted(DELIVERY_POLICIES))
+            )
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            previous = _safe_text(task.get("delivery_policy") or "").strip().lower()
+            if previous == wanted:
+                return task
+            project = self._project(data, task["project_id"])
+            delivery = task.setdefault(
+                "delivery", {"policy": previous, "state": "worktree", "events": []}
+            )
+            state = _safe_text(delivery.get("state") or "worktree").strip()
+            if state not in {"", "worktree"}:
+                raise SafetyError(
+                    f"task {task_id} is already delivered as {state};"
+                    " its delivery policy is history now, not a plan"
+                )
+            task["delivery_policy"] = wanted
+            delivery["policy"] = wanted
+            self._message(
+                data,
+                project,
+                task,
+                None,
+                "delivery-policy",
+                f"Delivery policy corrected from {previous or 'unset'} to {wanted}.",
+                {"from": previous, "to": wanted},
+            )
+            return task
+
     def record_pr_opened(
         self,
         task_id: str,
@@ -1676,7 +1729,9 @@ class Coordinator(
             project = self._project(data, task["project_id"])
             if task["delivery_policy"] != "pr":
                 raise SafetyError(
-                    f"task {task_id} uses {task['delivery_policy']} delivery; PR state belongs to PR-delivered tasks"
+                    f"task {task_id} uses {task['delivery_policy']} delivery; PR state belongs to"
+                    " PR-delivered tasks. If this work did go out as a pull request, the record is\n"
+                    f"    wrong and the commander corrects it: helm task delivery {task_id} pr"
                 )
             if task["status"] not in {"completed", "approved", "pr-open", "pr-merged"}:
                 raise SafetyError(
@@ -1740,7 +1795,9 @@ class Coordinator(
             project = self._project(data, task["project_id"])
             if task["delivery_policy"] != "pr":
                 raise SafetyError(
-                    f"task {task_id} uses {task['delivery_policy']} delivery; PR monitoring belongs to PR-delivered tasks"
+                    f"task {task_id} uses {task['delivery_policy']} delivery; PR monitoring belongs to"
+                    " PR-delivered tasks. If this work did go out as a pull request, the record is\n"
+                    f"    wrong and the commander corrects it: helm task delivery {task_id} pr"
                 )
             if task["status"] not in {"completed", "approved", "pr-open", "pr-merged"}:
                 raise SafetyError(

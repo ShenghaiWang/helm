@@ -1556,6 +1556,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pr_cmd.add_argument("--confirm", action="store_true", help="authorize this push explicitly")
     pr_cmd.add_argument("--grant", dest="grant_id", help="push under a standing approval")
     pr_cmd.add_argument("--no-open", action="store_true", help="push only; do not create a PR")
+    delivery_cmd = task_commands.add_parser(
+        "delivery",
+        help="correct a task's delivery policy to the one its work actually took",
+    )
+    delivery_cmd.add_argument("task_id")
+    delivery_cmd.add_argument("policy", choices=("local", "pr"))
     pr_status = task_commands.add_parser(
         "pr-status", help="record the observed state of a task's pull request"
     )
@@ -3446,6 +3452,10 @@ _ROOT_ONLY_COMMANDS = frozenset({
     ("task", "approve"),
     ("task", "merge"),
     ("task", "pr"),
+    # Which way a task delivers decides whether it can still be merged
+    # locally. A task that could rewrite its own answer could take itself out
+    # of that path, so the correction is the commander's.
+    ("task", "delivery"),
     ("approval", "grant"),
     ("approval", "revoke"),
     # Releasing a hold *is* the authorization the worker asked for. An agent
@@ -3821,6 +3831,12 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
                 task = coordinator.inspect_task(args.task_id)["task"]
                 if task.get("status") in {"pr-open", "pr-merged"}:
                     _release_finished_space(coordinator, task)
+    elif args.task_command == "delivery":
+        task = coordinator.set_task_delivery(args.task_id, args.policy)
+        print(
+            f"Task {task['id']} delivers by {task['delivery_policy']}"
+            f"  branch={task.get('branch') or '-'}"
+        )
     elif args.task_command == "pr-status":
         task = coordinator.record_pr_status(
             args.task_id,
