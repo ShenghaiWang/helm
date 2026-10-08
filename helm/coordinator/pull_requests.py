@@ -138,16 +138,27 @@ class PullRequestsMixin:
                 command, cwd=str(cwd), text=True, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, check=False, timeout=60,
             )
-            said = f"{result.stdout or ''}\n{result.stderr or ''}"
-            # GraphQL reports a rate limit either as a failed call or as an
-            # `errors` entry of type RATE_LIMITED inside a successful one.
-            if watch_error_kind(said) == "rate-limited" or "RATE_LIMITED" in said:
+            # The answer carries reviewers' own words, so it is never searched
+            # as text: a thread saying "rate limit" is a comment, not a limit.
+            # A limit is gh's error output on a failed call, or a structured
+            # `errors[].type == "RATE_LIMITED"` in the parsed answer.
+            try:
+                payload = json.loads(result.stdout or "{}")
+            except ValueError:
+                payload = None
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            structured = any(
+                isinstance(error, dict) and error.get("type") == "RATE_LIMITED"
+                for error in (errors if isinstance(errors, list) else [])
+            )
+            failed = result.returncode != 0
+            if structured or (failed and watch_error_kind(result.stderr or "") == "rate-limited"):
                 self._back_off_pr_reads("GraphQL review threads: rate limited", time.time())
                 self._pr_threads_rate_limited = True
                 return None
-            if result.returncode != 0:
+            if failed or payload is None:
                 return None
-            return parse_review_threads(json.loads(result.stdout or "{}"))
+            return parse_review_threads(payload)
         except (OSError, subprocess.SubprocessError, ValueError):
             return None
 

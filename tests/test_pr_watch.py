@@ -445,6 +445,29 @@ class PullRequestWatchTests(HelmTestCase):
         self.assertTrue(outcome["rate_limited"])
         self.assertTrue(self.state.load()["integrations"]["pr_watch"]["backoff_until"])
 
+    def test_a_thread_that_talks_about_rate_limits_is_not_one(self) -> None:
+        import json as _json
+
+        def node(tid: str, body: str) -> dict:
+            comment = {"nodes": [{"id": f"{tid}-c", "author": {"login": "reviewer"}, "body": body}]}
+            return {"id": tid, "isResolved": False, "path": "a.py", "line": 3, "first": comment, "last": comment}
+
+        answer = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+            node("T1", "This loop will hit the API rate limit exceeded path"),
+            node("T2", "Handle RATE_LIMITED from the client"),
+        ]}}}}}
+        ok = mock.Mock(returncode=0, stdout=_json.dumps(answer), stderr="")
+        with mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=ok):
+            threads = self.coordinator.read_review_threads(URL, cwd=Path("."))
+        self.assertEqual([t["id"] for t in threads], ["T1", "T2"])
+        self.assertNotIn("backoff_until", (self.state.load().get("integrations") or {}).get("pr_watch") or {})
+        # A failed call whose OUTPUT quotes such a comment is not a limit
+        # either: only gh's error stream on a failure is read for one.
+        failed = mock.Mock(returncode=1, stdout=_json.dumps(answer), stderr="HTTP 502: Bad Gateway")
+        with mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=failed):
+            self.assertIsNone(self.coordinator.read_review_threads(URL, cwd=Path(".")))
+        self.assertNotIn("backoff_until", (self.state.load().get("integrations") or {}).get("pr_watch") or {})
+
     def test_a_rate_limit_inside_a_graphql_answer_backs_off(self) -> None:
         answer = mock.Mock(returncode=0, stdout='{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}', stderr="")
         with mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=answer):
