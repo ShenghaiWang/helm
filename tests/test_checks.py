@@ -144,6 +144,19 @@ class EvidenceIsAboutTheTipUnderReviewTests(HelmTestCase):
         # The refusal has to name what to do, or it is just an obstacle.
         self.assertIn("git rev-parse HEAD", message)
 
+    def test_an_abbreviation_too_short_to_name_one_commit_is_refused(self) -> None:
+        """A one-character tip matches any head that starts with it."""
+        task = self._task_with_a_worker()
+        head = self._head(task["id"])
+        with self.assertRaises(HelmError):
+            self.coordinator.record_task_evidence(
+                task["id"], tip=head[:1], command="make test", exit_code=0, cases=7
+            )
+        report = self.coordinator.record_task_evidence(
+            task["id"], tip=head[:7], command="make test", exit_code=0, cases=7
+        )
+        self.assertEqual(report["tip"], head[:7])
+
     def test_an_unreadable_worktree_does_not_block_recording(self) -> None:
         """Unverifiable is weaker evidence, never a refusal."""
         task = self._task_with_a_worker()

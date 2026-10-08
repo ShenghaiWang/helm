@@ -904,7 +904,11 @@ class Coordinator(
             # against instead of leaving it to be discovered a round later.
             head = self._evidence_head(task)
             claimed = tip.lower()
-            if head and not (head.startswith(claimed) or claimed.startswith(head)):
+            # An abbreviation must still name one commit: below seven
+            # characters a claimed `a` would match every head that starts
+            # with it, which is the same floor the reviewer's grouping uses.
+            short, long = sorted((claimed, head), key=len)
+            if head and not (len(short) >= 7 and long.startswith(short)):
                 raise HelmError(
                     f"evidence names {tip[:12]} but {task_id} is on {head[:12]}: "
                     "the suite ran before the tip under review. Re-run it at the "
@@ -1748,6 +1752,16 @@ class Coordinator(
                 raise SafetyError(
                     f"task {task_id} is already delivered as {state};"
                     " its delivery policy is history now, not a plan"
+                )
+            # A held protected action is waiting on a decision made for work
+            # that would ship one way; flipping the way under it would let that
+            # one decision stand for another.
+            status = _safe_text(task.get("status") or "").strip()
+            if status == "approval-needed":
+                raise SafetyError(
+                    f"task {task_id} is approval-needed: its pending request was"
+                    " made for how it ships now. Answer or repair that request"
+                    " before changing the delivery policy"
                 )
             task["delivery_policy"] = wanted
             delivery["policy"] = wanted
