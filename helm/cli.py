@@ -515,18 +515,11 @@ def _sync_pull_request_status(coordinator: Coordinator, task_id: str) -> dict[st
     return coordinator.sync_pull_request(task_id)
 
 
-#: At most this many leads are appointed by one PR watch pass. A root with
-#: many leaderless PRs that all went red at once gets its leads over a few
-#: passes rather than a burst of agents in one; the rest wait, queued.
-PR_WATCH_APPOINTMENTS_PER_PASS = 2
-
-
 def _pr_event_lead(
     coordinator: Coordinator,
     event: dict[str, Any],
     *,
     herdr: bool = True,
-    may_appoint: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     """The task lead that owns this PR's work, appointing one only when there is work.
 
@@ -541,8 +534,10 @@ def _pr_event_lead(
     request -- never another ticket's lead. A green check, an approval, a
     merge or a close is news, and news is not worth starting an agent for:
     those come back as `(None, "quiet")`. `(None, "deferred")` is an
-    appointment this pass has no room for; `(None, "declined")` a project
-    that runs without leads.
+    appointment the root's budget has no room for right now -- at most two
+    attempts in ten minutes, across every loop that runs a pass, spent before
+    the launch so a launch that fails still counts; `(None, "declined")` a
+    project that runs without leads.
     """
     data = coordinator.store.load()
     task = data["tasks"][event["task_id"]]
@@ -561,7 +556,7 @@ def _pr_event_lead(
         return None, "quiet"
     if not coordinator.project_wants_foreman(project_id):
         return None, "declined"
-    if not may_appoint:
+    if not coordinator.reserve_pr_watch_appointment():
         return None, "deferred"
     started = _start_foreman(
         coordinator, project_id, herdr=herdr, request=event["text"], ticket=ticket or None,
@@ -574,7 +569,6 @@ def _deliver_pr_watch_events(
     events: list[dict[str, Any]],
     *,
     herdr: bool = True,
-    max_appointments: int = PR_WATCH_APPOINTMENTS_PER_PASS,
 ) -> list[str]:
     """Hand each PR watch event to its task's lead, the way an answer is handed.
 
@@ -593,7 +587,6 @@ def _deliver_pr_watch_events(
     lines: list[str] = []
     if not events or coordinator.caller_role() != "root":
         return lines
-    appointed = 0
     for queued in events:
         event = coordinator.claim_pr_watch_event(queued["task_id"])
         if event is None:
@@ -604,16 +597,16 @@ def _deliver_pr_watch_events(
         glyph = _glyph_for(coordinator, project_id)
         headline = (event.get("changes") or [""])[0][:100]
         try:
-            lead, how = _pr_event_lead(
-                coordinator, event, herdr=herdr, may_appoint=appointed < max_appointments,
-            )
+            lead, how = _pr_event_lead(coordinator, event, herdr=herdr)
             if lead is None:
                 if how == "deferred":
-                    coordinator.mark_pr_watch_event(task_id, ids, result="deferred")
-                    lines.append(
-                        f"{glyph} {project_id} PR watch: task {task_id}: {headline} "
-                        "[waiting for a lead; appointed on a later pass]"
-                    )
+                    # Queued, and said once per budget window: a pass every
+                    # few seconds repeating "still waiting" is noise.
+                    if coordinator.mark_pr_watch_event(task_id, ids, result="deferred"):
+                        lines.append(
+                            f"{glyph} {project_id} PR watch: task {task_id}: {headline} "
+                            "[waiting for a lead; Helm appoints at most two in ten minutes]"
+                        )
                     continue
                 if how == "declined":
                     # The project runs without leads: the commander is the
@@ -639,7 +632,6 @@ def _deliver_pr_watch_events(
                 payload={"via": "pr-watch", "task_id": task_id, "url": event.get("url")},
             )
             if how == "appointed":
-                appointed += 1
                 outcome = "appointed"
             else:
                 recorded = coordinator.latest_answer(lead["id"]) or {}

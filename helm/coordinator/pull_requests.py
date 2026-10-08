@@ -60,6 +60,11 @@ PR_WATCH_CLAIM_SECONDS = 300.0
 #: How long every PR read stops after the forge says Helm is asking too often.
 PR_WATCH_RATE_LIMIT_BACKOFF_SECONDS = 900.0
 
+#: The root's budget for leads the PR watch appoints: this many attempts in
+#: any rolling window, across every pass and every loop that runs one.
+PR_WATCH_APPOINTMENTS_PER_WINDOW = 2
+PR_WATCH_APPOINTMENT_WINDOW_SECONDS = 600.0
+
 #: A web address, before anything is handed to gh.
 _PR_URL = re.compile(r"https?://[^\s/]+/\S+$")
 
@@ -108,8 +113,12 @@ class PullRequestsMixin:
 
         Never raises: the threads are what makes a review comment actionable,
         but a forge that answers `pr view` and not GraphQL still has checks
-        and a decision worth reporting.
+        and a decision worth reporting. A rate limit is the one failure
+        that is not left at that: it starts the same backoff as a rate-limited
+        `pr view`, and the pass stops at the next PR.
         """
+        import time
+
         match = re.match(r"https?://([^/]+)/([^/]+)/([^/]+)/pull/(\d+)", url.strip())
         if match is None or shutil.which("gh") is None:
             return None
@@ -127,8 +136,15 @@ class PullRequestsMixin:
         try:
             result = subprocess.run(
                 command, cwd=str(cwd), text=True, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, check=False, timeout=60,
+                stderr=subprocess.PIPE, check=False, timeout=60,
             )
+            said = f"{result.stdout or ''}\n{result.stderr or ''}"
+            # GraphQL reports a rate limit either as a failed call or as an
+            # `errors` entry of type RATE_LIMITED inside a successful one.
+            if watch_error_kind(said) == "rate-limited" or "RATE_LIMITED" in said:
+                self._back_off_pr_reads("GraphQL review threads: rate limited", time.time())
+                self._pr_threads_rate_limited = True
+                return None
             if result.returncode != 0:
                 return None
             return parse_review_threads(json.loads(result.stdout or "{}"))
@@ -295,9 +311,11 @@ class PullRequestsMixin:
                     )
                     break
                 continue
+            self._pr_threads_rate_limited = False
             threads = self.read_review_threads(url, cwd=cwd)
             event = self._observe_pull_request(task_id, payload, threads, stamp)
             outcome["watched"].append(task_id)
+            stop_after = bool(getattr(self, "_pr_threads_rate_limited", False))
             forge_state = str(payload.get("state") or "OPEN").upper()
             if sync_due or forge_state in {"MERGED", "CLOSED"}:
                 try:
@@ -316,15 +334,49 @@ class PullRequestsMixin:
                         event = self.pr_watch_event(task_id)
             if event is not None:
                 outcome["events"].append(event)
+            if stop_after:
+                # The threads read was rate-limited: this PR's checks are
+                # recorded, and nothing more is asked of the forge.
+                outcome["rate_limited"] = True
+                outcome["skipped"].extend(
+                    {"task_id": rest, "reason": "not read: the forge is rate-limiting gh"}
+                    for rest, *_ in due[index + 1:]
+                )
+                break
         return outcome
 
     def _back_off_pr_reads(self, reason: str, current: float) -> None:
         """Stop every PR read until the forge has had time to forgive us."""
         with self.store.locked() as data:
-            data.setdefault("integrations", {})["pr_watch"] = {
-                "backoff_until": _stamp(current + PR_WATCH_RATE_LIMIT_BACKOFF_SECONDS),
-                "reason": reason[:200],
-            }
+            limit = data.setdefault("integrations", {}).setdefault("pr_watch", {})
+            limit["backoff_until"] = _stamp(current + PR_WATCH_RATE_LIMIT_BACKOFF_SECONDS)
+            limit["reason"] = reason[:200]
+
+    def reserve_pr_watch_appointment(self, now_epoch: float | None = None) -> bool:
+        """Spend one of the root's PR-watch lead appointments, or say there is none left.
+
+        A budget per root, not per pass: `pending --changes` runs a pass every
+        few seconds, so a per-pass cap still let a burst of leaderless red PRs
+        start a lead every few seconds. At most
+        `PR_WATCH_APPOINTMENTS_PER_WINDOW` attempts in any rolling
+        `PR_WATCH_APPOINTMENT_WINDOW_SECONDS`, counted when the attempt is
+        made -- an appointment that then fails still spent its place, so a
+        launch that keeps failing is not retried for every queued event.
+        """
+        import time
+
+        current = time.time() if now_epoch is None else now_epoch
+        with self.store.locked() as data:
+            limit = data.setdefault("integrations", {}).setdefault("pr_watch", {})
+            recent = [
+                stamp for stamp in limit.get("appointments") or []
+                if current - _epoch(stamp) < PR_WATCH_APPOINTMENT_WINDOW_SECONDS
+            ]
+            granted = len(recent) < PR_WATCH_APPOINTMENTS_PER_WINDOW
+            if granted:
+                recent.append(_stamp(current))
+            limit["appointments"] = recent[-PR_WATCH_APPOINTMENTS_PER_WINDOW:]
+            return granted
 
     def _observe_pull_request(
         self,
@@ -439,28 +491,38 @@ class PullRequestsMixin:
         result: str = "delivered",
         lead_id: str = "",
         outcome: str = "",
-    ) -> None:
+    ) -> bool:
         """Settle a claimed event: `delivered`, `failed` (retry later) or `deferred`.
 
         Delivered removes exactly the changes that went out; anything that
         arrived while they were being delivered stays queued for next time.
+        For `deferred`, returns whether this is the first deferral in the
+        current budget window -- the only one worth a line.
         """
+        import time
+
         with self.store.locked() as data:
             task = data.get("tasks", {}).get(task_id)
             if task is None:
-                return
+                return False
             watch = (task.get("delivery") or {}).get("watch")
             if not isinstance(watch, dict):
-                return
+                return False
             outbox = watch.get("outbox") or {}
             outbox.pop("claimed_at", None)
             if result == "deferred":
-                return
+                # Said once per budget window, not on every pass that finds
+                # the budget still spent.
+                said = _epoch(outbox.get("deferred_at"))
+                if time.time() - said < PR_WATCH_APPOINTMENT_WINDOW_SECONDS:
+                    return False
+                outbox["deferred_at"] = now()
+                return True
             if result == "failed":
                 if outbox:
                     outbox["attempted_at"] = now()
                     outbox["last_failure"] = str(outcome)[:200]
-                return
+                return False
             sent = set(change_ids)
             remaining = [item for item in outbox.get("items") or [] if item.get("id") not in sent]
             history = list(watch.get("delivered") or [])
@@ -473,6 +535,7 @@ class PullRequestsMixin:
                 outbox["items"] = remaining
             else:
                 watch.pop("outbox", None)
+            return True
 
     def _note_pr_watch_error(self, task_id: str, reason: str, stamp: str) -> None:
         """Record why the watch could not read a PR; tell the commander once.

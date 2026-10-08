@@ -374,27 +374,82 @@ class PullRequestWatchTests(HelmTestCase):
         with mock.patch.object(cli, "_start_foreman", self._no_appointment):
             self._deliver(synced)
 
-    def test_appointments_are_capped_per_pass_and_the_rest_wait(self) -> None:
+    def _age_appointments(self, seconds: float) -> None:
+        data = self.state.load()
+        limit = data["integrations"]["pr_watch"]
+        limit["appointments"] = [
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
+            for _ in limit["appointments"]
+        ]
+        self.state.save(data)
+
+    def _queued_pass(self, start: float, offset: float) -> dict:
+        with mock.patch.object(Coordinator, "read_pull_request", side_effect=AssertionError("not due")):
+            return self.coordinator.sync_open_pull_requests(now_epoch=start + offset)
+
+    def test_appointments_are_budgeted_per_root_across_passes(self) -> None:
         tasks = [self._pr_task(f"cap{n}", ticket=f"TICKET-{n}", lead=False)[1] for n in (1, 2, 3)]
         appointed: list[str] = []
         start = time.time()
         synced = self._pass(_payload(checks=[_check("build", "FAILURE")]), at=start + 130)
         self.assertEqual(len(synced["events"]), 3)
         with mock.patch.object(cli, "_start_foreman", self._appointing(appointed)):
-            self._deliver(synced)
+            lines = self._deliver(synced)
         self.assertEqual(len(appointed), 2)
+        self.assertEqual(sum("waiting for a lead" in line for line in lines), 1)
         queued = [
             t["id"] for t in tasks
             if self.state.load()["tasks"][t["id"]]["delivery"]["watch"].get("outbox")
         ]
         self.assertEqual(len(queued), 1)
-        # The next pass delivers the one that waited, without reading any PR.
-        with mock.patch.object(Coordinator, "read_pull_request", side_effect=AssertionError("not due")):
-            later = self.coordinator.sync_open_pull_requests(now_epoch=start + 140)
-        self.assertEqual([e["task_id"] for e in later["events"]], queued)
+        # Later passes inside the window -- `pending --changes` runs one every
+        # few seconds -- appoint nobody, and do not repeat the waiting line.
+        for offset in (140, 160, 180):
+            later = self._queued_pass(start, offset)
+            self.assertEqual([e["task_id"] for e in later["events"]], queued)
+            with mock.patch.object(cli, "_start_foreman", self._no_appointment):
+                self.assertEqual(self._deliver(later), [])
+        # Once the window has rolled past, the one that waited gets its lead.
+        self._age_appointments(601)
         with mock.patch.object(cli, "_start_foreman", self._appointing(appointed)):
-            self._deliver(later)
+            self._deliver(self._queued_pass(start, 200))
         self.assertEqual(sorted(appointed), ["TICKET-1", "TICKET-2", "TICKET-3"])
+
+    def test_a_failed_appointment_spends_the_budget_too(self) -> None:
+        for n in (1, 2, 3):
+            self._pr_task(f"fail{n}", ticket=f"TICKET-{n}", lead=False)
+        attempts: list[str] = []
+
+        def failing(*_a, ticket=None, **_k):
+            attempts.append(ticket)
+            raise HelmError("the runtime would not start")
+
+        start = time.time()
+        synced = self._pass(_payload(checks=[_check("build", "FAILURE")]), at=start + 130)
+        with mock.patch.object(cli, "_start_foreman", failing):
+            self._deliver(synced)
+            self.assertEqual(len(attempts), 2, "a failing launch is not retried for every event")
+            for offset in (140, 200, 240):
+                self._deliver(self._queued_pass(start, offset))
+        self.assertEqual(len(attempts), 2)
+
+    def test_a_rate_limited_threads_read_backs_off_and_stops_the_pass(self) -> None:
+        self._pr_task("threadsone", ticket="TICKET-1")
+        self._pr_task("threadstwo", ticket="TICKET-2")
+        start = time.time()
+        limited = mock.Mock(returncode=1, stdout="", stderr="GraphQL: API rate limit exceeded")
+        with mock.patch.object(Coordinator, "read_pull_request", return_value=_payload()) as read, \
+                mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=limited):
+            outcome = self.coordinator.sync_open_pull_requests(now_epoch=start + 130)
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(outcome["rate_limited"])
+        self.assertTrue(self.state.load()["integrations"]["pr_watch"]["backoff_until"])
+
+    def test_a_rate_limit_inside_a_graphql_answer_backs_off(self) -> None:
+        answer = mock.Mock(returncode=0, stdout='{"errors":[{"type":"RATE_LIMITED","message":"slow down"}]}', stderr="")
+        with mock.patch("helm.coordinator.pull_requests.subprocess.run", return_value=answer):
+            self.assertIsNone(self.coordinator.read_review_threads(URL, cwd=Path(".")))
+        self.assertTrue(self.state.load()["integrations"]["pr_watch"]["backoff_until"])
 
     def test_two_passes_at_once_read_once_and_deliver_once(self) -> None:
         _project, _task, lead = self._pr_task("double")

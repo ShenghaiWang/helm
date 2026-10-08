@@ -175,14 +175,15 @@ The owning lead is found the way `helm route --ticket` finds one: the lead the
 record names for the task, else the live lead named for its ticket. Only an
 event with something to fix -- a failed check, a new thread or comment,
 `CHANGES_REQUESTED` -- on a PR that is still open appoints a new lead for the
-ticket when none is live, and at most two are appointed per pass; the rest
-wait, queued, for the next. A green check, an approval, a merge or a close
+ticket when none is live, and the root appoints at most two such leads in any
+ten minutes, across every loop that runs a pass -- a launch that fails still
+counts. The rest wait, queued, and say so once per window. A green check, an approval, a merge or a close
 with no live lead is recorded on the task and starts nobody. An event is
 delivered once; several changes in one pass are one message; the same state
 read twice sends nothing. Concurrent passes claim each PR read and each queued
 event under the state lock, so only one of them reads or delivers it. A gh
 that is missing or logged out is recorded on the task and shown once in
-`helm pending`; an unreachable forge stays quiet; a rate limit stops the pass
+`helm pending`; an unreachable forge stays quiet; a rate limit on either read stops the pass
 and every PR read for fifteen minutes.
 
 Known limits: the watch reads the first 100 review threads of a PR, and
