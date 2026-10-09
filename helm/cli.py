@@ -1615,6 +1615,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--blocked-by", action="append", default=[], metavar="TASK_ID",
         help="a task of the same project this one waits on; repeatable. Helm launches it only once every blocker is delivered",
     )
+    create.add_argument(
+        "--adopt-dirty-base", action="store_true",
+        help="root only: move the project checkout's uncommitted changes (tracked and "
+             "untracked, never .helm/) onto the new task's branch as its first commit and "
+             "put the checkout back to HEAD; recorded on the task, kept under "
+             "refs/helm/adopted/<task>, and refused if anything would be lost",
+    )
     create.add_argument("--ticket",
         help="tracker id for this work; goes in the branch name so a human can find it")
     create.add_argument("--base",
@@ -4059,9 +4066,18 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
             read_only=args.read_only,
             base=args.base,
             new=args.new,
+            adopt_dirty_base=args.adopt_dirty_base,
         )
         _relabel_leads_named_by(coordinator, task)
         print(f"Created task {task['id']} [{task['status']}] project={task['project_id']} policy={task['delivery_policy']}")
+        adopted = task.get("adopted_base_changes")
+        if adopted:
+            print(
+                f"  Adopted {adopted['path_count']} uncommitted path(s) from the project "
+                f"checkout as the branch's first commit {adopted['start_commit'][:12]}; "
+                "the checkout is back at HEAD."
+            )
+            print(f"  To put them back instead (they return unstaged): {adopted['restore']}")
     elif args.task_command == "allocate":
         task = coordinator.allocate_task(args.task_id)
         print(f"Allocated {task['id']} workspace={task['workspace']} branch={task['branch']}")

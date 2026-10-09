@@ -85,6 +85,16 @@ class ArchiveMixin:
                     if not listed:
                         task["branch_removed"] = True
                         task["branch_removed_at"] = now()
+        adopted = task.get("adopted_base_changes")
+        if adopted and not adopted.get("refs_removed") and project.get("root"):
+            root = canonical(project["root"])
+            with contextlib.suppress(HelmError, OSError):
+                if root.is_dir() and not any(
+                    _git(root, "rev-parse", "--verify", "--quiet", ref, check=False)
+                    for ref in adopted.get("refs") or []
+                ):
+                    adopted["refs_removed"] = True
+                    adopted["refs_removed_at"] = now()
         for worker in self._task_workers(data, task["id"]):
             config_file = worker.get("config_file")
             if not config_file or worker.get("directory_removed"):
@@ -230,6 +240,11 @@ class ArchiveMixin:
                     if task_owns_branch(task) and not task.get("branch_removed"):
                         task["branch_removed"] = True
                         task["branch_removed_at"] = now()
+                    adopted = task.get("adopted_base_changes")
+                    if adopted and not adopted.get("refs_removed"):
+                        # Refs live in the repository, which is gone.
+                        adopted["refs_removed"] = True
+                        adopted["refs_removed_at"] = now()
                     task["reconciled_by"] = "project remove: repository root missing"
                     # Worker directories are Helm's own residue under state/,
                     # shed the way cleanup sheds them.

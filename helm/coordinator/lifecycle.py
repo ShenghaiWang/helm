@@ -534,10 +534,25 @@ class LifecycleMixin:
         shape: str | None = None,
         shape_reason: str | None = None,
         blocked_by: list[str] | None = None,
+        adopt_dirty_base: bool = False,
     ) -> dict[str, Any]:
         brief, brief_cut = _bounded_brief(brief)
         if not brief:
             raise HelmError("task brief is required")
+        if adopt_dirty_base:
+            # A project's own tool can write into its base checkout by design,
+            # and the dirty-checkout refusal then blocked the very task that
+            # would commit the result -- so someone stashed in the project
+            # root by hand. This is the sanctioned path: the changes become
+            # the new task's first commit, recorded and reversible, and the
+            # checkout goes back to HEAD. It moves the commander's files, so
+            # it is the commander's call, not an agent's.
+            if role in WORKTREELESS_ROLES or read_only:
+                raise HelmError(
+                    "--adopt-dirty-base hands the checkout's changes to a task that "
+                    "will commit them; a read-only or worktreeless task cannot take them"
+                )
+            self.authority("adopting the project checkout's uncommitted changes", project_id)
         if review_episode is not None:
             # Issued by `new_review_episode` and written into this brief by
             # the review loop, so the first round's handoff can name it.
@@ -679,12 +694,27 @@ class LifecycleMixin:
             # Resolution reads and, when fetching, fetches -- it never
             # switches, resets, rebases, merges, or otherwise touches the
             # project's own checkout.
+            captured = adopted_start = None
+            if adopt_dirty_base:
+                # Captured as commit objects only: nothing in the checkout
+                # moves until the task record is about to be written.
+                captured = git.capture_checkout_changes(root)
+                if captured is None:
+                    raise HelmError(
+                        f"project {project_id}'s checkout has no uncommitted changes "
+                        "to adopt; create the task without --adopt-dirty-base"
+                    )
             base_info = git._resolve_task_base(
                 root,
                 snapshot_base_branch,
                 fetch=worktree_backed,
                 local_delivery=policy == "local",
+                **({"adopting": True} if captured is not None else {}),
             )
+            if captured is not None:
+                adopted_start = git.build_adopted_start(
+                    root, captured, base_info["base_revision"]
+                )
 
             # Phase 3: write the task record. The project is re-read fresh
             # and checked against what phase 1 resolved against -- a
@@ -899,6 +929,40 @@ class LifecycleMixin:
                             "opened_by": creator_id or "root",
                             "result": None,
                         }]
+                    if captured is not None and adopted_start is not None:
+                        # Last, so nothing after it can fail and leave the
+                        # checkout restored with no task holding its changes.
+                        ref_prefix = f"refs/helm/adopted/{task_id}"
+                        git.restore_checkout_after_adoption(
+                            root, captured, adopted_start, ref_prefix
+                        )
+                        paths = list(captured["paths"])
+                        task["adopted_base_changes"] = {
+                            "adopted_at": now(),
+                            # The checkout's state as git would commit it --
+                            # through its clean filters, so line endings may be
+                            # normalised -- on the HEAD it was found on. Kept
+                            # for reversal.
+                            "checkout_head": captured["head"],
+                            "checkout_commit": captured["commit"],
+                            # The same changes as the task's first commit,
+                            # on its own base; the branch starts here.
+                            "start_commit": adopted_start["commit"],
+                            "start_tree": adopted_start["tree"],
+                            # Resources this task owns: cleanup sheds them
+                            # with the branch, once the first commit is on
+                            # a remote or the base; see `_remove_task_branch`.
+                            "refs": [f"{ref_prefix}/checkout", f"{ref_prefix}/task"],
+                            "refs_removed": False,
+                            "path_count": len(paths),
+                            "paths": paths[: git.ADOPT_RECORDED_PATHS],
+                            # The undo brings every change back unstaged;
+                            # these were staged, for whoever re-adds them.
+                            "staged_paths": list(captured.get("staged") or [])[
+                                : git.ADOPT_RECORDED_PATHS
+                            ],
+                            "restore": git.adoption_restore_command(root, captured),
+                        }
                     data["tasks"][task_id] = task
                     # After the gates above are spent, so a pair bound to this
                     # task counts as the lead taking it on.
@@ -967,7 +1031,22 @@ class LifecycleMixin:
                         f"task {task['id']}'s recorded base commit no longer resolves in the "
                         f"project: {base_revision}"
                     )
-                _git(root, "worktree", "add", "-b", task["branch"], str(workspace), base_revision)
+                start = base_revision
+                adopted = task.get("adopted_base_changes")
+                if adopted:
+                    # The checkout's adopted changes are this branch's first
+                    # commit. Verified, not trusted: it must still sit on the
+                    # pinned base and still carry exactly the tree recorded.
+                    start = adopted["start_commit"]
+                    parent = _git(root, "rev-parse", "--verify", "--quiet", f"{start}^", check=False)
+                    tree = _git(root, "rev-parse", "--verify", "--quiet", f"{start}^{{tree}}", check=False)
+                    if parent != base_revision or tree != adopted["start_tree"]:
+                        raise HelmError(
+                            f"task {task['id']}'s adopted starting commit {start} no longer "
+                            f"resolves to what was recorded; the changes are still at "
+                            f"{', '.join(adopted['refs'])}"
+                        )
+                _git(root, "worktree", "add", "-b", task["branch"], str(workspace), start)
             self._verify_workspace_record(data, project, task)
             task["status"] = "allocated"
             task["allocated_at"] = now()

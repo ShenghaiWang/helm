@@ -487,6 +487,9 @@ class DecisionsMixin:
             retained.append("its task worktree")
         if task_owns_branch(task) and not task.get("branch_removed"):
             retained.append(f"its task branch {task['branch']}")
+        adopted = task.get("adopted_base_changes")
+        if adopted and not adopted.get("refs_removed"):
+            retained.append("its adopted-changes refs " + ", ".join(adopted.get("refs") or []))
         directories = 0
         for worker in self._task_workers(data, task["id"]):
             config_file = worker.get("config_file")

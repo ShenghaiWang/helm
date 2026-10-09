@@ -63,6 +63,37 @@ only an explicit re-setting changes it. A single task can start from another
 branch with `helm task create --base <branch>`, for a fix that must sit on a
 release branch.
 
+## A dirty base checkout
+
+A task will not start from a project checkout with uncommitted changes to
+tracked files, or one in the middle of a merge or rebase. When those changes
+are themselves the work -- a project tool that records a result row in a
+tracked file by design -- the commander hands them to the new task instead of
+stashing in the project root: `helm task create ... --adopt-dirty-base`.
+
+Helm captures the checkout's working state, tracked and untracked (never
+ignored files, never `.helm/`), as commit objects without touching anything,
+builds the task's first commit from it on the task's own base, and proves
+every adopted path reproduces exactly. Only then does it anchor both commits
+under `refs/helm/adopted/<task>`, restore exactly the adopted paths to HEAD,
+and verify the checkout is clean. The task records the paths, both commits,
+which paths were staged, and a one-line restore command; the restore brings
+every change back unstaged. Content is captured as `git add` stores it, so
+line endings a `.gitattributes` filter normalises come back normalised. It
+refuses, changing nothing, when something would be lost: a partly staged
+file, a conflict, a submodule, a sparse checkout, a skip-worktree or
+assume-unchanged path, a change to `.helm/`, a change that does not apply to
+the base, or a checkout that moved while it was being captured. If restoring
+the checkout fails part-way, the error names both refs and a recovery
+command that works whatever state the checkout was left in. Refs left by a
+failed adoption belong to no task; once the changes are back, delete them by
+hand with `git update-ref -d <ref>`. It never uses `git stash`, whose one stack is shared with the user
+and every worktree. Root only.
+
+The refs are the task's own resources: `helm task cleanup` sheds them with
+the task branch, once the task's first commit is on a remote or the base
+branch, and until then the cleanup decision names them as held.
+
 ## One ticket, one worktree
 
 `helm task create --ticket X` refuses when the project already has a worker

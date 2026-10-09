@@ -459,7 +459,7 @@ helm pr watch [--once] [--interval SECONDS]
 helm lead PROJECT [--agent A] [--command CMD] [--no-herdr] [--new] [--ticket T]
 helm gate propose|decide LEAD_TASK --type requirement|solution
 helm run PROJECT [TASK] [--domain D] [--agent A] [--model M] [--effort E] [--no-herdr] [--async|--wait]
-helm task create --project P --brief TEXT [--read-only] [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--blocked-by TASK_ID]... [--base B] [--new]
+helm task create --project P --brief TEXT [--read-only] [--shape small|standard|critical] [--shape-reason TEXT] [--ticket T] [--blocked-by TASK_ID]... [--base B] [--new] [--adopt-dirty-base]
 helm task shape TASK_ID small|standard|critical [--reason TEXT]
 helm task evidence TASK_ID --tip SHA --command CMD --exit N [--cases N] [--suite NAME=COUNT]... [--check NAME]
 helm task allocate|inspect|continue|reopen|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|provenance|cleanup [--delete-branch]

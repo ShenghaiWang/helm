@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -263,6 +265,10 @@ CHECKOUT_OPERATION_MARKERS = (
 )
 
 
+#: The one conflict a task may take with it: see `--adopt-dirty-base`.
+CHECKOUT_DIRTY = "the checkout has uncommitted changes to tracked files"
+
+
 def _project_checkout_conflict(root: Path) -> str | None:
     """Describe a dirty or mid-operation project checkout, or None if clean.
 
@@ -286,7 +292,7 @@ def _project_checkout_conflict(root: Path) -> str | None:
             return f"an unresolved {marker.replace('_HEAD', '').replace('-', ' ').lower()} is in progress"
     dirty = _git(root, "status", "--porcelain=v1", "--untracked-files=no", check=False)
     if dirty:
-        return "the checkout has uncommitted changes to tracked files"
+        return CHECKOUT_DIRTY
     return None
 
 
@@ -350,7 +356,12 @@ def _delete_ref(root: Path, ref: str) -> str | None:
 
 
 def _resolve_task_base(
-    root: Path, base_branch: str, *, fetch: bool, local_delivery: bool = False
+    root: Path,
+    base_branch: str,
+    *,
+    fetch: bool,
+    local_delivery: bool = False,
+    adopting: bool = False,
 ) -> dict[str, Any]:
     """Resolve the immutable commit a new task's baseline is cut from.
 
@@ -388,11 +399,17 @@ def _resolve_task_base(
     if not local_sha:
         raise HelmError(f"configured base branch does not exist in the project: {base_branch}")
     conflict = _project_checkout_conflict(root)
-    if conflict:
+    # A task adopting the checkout's changes takes them with it, so their
+    # presence is the point; a merge or rebase in progress still refuses.
+    if conflict and not (adopting and conflict == CHECKOUT_DIRTY):
         raise HelmError(
             f"refusing to start a task from a dirty project checkout: {conflict}. "
             "Resolve or commit it yourself -- Helm will not merge, rebase, reset, "
-            "or discard anything to clear it."
+            "or discard anything to clear it. If the changes are work for this "
+            "task -- a project tool that writes into its own checkout -- the "
+            "commander can hand them to it: helm task create ... --adopt-dirty-base "
+            "moves them onto the new task's branch, recorded and reversible, and "
+            "puts the checkout back to HEAD."
         )
     remotes = [line for line in _git(root, "remote", check=False).splitlines() if line]
     upstream_short = _git(root, "for-each-ref", "--format=%(upstream:short)", ref, check=False)
@@ -609,3 +626,422 @@ def _resolve_task_base(
         f"base branch {base_branch} has diverged from its upstream {upstream_label}; "
         "reconcile it before starting a task -- Helm will not guess which side is right"
     )
+
+
+# --- Adopting a dirty base checkout into a task ------------------------------
+#
+# A project's own tool can write into its base checkout by design -- a publish
+# script recording a result row in a tracked file -- and the dirty-checkout
+# refusal above then blocks the very task that would commit it. These helpers
+# move that state into a task instead of leaving someone to stash it by hand:
+# capture it as commits without touching the checkout, prove the task's start
+# reproduces it, and only then put the checkout back to HEAD. Nothing here
+# uses `git stash`, whose one stack is shared with the user and every
+# worktree.
+
+#: Untracked paths never adopted: Helm's own per-project settings live here,
+#: and moving them into a task would take the project's configuration with it.
+ADOPT_EXCLUDED_PREFIX = ".helm"
+
+#: How many adopted paths the task record lists; the commit holds them all.
+ADOPT_RECORDED_PATHS = 200
+
+
+def _git_run(
+    cwd: Path,
+    *args: str,
+    index: Path | None = None,
+    stdin: bytes | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run git with raw bytes in and out, optionally against a private index.
+
+    `_git` strips its output, which eats the leading space of a porcelain
+    status line; NUL-separated listings need the bytes exactly as written.
+    Pathspecs are literal: an adopted file name is a name, never a pattern.
+    """
+    env = dict(os.environ)
+    if index is not None:
+        env["GIT_INDEX_FILE"] = str(index)
+    proc = subprocess.run(
+        ["git", "-C", str(cwd), "--literal-pathspecs", *args],
+        input=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    if check and proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip() or "git command failed"
+        raise HelmError(detail)
+    return proc
+
+
+def _nul_list(raw: bytes) -> list[str]:
+    return [entry.decode("utf-8", "surrogateescape") for entry in raw.split(b"\0") if entry]
+
+
+def _nul_join(paths: list[str]) -> bytes:
+    return b"\0".join(path.encode("utf-8", "surrogateescape") for path in paths)
+
+
+def _tree_entries(root: Path, tree: str) -> dict[str, str]:
+    """Every path in a tree, mapped to its mode and object id."""
+    raw = _git_run(root, "ls-tree", "-r", "-z", "--full-tree", tree).stdout
+    entries: dict[str, str] = {}
+    for line in raw.split(b"\0"):
+        if not line:
+            continue
+        meta, _, path = line.partition(b"\t")
+        mode, _kind, oid = meta.decode().split(" ")
+        entries[path.decode("utf-8", "surrogateescape")] = f"{mode} {oid}"
+    return entries
+
+
+def _commit_tree(root: Path, tree: str, parent: str, message: str) -> str:
+    env = dict(os.environ)
+    if _git_run(root, "var", "GIT_COMMITTER_IDENT", check=False).returncode != 0:
+        # A repository with no identity configured still gets a commit; the
+        # record says Helm made it, which is true.
+        env.update({
+            "GIT_AUTHOR_NAME": "Helm", "GIT_AUTHOR_EMAIL": "helm@localhost",
+            "GIT_COMMITTER_NAME": "Helm", "GIT_COMMITTER_EMAIL": "helm@localhost",
+        })
+    proc = subprocess.run(
+        ["git", "-C", str(root), "commit-tree", tree, "-p", parent, "-m", message],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    if proc.returncode != 0:
+        raise HelmError(proc.stderr.strip() or "git commit-tree failed")
+    return proc.stdout.strip()
+
+
+def _working_state_tree(root: Path) -> str:
+    """The checkout's working state -- tracked and untracked -- as a tree.
+
+    Built in a private index starting from HEAD, so the user's own index is
+    read, never written. Ignored files stay out, as they would from a commit,
+    and so does Helm's own `.helm/` settings directory.
+    """
+    with tempfile.TemporaryDirectory(prefix="helm-adopt-") as scratch:
+        index = Path(scratch) / "index"
+        _git_run(root, "read-tree", "HEAD", index=index)
+        # Not `_git_run`: the exclusion is pathspec magic, which literal
+        # pathspecs would read as a file name.
+        proc = subprocess.run(
+            ["git", "-C", str(root), "add", "-A", "--", ".",
+             f":(exclude){ADOPT_EXCLUDED_PREFIX}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, "GIT_INDEX_FILE": str(index)},
+        )
+        if proc.returncode != 0:
+            raise HelmError(
+                "could not capture the project checkout's uncommitted changes: "
+                + (proc.stderr.decode("utf-8", "replace").strip() or "git add failed")
+            )
+        return _git_run(root, "write-tree", index=index).stdout.decode().strip()
+
+
+def _adoption_refusal(root: Path, head: str, tree: str, changed: list[str]) -> str | None:
+    """Why this checkout's changes cannot be moved without losing something."""
+    sparse = _git_run(root, "config", "--bool", "core.sparseCheckout", check=False)
+    if sparse.stdout.decode().strip() == "true":
+        # A capture index is built fresh from HEAD, with none of the sparse
+        # bits; every path outside the cone would read as deleted.
+        return "the checkout is sparse, so paths outside it would read as deleted"
+    for entry in _nul_list(_git_run(root, "ls-files", "-v", "-z").stdout):
+        tag, _, path = entry.partition(" ")
+        if tag == "S" or (tag.isalpha() and tag.islower()):
+            # Skip-worktree or assume-unchanged: git is told not to look at
+            # the file, so its absence or edit is not what the user did.
+            return (
+                f"{path} is marked skip-worktree or assume-unchanged, so what the "
+                "checkout shows for it is not its real state"
+            )
+    status =_git_run(root, "status", "--porcelain=v1", "-z", "--untracked-files=no").stdout
+    skip = False
+    for entry in status.split(b"\0"):
+        if skip:
+            skip = False
+            continue
+        if len(entry) < 4:
+            continue
+        x, y = chr(entry[0]), chr(entry[1])
+        path = entry[3:].decode("utf-8", "surrogateescape")
+        if x in "RC":
+            skip = True  # the rename's source path follows as its own entry
+        if "U" in (x, y) or (x, y) in {("A", "A"), ("D", "D")}:
+            return f"{path} has an unresolved conflict"
+        if x != " " and y != " ":
+            # Staged one way and edited another: the index holds a state the
+            # working tree does not, and moving the working tree would lose it.
+            return f"{path} is partly staged (the index and the working tree differ)"
+        if path == ADOPT_EXCLUDED_PREFIX or path.startswith(ADOPT_EXCLUDED_PREFIX + "/"):
+            return (
+                f"{path} is Helm's own project settings; commit or revert it "
+                "yourself, it is not work to hand a task"
+            )
+    staged = _nul_list(
+        _git_run(root, "diff", "--cached", "--name-only", "--no-renames", "-z", head).stdout
+    )
+    missing = sorted(set(staged) - set(changed))
+    if missing:
+        # Staged, but not in what was captured -- an ignored file added with
+        # force. Restoring around it would leave it, and the checkout, dirty.
+        return f"{missing[0]} is staged but would not be captured (is it ignored?)"
+    before = _tree_entries(root, head)
+    after = _tree_entries(root, tree)
+    for path in changed:
+        if (before.get(path) or "").startswith("160000") or (
+            after.get(path) or ""
+        ).startswith("160000"):
+            return f"{path} is a submodule or nested repository; Helm will not move one"
+    return None
+
+
+def capture_checkout_changes(root: Path) -> dict[str, Any] | None:
+    """Capture a checkout's uncommitted state as a commit on HEAD, or None.
+
+    Writes git objects and nothing else: no ref, no index, no working-tree
+    change. None when there is nothing to adopt. Raises when moving the state
+    would lose something -- a partly staged file, a conflict, a submodule, a
+    sparse checkout or a skip-worktree/assume-unchanged path.
+
+    The capture is what `git add` stores, so content passes through the
+    repository's clean filters: line endings normalised by `.gitattributes`
+    come back as git would check them out, not byte for byte.
+    """
+    head = _git(root, "rev-parse", "--verify", "HEAD")
+    tree = _working_state_tree(root)
+    if tree == _git(root, "rev-parse", f"{head}^{{tree}}"):
+        return None
+    commit = _commit_tree(
+        root, tree, head,
+        "Uncommitted changes in the project checkout, as Helm adopted them",
+    )
+    changed = _nul_list(
+        _git_run(root, "diff", "--name-only", "-z", "--no-renames", head, commit).stdout
+    )
+    refusal = _adoption_refusal(root, head, tree, changed)
+    if refusal:
+        raise HelmError(
+            f"refusing to adopt the project checkout's changes: {refusal}. "
+            "Nothing was changed."
+        )
+    # Staged paths, kept so the record can say which ones were: the undo
+    # brings every change back unstaged, and these are the ones to re-add.
+    staged = _nul_list(
+        _git_run(root, "diff", "--cached", "--name-only", "--no-renames", "-z", head).stdout
+    )
+    return {
+        "head": head, "tree": tree, "commit": commit, "paths": changed, "staged": staged,
+    }
+
+
+def build_adopted_start(
+    root: Path, captured: dict[str, Any], base_revision: str
+) -> dict[str, Any]:
+    """The captured changes as one commit on the task's base, verified.
+
+    When the base is the checkout's own HEAD this is the captured tree
+    exactly. Otherwise the change is applied onto the base and every adopted
+    path is compared with what was captured; anything that did not reproduce
+    exactly is a refusal, before the checkout has been touched.
+    """
+    head = captured["head"]
+    if base_revision == head:
+        tree = captured["tree"]
+    else:
+        patch = _git_run(
+            root, "diff", "--binary", "--full-index", "--no-renames", head, captured["commit"]
+        ).stdout
+        with tempfile.TemporaryDirectory(prefix="helm-adopt-") as scratch:
+            index = Path(scratch) / "index"
+            _git_run(root, "read-tree", base_revision, index=index)
+            applied = _git_run(
+                root, "apply", "--cached", "--whitespace=nowarn",
+                index=index, stdin=patch, check=False,
+            )
+            if applied.returncode != 0:
+                raise HelmError(
+                    "refusing to adopt the project checkout's changes: they do not apply "
+                    f"cleanly to the task's base {base_revision[:12]} (the checkout is on "
+                    f"{head[:12]}). Nothing was changed."
+                )
+            tree = _git_run(root, "write-tree", index=index).stdout.decode().strip()
+    wanted = _tree_entries(root, captured["tree"])
+    got = _tree_entries(root, tree)
+    for path in captured["paths"]:
+        if wanted.get(path) != got.get(path):
+            raise HelmError(
+                "refusing to adopt the project checkout's changes: "
+                f"{path} would not be reproduced exactly on the task's base. "
+                "Nothing was changed."
+            )
+    commit = _commit_tree(
+        root, tree, base_revision,
+        "Adopt the uncommitted changes left in the project checkout",
+    )
+    return {"tree": tree, "commit": commit}
+
+
+def adoption_restore_command(root: Path, captured: dict[str, Any]) -> str:
+    """The one line that puts adopted changes back into the checkout.
+
+    They come back as unstaged changes. Restaging with `apply --index` would
+    be wrong whenever only some paths had been staged, so the record lists the
+    staged ones instead (`staged_paths`) for whoever wants them re-added.
+    """
+    quoted = shlex.quote(str(root))
+    return (
+        f"git -C {quoted} diff --binary {captured['head']} {captured['commit']} "
+        f"| git -C {quoted} apply"
+    )
+
+
+def restore_checkout_after_adoption(
+    root: Path, captured: dict[str, Any], start: dict[str, Any], ref_prefix: str
+) -> None:
+    """Put the checkout back to HEAD for exactly the paths that were adopted.
+
+    Both commits are anchored under `ref_prefix` first -- the checkout's state
+    as captured, and the task's start built from it -- so they are reachable
+    from the moment anything is removed. The checkout is captured
+    again and compared before touching it: anything written since the first
+    capture is refused rather than discarded. Only adopted paths are restored
+    -- never a blanket reset -- and the result is verified.
+
+    One window remains: a write landing between that re-capture and the
+    restore below, a few milliseconds, is not seen. Git offers no lock over
+    a working tree to close it. What such a write touched in an adopted path
+    is overwritten by HEAD's content; anything else is left alone, and the
+    final check reports the checkout unclean if it touched tracked files.
+    Any failure after the refs are written names them and the undo, so a
+    half-finished restore never leaves the changes without a pointer.
+    """
+    if _git(root, "rev-parse", "--verify", "HEAD") != captured["head"] or (
+        _working_state_tree(root) != captured["tree"]
+    ):
+        raise HelmError(
+            "refusing to adopt the project checkout's changes: the checkout changed "
+            "while they were being captured. Nothing was changed; try again."
+        )
+    _git(root, "update-ref", f"{ref_prefix}/checkout", captured["commit"])
+    _git(root, "update-ref", f"{ref_prefix}/task", start["commit"])
+    try:
+        _restore_adopted_paths(root, captured)
+    except (HelmError, OSError) as exc:
+        raise HelmError(
+            f"adopting the project checkout's changes did not finish: {exc}. Nothing "
+            f"is lost -- they are kept at {ref_prefix}/checkout (the checkout's own "
+            f"state) and {ref_prefix}/task (as the task's first commit), and no task "
+            "was recorded. Put them back, whatever state the checkout was left "
+            f"in, with: {_recovery_command(root, captured, f'{ref_prefix}/checkout')}"
+        ) from exc
+
+
+#: Past this length the recovery command is written to a script under the
+#: repository's git directory and the error names the script instead.
+_RECOVERY_INLINE_LIMIT = 4000
+
+
+def _recovery_command(root: Path, captured: dict[str, Any], checkout_ref: str) -> str:
+    """A command that restores the captured state from any half-restored checkout.
+
+    `git apply` of the whole change needs the checkout back at HEAD and
+    rejects everything if one path has already moved. This instead sets each
+    adopted path directly: content from the anchored ref for every path the
+    capture holds, removal for every path it deleted, then unstages them all
+    so they come back as unstaged changes, like the ordinary undo.
+    """
+    captured_paths = set(_tree_entries(root, captured["tree"]))
+    present = [path for path in captured["paths"] if path in captured_paths]
+    deleted = [path for path in captured["paths"] if path not in captured_paths]
+    git = f"git -C {shlex.quote(str(root))} --literal-pathspecs"
+
+    def paths(items: list[str]) -> str:
+        return " ".join(shlex.quote(item) for item in items)
+
+    steps = []
+    if present:
+        steps.append(f"{git} checkout {shlex.quote(checkout_ref)} -- {paths(present)}")
+    if deleted:
+        steps.append(f"{git} rm -q --ignore-unmatch -- {paths(deleted)}")
+    steps.append(f"{git} reset -q -- {paths(list(captured['paths']))}")
+    command = " && ".join(steps)
+    if len(command) <= _RECOVERY_INLINE_LIMIT:
+        return command
+    # Named for the task the refs are under, so two failures never share one.
+    token = checkout_ref.rstrip("/").split("/")[-2]
+    located = _git(
+        root, "rev-parse", "--git-path", f"helm-adopted-recover-{token}.sh", check=False
+    )
+    script = Path(located) if Path(located).is_absolute() else root / located
+    script.write_text("#!/bin/sh\nset -e\n" + "\n".join(steps) + "\n", encoding="utf-8")
+    return f"sh {shlex.quote(str(script))}"
+
+
+def _restore_adopted_paths(root: Path, captured: dict[str, Any]) -> None:
+    in_head = set(_tree_entries(root, captured["head"]))
+    added = [path for path in captured["paths"] if path not in in_head]
+    existing = [path for path in captured["paths"] if path in in_head]
+    if added:
+        _git_run(
+            root, "rm", "--cached", "-q", "--ignore-unmatch",
+            "--pathspec-from-file=-", "--pathspec-file-nul", stdin=_nul_join(added),
+        )
+        for path in added:
+            target = root / path
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            parent = target.parent
+            while parent != root and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+    if existing:
+        _git_run(
+            root, "checkout", captured["head"],
+            "--pathspec-from-file=-", "--pathspec-file-nul", stdin=_nul_join(existing),
+        )
+    leftover = set(_nul_list(
+        _git_run(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                 "--no-renames").stdout
+    ))
+    adopted = set(captured["paths"])
+    still_there = [entry for entry in leftover if entry[3:] in adopted]
+    if still_there or _project_checkout_conflict(root):
+        raise HelmError("the checkout is not clean after restoring the adopted paths")
+
+
+def shed_adopted_refs(root: Path, adopted: dict[str, Any], elsewhere: list[str]) -> str | None:
+    """Delete a task's adopted-changes refs once its start lives elsewhere.
+
+    `elsewhere` is what counts as another copy -- `--remotes`, the base
+    branch, a merged pull request's head. While the task's first commit is
+    reachable from none of them the refs may be the only copy, so they stay
+    and the reason is returned. None once they are gone.
+    """
+    start = adopted.get("start_commit") or ""
+    for commit in (adopted.get("checkout_commit") or "", start):
+        if not commit or not _git(
+            root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False
+        ):
+            # Something already went wrong with this record; deleting on a
+            # guess could drop the last copy, so both refs stay.
+            return (
+                f"the adopted commit {commit[:12] or '(unrecorded)'} no longer "
+                "resolves, so both refs are kept"
+            )
+    only_here = _git(
+        root, "rev-list", "--count", start, "--not", *elsewhere, check=False
+    ).strip()
+    if only_here != "0":
+        return (
+            f"the adopted changes' commit {start[:12]} is not on any remote or "
+            "the base branch, so its refs are kept"
+        )
+    for ref in adopted.get("refs") or []:
+        if _git(root, "rev-parse", "--verify", "--quiet", ref, check=False):
+            note = _delete_ref(root, ref)
+            if note:
+                return note
+    return None
