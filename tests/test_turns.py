@@ -365,3 +365,36 @@ class TurnsTests(HelmTestCase):
             self.assertFalse((turns_dir / "1.json").exists())
         finally:
             os.close(held)
+
+    def test_concurrent_probes_of_a_dead_runner_both_read_it_dead(self) -> None:
+        """Two exclusive probes collided, and the loser read a dead runner as alive."""
+        import fcntl
+
+        from helm.paths import TURN_RUNNER_LOCK, hold_turns_runner_lock, turns_runner_lock_held
+
+        turns_dir = Path(self.temp.name) / "probe-turns"
+        # A runner ran once and is gone: the lock file is there, nobody holds it.
+        os.close(hold_turns_runner_lock(turns_dir))
+        # Another probe is mid-flight, holding the lock the way a probe does.
+        other = os.open(turns_dir / TURN_RUNNER_LOCK, os.O_RDWR)
+        try:
+            fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            self.assertIs(turns_runner_lock_held(turns_dir), False)
+            results: list = []
+            threads = [
+                threading.Thread(target=lambda: results.append(turns_runner_lock_held(turns_dir)))
+                for _ in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(results, [False] * 8)
+        finally:
+            os.close(other)
+        # A live runner still reads as alive.
+        held = hold_turns_runner_lock(turns_dir)
+        try:
+            self.assertIs(turns_runner_lock_held(turns_dir), True)
+        finally:
+            os.close(held)

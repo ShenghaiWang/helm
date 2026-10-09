@@ -2121,25 +2121,53 @@ class HerdrAdapter:
         return False
 
     def wake_leads_for_deaths(self, worker_id: str | None = None) -> list[dict[str, Any]]:
-        """Tell the lead that started each newly dead worker, once.
+        """Tell the lead that started each newly dead worker.
 
         A dead worker pushes nothing, so the report-driven wake in
         `notify_foreman` never fires for it, and a turns lead between turns
-        has nothing else to start one. Each death is claimed under the state
+        has nothing else to start one. Each attempt is claimed under the state
         lock (`claim_death_notices`) before it is delivered, so concurrent
-        passes tell a lead once between them, and delivery takes the same path
-        an answer does: the inbox note, and for a turns lead its next turn.
+        passes never send one twice, and delivery takes the same path an
+        answer does: the inbox note, and for a turns lead its next turn.
+
+        An attempt that reaches nobody -- stranded, unreachable, or failed --
+        is not the end of it: the claim is released and the next pass tries
+        again, reusing the same inbox note and the same queued prompt, until
+        the attempts are spent and `pending` names the lead instead.
         """
         told: list[dict[str, Any]] = []
         for notice in self.coordinator.claim_death_notices(worker_id):
             outcome = ""
-            with contextlib.suppress(HelmError, SafetyError, HerdrUnavailable, OSError):
-                outcome = self.answer_worker(notice["lead_id"], notice["text"])
-            with contextlib.suppress(HelmError, OSError):
-                self.coordinator.record_death_notice(
-                    notice["worker_id"], outcome and self.last_wake_outcome
+            entry = notice.get("entry")
+            with contextlib.suppress(
+                HelmError, SafetyError, HerdrUnavailable, OSError, subprocess.SubprocessError
+            ):
+                note = self.coordinator.leave_inbox_note(
+                    notice["lead_id"], notice["text"], note_id=notice.get("answer_id")
                 )
-            told.append({**notice, "outcome": outcome and self.last_wake_outcome})
+                lead = (
+                    self.coordinator.store.load().get("workers", {}).get(notice["lead_id"]) or {}
+                )
+                if (
+                    entry
+                    and lead.get("execution_mode") == "turns"
+                    and self.coordinator.turn_entry_queued(notice["lead_id"], entry)
+                ):
+                    # The prompt from the last attempt is still waiting; what
+                    # failed was the runner, so start one rather than queue twice.
+                    outcome = self._answer_turns_worker(
+                        notice["lead_id"], notice["text"], lead, note, entry_id=entry
+                    )
+                else:
+                    outcome = self.answer_worker(notice["lead_id"], notice["text"], note=note)
+                entry = (self.last_turn_delivery or {}).get("entry") or entry
+            result = outcome and self.last_wake_outcome
+            state: dict[str, Any] = {}
+            with contextlib.suppress(HelmError, OSError):
+                state = self.coordinator.record_death_notice(
+                    notice["worker_id"], result, entry=entry
+                )
+            told.append({**notice, "outcome": result, "state": state.get("state", "")})
         return told
 
     def _route_to_project_pane(self, notice: dict[str, Any]) -> bool:
@@ -3854,7 +3882,13 @@ class HerdrAdapter:
     last_runner_problem = ""
 
     def _answer_turns_worker(
-        self, worker_id: str, text: str, worker: dict[str, Any], note: Path | None
+        self,
+        worker_id: str,
+        text: str,
+        worker: dict[str, Any],
+        note: Path | None,
+        *,
+        entry_id: str | None = None,
     ) -> str:
         """Deliver to a turns worker and say what actually happened to it.
 
@@ -3865,7 +3899,8 @@ class HerdrAdapter:
         queued while no turn ever started. Now the outcome is observed: the
         runner took the prompt (`started`), a turn in progress takes it when
         it ends (`queued`), a live runner has not taken it yet (`waiting`), or
-        nothing is running it (`stranded`, returned as "").
+        nothing is running it (`stranded`, returned as ""). `entry_id` names a
+        prompt already in the queue, to see through rather than queue again.
         """
         if worker.get("status") != "running":
             # Nothing will ever run a turn for a settled worker; queueing would
@@ -3876,12 +3911,8 @@ class HerdrAdapter:
             }
             self.last_wake_outcome = "turn-stranded"
             return ""
-        entry_id = self.coordinator.queue_turn_prompt(worker_id, text)
-        if note is not None:
-            # The inbox note is the same message; the queued prompt is how it
-            # reaches the session, so the note is not left to nag as unread.
-            with contextlib.suppress(HelmError, OSError):
-                self.coordinator.mark_inbox_read(worker_id, note)
+        if entry_id is None:
+            entry_id = self.coordinator.queue_turn_prompt(worker_id, text)
         failure = ""
         try:
             ensured = self.ensure_turns_runner(worker_id)
@@ -3914,8 +3945,15 @@ class HerdrAdapter:
             )
         self.last_turn_delivery = delivery
         if state == "stranded":
+            # Left unread: nothing has carried it to the session, and an
+            # unread note is what `pending` watches for.
             self.last_wake_outcome = "turn-stranded"
             return ""
+        if note is not None:
+            # The inbox note is the same message; the queued prompt is how it
+            # reaches the session, so the note is not left to nag as unread.
+            with contextlib.suppress(HelmError, OSError):
+                self.coordinator.mark_inbox_read(worker_id, note)
         self.last_wake_outcome = "turned"
         return "turned"
 
@@ -3983,6 +4021,10 @@ class HerdrAdapter:
                 age = time.time() - stop.stat().st_mtime
             except OSError:
                 age = 0.0
+            # Twice the stop grace: `stop_worker` writes the stop, waits up to
+            # one grace for the turn to end, then settles the record. A worker
+            # still recorded running a full grace past that is not being
+            # stopped by anybody -- the stop outlived whatever wrote it.
             if age < 2 * self.coordinator.TURN_STOP_GRACE_SECONDS:
                 self.last_runner_problem = "a stop is in progress for it"
                 return False

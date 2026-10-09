@@ -181,7 +181,11 @@ def turns_runner_lock_held(turns_dir: Path) -> bool | None:
     except OSError:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Shared, not exclusive. Only the runner takes the lock exclusively,
+        # so a shared probe fails exactly when a runner holds it. Two
+        # exclusive probes at once collided, and the loser read "a runner is
+        # alive" about a runner that was dead -- so nothing restarted it.
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
         return True
     else:

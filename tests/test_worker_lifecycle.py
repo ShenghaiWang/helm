@@ -10,6 +10,7 @@ agreed on one field and disagreed on the rest.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import signal
@@ -1518,8 +1519,10 @@ class DeadWorkerWakesItsLeadTests(HelmTestCase):
         self.assertEqual(settled["death"]["exit_code"], -9)
 
         adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        delivered = self._reachable(adapter)
         told = adapter.wake_leads_for_deaths()
         self.assertEqual([t["lead_id"] for t in told], [lead["id"]])
+        self.assertEqual(told[0]["state"], "delivered")
         notes = self.coordinator.inbox_notes(lead["id"])
         self.assertEqual(len(notes), 1)
         for fragment in (worker["id"], task["id"], "exit -9", "worker"):
@@ -1530,10 +1533,111 @@ class DeadWorkerWakesItsLeadTests(HelmTestCase):
         self.assertEqual(adapter.wake_leads_for_deaths(), [])
         adapter.poll_worker(worker["id"])
         self.assertEqual(adapter.wake_leads_for_deaths(worker["id"]), [])
+        self.assertEqual(len(delivered), 1)
         self.assertEqual(len(self.coordinator.inbox_notes(lead["id"])), 1)
         self.assertEqual(len(self._death_answers(lead["id"])), 1)
         notice = self.state.load()["workers"][worker["id"]]["death"]["notice"]
-        self.assertEqual(notice["lead"], lead["id"])
+        self.assertEqual((notice["lead"], notice["state"]), (lead["id"], "delivered"))
+
+    @staticmethod
+    def _reachable(adapter) -> list:
+        """Make the lead's session take whatever it is sent, and log each send."""
+        sent: list = []
+
+        def take(worker_id, text, *, note=None):
+            sent.append((worker_id, text))
+            adapter.last_wake_outcome = "typed"
+            return "typed"
+
+        adapter.answer_worker = take
+        return sent
+
+    def test_a_notice_nobody_received_is_retried_then_named_in_pending(self) -> None:
+        """A failed delivery used to be marked done; the lead never heard and nobody knew."""
+        from helm import cli
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        _, lead, _, worker = self._lead_and_worker("untold")
+        self._die(worker)
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        attempts = self.coordinator.DEATH_NOTICE_ATTEMPTS
+        # Its lead has no session Helm can reach: every attempt is a retry...
+        for attempt in range(1, attempts):
+            told = adapter.wake_leads_for_deaths()
+            self.assertEqual([(t["attempt"], t["state"]) for t in told], [(attempt, "retry")])
+        # ...until the last, which gives up and says so.
+        told = adapter.wake_leads_for_deaths()
+        self.assertEqual(told[0]["state"], "undelivered")
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+        # One message on the record and one note in the inbox, however many tries.
+        self.assertEqual(len(self._death_answers(lead["id"])), 1)
+        self.assertEqual(len(self.coordinator.inbox_notes(lead["id"])), 1)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_ENV", None)
+            cli.main(["--state-dir", str(self.state.directory), "pending"])
+        self.assertIn(f"{worker['id']} died and its task lead {lead['id']} was never told", out.getvalue())
+
+        # Read by the lead, it is no longer an item.
+        self.coordinator.read_inbox(lead["id"])
+        self.assertEqual(self.coordinator.untold_deaths(), [])
+
+    def test_a_retry_reaches_a_lead_that_becomes_reachable(self) -> None:
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        _, lead, _, worker = self._lead_and_worker("latereach")
+        self._die(worker)
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        self.assertEqual(adapter.wake_leads_for_deaths()[0]["state"], "retry")
+        sent = self._reachable(adapter)
+        self.assertEqual(adapter.wake_leads_for_deaths()[0]["state"], "delivered")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+
+    def test_a_vanished_pane_is_a_death_only_when_a_recorded_pid_is_dead(self) -> None:
+        """A pane is not a process: the historic false death is reported as unconfirmed."""
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        _, lead, _, unconfirmed = self._lead_and_worker("panegone")
+        self.coordinator.mark_worker_lost(unconfirmed["id"], "Herdr pane disappeared")
+        death = self.state.load()["workers"][unconfirmed["id"]]["death"]
+        self.assertEqual(death["kind"], "unreachable")
+
+        _, other_lead, _, dead = self._lead_and_worker("panegonedead")
+        corpse = subprocess.Popen([sys.executable, "-c", ""])
+        corpse.wait()
+        with self.coordinator.store.locked() as data:
+            data["workers"][dead["id"]]["pid"] = corpse.pid
+        self.coordinator.mark_worker_lost(dead["id"], "Herdr pane disappeared")
+        self.assertEqual(self.state.load()["workers"][dead["id"]]["death"]["kind"], "died")
+
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        self._reachable(adapter)
+        texts = {t["lead_id"]: t["text"] for t in adapter.wake_leads_for_deaths()}
+        self.assertIn(
+            "unreachable: its pane is gone and Helm cannot confirm the process; "
+            "check before relaunching",
+            texts[lead["id"]],
+        )
+        self.assertNotIn("DIED", texts[lead["id"]])
+        self.assertIn("WORKER DIED", texts[other_lead["id"]])
+        self.assertIn(f"pid {corpse.pid}", texts[other_lead["id"]])
+
+    def test_a_session_gone_with_no_exit_record_is_not_reported_as_exit_one(self) -> None:
+        _, _, _, worker = self._lead_and_worker("norecord")
+        corpse = subprocess.Popen([sys.executable, "-c", ""])
+        corpse.wait()
+        with self.coordinator.store.locked() as data:
+            data["workers"][worker["id"]]["pid"] = corpse.pid
+        self.coordinator.poll_worker(worker["id"])
+        settled = self.state.load()["workers"][worker["id"]]
+        self.assertEqual(settled["status"], "failed")
+        self.assertIsNone(settled["death"]["exit_code"])
+        self.assertIn("no exit record", settled["death"]["detail"])
 
     def test_a_dead_reviewer_tells_its_lead_to_run_the_review_again(self) -> None:
         from helm.herdr import HerdrAdapter
@@ -1605,6 +1709,6 @@ class DeadWorkerWakesItsLeadTests(HelmTestCase):
             line = cli._heal_dead_worker(
                 self.coordinator, {"worker_id": worker["id"], "project_id": project["id"]}
             )
-        self.assertIn(f"task lead {lead['id']} told", line or "")
+        self.assertIn(f"task lead {lead['id']} not reached yet", line or "")
         self.assertEqual(len(self.coordinator.inbox_notes(lead["id"])), 1)
         self.assertEqual(len(self._death_answers(lead["id"])), 1)

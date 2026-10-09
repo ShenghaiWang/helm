@@ -3216,8 +3216,13 @@ def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | 
             if told:
                 return (
                     f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead worker "
-                    f"{worker_id} stopped and its task lead {told[0]['lead_id']} told, "
-                    "so it can relaunch the work or escalate"
+                    f"{worker_id} stopped and its task lead {told[0]['lead_id']} "
+                    + (
+                        "told, so it can relaunch the work or escalate"
+                        if told[0].get("outcome")
+                        else "not reached yet; the note is in its inbox and the next "
+                        "pass tries again"
+                    )
                 )
             return (
                 f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead worker "
@@ -5239,6 +5244,20 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
             f"for {waited} -- it has run no helm command since; check its session"
         )
         entries.append((stamp, f"{_when_label(stamp)} {line}", line))
+    # A death no attempt could deliver: the lead that started the work is
+    # still waiting on a report that will never come, and only you can tell it.
+    with contextlib.suppress(HelmError, OSError):
+        for untold in coordinator.untold_deaths():
+            glyph = glyphs.get(untold.get("project_id"), "")
+            what = "is unreachable" if untold["kind"] == "unreachable" else "died"
+            line = (
+                f"{glyph} {untold['project_id']}: {untold['role']} {untold['worker_id']} "
+                f"{what} and its task lead {untold['lead_id']} was never told "
+                f"({untold.get('attempts')} attempts) -- tell it with helm worker answer "
+                f"{untold['lead_id']}"
+            )
+            stamp = untold.get("at") or ""
+            entries.append((stamp, f"{_when_label(stamp)} {line}", line))
     for entry in coordinator.worker_health(liveness=_liveness_probe(coordinator)):
         if entry["verdict"] in HEALTHY_WORKER_VERDICTS:
             continue
