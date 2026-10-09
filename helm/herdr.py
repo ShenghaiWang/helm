@@ -2826,6 +2826,12 @@ class HerdrAdapter:
         "is correct but does not meet it, or does more than it, is a finding.\n"
     )
 
+    _AMENDMENTS_HEADER = (
+        "COMMANDER AMENDMENTS, in the order the commander made them. Each one "
+        "is part of the contract: work it asks for is in scope, not a finding, "
+        "and where one disagrees with the text above, the later one stands.\n"
+    )
+
     def _contract_handoff(
         self, data: dict[str, Any], task_id: str, *, room: int | None = None
     ) -> str:
@@ -2845,11 +2851,25 @@ class HerdrAdapter:
         cuts.
         """
         contract = self.coordinator.confirmed_contract_for(task_id, data=data)
-        if not contract.get("requirement"):
+        amendments = self.coordinator.contract_amendments_for(task_id, data)
+        if not contract.get("requirement") and not amendments:
             return ""
-        body = f"Requirement: {contract['requirement'].strip()}\n"
-        if contract.get("solution"):
-            body += f"Confirmed approach: {contract['solution'].strip()}\n"
+        body = ""
+        if contract.get("requirement"):
+            body += f"Requirement: {contract['requirement'].strip()}\n"
+            if contract.get("solution"):
+                body += f"Confirmed approach: {contract['solution'].strip()}\n"
+        if amendments:
+            # Appended after the original, in the order the commander made
+            # them, and labelled as theirs: a reviewer reading only the spent
+            # gate pair requested changes on the very work the commander had
+            # since added to the task.
+            body += self._AMENDMENTS_HEADER
+            for number, amendment in enumerate(amendments, 1):
+                body += (
+                    f"Commander amendment {number} ({amendment.get('at') or 'undated'}): "
+                    f"{str(amendment['text']).strip()}\n"
+                )
         whole = self._CONTRACT_HEADER + body + "\n"
         if room is None or len(whole) <= room:
             return whole

@@ -1597,6 +1597,15 @@ def _build_parser() -> argparse.ArgumentParser:
     reshape.add_argument("task_id")
     reshape.add_argument("shape", choices=TASK_SHAPES)
     reshape.add_argument("--reason", default="", help="why; recorded with the old and new shape")
+    amend = task_commands.add_parser(
+        "amend",
+        help="commander: append to the contract a live task's reviewer judges, "
+             "when the scope widened after its gates were spent",
+    )
+    amend.add_argument("task_id")
+    amend.add_argument("--text", required=True, help="what the contract now also covers")
+    amend.add_argument("--confirm", action="store_true",
+        help="required: this is the commander's own scope decision")
     create.add_argument("--delivery", choices=("local", "pr"))
     create.add_argument("--domain", help="explicit domain override for ambiguous tasks")
     create.add_argument("--no-domain", action="store_true")
@@ -3621,6 +3630,9 @@ _ROOT_ONLY_COMMANDS = frozenset({
     # locally. A task that could rewrite its own answer could take itself out
     # of that path, so the correction is the commander's.
     ("task", "delivery"),
+    # Amending the contract widens what a reviewer accepts. A lead or worker
+    # that could run it could make its own work pass review.
+    ("task", "amend"),
     ("approval", "grant"),
     ("approval", "revoke"),
     # Releasing a hold *is* the authorization the worker asked for. An agent
@@ -4040,6 +4052,13 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
             f"Task {reshaped['id']} is now shaped {reshaped['shape']}"
             f" (was {history[-1].get('from')})"
             + (f": {args.reason}" if args.reason else "")
+        )
+    elif args.task_command == "amend":
+        amended = coordinator.amend_contract(args.task_id, args.text, confirm=args.confirm)
+        count = len(amended.get("contract_amendments") or [])
+        print(
+            f"Amended the contract for task {amended['id']} (amendment {count}); "
+            "its next review round reads the original contract and every amendment in order."
         )
     elif args.task_command == "cost":
         usage = coordinator.task_usage(args.task_id, with_reviews=not args.no_reviews)

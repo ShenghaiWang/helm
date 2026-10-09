@@ -226,6 +226,24 @@ or `--state-changing` — with no default and no inheritance from the round
 before. Leaving it unstated would let a finished read-only investigation
 silently continue as state-changing work.
 
+### Amending a spent contract
+
+A reviewer judges the change against the requirement and solution its task
+spent. When the commander widens a live task after that — "also merge the
+base and answer the PR comments" — the root amends that contract instead of
+proposing a whole new pair for work that already has a task:
+
+```sh
+helm task amend <task> --text "also merge the base and answer the open PR comments" --confirm   # root only
+```
+
+An amendment is appended, never substituted: it is recorded on the task with
+its time and the authority that verified it, and every later review round's
+brief carries the original contract followed by each amendment in order,
+labelled as the commander's. Like `gate decide`, it is refused for a task
+lead or a worker, because widening what a reviewer accepts is the
+commander's scope decision.
+
 ## The shape of the change sizes the ceremony
 
 Every task carries a shape, stated by whoever creates it with a one-line

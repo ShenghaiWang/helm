@@ -15,7 +15,7 @@ from typing import Any
 
 from ..errors import HelmError, SafetyError
 from ..values import (
-    GATE_TYPES, REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND, _safe_text, now, requirement_shortfalls,
+    DELIVERED_TASK_STATES, GATE_TYPES, REQUIREMENT_GATE_KIND, SOLUTION_GATE_KIND, _safe_text, now, requirement_shortfalls,
 )
 
 
@@ -49,6 +49,68 @@ class GatesMixin:
                     contract[gate_type] = str(gate["text"])
             return contract
         return {}
+
+    def amend_contract(self, task_id: str, text: str, *, confirm: bool) -> dict[str, Any]:
+        """Append a commander amendment to the contract a task's reviewer reads. Root-only.
+
+        A reviewer judges the change against the gate pair its task spent, and
+        that pair is fixed the moment it is spent. When the commander widened
+        a live task -- also merge the base, also answer the PR comments -- the
+        reviewer kept judging the old, narrower text and requested changes on
+        exactly the work it had been asked for; the only way round it was a
+        whole new gate pair for work that already had a task. An amendment is
+        appended, never substituted: the original contract stays as it was
+        confirmed, and every amendment follows it in order with when it was
+        made and which boundary verified the commander, so a later reader sees
+        how the scope moved rather than only where it ended.
+
+        The same boundary as deciding a gate guards it, because widening what
+        a reviewer accepts is a scope decision -- a lead or a worker that
+        could amend could make its own work pass review.
+        """
+        if not confirm:
+            raise HelmError("amending a task's contract is the commander's decision; pass --confirm")
+        text = _safe_text(text).strip()
+        if not text:
+            raise HelmError("an amendment needs --text saying what the contract now also covers")
+        authority = self.authority("amending a task's review contract")
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            if task.get("role") != "worker":
+                raise HelmError(
+                    f"task {task_id} is a {task.get('role')} task; a contract is amended "
+                    "on the worker task its reviewer judges"
+                )
+            if task.get("status") in DELIVERED_TASK_STATES:
+                raise HelmError(
+                    f"task {task_id} is already {task['status']}; there is no review "
+                    "left for an amendment to reach"
+                )
+            amendment = {
+                "text": text,
+                "at": now(),
+                "by": "commander",
+                "authority": authority.record(),
+            }
+            task.setdefault("contract_amendments", []).append(amendment)
+            project = self._project(data, task["project_id"])
+            self._message(
+                data, project, task, None, "status",
+                f"Commander amended the contract for task {task_id}",
+                {"contract_amendment": len(task["contract_amendments"])},
+            )
+            return dict(task)
+
+    @staticmethod
+    def contract_amendments_for(
+        task_id: str, data: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """The commander's amendments to a task's contract, oldest first."""
+        task = data.get("tasks", {}).get(task_id) or {}
+        return [
+            entry for entry in task.get("contract_amendments") or []
+            if isinstance(entry, dict) and str(entry.get("text") or "").strip()
+        ]
 
     def _inherited_gates(self, data: dict[str, Any], project_id: str) -> dict[str, Any]:
         """Carry an UNSPENT gate decision onto a project's next foreman task.

@@ -1139,6 +1139,123 @@ class ReviewTests(HelmTestCase):
         self.assertNotIn("contract.md", brief)
         self.assertLessEqual(len(brief), 20_000)
 
+    def test_a_commander_amendment_follows_the_original_contract_into_the_brief(self) -> None:
+        """A widened task was reviewed against the narrow pair it had spent.
+
+        The commander added work mid-task and the reviewer requested changes
+        on exactly that work, because nothing let the contract it read grow.
+        """
+        task, _worker = self._gated_task("amended")
+        self.commit_on_task_branch(task)
+
+        first = self.coordinator.amend_contract(
+            task["id"], "also merge the base branch into the task branch", confirm=True
+        )
+        second = self.coordinator.amend_contract(
+            task["id"], "also answer the open pull request comments", confirm=True
+        )
+        amendments = second["contract_amendments"]
+        self.assertEqual(len(first["contract_amendments"]), 1)
+        self.assertEqual(
+            [entry["text"] for entry in amendments],
+            [
+                "also merge the base branch into the task branch",
+                "also answer the open pull request comments",
+            ],
+        )
+        for entry in amendments:
+            self.assertEqual(entry["by"], "commander")
+            self.assertEqual(entry["authority"], {"mode": "session", "actor": "root"})
+            self.assertTrue(entry["at"])
+
+        brief = self._captured_reviewer_brief(task)
+
+        # Appended, not substituted: the original contract is still first.
+        self.assertTrue(brief.startswith("THE CONFIRMED CONTRACT"), brief[:200])
+        original = brief.index("Done means: one fetch per hour")
+        approach = brief.index("a TTL dict in rates.py")
+        header = brief.index("COMMANDER AMENDMENTS")
+        one = brief.index(
+            f"Commander amendment 1 ({amendments[0]['at']}): also merge the base branch"
+        )
+        two = brief.index(
+            f"Commander amendment 2 ({amendments[1]['at']}): also answer the open pull request"
+        )
+        self.assertLess(original, approach)
+        self.assertLess(approach, header)
+        self.assertLess(header, one)
+        self.assertLess(one, two)
+        # The reviewer's instructions still follow the whole contract.
+        self.assertLess(two, brief.index("FIRST WORD is APPROVED or CHANGES-REQUESTED"))
+
+    def test_an_amendment_reaches_a_reviewer_whose_task_spent_no_gate_pair(self) -> None:
+        root = self.repo("amendnogates")
+        project = self.coordinator.register_project("Amend", str(root), project_id="amendnogates")
+        task = self.coordinator.create_task(project["id"], "the change under review")
+        self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.commit_on_task_branch(task)
+        self.assertNotIn("CONTRACT", self._captured_reviewer_brief(task)[:200])
+
+        self.coordinator.amend_contract(task["id"], "also update the changelog", confirm=True)
+
+        brief = self._captured_reviewer_brief(task)
+        self.assertTrue(brief.startswith("THE CONFIRMED CONTRACT"), brief[:200])
+        self.assertIn("COMMANDER AMENDMENTS", brief)
+        self.assertIn("also update the changelog", brief)
+        self.assertNotIn("Requirement:", brief.split("FIRST WORD")[0])
+
+    def test_only_the_commander_can_amend_a_contract(self) -> None:
+        task, worker = self._gated_task("amendrefused")
+        data = self.coordinator.store.load()
+        lead_id = next(
+            worker_id for worker_id, entry in data["workers"].items()
+            if data["tasks"][entry["task_id"]].get("role") == "foreman"
+            and entry["project_id"] == task["project_id"]
+        )
+
+        for agent in (lead_id, worker["id"]):
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": agent}):
+                # Refused in core, where importing Coordinator cannot skip it...
+                with self.assertRaisesRegex(SafetyError, "amending a task's review contract"):
+                    self.coordinator.amend_contract(task["id"], "also rewrite the UI", confirm=True)
+                # ...and in CLI dispatch, before the command runs.
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    code = cli.main([
+                        "--state-dir", str(self.coordinator.store.directory),
+                        "task", "amend", task["id"], "--text", "also rewrite the UI", "--confirm",
+                    ])
+                self.assertEqual(code, 2)
+                self.assertIn("held at the Helm root", stderr.getvalue())
+
+        # The commander must say --confirm, and an empty amendment says nothing.
+        with self.assertRaisesRegex(HelmError, "--confirm"):
+            self.coordinator.amend_contract(task["id"], "also rewrite the UI", confirm=False)
+        with self.assertRaisesRegex(HelmError, "--text"):
+            self.coordinator.amend_contract(task["id"], "   ", confirm=True)
+        # Only a worker task's contract is amended -- not its lead's.
+        with self.assertRaisesRegex(HelmError, "foreman task"):
+            self.coordinator.amend_contract(
+                data["workers"][lead_id]["task_id"], "anything", confirm=True
+            )
+        stored = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(stored.get("contract_amendments") or [], [])
+
+        # The root, through the CLI, records it.
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main([
+                "--state-dir", str(self.coordinator.store.directory),
+                "task", "amend", task["id"], "--text", "also fix the flaky test", "--confirm",
+            ])
+        self.assertEqual(code, 0, stdout.getvalue())
+        self.assertIn("amendment 1", stdout.getvalue())
+        stored = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(
+            [entry["text"] for entry in stored["contract_amendments"]],
+            ["also fix the flaky test"],
+        )
+
     def test_a_long_change_cannot_push_the_evidence_or_contract_off_the_brief(self) -> None:
         """The whole diffstat went inline ahead of the evidence.
 
