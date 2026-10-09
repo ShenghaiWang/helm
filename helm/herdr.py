@@ -2139,6 +2139,19 @@ class HerdrAdapter:
         for notice in self.coordinator.claim_death_notices(worker_id):
             outcome = ""
             entry = notice.get("entry")
+            if notice.get("attempt", 1) > 1:
+                arrived = ""
+                with contextlib.suppress(HelmError, OSError):
+                    arrived = self.coordinator.death_notice_arrived(notice)
+                if arrived:
+                    # Settled without a second copy: the first one landed.
+                    state: dict[str, Any] = {}
+                    with contextlib.suppress(HelmError, OSError):
+                        state = self.coordinator.record_death_notice(
+                            notice["worker_id"], arrived, entry=entry
+                        )
+                    told.append({**notice, "outcome": arrived, "state": state.get("state", "")})
+                    continue
             with contextlib.suppress(
                 HelmError, SafetyError, HerdrUnavailable, OSError, subprocess.SubprocessError
             ):
@@ -2162,7 +2175,7 @@ class HerdrAdapter:
                     outcome = self.answer_worker(notice["lead_id"], notice["text"], note=note)
                 entry = (self.last_turn_delivery or {}).get("entry") or entry
             result = outcome and self.last_wake_outcome
-            state: dict[str, Any] = {}
+            state = {}
             with contextlib.suppress(HelmError, OSError):
                 state = self.coordinator.record_death_notice(
                     notice["worker_id"], result, entry=entry

@@ -1579,6 +1579,21 @@ class DeadWorkerWakesItsLeadTests(HelmTestCase):
             os.environ.pop("HERDR_ENV", None)
             cli.main(["--state-dir", str(self.state.directory), "pending"])
         self.assertIn(f"{worker['id']} died and its task lead {lead['id']} was never told", out.getvalue())
+        self.assertIn(f"helm worker answer {lead['id']}", out.getvalue())
+
+        # A turns lead nobody could reach has no runner: an answer would strand
+        # too, so the line points at what can start one, or end the lead.
+        with self.coordinator.store.locked() as data:
+            data["workers"][lead["id"]]["execution_mode"] = "turns"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_ENV", None)
+            cli.main(["--state-dir", str(self.state.directory), "pending"])
+        self.assertIn("helm pending --heal", out.getvalue())
+        self.assertIn(f"helm worker stop {lead['id']}", out.getvalue())
+        self.assertNotIn(f"helm worker answer {lead['id']}", out.getvalue())
+        with self.coordinator.store.locked() as data:
+            data["workers"][lead["id"]]["execution_mode"] = "session"
 
         # Read by the lead, it is no longer an item.
         self.coordinator.read_inbox(lead["id"])
@@ -1712,3 +1727,57 @@ class DeadWorkerWakesItsLeadTests(HelmTestCase):
         self.assertIn(f"task lead {lead['id']} not reached yet", line or "")
         self.assertEqual(len(self.coordinator.inbox_notes(lead["id"])), 1)
         self.assertEqual(len(self._death_answers(lead["id"])), 1)
+
+    def test_a_retry_does_not_resend_a_notice_a_restarted_runner_already_took(self) -> None:
+        """Stranded, then taken by a runner restarted elsewhere: the retry must not send it twice."""
+        from helm import cli
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        _, lead, _, worker = self._lead_and_worker("takenlater")
+        with self.coordinator.store.locked() as data:
+            # A turns lead with no runner Helm can start: attempt 1 strands.
+            data["workers"][lead["id"]]["execution_mode"] = "turns"
+            data["workers"][lead["id"]].pop("runner_command", None)
+        self._die(worker)
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        first = adapter.wake_leads_for_deaths()
+        self.assertEqual(first[0]["state"], "retry")
+        self.assertEqual(self.coordinator.queued_turn_count(lead["id"]), 1)
+
+        # The lead's runner comes back by some other road and takes the prompt.
+        turns_dir = self.coordinator.turns_dir(lead["id"])
+        state: dict = {"turn": 1, "history": []}
+        taken = cli._take_turn_prompt(turns_dir, state, turns_dir / "state.json")
+        self.assertIn("WORKER DIED", taken)
+
+        second = adapter.wake_leads_for_deaths()
+        self.assertEqual(second[0]["state"], "delivered")
+        self.assertIn("taken by its runner", second[0]["outcome"])
+        self.assertEqual(self.coordinator.queued_turn_count(lead["id"]), 0, "queued a second copy")
+        self.assertEqual(len(self._death_answers(lead["id"])), 1)
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+
+    def test_a_retry_counts_a_note_the_lead_already_read(self) -> None:
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        _, lead, _, worker = self._lead_and_worker("readlater")
+        self._die(worker)
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        self.assertEqual(adapter.wake_leads_for_deaths()[0]["state"], "retry")
+        # The lead ran a helm command, which printed its inbox and marked it read.
+        self.coordinator.read_inbox(lead["id"])
+        sent = self._reachable(adapter)
+        second = adapter.wake_leads_for_deaths()
+        self.assertEqual(second[0]["state"], "delivered")
+        self.assertEqual(sent, [], "re-sent a note the lead had already read")
+        self.assertEqual(self.coordinator.inbox_notes(lead["id"]), [])
+
+    def test_a_read_note_is_never_resurrected_under_its_own_id(self) -> None:
+        _, lead, _, _ = self._lead_and_worker("noresurrect")
+        note = self.coordinator.leave_inbox_note(lead["id"], "first copy", note_id="m-fixed")
+        self.coordinator.mark_inbox_read(lead["id"], note)
+        again = self.coordinator.leave_inbox_note(lead["id"], "first copy", note_id="m-fixed")
+        self.assertEqual(again.parent.name, "read")
+        self.assertEqual(self.coordinator.inbox_notes(lead["id"]), [])
