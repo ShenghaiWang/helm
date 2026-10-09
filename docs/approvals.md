@@ -131,6 +131,15 @@ HEAD says nothing about the branch being pushed. A task with a branch of its
 own may not name a different subject: its request always binds, and is
 reviewed as, its own branch.
 
+One protected action has one hold. A request for an action on a target that
+another task in the same project already holds open -- a lead asking to
+publish the branch its worker is already waiting to publish, or the other way
+round -- is refused, naming that hold, its task and the worker that raised
+it, because releasing both would perform the action twice. The target is the
+branch the request binds (a worker's own, or the lead's `--subject`); a
+lead's request with no branch to bind matches only itself. Withdraw the
+existing hold first to move the request.
+
 A `push` or `publish` of a `standard` or `critical` task's branch also needs an
 independent review that approved that exact tip. Each reviewer task is pinned
 to the exact commit it was handed before it read anything -- the commit its

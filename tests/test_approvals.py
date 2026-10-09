@@ -1701,13 +1701,8 @@ class EscalationReconciliationTests(ApprovalTests):
         self.assertEqual(reopened.get("status"), "approval-needed")
 
 
-class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
-    """A foreman asking to push a worker's branch is asking about that branch.
-
-    Its request used to bind to the project root's HEAD -- the commander's own
-    checkout -- so a fetch or a branch switch there invalidated a push the
-    commander had just approved, for a revision the request never mentioned.
-    """
+class _LeadAskingForApproval:
+    """A worker task with reviewed work, and a lead that may ask about it."""
 
     def _foreman_asking_to_push(
         self, name: str, *, subject: bool, action: str = "push",
@@ -1746,6 +1741,15 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
         return next(
             w for w in self.state.load()["workers"].values() if w["task_id"] == foreman_task["id"]
         )
+
+
+class AForemansApprovalBindsToItsSubjectTests(_LeadAskingForApproval, HelmTestCase):
+    """A foreman asking to push a worker's branch is asking about that branch.
+
+    Its request used to bind to the project root's HEAD -- the commander's own
+    checkout -- so a fetch or a branch switch there invalidated a push the
+    commander had just approved, for a revision the request never mentioned.
+    """
 
     def _move_project_root_head(self, root: Path) -> None:
         (root / "elsewhere.txt").write_text("the commander fetched something\n")
@@ -1842,6 +1846,79 @@ class AForemansApprovalBindsToItsSubjectTests(HelmTestCase):
         self.assertIn(task["branch"], text)
         self.assertIn(tip[:12], text)
         self.assertIn(task["id"], text)
+
+
+class OneProtectedActionHasOneHoldTests(_LeadAskingForApproval, HelmTestCase):
+    """A lead and its worker asked for the same upload, and both were held.
+
+    Releasing both would have performed it twice. The second request for the
+    same action on the same target is refused, naming the hold that has it.
+    """
+
+    def _task_worker(self, task: dict) -> dict:
+        return next(
+            w for w in self.state.load()["workers"].values() if w["task_id"] == task["id"]
+        )
+
+    def test_a_leads_request_for_its_workers_pending_action_is_refused(self) -> None:
+        root, project, task, foreman_task = self._foreman_asking_to_push(
+            "doubled", subject=True, action="publish", ask=False
+        )
+        worker = self._task_worker(task)
+        lead = self._lead_worker(foreman_task)
+        held = self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "publish the render", payload={"action": "publish"}
+        )
+        self.assertEqual(held["status"], "approval-needed")
+        hold = self.coordinator.latest_hold(self.coordinator.inspect_task(task["id"])["task"])
+        before = self.state.load()
+        with self.assertRaises(SafetyError) as refused:
+            self.coordinator.record_worker_message(
+                lead["id"], "approval-needed", "publish the render",
+                payload={"action": "publish", "subject": task["id"]},
+            )
+        message = str(refused.exception)
+        self.assertIn(task["id"], message)
+        self.assertIn(worker["id"], message)
+        self.assertIn(hold["id"], message)
+        # Nothing about the refused request was recorded.
+        after = self.state.load()
+        self.assertIsNone(self.coordinator.latest_hold(after["tasks"][foreman_task["id"]]))
+        self.assertEqual(len(after["messages"]), len(before["messages"]))
+
+    def test_the_workers_request_after_the_leads_is_refused_too(self) -> None:
+        root, project, task, foreman_task = self._foreman_asking_to_push(
+            "doubledback", subject=True, action="push"
+        )
+        worker = self._task_worker(task)
+        with self.assertRaisesRegex(SafetyError, rf"task {foreman_task['id']} already has a waiting hold"):
+            self.coordinator.record_worker_message(
+                worker["id"], "approval-needed", "push my branch", payload={"action": "push"}
+            )
+
+    def test_a_different_action_or_a_settled_hold_is_not_a_duplicate(self) -> None:
+        root, project, task, foreman_task = self._foreman_asking_to_push(
+            "distinct", subject=True, action="publish", ask=False
+        )
+        worker = self._task_worker(task)
+        lead = self._lead_worker(foreman_task)
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "push my branch", payload={"action": "push"}
+        )
+        # Publishing is a different action from pushing: both may wait.
+        held = self.coordinator.record_worker_message(
+            lead["id"], "approval-needed", "publish it",
+            payload={"action": "publish", "subject": task["id"]},
+        )
+        self.assertEqual(held["status"], "approval-needed")
+        # Once the worker's push hold is withdrawn, the lead may ask for it.
+        self.coordinator.withdraw_task_hold(worker["id"], reason="the lead will carry it")
+        self.coordinator.withdraw_task_hold(lead["id"], reason="ask for the push instead")
+        held = self.coordinator.record_worker_message(
+            lead["id"], "approval-needed", "push it",
+            payload={"action": "push", "subject": task["id"]},
+        )
+        self.assertEqual(held["status"], "approval-needed")
 
 
 class NoBranchLeavesUnreviewedTests(HelmTestCase):

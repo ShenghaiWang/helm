@@ -858,6 +858,55 @@ class ProtectionMixin:
             authorized.add(gates["bound_task_id"])
         return next(iter(authorized)) if len(authorized) == 1 else None
 
+    def _hold_target(
+        self, task: dict[str, Any], snapshot: dict[str, Any]
+    ) -> tuple[str, str]:
+        """What a hold would act on, normalized so two requests can be compared.
+
+        A request bound to a branch -- a worker's own, or the one a lead names
+        with --subject -- targets that task. A lead's request with no branch to
+        bind is scoped to the lead itself: nothing recorded says which resource
+        it means, and guessing would refuse requests that were never the same.
+        """
+        if snapshot.get("scope") == "subject" and snapshot.get("subject_task_id"):
+            return ("task", str(snapshot["subject_task_id"]))
+        if snapshot.get("scope") == "project":
+            return ("lead", str(task["id"]))
+        return ("task", str(task["id"]))
+
+    def _duplicate_open_hold(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        action: str,
+        snapshot: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Another task's open hold for the same action on the same target, if any.
+
+        A lead and the worker it drives both asked for one upload, and
+        releasing both would have performed it twice. "Same" is narrow on
+        purpose: the same project, the same action and the same normalized
+        target (see `_hold_target`). A different branch, a different action or
+        a project-scoped lead request never matches, so nothing that could be a
+        separate action is refused. Only this project's tasks are read.
+        """
+        target = self._hold_target(task, snapshot)
+        for other in data.get("tasks", {}).values():
+            if other.get("id") == task["id"] or other.get("project_id") != project["id"]:
+                continue
+            holds = other.get("holds")
+            # Read, never initialized: `task_hold` would write an empty
+            # history onto every task this scan merely looked at.
+            for other_hold in holds if isinstance(holds, list) else ():
+                if other_hold.get("status") not in HOLD_OPEN_STATUSES:
+                    continue
+                if other_hold.get("action") != action:
+                    continue
+                if self._hold_target(other, other_hold.get("snapshot") or {}) == target:
+                    return other, other_hold
+        return None
+
     def _hold_request(
         self,
         data: dict[str, Any],
@@ -934,6 +983,16 @@ class ProtectionMixin:
             )
             if refusal is not None:
                 raise SafetyError(refusal)
+        duplicate = self._duplicate_open_hold(data, project, task, action, snapshot)
+        if duplicate is not None:
+            other_task, other_hold = duplicate
+            raise SafetyError(
+                f"task {other_task['id']} already has a {other_hold['status']} hold "
+                f"({other_hold['id']}) for {action} on the same target, raised by "
+                f"worker {other_hold.get('worker_id')}. Releasing both would perform "
+                f"the {action} twice, so this request is refused: let that hold carry "
+                "it, or withdraw it there first and ask again here."
+            )
         open_hold = self.task_hold(task)
         # What the task was before it paused, so a hold that ends without
         # failing the work can hand it back. A request superseding an earlier
