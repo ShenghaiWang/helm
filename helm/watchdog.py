@@ -425,16 +425,40 @@ def _xml_escape(value: str) -> str:
     )
 
 
+def _scheduler_path() -> str:
+    """The installing shell's PATH, for the scheduler entry to run under.
+
+    launchd and systemd start the watchdog with a bare system PATH, so every
+    tool it shells out to that lives elsewhere -- `gh` under Homebrew, which
+    the pull-request watch needs -- reads as "not installed" and its news
+    reaches nobody. Recording the PATH the commander installed from fixes
+    that. Only PATH is copied: no other variable is, so nothing secret from
+    the installing shell can land in the scheduler entry.
+    """
+    seen: list[str] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry and entry not in seen:
+            seen.append(entry)
+    interpreter = str(Path(sys.executable).parent)
+    if interpreter not in seen:
+        seen.append(interpreter)
+    return os.pathsep.join(seen)
+
+
 def _launchd_plist(
     root: Path, interval: int, log: Path, *, notify_command: str = "",
     remind_minutes: float = DEFAULT_REMIND_MINUTES, heal: bool = True,
 ) -> str:
     executable = sys.executable
     heal_flag = "" if heal else "    <string>--no-heal</string>\n"
-    environment = (
-        f"  <key>EnvironmentVariables</key>\n  <dict>\n    <key>{NOTIFY_ENV}</key>"
-        f"<string>{_xml_escape(notify_command)}</string>\n  </dict>\n"
+    notify = (
+        f"    <key>{NOTIFY_ENV}</key><string>{_xml_escape(notify_command)}</string>\n"
         if notify_command else ""
+    )
+    environment = (
+        "  <key>EnvironmentVariables</key>\n  <dict>\n"
+        f"    <key>PATH</key><string>{_xml_escape(_scheduler_path())}</string>\n"
+        f"{notify}  </dict>\n"
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -466,8 +490,11 @@ def _systemd_units(
 ) -> tuple[str, str]:
     executable = sys.executable
     heal_flag = "" if heal else " --no-heal"
-    environment = (
-        f'Environment="{NOTIFY_ENV}={notify_command.replace(chr(34), chr(92) + chr(34))}"\n'
+    def quoted(value: str) -> str:
+        return value.replace(chr(34), chr(92) + chr(34))
+
+    environment = f'Environment="PATH={quoted(_scheduler_path())}"\n' + (
+        f'Environment="{NOTIFY_ENV}={quoted(notify_command)}"\n'
         if notify_command else ""
     )
     service = f"""[Unit]
@@ -568,6 +595,7 @@ def install(
         print(f"  then saying it again every {remind_minutes:g} minutes while it still waits.")
         if notify_command:
             print(f"  Each notification also runs your command: {notify_command}")
+        print("  Runs with this shell's PATH, captured now, so tools like gh are found.")
         print(
             "  A worker that reads as dead on two checks a minute apart is stopped, a dead task lead "
             "replaced, and a project with running workers and no driver re-driven."
@@ -595,6 +623,7 @@ def install(
             )
         print(f"Installed the Helm watchdog: {unit_dir}/helm-watchdog.service")
         print(f"  Runs every {interval}s against {root}.")
+        print("  Runs with this shell's PATH, captured now, so tools like gh are found.")
         return 0
     # Windows, BSD, a container without an init -- say so rather than pretending.
     print(f"No scheduler integration for {system}.")

@@ -58,10 +58,25 @@ class WatchdogTests(HelmTestCase):
         )
         self.assertIn("<key>HELM_WATCHDOG_NOTIFY</key><string>say &quot;&lt;needs a human&gt;&quot; &amp; post</string>", plist)
         self.assertIn("<string>--remind-after</string><string>45</string>", plist)
-        self.assertNotIn("EnvironmentVariables", watchdog._launchd_plist(Path("/root"), 20, Path("/l")))
         service, _timer = watchdog._systemd_units(Path("/root"), 20, notify_command="post it", remind_minutes=30)
         self.assertIn('Environment="HELM_WATCHDOG_NOTIFY=post it"', service)
         self.assertIn("--remind-after 30", service)
+
+    def test_the_scheduler_entries_carry_the_installing_path_and_nothing_else(self) -> None:
+        import plistlib
+        import sys
+
+        interpreter = str(Path(sys.executable).parent)
+        environ = {"PATH": "/opt/homebrew/bin:/usr/bin:/opt/homebrew/bin:/a&b", "GH_TOKEN": "nope"}
+        with mock.patch.dict(os.environ, environ, clear=True):
+            plist = watchdog._launchd_plist(Path("/root"), 20, Path("/l"))
+            service, _timer = watchdog._systemd_units(Path("/root"), 20)
+        expected = f"/opt/homebrew/bin:/usr/bin:/a&b:{interpreter}" if interpreter not in (
+            "/opt/homebrew/bin", "/usr/bin", "/a&b") else "/opt/homebrew/bin:/usr/bin:/a&b"
+        variables = plistlib.loads(plist.encode())["EnvironmentVariables"]
+        self.assertEqual(variables, {"PATH": expected})
+        self.assertIn(f'Environment="PATH={expected}"', service)
+        self.assertNotIn("GH_TOKEN", plist + service)
 
     def test_a_death_is_healed_only_after_it_reads_the_same_twice_a_minute_apart(self) -> None:
         import json

@@ -536,12 +536,34 @@ class _Doctor:
             return
         if present:
             self._check_watchdog_freshness(entry)
+            if entry.suffix == ".plist":
+                self._check_watchdog_path(entry)
         else:
             self.warn(
                 "root.watchdog",
                 "no watchdog scheduler entry: nothing reaches a human while no "
                 "session is open",
                 "run helm watchdog install",
+            )
+
+    def _check_watchdog_path(self, entry: "object") -> None:
+        """Does the installed launchd entry carry a PATH?
+
+        launchd runs an entry without one under the bare system PATH, so a
+        tool the watchdog shells out to from Homebrew -- `gh`, for the
+        pull-request watch -- reads as not installed and that news reaches
+        nobody. Entries installed before the PATH was recorded need a reinstall.
+        """
+        try:
+            text = entry.read_text(encoding="utf-8")  # type: ignore[attr-defined]
+        except OSError:
+            return
+        if "<key>PATH</key>" not in text:
+            self.warn(
+                "root.watchdog.path",
+                "the watchdog entry has no PATH, so tools outside the system "
+                "directories (gh, for the pull-request watch) read as not installed",
+                "rerun helm watchdog install",
             )
 
     def _check_watchdog_freshness(self, entry: "object") -> None:
