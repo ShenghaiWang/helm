@@ -1937,11 +1937,38 @@ class AdoptDirtyBaseTests(HelmTestCase):
             self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
         self.assertEqual(self.state.load()["tasks"], {})
 
+    def _fail_half_way(self, root: Path):
+        """Restore part of the checkout, then fail, as a dying disk would."""
+        def half(_root, _captured):
+            (root / "results" / "row.csv").unlink()
+            self._run_git(root, "rm", "-q", "--cached", "staged.txt")
+            (root / "staged.txt").unlink()
+            self._run_git(root, "checkout", "HEAD", "--", "README.txt")
+            raise OSError("disk went away")
+        return half
+
+    def _recover_and_compare(self, root: Path, message: str) -> None:
+        from helm import git as helm_git
+        command = message.split("in, with: ", 1)[1]
+        subprocess.run(command, shell=True, check=True)
+        checkout_ref = next(
+            ref for ref in self._run_git(
+                root, "for-each-ref", "--format=%(refname)", "refs/helm/adopted"
+            ).split() if ref.endswith("/checkout")
+        )
+        self.assertEqual(
+            helm_git._working_state_tree(root),
+            self._run_git(root, "rev-parse", f"{checkout_ref}^{{tree}}"),
+        )
+        self.assertEqual((root / "README.txt").read_text(), "a result row the tool recorded\n")
+        self.assertFalse((root / "gone.txt").exists())
+        self.assertEqual((root / "results" / "row.csv").read_text(), "id,value\n1,2\n")
+        self.assertEqual((root / "staged.txt").read_text(), "staged and unchanged since\n")
+        self.assertEqual(self._run_git(root, "diff", "--cached", "--name-only"), "")
+
     def test_a_failure_mid_restore_names_where_the_changes_are(self) -> None:
         root, project = self._dirty_project("midrestore")
-        with mock.patch(
-            "helm.git._restore_adopted_paths", side_effect=OSError("disk went away")
-        ):
+        with mock.patch("helm.git._restore_adopted_paths", side_effect=self._fail_half_way(root)):
             with self.assertRaises(HelmError) as failed:
                 self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
         message = str(failed.exception)
@@ -1950,8 +1977,31 @@ class AdoptDirtyBaseTests(HelmTestCase):
         self.assertEqual(len(refs), 2)
         for ref in refs:
             self.assertIn(ref, message)
-        self.assertIn("| git -C", message)
         self.assertEqual(self.state.load()["tasks"], {})
+        # The printed command works on the half-restored checkout.
+        self._recover_and_compare(root, message)
+
+    def test_a_long_recovery_is_written_to_a_script(self) -> None:
+        root, project = self._dirty_project("longrecovery")
+        with mock.patch("helm.git._RECOVERY_INLINE_LIMIT", 10), mock.patch(
+            "helm.git._restore_adopted_paths", side_effect=self._fail_half_way(root)
+        ):
+            with self.assertRaises(HelmError) as failed:
+                self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        message = str(failed.exception)
+        self.assertRegex(message, r"in, with: sh .*helm-adopted-recover-[^/]+\.sh$")
+        self._recover_and_compare(root, message)
+
+    def test_shedding_keeps_both_refs_when_a_commit_does_not_resolve(self) -> None:
+        from helm import git as helm_git
+        root, project = self._dirty_project("unresolved")
+        task = self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        adopted = dict(self.state.load()["tasks"][task["id"]]["adopted_base_changes"])
+        adopted["checkout_commit"] = "0" * 40
+        kept = helm_git.shed_adopted_refs(root, adopted, ["--remotes", "HEAD", adopted["start_commit"]])
+        self.assertIn("no longer resolves", kept)
+        for ref in adopted["refs"]:
+            self.assertTrue(self._run_git(root, "rev-parse", "--verify", ref))
 
     def test_the_undo_survives_a_root_with_a_space_and_lists_what_was_staged(self) -> None:
         root = self.repo("with space")

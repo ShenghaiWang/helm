@@ -84,8 +84,10 @@ refuses, changing nothing, when something would be lost: a partly staged
 file, a conflict, a submodule, a sparse checkout, a skip-worktree or
 assume-unchanged path, a change to `.helm/`, a change that does not apply to
 the base, or a checkout that moved while it was being captured. If restoring
-the checkout fails part-way, the error names both refs and the restore
-command. It never uses `git stash`, whose one stack is shared with the user
+the checkout fails part-way, the error names both refs and a recovery
+command that works whatever state the checkout was left in. Refs left by a
+failed adoption belong to no task; once the changes are back, delete them by
+hand with `git update-ref -d <ref>`. It never uses `git stash`, whose one stack is shared with the user
 and every worktree. Root only.
 
 The refs are the task's own resources: `helm task cleanup` sheds them with

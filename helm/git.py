@@ -934,9 +934,50 @@ def restore_checkout_after_adoption(
             f"adopting the project checkout's changes did not finish: {exc}. Nothing "
             f"is lost -- they are kept at {ref_prefix}/checkout (the checkout's own "
             f"state) and {ref_prefix}/task (as the task's first commit), and no task "
-            "was recorded. Put them back with: "
-            f"{adoption_restore_command(root, captured)}"
+            "was recorded. Put them back, whatever state the checkout was left "
+            f"in, with: {_recovery_command(root, captured, f'{ref_prefix}/checkout')}"
         ) from exc
+
+
+#: Past this length the recovery command is written to a script under the
+#: repository's git directory and the error names the script instead.
+_RECOVERY_INLINE_LIMIT = 4000
+
+
+def _recovery_command(root: Path, captured: dict[str, Any], checkout_ref: str) -> str:
+    """A command that restores the captured state from any half-restored checkout.
+
+    `git apply` of the whole change needs the checkout back at HEAD and
+    rejects everything if one path has already moved. This instead sets each
+    adopted path directly: content from the anchored ref for every path the
+    capture holds, removal for every path it deleted, then unstages them all
+    so they come back as unstaged changes, like the ordinary undo.
+    """
+    captured_paths = set(_tree_entries(root, captured["tree"]))
+    present = [path for path in captured["paths"] if path in captured_paths]
+    deleted = [path for path in captured["paths"] if path not in captured_paths]
+    git = f"git -C {shlex.quote(str(root))} --literal-pathspecs"
+
+    def paths(items: list[str]) -> str:
+        return " ".join(shlex.quote(item) for item in items)
+
+    steps = []
+    if present:
+        steps.append(f"{git} checkout {shlex.quote(checkout_ref)} -- {paths(present)}")
+    if deleted:
+        steps.append(f"{git} rm -q --ignore-unmatch -- {paths(deleted)}")
+    steps.append(f"{git} reset -q -- {paths(list(captured['paths']))}")
+    command = " && ".join(steps)
+    if len(command) <= _RECOVERY_INLINE_LIMIT:
+        return command
+    # Named for the task the refs are under, so two failures never share one.
+    token = checkout_ref.rstrip("/").split("/")[-2]
+    located = _git(
+        root, "rev-parse", "--git-path", f"helm-adopted-recover-{token}.sh", check=False
+    )
+    script = Path(located) if Path(located).is_absolute() else root / located
+    script.write_text("#!/bin/sh\nset -e\n" + "\n".join(steps) + "\n", encoding="utf-8")
+    return f"sh {shlex.quote(str(script))}"
 
 
 def _restore_adopted_paths(root: Path, captured: dict[str, Any]) -> None:
@@ -980,15 +1021,24 @@ def shed_adopted_refs(root: Path, adopted: dict[str, Any], elsewhere: list[str])
     and the reason is returned. None once they are gone.
     """
     start = adopted.get("start_commit") or ""
-    if _git(root, "rev-parse", "--verify", "--quiet", f"{start}^{{commit}}", check=False):
-        only_here = _git(
-            root, "rev-list", "--count", start, "--not", *elsewhere, check=False
-        ).strip()
-        if only_here != "0":
+    for commit in (adopted.get("checkout_commit") or "", start):
+        if not commit or not _git(
+            root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False
+        ):
+            # Something already went wrong with this record; deleting on a
+            # guess could drop the last copy, so both refs stay.
             return (
-                f"the adopted changes' commit {start[:12]} is not on any remote or "
-                "the base branch, so its refs are kept"
+                f"the adopted commit {commit[:12] or '(unrecorded)'} no longer "
+                "resolves, so both refs are kept"
             )
+    only_here = _git(
+        root, "rev-list", "--count", start, "--not", *elsewhere, check=False
+    ).strip()
+    if only_here != "0":
+        return (
+            f"the adopted changes' commit {start[:12]} is not on any remote or "
+            "the base branch, so its refs are kept"
+        )
     for ref in adopted.get("refs") or []:
         if _git(root, "rev-parse", "--verify", "--quiet", ref, check=False):
             note = _delete_ref(root, ref)
