@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -210,3 +214,187 @@ class TurnsTests(HelmTestCase):
             self.assertEqual(record.get("returncode"), 0, record)
             self.coordinator.poll_worker(worker["id"])
             self.assertNotEqual(self.state.load()["workers"][worker["id"]]["status"], "running")
+
+    def _idle_turns_worker(self, name: str) -> tuple[dict, Path, Path]:
+        """A turns worker whose first turn has ended, with its runner then killed."""
+        self.write_preferences(execution={"turns": "on"})
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        task = self.coordinator.create_task(project["id"], "do the thing", agent="claude")
+        bin_dir = self._fake_claude()
+        worker = self.coordinator.launch_worker(task["id"], None, wait=False, agent="claude")
+        turns_dir = Path(worker["config_file"]).parent / "turns"
+        self._wait_for(turns_dir / "1.json")
+        self._wait_for(turns_dir / "runner.pid")
+        pid = int((turns_dir / "runner.pid").read_text().strip())
+        os.kill(pid, signal.SIGKILL)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                break
+        return worker, turns_dir, bin_dir
+
+    def test_an_answer_to_an_idle_lead_whose_runner_is_gone_starts_a_turn_and_says_so(self) -> None:
+        """The lost answer: reported as queued, while no turn would ever start.
+
+        `worker answer` printed "queued as the prompt of its next turn; the
+        runner starts it" for every turns delivery. Behind it, the runner's
+        liveness was read from a pid -- the record's, which `adopt_worker_pid`
+        fills with the first process naming the worker's state directory (a
+        `tail -f` of its log will do) -- so a dead runner read as alive and was
+        never restarted. A stop file left behind would have made a restarted
+        one exit before reading its queue anyway. The lead sat idle for two
+        hours on an answer it never received.
+        """
+        from helm import cli
+
+        bin_dir = Path(self.temp.name) / "bin"
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        with mock.patch.dict(os.environ, env):
+            worker, turns_dir, bin_dir = self._idle_turns_worker("lostanswer")
+            # The runner is dead; a live, unrelated process now answers to the
+            # pid on its record, and an old stop file sits in its directory.
+            bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+            self.addCleanup(bystander.wait)
+            self.addCleanup(bystander.kill)
+            with self.coordinator.store.locked() as data:
+                data["workers"][worker["id"]]["pid"] = bystander.pid
+            stop = turns_dir / "stop"
+            stop.write_text("old\n", encoding="utf-8")
+            stale = time.time() - 3600
+            os.utime(stop, (stale, stale))
+            adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+            self.assertFalse(
+                adapter.turns_runner_alive(worker["id"]),
+                "a live pid that is not the runner was read as the runner",
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cli.main([
+                    "--state-dir", str(self.state.directory),
+                    "worker", "answer", worker["id"], "--text", "carry on with step two",
+                ])
+            self.assertEqual(code, 0, out.getvalue())
+            self.assertIn("delivered: turn started by runner pid", out.getvalue())
+            self.assertNotIn("the runner starts it", out.getvalue())
+            self._wait_for(turns_dir / "2.json")
+            runs = [json.loads(line) for line in (bin_dir / "claude-args.log").read_text().splitlines()]
+            self.assertEqual(runs[-1][-1], "carry on with step two")
+            self.assertFalse(stop.exists(), "the stale stop was cleared, not obeyed")
+            self.coordinator.stop_turns(worker["id"])
+            self._wait_for(Path(worker["exit_file"]))
+
+    def test_an_answer_nothing_will_run_is_reported_as_not_started(self) -> None:
+        """A stop in progress means no turn will start; the reply says that, and fails."""
+        from helm import cli
+
+        bin_dir = Path(self.temp.name) / "bin"
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+        with mock.patch.dict(os.environ, env):
+            worker, turns_dir, _ = self._idle_turns_worker("strandedanswer")
+            self.coordinator.stop_turns(worker["id"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = cli.main([
+                    "--state-dir", str(self.state.directory),
+                    "worker", "answer", worker["id"], "--text", "are you there",
+                ])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("NOT started", out.getvalue())
+        self.assertIn("a stop is in progress", out.getvalue())
+        # Still recorded and still in its inbox: nothing was dropped, only not run.
+        self.assertTrue(self.coordinator.turn_entry_queued(
+            worker["id"],
+            json.loads((turns_dir / "next.json").read_text())[-1]["id"],
+        ))
+
+    def test_a_prompt_queued_while_the_runner_takes_the_queue_is_not_lost(self) -> None:
+        """The runner read the queue, then unlinked it; a prompt written between went with it."""
+        from helm import cli
+
+        root = self.repo("queuerace")
+        project = self.coordinator.register_project("Queuerace", str(root), project_id="queuerace")
+        task = self.coordinator.create_task(project["id"], "do the thing")
+        worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        turns_dir = self.coordinator.turns_dir(worker["id"])
+        self.coordinator.deliver_turn(worker["id"], "first")
+        state: dict = {"turn": 1, "history": []}
+        late: list[threading.Thread] = []
+        real_write = cli._write_private_text
+
+        def write_then_race(path, content):
+            # The moment between the runner's read and its unlink: another
+            # Helm command queues an answer exactly now.
+            if not late:
+                thread = threading.Thread(
+                    target=self.coordinator.deliver_turn, args=(worker["id"], "second")
+                )
+                late.append(thread)
+                thread.start()
+                time.sleep(0.3)
+            real_write(path, content)
+
+        with mock.patch.object(cli, "_write_private_text", side_effect=write_then_race):
+            taken = cli._take_turn_prompt(turns_dir, state, turns_dir / "state.json")
+        late[0].join(timeout=10)
+        self.assertEqual(taken, "first")
+        self.assertEqual(state["pending_prompt"], "first", "recorded before the queue went")
+        queued = json.loads((turns_dir / "next.json").read_text())
+        self.assertEqual([entry["text"] for entry in queued], ["second"])
+
+    def test_a_second_runner_for_the_same_worker_leaves_without_an_exit_record(self) -> None:
+        """A restart that races a live runner must not run turns beside it, or end the worker."""
+        from helm import cli
+        from helm.paths import hold_turns_runner_lock
+
+        turns_dir = Path(self.temp.name) / "dup-turns"
+        held = hold_turns_runner_lock(turns_dir)
+        self.assertIsNotNone(held)
+        try:
+            config = {
+                "turns_dir": str(turns_dir),
+                "initial_prompt": "go",
+                "turn_start": [sys.executable, "-c", "raise SystemExit(3)"],
+                "turn_resume": [],
+            }
+            with self.assertRaises(cli._RunnerAlreadyRunning):
+                cli._run_turns(config, self.temp.name, dict(os.environ), io.StringIO())
+            self.assertFalse((turns_dir / "1.json").exists())
+        finally:
+            os.close(held)
+
+    def test_concurrent_probes_of_a_dead_runner_both_read_it_dead(self) -> None:
+        """Two exclusive probes collided, and the loser read a dead runner as alive."""
+        import fcntl
+
+        from helm.paths import TURN_RUNNER_LOCK, hold_turns_runner_lock, turns_runner_lock_held
+
+        turns_dir = Path(self.temp.name) / "probe-turns"
+        # A runner ran once and is gone: the lock file is there, nobody holds it.
+        os.close(hold_turns_runner_lock(turns_dir))
+        # Another probe is mid-flight, holding the lock the way a probe does.
+        other = os.open(turns_dir / TURN_RUNNER_LOCK, os.O_RDWR)
+        try:
+            fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            self.assertIs(turns_runner_lock_held(turns_dir), False)
+            results: list = []
+            threads = [
+                threading.Thread(target=lambda: results.append(turns_runner_lock_held(turns_dir)))
+                for _ in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(results, [False] * 8)
+        finally:
+            os.close(other)
+        # A live runner still reads as alive.
+        held = hold_turns_runner_lock(turns_dir)
+        try:
+            self.assertIs(turns_runner_lock_held(turns_dir), True)
+        finally:
+            os.close(held)

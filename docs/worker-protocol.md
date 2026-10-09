@@ -140,8 +140,13 @@ starts the first turn with the brief, streams the turn's output into the
 Herdr tab and the log, and closes it with one line Helm's poll reads: the
 session id and the agent's final words, recorded as a summary status. Then
 it waits. An answer, review findings, a continuation, a routed request, a
-gate decision or an authorization is the prompt that opens the next turn —
-`helm worker answer` reports `turned` — and nothing is ever typed. A worker
+gate decision or an authorization is the prompt that opens the next turn,
+and nothing is ever typed. `helm worker answer` says what it saw happen to
+that prompt: a turn started by the runner (with its pid), queued behind the
+turn in progress, waiting on a live runner that has not taken it yet, or
+**NOT started** — no runner is running and none could be started — which
+exits non-zero, because the answer is then in the inbox with nobody coming
+to read it. A worker
 is told this in its context: to ask, push a `question` and end the turn;
 when the work is done, push `result` and end. It is also told that a
 background command does not outlive the turn and nothing re-invokes it when
@@ -151,9 +156,34 @@ by a job that had died with the turn, and sat idle until a human noticed.
 Their runtime's notice about the dropped job is not read as a failure by
 the health check.
 
-Liveness is a pid and an exit code. A runner the machine killed — sleep, an
-OOM — is started again by the next message or by the watchdog's healing,
-and resumes the same session where it stopped; the task does not fail.
+Liveness is the runner's lock and an exit code. Each runner holds an
+exclusive lock in its `turns/` directory for as long as it lives, so the
+kernel says whether it is alive — a recorded pid outlives its runner and can
+name an unrelated process — and a second runner for the same worker leaves
+without running a turn or writing an exit record. The queue of prompts is
+written and consumed under its own lock, and a prompt the runner takes is
+recorded as its `pending_prompt` before it leaves the queue. A runner the
+machine killed — sleep, an OOM — is started again by the next message or by
+the watchdog's healing, and resumes the same session where it stopped; the
+task does not fail. A stop file older than twice the stop grace beside a worker
+still recorded running is stale and is cleared by that restart, rather
+than making the new runner exit before it reads its queue.
+
+A worker or reviewer that dies — it exits non-zero without reporting, its
+recorded process is gone, or healing settles it as provably gone — reports
+nothing, so Helm tells the task lead that started it: one message, through
+the same path as an answer, naming the worker, its role, its task and the
+exit (or that it left no exit record). A worker whose pane vanished with no
+recorded pid to prove the process gone is not called dead: its lead is told
+it is unreachable and to check before relaunching. The message is recorded
+on the lead under the state lock before it is delivered, and each delivery
+attempt is claimed there too, so no attempt is sent twice. An attempt that
+reaches nobody is retried by the next pass with the same inbox note and the
+same queued prompt; after five, `helm pending` names the lead that was never
+told until it reads its inbox. A deliberate stop is not a death; a lead that
+is itself gone, a lead that did not start the work, and another project's
+lead are never told.
+
 Stopping a worker lets the turn in progress end, then exits the runner.
 A worker's own terminal report is part of such a turn, so the release it
 triggers only asks the runner to stop: the runner exits once that turn is

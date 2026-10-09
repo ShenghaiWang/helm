@@ -1365,6 +1365,8 @@ class Coordinator(
         task: dict[str, Any],
         worker: dict[str, Any],
         exit_code: int | None,
+        *,
+        exit_recorded: bool = True,
     ) -> str | None:
         """Fold one process-exit observation into the lifecycle. Under lock.
 
@@ -1402,6 +1404,10 @@ class Coordinator(
                 "its session ended before the authorization was used",
             )
             return held
+        # Whether a return code was actually observed: the lifecycle settles a
+        # missing one as 1, but a lead told "exit 1" about a session that left
+        # no record at all is told something nobody saw.
+        observed = exit_code if exit_recorded else None
         exit_code = 1 if exit_code is None else exit_code
         worker["outcome_source"] = "process"
         worker["process_settled"] = True
@@ -1414,6 +1420,15 @@ class Coordinator(
                 data, project, task, worker, "failure",
                 f"Worker exited with code {exit_code}",
                 {"exit_code": exit_code, "source": "process-fallback"},
+            )
+            self._note_worker_death(
+                worker,
+                (
+                    f"its session exited with code {observed} without reporting"
+                    if observed is not None
+                    else "its session is gone with no exit record and no report"
+                ),
+                observed,
             )
             self._abandon_open_hold(
                 data, project, task, f"its session exited with code {exit_code}"
@@ -1443,6 +1458,9 @@ class Coordinator(
                 "over and nothing is listening for an answer. The blocker still "
                 "stands: a new driver has to pick it up.",
                 {"exit_code": exit_code, "source": "process-fallback"},
+            )
+            self._note_worker_death(
+                worker, "its session ended while its task was blocked", observed
             )
         elif task["status"] in {"created", "allocated", "running"}:
             task["status"] = "completed"
@@ -1537,6 +1555,7 @@ class Coordinator(
                 worker["processed_lines"] = len(lines)
 
                 finished = False
+                exit_unrecorded = False
                 exit_code: int | None = self._read_exit_record(worker)
                 if exit_code is not None:
                     finished = True
@@ -1561,6 +1580,7 @@ class Coordinator(
                         exit_code = recorded
                     else:
                         exit_code = 1
+                        exit_unrecorded = True
                         if self.terminal_protocol_outcome(worker) is None:
                             # No completion record and no word from the worker: the
                             # runner died. With a terminal outcome this is only
@@ -1578,7 +1598,8 @@ class Coordinator(
                             )
                 if finished:
                     resolved = self._apply_process_exit(
-                        data, project, task, worker, exit_code
+                        data, project, task, worker, exit_code,
+                        exit_recorded=not exit_unrecorded,
                     )
                     if resolved:
                         events.append(self._hold_resolved_event(task, worker, resolved))

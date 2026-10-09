@@ -103,3 +103,93 @@ def package_parent() -> Path:
 
     return canonical(Path(helm.__file__).resolve().parent.parent)
 
+
+
+#: The two files that make a turns worker's queue and runner safe to share
+#: between processes. The queue (`next.json`) is written by whichever Helm
+#: command has something to say and consumed by the runner; the runner lock is
+#: held by the one runner alive for that worker, for as long as it lives.
+TURN_QUEUE_LOCK = "queue.lock"
+TURN_RUNNER_LOCK = "runner.lock"
+
+
+@contextlib.contextmanager
+def turn_queue_lock(turns_dir: Path):
+    """Hold the exclusive lock on one turns worker's prompt queue.
+
+    `next.json` is appended to by a read-modify-write and consumed by a
+    read-then-unlink. Unlocked, a prompt written between the runner's read and
+    its unlink is deleted unread -- and the sender has already been told it is
+    queued. Both sides take this lock, so a prompt is either in the read the
+    runner acts on or still in the file afterwards.
+    """
+    import fcntl
+
+    turns_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(turns_dir / TURN_QUEUE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def hold_turns_runner_lock(turns_dir: Path) -> int | None:
+    """Take the runner lock for life; the open fd, or None when a runner holds it.
+
+    The lock, not a pid, is what says a runner is alive: the kernel releases it
+    the instant the process ends, however it ends, and no other process can be
+    mistaken for it -- where a recorded pid outlives its runner and can name
+    whatever the system hands that number to next. It also makes a second
+    runner for the same worker refuse to start rather than run turns beside
+    the first.
+    """
+    import fcntl
+    import time
+
+    turns_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(turns_dir / TURN_RUNNER_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    # A few tries, because `turns_runner_lock_held` probes by taking the lock
+    # for an instant: a runner starting in that instant must not read the
+    # probe as a rival and leave.
+    for _attempt in range(20):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            time.sleep(0.05)
+    os.close(fd)
+    return None
+
+
+def turns_runner_lock_held(turns_dir: Path) -> bool | None:
+    """Whether a live runner holds this worker's runner lock.
+
+    None when there is no lock file at all -- a runner from before the lock
+    existed, or none ever started -- so the caller can fall back to what it
+    knew before rather than read "no evidence" as "dead".
+    """
+    import fcntl
+
+    path = turns_dir / TURN_RUNNER_LOCK
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        # Shared, not exclusive. Only the runner takes the lock exclusively,
+        # so a shared probe fails exactly when a runner holds it. Two
+        # exclusive probes at once collided, and the loser read "a runner is
+        # alive" about a runner that was dead -- so nothing restarted it.
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..paths import _write_private_text, _private_dir
+from ..paths import _write_private_text, _private_dir, turn_queue_lock, turns_runner_lock_held
 from ..processes import _process_parents, _scan_worker_pid
 from ..values import _safe_text, new_id, now
 from .. import costs
@@ -100,20 +100,55 @@ class WorkersMixin:
         same whichever way the worker runs; the queue is what starts the
         turn. Several messages arriving between turns are delivered
         together, in order, as one prompt.
+
+        Written under the same lock the runner holds while it consumes the
+        queue: appended unlocked, a prompt written between the runner's read
+        and its unlink was deleted unread.
+        """
+        self.queue_turn_prompt(worker_id, text, kind=kind)
+        return self.turns_dir(worker_id) / "next.json"
+
+    def queue_turn_prompt(self, worker_id: str, text: str, *, kind: str = "note") -> str:
+        """`deliver_turn`, returning the id of the entry it queued.
+
+        The id is what lets a caller say afterwards whether the runner took
+        this prompt, rather than assuming it from having written it.
         """
         directory = self.turns_dir(worker_id)
         _private_dir(directory.parent)
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
         path = directory / "next.json"
-        queued: list[dict[str, Any]] = []
-        with contextlib.suppress(OSError, ValueError):
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, list):
-                queued = loaded
-        queued.append({"text": _safe_text(text), "kind": kind, "at": now()})
-        _write_private_text(path, json.dumps(queued) + "\n")
-        return path
+        entry_id = new_id("q")
+        with turn_queue_lock(directory):
+            queued: list[dict[str, Any]] = []
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    queued = loaded
+            queued.append({"id": entry_id, "text": _safe_text(text), "kind": kind, "at": now()})
+            _write_private_text(path, json.dumps(queued) + "\n")
+        return entry_id
+
+    def turn_entry_queued(self, worker_id: str, entry_id: str) -> bool:
+        """Whether a prompt `deliver_turn` queued is still waiting in the queue.
+
+        False once the runner has taken it -- which it does in the same locked
+        step that records it as the prompt of the turn it is starting.
+        """
+        directory = self.turns_dir(worker_id)
+        path = directory / "next.json"
+        if not path.exists():
+            return False
+        with turn_queue_lock(directory):
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    return any(
+                        isinstance(entry, dict) and entry.get("id") == entry_id
+                        for entry in loaded
+                    )
+        return False
 
     def queued_turn_queued_at(self, worker_id: str) -> float:
         """When the waiting prompt was queued, as an epoch float, or 0.
@@ -210,9 +245,17 @@ class WorkersMixin:
         self.stop_turns(worker["id"])
         if self.inside_own_turn(worker):
             return
+        # Recorded for the caller, which signals this pid if the grace runs
+        # out; the wait itself asks the runner's lock, which a pid cannot
+        # answer reliably once its runner is gone.
         pid = self._runner_pid(worker)
+        turns_dir = self.turns_dir(worker["id"])
         deadline = time.monotonic() + self.TURN_STOP_GRACE_SECONDS
-        while pid and self._pid_alive(pid) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            held = turns_runner_lock_held(turns_dir)
+            alive = held if held is not None else bool(pid) and self._pid_alive(pid)
+            if not alive:
+                break
             time.sleep(0.2)
 
     def turn_state(self, worker_id: str) -> dict[str, Any]:
@@ -542,6 +585,12 @@ class WorkersMixin:
             worker["signalled"] = signalled
             return worker
         detail = _safe_text(reason).strip() or "stopped by the coordinator"
+        # A stop is somebody's decision, not a death: whoever asked for it
+        # knows already, so the settlement it leads to wakes no lead.
+        with self.store.locked() as live:
+            current = live.get("workers", {}).get(worker_id)
+            if current is not None and not current.get("stop_requested_at"):
+                current["stop_requested_at"] = now()
         self._let_turns_finish(worker)
         # A provider-launched worker never had its pid recorded, so this used
         # to signal nothing and "stopped" meant only that the record changed --
@@ -784,4 +833,276 @@ class WorkersMixin:
                 else f"External worker lost: {detail}"
             )
             self._message(data, project, task, worker, "failure", headline, {"stop_kind": kind})
+            if kind == "lost":
+                # A pane that is gone is not a process that is gone. Only a
+                # recorded pid that is dead proves a death; without one this
+                # is the historic false death, and the lead is told it cannot
+                # be confirmed rather than told to relaunch over a live agent.
+                pid = worker.get("pid")
+                if pid and not self._pid_alive(pid):
+                    self._note_worker_death(
+                        worker, f"its session disappeared and its process (pid {pid}) is gone"
+                    )
+                else:
+                    self._note_worker_death(
+                        worker,
+                        "its pane is gone and Helm cannot confirm the process; "
+                        "check before relaunching",
+                        kind="unreachable",
+                    )
             return worker
+
+    @staticmethod
+    def _note_worker_death(
+        worker: dict[str, Any],
+        detail: str,
+        exit_code: int | None = None,
+        *,
+        kind: str = "died",
+    ) -> None:
+        """Mark a settlement as a death the worker's lead has to hear about. Under lock.
+
+        A worker that dies reports nothing, and its lead -- between turns,
+        waiting for that report -- was never told: it sat idle until a human
+        noticed, two and a half hours once. The mark is what
+        `claim_death_notices` turns into one message. A deliberate stop is not
+        a death; whoever stopped it already knows. `kind` is `died` when the
+        process is known to be gone and `unreachable` when only its surface
+        is, which the message says in so many words.
+        """
+        if worker.get("death") or worker.get("stop_requested_at"):
+            return
+        worker["death"] = {
+            "at": now(),
+            "kind": kind,
+            "detail": _safe_text(detail)[:400],
+            "exit_code": exit_code,
+        }
+
+    def record_worker_death(self, worker_id: str, detail: str) -> None:
+        """Mark a settled worker as dead even though a stop settled it.
+
+        For the watch's healing, which settles a provably dead worker by
+        stopping it: the stop is bookkeeping there, not anybody's decision,
+        and the lead that started the worker still has to be told.
+        """
+        with self.store.locked() as data:
+            worker = data.get("workers", {}).get(worker_id)
+            if worker is None or worker.get("status") == "running" or worker.get("death"):
+                return
+            worker["death"] = {
+                "at": now(), "kind": "died", "detail": _safe_text(detail)[:400], "exit_code": None,
+            }
+
+    #: How many passes try to reach a lead about one death before Helm stops
+    #: trying and says so in `pending` instead.
+    DEATH_NOTICE_ATTEMPTS = 5
+    #: A claim older than this was taken by a pass that never finished it --
+    #: killed mid-delivery -- and the next pass may take it over.
+    DEATH_NOTICE_CLAIM_SECONDS = 120.0
+
+    def claim_death_notices(self, worker_id: str | None = None) -> list[dict[str, Any]]:
+        """Claim the message each newly dead worker owes the lead that started it.
+
+        Under the state lock, so concurrent passes -- a watch, `pending`, the
+        watchdog -- never deliver the same attempt twice. The first claim
+        records the message on the lead as an answer before anything is
+        delivered, so the lead's inbox and the record say the same thing
+        whatever delivery then manages; a retry reuses that record. A delivery
+        that reaches nobody is retried by the next pass, up to
+        `DEATH_NOTICE_ATTEMPTS`, and then left as an `undelivered` notice that
+        `pending` names. Only the lead that started the work is told: never a
+        guessed lead, never another project's, never a lead that is itself
+        gone (the replacement Helm appoints reads the record), and never
+        anybody about a lead's own death, which healing handles by replacing
+        it.
+        """
+        claimed: list[dict[str, Any]] = []
+        moment = _dt.datetime.now(_dt.timezone.utc).timestamp()
+
+        def claim_live(death: dict[str, Any]) -> bool:
+            claim = death.get("claim")
+            if not isinstance(claim, dict):
+                return False
+            return moment - float(claim.get("epoch") or 0) < self.DEATH_NOTICE_CLAIM_SECONDS
+
+        def owed(worker: dict[str, Any] | None) -> bool:
+            death = (worker or {}).get("death")
+            return (
+                isinstance(death, dict) and not death.get("notice")
+                and not claim_live(death)
+                and (worker or {}).get("status") != "running"
+            )
+
+        # Looked for first without the lock: this runs on every `pending`, and
+        # taking the lock re-reads the whole state document to find nothing.
+        seen = self.store.load().get("workers", {})
+        if worker_id is not None:
+            if not owed(seen.get(worker_id)):
+                return claimed
+        elif not any(owed(worker) for worker in seen.values()):
+            return claimed
+        with self.store.locked() as data:
+            workers = data.get("workers", {})
+            candidates = (
+                [workers.get(worker_id)] if worker_id is not None else list(workers.values())
+            )
+            for worker in candidates:
+                if not owed(worker):
+                    continue
+                death = worker["death"]
+                task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+                role = task.get("role") or "worker"
+                if death.get("lead"):
+                    # A retry: the lead was named on the first claim and the
+                    # message is already on its record. It must still be live.
+                    lead_record = workers.get(death["lead"]) or {}
+                    if lead_record.get("status") != "running":
+                        death["notice"] = {
+                            "at": now(), "lead": None,
+                            "skipped": "its task lead was gone before it could be told",
+                        }
+                        continue
+                else:
+                    lead, how = (None, "none")
+                    if role != "foreman" and task:
+                        lead, how = self.driver_resolution(str(task["id"]), data=data)
+                    lead_record = workers.get((lead or {}).get("id") or "") or {}
+                    if (
+                        role == "foreman"
+                        or lead is None
+                        or how in {"project", "none"}
+                        or lead_record.get("id") == worker.get("id")
+                        or lead_record.get("status") != "running"
+                        or lead_record.get("project_id") != worker.get("project_id")
+                    ):
+                        death["notice"] = {
+                            "at": now(),
+                            "lead": None,
+                            "skipped": (
+                                "a task lead's death is handled by replacing it"
+                                if role == "foreman"
+                                else "no live task lead started this work"
+                            ),
+                        }
+                        continue
+                    death["lead"] = lead_record["id"]
+                    death["text"] = self._death_notice_text(worker, task, role, death)
+                    project = self._project(data, worker["project_id"])
+                    lead_task = data.get("tasks", {}).get(lead_record.get("task_id")) or None
+                    message = self._message(
+                        data, project, lead_task, lead_record, "answer", death["text"],
+                        {"via": "death-notice", "worker_id": worker["id"], "task_id": task.get("id")},
+                    )
+                    death["answer_id"] = message["id"]
+                death["claim"] = {"at": now(), "epoch": moment}
+                claimed.append({
+                    "worker_id": worker["id"],
+                    "lead_id": death["lead"],
+                    "task_id": task.get("id"),
+                    "project_id": worker.get("project_id"),
+                    "role": role,
+                    "kind": death.get("kind") or "died",
+                    "text": death["text"],
+                    "answer_id": death.get("answer_id"),
+                    "entry": death.get("entry"),
+                    "attempt": int(death.get("attempts") or 0) + 1,
+                })
+        return claimed
+
+    @staticmethod
+    def _death_notice_text(
+        worker: dict[str, Any], task: dict[str, Any], role: str, death: dict[str, Any]
+    ) -> str:
+        task_id = task.get("id")
+        if death.get("kind") == "unreachable":
+            return (
+                f"WORKER UNREACHABLE -- from Helm: {role} {worker['id']} on task {task_id} "
+                "is unreachable: its pane is gone and Helm cannot confirm the process; "
+                f"check before relaunching. Read `helm inspect {task_id}` and its log "
+                "first -- it may still be working and may still report."
+            )
+        exit_code = death.get("exit_code")
+        exit_words = f" (exit {exit_code})" if exit_code is not None else ""
+        if role == "reviewer" and task.get("reviews"):
+            next_step = (
+                f"Its review of {task['reviews']} did not finish: run `helm "
+                f"review {task['reviews']}` again, or escalate."
+            )
+        else:
+            next_step = (
+                f"Read `helm inspect {task_id}` and its log, then relaunch "
+                "the work or escalate."
+            )
+        return (
+            f"WORKER DIED -- from Helm: {role} {worker['id']} on task {task_id} "
+            f"died{exit_words}: {death.get('detail')}. It will not report, so "
+            f"nothing else will tell you. {next_step}"
+        )
+
+    def record_death_notice(
+        self, worker_id: str, outcome: str, *, entry: str | None = None
+    ) -> dict[str, Any]:
+        """Settle one delivery attempt of a death notice; the notice state after it.
+
+        Reached: the notice is `delivered` and done. Not reached: the claim is
+        released so the next pass tries again, or, once the attempts are
+        spent, the notice is `undelivered` and `pending` names the lead that
+        was never told. `entry` is the queued turn prompt an attempt left for
+        a turns lead, which a retry reuses rather than queueing it twice.
+        """
+        with self.store.locked() as data:
+            worker = data.get("workers", {}).get(worker_id) or {}
+            death = worker.get("death")
+            if not isinstance(death, dict):
+                return {}
+            death.pop("claim", None)
+            if entry:
+                death["entry"] = entry
+            if outcome:
+                death["notice"] = {
+                    "at": now(), "lead": death.get("lead"), "state": "delivered",
+                    "outcome": _safe_text(outcome)[:200],
+                }
+                return dict(death["notice"])
+            death["attempts"] = int(death.get("attempts") or 0) + 1
+            if death["attempts"] >= self.DEATH_NOTICE_ATTEMPTS:
+                death["notice"] = {
+                    "at": now(), "lead": death.get("lead"), "state": "undelivered",
+                    "attempts": death["attempts"],
+                }
+                return dict(death["notice"])
+            return {"state": "retry", "attempts": death["attempts"]}
+
+    def untold_deaths(self) -> list[dict[str, Any]]:
+        """Deaths whose lead was never reached, while that lead runs and has not read it.
+
+        The `pending` line for a notice every attempt failed to deliver. It
+        clears itself once the lead reads its inbox -- the note is the same
+        message -- or once the lead is gone, whose replacement reads the record.
+        """
+        data = self.store.load()
+        workers = data.get("workers", {})
+        found: list[dict[str, Any]] = []
+        for worker in workers.values():
+            death = worker.get("death")
+            notice = (death or {}).get("notice") if isinstance(death, dict) else None
+            if not isinstance(notice, dict) or notice.get("state") != "undelivered":
+                continue
+            lead = workers.get(notice.get("lead") or "") or {}
+            if lead.get("status") != "running":
+                continue
+            unread = {note.get("id") for note in self.inbox_notes(lead["id"])}
+            if death.get("answer_id") not in unread:
+                continue
+            task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+            found.append({
+                "worker_id": worker["id"],
+                "project_id": worker.get("project_id"),
+                "lead_id": lead["id"],
+                "role": task.get("role") or "worker",
+                "kind": death.get("kind") or "died",
+                "attempts": notice.get("attempts"),
+                "at": notice.get("at"),
+            })
+        return found
