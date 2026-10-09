@@ -249,6 +249,16 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
             current[entry["worker_id"]] = first
     with _quiet():
         memory.write_text(json.dumps(current), encoding="utf-8")
+    # A worker that died and was settled anywhere -- here, by a poll, by a
+    # lost pane -- tells the lead that started it, once.
+    with _quiet():
+        from .herdr import HerdrAdapter
+
+        for notice in HerdrAdapter(coordinator).wake_leads_for_deaths():
+            reports.append(
+                f"helm watchdog: {notice['project_id']} {notice['role']} "
+                f"{notice['worker_id']} died; told its task lead {notice['lead_id']}"
+            )
     # An authorization only the asking session can spend, and that session
     # is gone -- settled above, or ended some other way. Left open, the task
     # sat in approval-needed and the commander saw it as waiting on them.

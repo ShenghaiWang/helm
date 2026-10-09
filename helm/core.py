@@ -1415,6 +1415,9 @@ class Coordinator(
                 f"Worker exited with code {exit_code}",
                 {"exit_code": exit_code, "source": "process-fallback"},
             )
+            self._note_worker_death(
+                worker, f"its session exited with code {exit_code} without reporting", exit_code
+            )
             self._abandon_open_hold(
                 data, project, task, f"its session exited with code {exit_code}"
             )
@@ -1443,6 +1446,9 @@ class Coordinator(
                 "over and nothing is listening for an answer. The blocker still "
                 "stands: a new driver has to pick it up.",
                 {"exit_code": exit_code, "source": "process-fallback"},
+            )
+            self._note_worker_death(
+                worker, "its session ended while its task was blocked", exit_code
             )
         elif task["status"] in {"created", "allocated", "running"}:
             task["status"] = "completed"

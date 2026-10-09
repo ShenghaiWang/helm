@@ -577,6 +577,12 @@ class WorkersMixin:
             worker["signalled"] = signalled
             return worker
         detail = _safe_text(reason).strip() or "stopped by the coordinator"
+        # A stop is somebody's decision, not a death: whoever asked for it
+        # knows already, so the settlement it leads to wakes no lead.
+        with self.store.locked() as live:
+            current = live.get("workers", {}).get(worker_id)
+            if current is not None and not current.get("stop_requested_at"):
+                current["stop_requested_at"] = now()
         self._let_turns_finish(worker)
         # A provider-launched worker never had its pid recorded, so this used
         # to signal nothing and "stopped" meant only that the record changed --
@@ -819,4 +825,145 @@ class WorkersMixin:
                 else f"External worker lost: {detail}"
             )
             self._message(data, project, task, worker, "failure", headline, {"stop_kind": kind})
+            if kind == "lost":
+                self._note_worker_death(worker, f"its session disappeared: {detail}")
             return worker
+
+    @staticmethod
+    def _note_worker_death(
+        worker: dict[str, Any], detail: str, exit_code: int | None = None
+    ) -> None:
+        """Mark a settlement as a death the worker's lead has to hear about. Under lock.
+
+        A worker that dies reports nothing, and its lead -- between turns,
+        waiting for that report -- was never told: it sat idle until a human
+        noticed, two and a half hours once. The mark is what
+        `claim_death_notices` turns into exactly one message. A deliberate
+        stop is not a death; whoever stopped it already knows.
+        """
+        if worker.get("death") or worker.get("stop_requested_at"):
+            return
+        worker["death"] = {
+            "at": now(),
+            "detail": _safe_text(detail)[:400],
+            "exit_code": exit_code,
+        }
+
+    def record_worker_death(self, worker_id: str, detail: str) -> None:
+        """Mark a settled worker as dead even though a stop settled it.
+
+        For the watch's healing, which settles a provably dead worker by
+        stopping it: the stop is bookkeeping there, not anybody's decision,
+        and the lead that started the worker still has to be told.
+        """
+        with self.store.locked() as data:
+            worker = data.get("workers", {}).get(worker_id)
+            if worker is None or worker.get("status") == "running" or worker.get("death"):
+                return
+            worker["death"] = {"at": now(), "detail": _safe_text(detail)[:400], "exit_code": None}
+
+    def claim_death_notices(self, worker_id: str | None = None) -> list[dict[str, Any]]:
+        """Claim, once, the message each newly dead worker owes the lead that started it.
+
+        Under the state lock, so concurrent passes -- a watch, `pending`, the
+        watchdog -- claim each death once between them. The claim records the
+        message on the lead as an answer before anything is delivered, so the
+        lead's inbox and the record say the same thing whatever delivery then
+        manages. Only the lead that started the work is told: never a guessed
+        lead, never another project's, never a lead that is itself gone (the
+        replacement Helm appoints reads the record), and never anybody about a
+        lead's own death, which healing handles by replacing it.
+        """
+        claimed: list[dict[str, Any]] = []
+
+        def owed(worker: dict[str, Any] | None) -> bool:
+            death = (worker or {}).get("death")
+            return (
+                isinstance(death, dict) and not death.get("notice")
+                and (worker or {}).get("status") != "running"
+            )
+
+        # Looked for first without the lock: this runs on every `pending`, and
+        # taking the lock re-reads the whole state document to find nothing.
+        seen = self.store.load().get("workers", {})
+        if worker_id is not None:
+            if not owed(seen.get(worker_id)):
+                return claimed
+        elif not any(owed(worker) for worker in seen.values()):
+            return claimed
+        with self.store.locked() as data:
+            workers = data.get("workers", {})
+            candidates = (
+                [workers.get(worker_id)] if worker_id is not None else list(workers.values())
+            )
+            for worker in candidates:
+                if not owed(worker):
+                    continue
+                death = worker["death"]
+                task = data.get("tasks", {}).get(worker.get("task_id")) or {}
+                role = task.get("role") or "worker"
+                lead, how = (None, "none")
+                if role != "foreman" and task:
+                    lead, how = self.driver_resolution(str(task["id"]), data=data)
+                lead_record = workers.get((lead or {}).get("id") or "") or {}
+                if (
+                    role == "foreman"
+                    or lead is None
+                    or how in {"project", "none"}
+                    or lead_record.get("id") == worker.get("id")
+                    or lead_record.get("status") != "running"
+                    or lead_record.get("project_id") != worker.get("project_id")
+                ):
+                    death["notice"] = {
+                        "at": now(),
+                        "lead": None,
+                        "skipped": (
+                            "a task lead's death is handled by replacing it"
+                            if role == "foreman"
+                            else "no live task lead started this work"
+                        ),
+                    }
+                    continue
+                task_id = task["id"]
+                exit_code = death.get("exit_code")
+                exit_words = f" (exit {exit_code})" if exit_code is not None else ""
+                if role == "reviewer" and task.get("reviews"):
+                    next_step = (
+                        f"Its review of {task['reviews']} did not finish: run `helm "
+                        f"review {task['reviews']}` again, or escalate."
+                    )
+                else:
+                    next_step = (
+                        f"Read `helm inspect {task_id}` and its log, then relaunch "
+                        "the work or escalate."
+                    )
+                text = (
+                    f"WORKER DIED -- from Helm: {role} {worker['id']} on task {task_id} "
+                    f"died{exit_words}: {death.get('detail')}. It will not report, so "
+                    f"nothing else will tell you. {next_step}"
+                )
+                project = self._project(data, worker["project_id"])
+                lead_task = data.get("tasks", {}).get(lead_record.get("task_id")) or None
+                self._message(
+                    data, project, lead_task, lead_record, "answer", text,
+                    {"via": "death-notice", "worker_id": worker["id"], "task_id": task_id},
+                )
+                death["notice"] = {"at": now(), "lead": lead_record["id"], "state": "claimed"}
+                claimed.append({
+                    "worker_id": worker["id"],
+                    "lead_id": lead_record["id"],
+                    "task_id": task_id,
+                    "project_id": worker.get("project_id"),
+                    "role": role,
+                    "text": text,
+                })
+        return claimed
+
+    def record_death_notice(self, worker_id: str, outcome: str) -> None:
+        """Say on the dead worker's record how its lead was reached."""
+        with self.store.locked() as data:
+            worker = data.get("workers", {}).get(worker_id) or {}
+            notice = (worker.get("death") or {}).get("notice")
+            if isinstance(notice, dict):
+                notice["state"] = "delivered" if outcome else "recorded"
+                notice["outcome"] = _safe_text(outcome or "not reached; in its inbox")[:200]

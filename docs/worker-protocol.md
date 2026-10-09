@@ -168,6 +168,15 @@ the watchdog's healing, and resumes the same session where it stopped; the
 task does not fail. A stop file older than the stop grace beside a worker
 still recorded running is stale and is cleared by that restart, rather
 than making the new runner exit before it reads its queue.
+
+A worker or reviewer that dies — it exits non-zero without reporting, its
+session disappears, or healing settles it as provably gone — reports
+nothing, so Helm tells the task lead that started it: one message, through
+the same path as an answer, naming the worker, its role, its task and the
+exit. It is claimed under the state lock and recorded on the lead before it
+is delivered, so it is sent once however many passes see the death. A
+deliberate stop is not a death; a lead that is itself gone, a lead that did
+not start the work, and another project's lead are never told.
 Stopping a worker lets the turn in progress end, then exits the runner.
 A worker's own terminal report is part of such a turn, so the release it
 triggers only asks the runner to stop: the runner exits once that turn is

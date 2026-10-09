@@ -2120,6 +2120,28 @@ class HerdrAdapter:
             return bool(self.answer_worker(foreman["id"], text))
         return False
 
+    def wake_leads_for_deaths(self, worker_id: str | None = None) -> list[dict[str, Any]]:
+        """Tell the lead that started each newly dead worker, once.
+
+        A dead worker pushes nothing, so the report-driven wake in
+        `notify_foreman` never fires for it, and a turns lead between turns
+        has nothing else to start one. Each death is claimed under the state
+        lock (`claim_death_notices`) before it is delivered, so concurrent
+        passes tell a lead once between them, and delivery takes the same path
+        an answer does: the inbox note, and for a turns lead its next turn.
+        """
+        told: list[dict[str, Any]] = []
+        for notice in self.coordinator.claim_death_notices(worker_id):
+            outcome = ""
+            with contextlib.suppress(HelmError, SafetyError, HerdrUnavailable, OSError):
+                outcome = self.answer_worker(notice["lead_id"], notice["text"])
+            with contextlib.suppress(HelmError, OSError):
+                self.coordinator.record_death_notice(
+                    notice["worker_id"], outcome and self.last_wake_outcome
+                )
+            told.append({**notice, "outcome": outcome and self.last_wake_outcome})
+        return told
+
     def _route_to_project_pane(self, notice: dict[str, Any]) -> bool:
         """Print a notice into the project's own overview pane.
 
@@ -4119,6 +4141,11 @@ class HerdrAdapter:
                 )
             elif alive is False:
                 worker = self.coordinator.mark_worker_orphaned(worker_id)
+        death = worker.get("death")
+        if worker.get("status") != "running" and isinstance(death, dict) and not death.get("notice"):
+            # It died without a word: tell the lead that started it, once.
+            with contextlib.suppress(HelmError, SafetyError, OSError):
+                self.wake_leads_for_deaths(worker_id)
         if worker.get("execution") == "herdr":
             self._route_messages(worker)
             # A worker's final push happens while it is still running, so the

@@ -3207,6 +3207,18 @@ def _heal_dead_worker(coordinator: Coordinator, entry: dict[str, Any]) -> str | 
             ),
         )
         if not was_foreman:
+            # Settled by a stop, but nobody decided this one: it died. The
+            # lead that started it is waiting on a report that cannot come.
+            coordinator.record_worker_death(
+                worker_id, "its process is gone with no exit record"
+            )
+            told = HerdrAdapter(coordinator).wake_leads_for_deaths(worker_id)
+            if told:
+                return (
+                    f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead worker "
+                    f"{worker_id} stopped and its task lead {told[0]['lead_id']} told, "
+                    "so it can relaunch the work or escalate"
+                )
             return (
                 f"{_glyph_for(coordinator, project_id)} {project_id} healed: dead worker "
                 f"{worker_id} stopped so its task can be reopened or retried"
@@ -5048,6 +5060,12 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
                 continue
             with contextlib.suppress(HelmError, OSError):
                 coordinator.poll_worker(entry["id"])
+    # A worker that died just now -- settled above or anywhere else -- tells
+    # the lead that started it, once. It reported nothing, so nothing else
+    # would, and a lead between turns waits on that report forever.
+    with contextlib.suppress(HelmError, SafetyError, OSError), \
+            contextlib.redirect_stdout(io.StringIO()):
+        HerdrAdapter(coordinator).wake_leads_for_deaths()
     # `--changes` is the loop a session's monitor runs every few seconds, so
     # it is the beat the PR watch rides on when no watchdog is installed. The
     # watch bounds itself to one read per PR per interval and delivers to
@@ -5387,6 +5405,13 @@ def _cmd_ack(ctx: _Context, args: argparse.Namespace) -> int | None:
 def _cmd_watch(ctx: _Context, args: argparse.Namespace) -> int | None:
     coordinator = ctx.coordinator
     report = coordinator.sweep_workers(silence_seconds=args.silence)
+    with contextlib.suppress(HelmError, SafetyError, OSError):
+        for notice in HerdrAdapter(coordinator).wake_leads_for_deaths():
+            print(
+                f"{_glyph_for(coordinator, notice['project_id'])} {notice['project_id']} "
+                f"{notice['role']} {notice['worker_id']} died; told its task lead "
+                f"{notice['lead_id']} [{notice['outcome'] or 'in its inbox only'}]"
+            )
     # A merged PR used to age as pr-open until somebody ran pr-sync
     # by hand. Read the remote here, at most once per task per
     # interval, and say what moved; a remote that cannot be reached

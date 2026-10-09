@@ -1464,3 +1464,147 @@ class ProviderWorkersDieTooTests(HelmTestCase):
         self.assertTrue(Path(worker["exit_file"]).exists())
         # Which is what lets the task be cleaned up on the first try.
         self.coordinator.cleanup_task(task["id"])
+
+
+class DeadWorkerWakesItsLeadTests(HelmTestCase):
+    """A worker that dies reports nothing, so Helm tells the lead that started it.
+
+    A tail-recovery worker was killed seventeen minutes in. Its failure was
+    recorded correctly, the lead's last turn had already ended, and nothing
+    started another: the lead waited two and a half hours for a report that
+    could never come, until the coordinator told it by hand.
+    """
+
+    def _lead_and_worker(
+        self, name: str, *, role: str | None = None
+    ) -> tuple[dict, dict, dict, dict]:
+        root = self.repo(name)
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        lead_task = self.coordinator.create_task(
+            project["id"], "drive the work", no_domain=True, role="foreman", new=True,
+            ticket="LEAD-1",
+        )
+        lead = self.coordinator.prepare_external_worker(
+            lead_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        task = self.coordinator.create_task(project["id"], "write the code")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["created_by"] = lead["id"]
+            data["tasks"][task["id"]]["created_by_task"] = lead["task_id"]
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        return project, lead, task, worker
+
+    def _die(self, worker: dict, code: int = -9) -> None:
+        Path(worker["exit_file"]).write_text(json.dumps({"returncode": code}) + "\n")
+        self.coordinator.poll_worker(worker["id"])
+
+    def _death_answers(self, lead_id: str) -> list[dict]:
+        return [
+            m for m in self.state.load()["messages"]
+            if m.get("worker_id") == lead_id and m.get("kind") == "answer"
+            and (m.get("payload") or {}).get("via") == "death-notice"
+        ]
+
+    def test_a_dead_worker_tells_the_lead_that_started_it_exactly_once(self) -> None:
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        _, lead, task, worker = self._lead_and_worker("deadworker")
+        self._die(worker)
+        settled = self.state.load()["workers"][worker["id"]]
+        self.assertEqual(settled["status"], "failed")
+        self.assertEqual(settled["death"]["exit_code"], -9)
+
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        told = adapter.wake_leads_for_deaths()
+        self.assertEqual([t["lead_id"] for t in told], [lead["id"]])
+        notes = self.coordinator.inbox_notes(lead["id"])
+        self.assertEqual(len(notes), 1)
+        for fragment in (worker["id"], task["id"], "exit -9", "worker"):
+            self.assertIn(fragment, notes[0]["text"])
+        self.assertEqual(len(self._death_answers(lead["id"])), 1)
+
+        # Once per death, whichever pass or poll comes next.
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+        adapter.poll_worker(worker["id"])
+        self.assertEqual(adapter.wake_leads_for_deaths(worker["id"]), [])
+        self.assertEqual(len(self.coordinator.inbox_notes(lead["id"])), 1)
+        self.assertEqual(len(self._death_answers(lead["id"])), 1)
+        notice = self.state.load()["workers"][worker["id"]]["death"]["notice"]
+        self.assertEqual(notice["lead"], lead["id"])
+
+    def test_a_dead_reviewer_tells_its_lead_to_run_the_review_again(self) -> None:
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        project, lead, task, _author = self._lead_and_worker("deadreviewer")
+        self.commit_on_task_branch(task, "the change")
+        tip = subprocess.run(
+            ["git", "-C", task["workspace"], "rev-parse", "HEAD"],
+            check=True, text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            review = self.coordinator.create_task(
+                project["id"], "review it", role="reviewer", reviews=task["id"],
+                read_only=True, review_tip=tip,
+            )
+        reviewer = self.coordinator.prepare_external_worker(
+            review["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self._die(reviewer, code=137)
+        told = HerdrAdapter(self.coordinator, FakeHerdr()).wake_leads_for_deaths()
+        self.assertEqual([t["lead_id"] for t in told], [lead["id"]])
+        self.assertIn(f"helm review {task['id']}", told[0]["text"])
+        self.assertIn("reviewer", told[0]["text"])
+
+    def test_no_lead_is_told_about_a_stop_or_by_a_dead_lead_or_across_projects(self) -> None:
+        from helm.herdr import HerdrAdapter
+        from tests.support import FakeHerdr
+
+        adapter = HerdrAdapter(self.coordinator, FakeHerdr())
+        # A deliberate stop is somebody's decision, not a death.
+        _, lead, _, stopped = self._lead_and_worker("stoppedworker")
+        self.coordinator.stop_worker(stopped["id"], "not needed after all")
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+        self.assertEqual(self.coordinator.inbox_notes(lead["id"]), [])
+
+        # A lead that is itself gone is not messaged; its replacement reads
+        # the record.
+        _, gone_lead, _, orphan = self._lead_and_worker("deadlead")
+        self.coordinator.stop_worker(gone_lead["id"], "replaced")
+        self._die(orphan)
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+        self.assertEqual(self.coordinator.inbox_notes(gone_lead["id"]), [])
+        skipped = self.state.load()["workers"][orphan["id"]]["death"]["notice"]
+        self.assertIsNone(skipped["lead"])
+
+        # Another project's live lead is never told about this one's worker,
+        # and neither is a lead that did not start it.
+        _, other_lead, _, _ = self._lead_and_worker("otherproject")
+        root = self.repo("leadless")
+        project = self.coordinator.register_project("Leadless", str(root), project_id="leadless")
+        task = self.coordinator.create_task(project["id"], "root's own work")
+        rootless = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self._die(rootless)
+        self.assertEqual(adapter.wake_leads_for_deaths(), [])
+        self.assertEqual(self.coordinator.inbox_notes(other_lead["id"]), [])
+        self.assertEqual(self.coordinator.inbox_notes(lead["id"]), [])
+
+    def test_a_worker_healed_as_dead_tells_its_lead(self) -> None:
+        """The watch settles a provably dead worker with a stop; that stop is not a decision."""
+        from helm import cli
+
+        project, lead, _, worker = self._lead_and_worker("healedworker")
+        with mock.patch.dict(os.environ):
+            # No Herdr here: the lead is reached through its inbox.
+            os.environ.pop("HERDR_ENV", None)
+            line = cli._heal_dead_worker(
+                self.coordinator, {"worker_id": worker["id"], "project_id": project["id"]}
+            )
+        self.assertIn(f"task lead {lead['id']} told", line or "")
+        self.assertEqual(len(self.coordinator.inbox_notes(lead["id"])), 1)
+        self.assertEqual(len(self._death_answers(lead["id"])), 1)
