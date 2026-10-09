@@ -777,8 +777,12 @@ def apply_prompt(
         WORKER_SETTINGS_PLACEHOLDER: worker_settings,
         SESSION_PLACEHOLDER: session,
     }
-    # JSON strings and arrays are valid TOML basic strings and inline arrays.
-    roots_toml = json.dumps([root for root in (state_dir, git_common_dir) if root])
+    # JSON strings and arrays are valid TOML basic strings and inline arrays,
+    # provided non-ASCII stays literal: ensure_ascii would write an emoji as a
+    # surrogate pair of \u escapes, which TOML rejects.
+    roots_toml = json.dumps(
+        [root for root in (state_dir, git_common_dir) if root], ensure_ascii=False
+    )
     out: list[str] = []
     for part in command:
         if WRITABLE_ROOTS_TOML_PLACEHOLDER in part:

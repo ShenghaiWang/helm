@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from unittest import mock
 
@@ -974,7 +975,6 @@ class RuntimeSelectionTests(HelmTestCase):
         self.assertNotIn("--sandbox", argv)
         self.assertNotIn("--add-dir", argv)
         # The boundary the first turn set still holds on the second.
-        import tomllib
         parsed = {}
         for override in overrides:
             key, _, value = override.partition("=")
@@ -984,6 +984,13 @@ class RuntimeSelectionTests(HelmTestCase):
         # No Git directory known: it is left out, never written as "".
         bare = runtimes.apply_prompt(codex.turn_resume, "p", "/w", "/state", session="s")
         self.assertIn('sandbox_workspace_write.writable_roots=["/state"]', bare)
+        # A path with an astral character (an emoji) or a quote must still be
+        # valid TOML, and read back as exactly the path it was.
+        odd_state, odd_git = "/home/🚀 state", '/repo "x"/.git'
+        odd = runtimes.apply_prompt(codex.turn_resume, "p", "/w", odd_state, odd_git, session="s")
+        roots_part = next(p for p in odd if p.startswith("sandbox_workspace_write.writable_roots="))
+        value = roots_part.partition("=")[2]
+        self.assertEqual(tomllib.loads(f"v = {value}")["v"], [odd_state, odd_git])
 
 
 class EffortCapabilityTests(HelmTestCase):
