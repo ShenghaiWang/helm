@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 from helm import cli
 from helm.core import (
@@ -971,3 +972,82 @@ class DomainsSkillsTests(HelmTestCase):
         # A skill that cannot be read is the case most likely to matter.
         self.assertEqual(code, 1)
         self.assertIn("broken", buffer.getvalue())
+
+
+class ALeadsWorkerGetsTheWorkDomainTests(HelmTestCase):
+    """A lead's worker was composed the lead's own driving domain.
+
+    The lead's task carries `driving-delegated-work`, whose rules say do not
+    do the delegated work. Learned as the project's default, it reached every
+    worker the lead then created -- briefed never to do its own job.
+    """
+
+    DRIVER = "driving-delegated-work"
+
+    def _lead(self, coordinator: Coordinator, project: dict) -> dict:
+        lead_task = coordinator.create_foreman_task(project["id"])
+        return coordinator.prepare_external_worker(
+            lead_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+
+    def _declare_work_domain(self, project: dict, domain: str) -> None:
+        root = Path(project["root"])
+        (root / ".helm").mkdir(exist_ok=True)
+        (root / ".helm" / "project.json").write_text(
+            json.dumps({"domains": [domain]}), encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(root), "add", ".helm"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "domains"], check=True)
+
+    def test_appointing_a_lead_never_teaches_the_project_the_driver_domain(self) -> None:
+        coordinator, project = self._shipped_domains_project("leadnodefault")
+        lead = self._lead(coordinator, project)
+        stored = coordinator.store.load()["projects"][project["id"]]
+        self.assertEqual(coordinator._project_domains(stored), [])
+
+        # So the lead's worker is asked for a work domain rather than
+        # silently handed the driver's.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            with self.assertRaisesRegex(HelmError, "no domain chosen"):
+                coordinator.create_task(project["id"], "investigate the parser", read_only=True)
+
+    def test_a_lead_cannot_hand_its_worker_or_reviewer_the_driver_domain(self) -> None:
+        coordinator, project = self._shipped_domains_project("leadexplicit")
+        self._declare_work_domain(project, "software-delivery")
+        lead = self._lead(coordinator, project)
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            for role in ("worker", "reviewer"):
+                with self.assertRaisesRegex(HelmError, "task lead's own domain"):
+                    coordinator.create_task(
+                        project["id"], "do the work", domain=self.DRIVER,
+                        role=role, read_only=True,
+                    )
+            # Without a domain it gets the project's work domain, and the
+            # composed context carries none of the driver's rules.
+            task = coordinator.create_task(project["id"], "do the work", read_only=True)
+        self.assertEqual(task["domain"], "software-delivery")
+        self.assertEqual(task["domain_selection"], "project default domain")
+        context = coordinator._context(project, task, "w-work")
+        self.assertNotIn(self.DRIVER, context["domain_chain"])
+        self.assertNotIn("Do not do the delegated work yourself", json.dumps(context))
+        # The lead itself still drives with the driver domain.
+        lead_task = coordinator.store.load()["tasks"][lead["task_id"]]
+        self.assertEqual(lead_task["domain"], self.DRIVER)
+
+    def test_a_driver_default_left_by_an_older_helm_falls_through_to_the_work_domain(self) -> None:
+        coordinator, project = self._shipped_domains_project("leadpolluted")
+        self._declare_work_domain(project, "software-delivery")
+        with coordinator.store.locked() as data:
+            data["projects"][project["id"]]["domains"] = [self.DRIVER]
+        lead = self._lead(coordinator, project)
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            task = coordinator.create_task(project["id"], "do the work", read_only=True)
+        self.assertEqual(task["domain"], "software-delivery")
+        # And the driver domain can never be set as a project's default again.
+        with self.assertRaisesRegex(HelmError, "task lead's own domain"):
+            coordinator.set_project_domains(project["id"], [self.DRIVER])
+        # A launch-time override cannot smuggle it in either.
+        with self.assertRaisesRegex(HelmError, "task lead's own domain"):
+            coordinator.prepare_external_worker(
+                task["id"], [sys.executable, "-c", ""], domain=self.DRIVER
+            )

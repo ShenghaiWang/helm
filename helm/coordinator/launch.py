@@ -1226,7 +1226,8 @@ class LaunchMixin:
             project = self._project(data, task["project_id"])
             if domain is not None:
                 task["domain"], task["domain_selection"] = self.resolve_domain(
-                    project, task["brief"], explicit=domain
+                    project, task["brief"], explicit=domain,
+                    role=task.get("role", "worker"),
                 )
             if agent is not None:
                 _validate_agent_id(agent, "--agent")

@@ -28,6 +28,7 @@ from ..paths import _private_dir, _safe_configuration_path, canonical, inside, o
 from ..state import StateStore
 from ..values import (
     DELIVERY_POLICIES,
+    FOREMAN_DOMAIN,
     GATE_TYPES,
     RUNTIME_DEFAULT_MODEL,
     PORTABLE_SKILL_ROOT,
@@ -394,14 +395,23 @@ class SkillsMixin:
 
     @staticmethod
     def _project_domains(project: dict[str, Any]) -> list[str]:
-        configured = project.get("domains")
+        # The driver's domain is never a project's work domain. An older Helm
+        # learned it as the default from a lead's own task, and every worker
+        # that lead then created arrived briefed never to do the work; so it
+        # is dropped from either source, and a record holding nothing else
+        # falls through to the project's own file.
+        configured = [
+            _validate_domain_id(domain)
+            for domain in _string_list(project.get("domains") or [], "project domains")
+        ]
+        configured = [domain for domain in configured if domain != FOREMAN_DOMAIN]
         if configured:
-            return [_validate_domain_id(domain) for domain in _string_list(configured, "project domains")]
+            return configured
         settings_file = canonical(project["root"]) / ".helm" / "project.json"
         if not settings_file.exists():
             return []
         settings = _discovery_settings(canonical(project["root"]))
-        return list(settings.get("domains", []))
+        return [domain for domain in settings.get("domains", []) if domain != FOREMAN_DOMAIN]
 
     @staticmethod
     def _project_agent(project: dict[str, Any]) -> str | None:
@@ -917,6 +927,11 @@ class SkillsMixin:
             selected = []
             for domain in _string_list(domains, "project domains"):
                 domain = _validate_domain_id(domain)
+                if domain == FOREMAN_DOMAIN:
+                    raise HelmError(
+                        f"{FOREMAN_DOMAIN} is the task lead's own domain, not a "
+                        "project's work domain; name the domain the work needs"
+                    )
                 if known and domain not in known:
                     raise HelmError(
                         f"unknown domain: {domain} (available: {', '.join(known)})"
@@ -933,6 +948,7 @@ class SkillsMixin:
         *,
         explicit: str | None = None,
         no_domain: bool = False,
+        role: str = "worker",
     ) -> tuple[str | None, str]:
         """Resolve one domain without guessing from the words in a brief.
 
@@ -941,9 +957,23 @@ class SkillsMixin:
         domain says what work it applies to -- or by the project's own default.
         Anything else resolves to no domain, which is honest: the worker gets
         core safety rules rather than a pack matched on a coincidence.
+
+        The driver's domain belongs to the lead role alone. Its guardrails --
+        do not do the delegated work, never spawn -- are the opposite of a
+        worker's or a reviewer's job, so a task in either role never resolves
+        to it: named explicitly it is refused, and `_project_domains` never
+        offers it as a project default, so the project's work domain is what
+        arrives.
         """
         if explicit is not None:
             selected = _validate_domain_id(explicit)
+            if selected == FOREMAN_DOMAIN and role != "foreman":
+                raise HelmError(
+                    f"{FOREMAN_DOMAIN} is the task lead's own domain and cannot be "
+                    f"given to a {role} task: its rules forbid doing the delegated "
+                    "work. Omit --domain to use the project's work domain, or name "
+                    "the domain the work itself needs (helm domain list)."
+                )
             known = self._all_domain_ids(project)
             if known and selected not in known:
                 raise HelmError(

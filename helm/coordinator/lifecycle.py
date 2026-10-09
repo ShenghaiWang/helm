@@ -643,10 +643,15 @@ class LifecycleMixin:
                         " setting if the commander wants this reviewed."
                     )
                 selected_domain, domain_reason = self.resolve_domain(
-                    project, brief, explicit=domain, no_domain=no_domain
+                    project, brief, explicit=domain, no_domain=no_domain, role=role
                 )
+                # Only a work task teaches the project its default. A lead's
+                # task carries the driver domain, and learning that as the
+                # project's default is how a lead's worker once arrived
+                # briefed never to do the work it was created for.
                 learn_default = (
-                    selected_domain is not None
+                    role != "foreman"
+                    and selected_domain is not None
                     and not no_domain
                     and not self._project_domains(project)
                 )
