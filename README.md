@@ -463,6 +463,7 @@ helm task create --project P --brief TEXT [--read-only] [--shape small|standard|
 helm task shape TASK_ID small|standard|critical [--reason TEXT]
 helm task evidence TASK_ID --tip SHA --command CMD --exit N [--cases N] [--suite NAME=COUNT]... [--check NAME]
 helm task allocate|inspect|continue|reopen|approve|merge|deliver|pr|pr-status|pr-sync|outcome|cost|provenance|cleanup [--delete-branch]
+helm task discard TASK_ID --confirm --note TEXT [--force-dirty]
 helm review TASK_ID [--reviewer-agent A] [--reviewer-model M] [--rounds N] [--reviewer-effort E]
 helm worker launch|round|poll|wait|message|report|answer|inbox|interrupt|action-start|reconcile|stop
 helm approval grant ACTION [--project P] [--note N] [--stale-days D] · list|check|revoke|release|repair

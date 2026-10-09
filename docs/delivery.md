@@ -247,6 +247,21 @@ even with `--delete-branch`, and the task log says so. Cleanup also refuses a
 task whose recorded pull request is not merged or closed, or that holds an
 open approval, whatever its status reads.
 
+Cleanup keeps work nobody has decided about. When the commander *has*
+decided -- an approved, completed, blocked or failed change that is no
+longer wanted -- `helm task discard <task> --confirm --note "why"` throws it
+away. It is root-only, and it refuses a merged task, one with a pull request
+still open (close the PR, then `helm task pr-sync`), and one whose worker is
+still live (`helm worker stop` it first); a lead task is refused while a
+worker it started is still running. Before deleting anything it records and
+prints the branch, its tip and how many of its commits no remote holds, so
+`git branch <branch> <tip>` recovers it while the reflog keeps the commit.
+It then removes the worktree (a dirty one is refused, naming the changes,
+unless `--force-dirty`), deletes the branch even when unpushed, withdraws
+any open approval hold, marks the task `discarded` -- terminal, holding
+nothing, with no delivery or cleanup decision left -- and archives it.
+Nothing outside that one task's worktree and branch is touched.
+
 What it names is read from Helm's own record of what the task owns, not from
 a live look at the disk: `helm status` and `helm watch` run no git or
 filesystem probe for it, and a project root that has moved or gone unreadable

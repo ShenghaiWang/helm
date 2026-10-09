@@ -324,13 +324,14 @@ class DecisionsMixin:
     def task_delivery_resolved(task: dict[str, Any]) -> bool:
         """Whether a task's outcome has actually been settled.
 
-        Delivered by a merge or a merged PR, or explicitly cleaned up. Nothing
+        Delivered by a merge or a merged PR, explicitly discarded, or cleaned
+        up. Nothing
         else counts -- in particular not `completed`, and not the absence of a
         worker or a pane. A task whose worker finished and whose tab was closed
         looks quiet from every direction and is still a change nobody decided
         anything about.
         """
-        if task.get("status") in DELIVERED_TASK_STATES:
+        if task.get("status") in DELIVERED_TASK_STATES or task.get("status") == "discarded":
             return True
         return bool(task.get("workspace_removed"))
 

@@ -23,6 +23,7 @@ CORE_SEAMS: dict[tuple[str, str | None], str] = {
     ("state", "archive"): "archive_tasks",
     ("task", "approve"): "approve_task",
     ("task", "merge"): "merge_task",
+    ("task", "discard"): "discard_task",
     ("task", "pr"): "publish_task_branch",
     ("approval", "grant"): "grant_approval",
     ("approval", "revoke"): "revoke_approval_grant",

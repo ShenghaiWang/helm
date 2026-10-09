@@ -615,7 +615,8 @@ PR_WATCH_QUIET_INSTRUCTIONS = (
 #: propose either, never confirm or skip its own.
 GATE_TYPES = ("requirement", "solution")
 _TERMINAL_WORKER_TASK_STATES = {
-    "blocked", "failed", "approval-needed", "approved", "pr-open", "pr-merged", "merged"
+    "blocked", "failed", "approval-needed", "approved", "pr-open", "pr-merged", "merged",
+    "discarded",
 }
 
 #: The only task states in which a change has actually been delivered. A
@@ -910,6 +911,9 @@ TASK_STATUSES = {
     "pr-open",
     "pr-merged",
     "merged",
+    # The commander threw the work away with `helm task discard`: terminal,
+    # undelivered on purpose, and holding no worktree or branch.
+    "discarded",
 }
 
 

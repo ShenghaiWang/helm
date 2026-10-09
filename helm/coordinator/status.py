@@ -418,7 +418,7 @@ class StatusMixin:
             """
             task = data.get("tasks", {}).get(entry.get("task_id")) or {}
             state = task.get("status") or ""
-            if state in {"merged", "pr-merged"}:
+            if state in {"merged", "pr-merged", "discarded"}:
                 return False
             if state in {"failed", "blocked"}:
                 return True

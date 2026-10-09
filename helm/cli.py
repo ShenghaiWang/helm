@@ -1713,6 +1713,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "never when a remote holds none of them, since it is then their only copy"
         ),
     )
+    discard_cmd = task_commands.add_parser(
+        "discard",
+        help="throw away a task's unwanted work: its worktree and its branch, even unpushed",
+    )
+    discard_cmd.add_argument("task_id")
+    discard_cmd.add_argument(
+        "--confirm", action="store_true", required=True,
+        help="you have decided this work is unwanted; required",
+    )
+    discard_cmd.add_argument("--note", required=True, help="why the work is being discarded")
+    discard_cmd.add_argument(
+        "--force-dirty",
+        action="store_true",
+        help="also throw away uncommitted changes in the worktree, otherwise refused",
+    )
     pr_cmd = task_commands.add_parser(
         "pr", help="push the task branch so the change can be reviewed on the remote"
     )
@@ -3781,6 +3796,9 @@ _ROOT_ONLY_COMMANDS = frozenset({
     ("state", "archive"),
     ("task", "approve"),
     ("task", "merge"),
+    # Discarding deletes a branch that may be the only copy of its commits.
+    # That is the commander's decision about their own work, never an agent's.
+    ("task", "discard"),
     ("task", "pr"),
     # Which way a task delivers decides whether it can still be merged
     # locally. A task that could rewrite its own answer could take itself out
@@ -4305,6 +4323,32 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
             f"in {task['workspace']}"
         )
         print(f"  branch {task.get('branch') or '(none)'} — launch a worker to run it")
+    elif args.task_command == "discard":
+        task = coordinator.discard_task(
+            args.task_id, note=args.note, force_dirty=args.force_dirty
+        )
+        record = task.get("discard") or {}
+        print(f"Discarded task {task['id']} (was {record.get('from_status')}): {record.get('note')}")
+        if record.get("tip"):
+            unpushed = record.get("unpushed_commits")
+            counted = "an unknown number of" if unpushed is None else str(unpushed)
+            print(
+                f"  branch {record['branch']} was at {record['tip']}, "
+                f"with {counted} commit(s) on no remote"
+            )
+            if task.get("branch_removed"):
+                print(
+                    "  recover it while the reflog keeps it: "
+                    f"git branch {record['branch']} {record['tip']}"
+                )
+            else:
+                print(f"  branch {record['branch']} could not be deleted; its task log says why")
+        if record.get("dirty_discarded"):
+            print(f"  uncommitted changes thrown away: {len(record['dirty_discarded'])} path(s)")
+        _release_finished_space(coordinator, task)
+        with contextlib.suppress(HelmError, OSError):
+            if coordinator.archive_tasks([task["id"]])["archived"]:
+                print(f"  record archived to state/archive/tasks/{task['id']}.json")
     elif args.task_command == "cleanup":
         task = coordinator.cleanup_task(
             args.task_id, delete_branch=args.delete_branch

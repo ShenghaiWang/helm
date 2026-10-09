@@ -719,6 +719,7 @@ class HealthMixin:    #: How long a queued prompt may sit before its runner is c
         "pr-open": ("PR open", "amber"),
         "pr-merged": ("PR merged", "green"),
         "merged": ("landed", "green"),
+        "discarded": ("discarded", "grey"),
     }
 
     def board(self, *, limit_per_project: int = 8) -> list[dict[str, Any]]:

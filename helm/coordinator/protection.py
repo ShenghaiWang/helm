@@ -2479,7 +2479,7 @@ class ProtectionMixin:
             return "waiting on a human decision"
         if task["status"] in {"created", "allocated", "running"}:
             return f"still {task['status']}"
-        if task["status"] in {"merged", "pr-merged"}:
+        if task["status"] in {"merged", "pr-merged", "discarded"}:
             return None
         if task["status"] == "pr-open":
             return "PR open; monitor comments/checks until it merges"
@@ -2702,7 +2702,9 @@ class ProtectionMixin:
             never_ran = not self._task_workers(data, task["id"])
             if (
                 not never_ran
-                and task["status"] not in {"completed", "failed", "merged", "pr-merged"}
+                # A discarded task was already let go of by the commander;
+                # cleaning it again only reconciles what is left.
+                and task["status"] not in {"completed", "failed", "merged", "pr-merged", "discarded"}
                 # The status gate protects a checkout: work not yet reviewed,
                 # or waiting on approval, must not have the directory holding
                 # it removed underneath. A role with no worktree has no such
@@ -2817,3 +2819,210 @@ class ProtectionMixin:
             with contextlib.suppress(HelmError, OSError):
                 self.refresh_finalization_decisions(project["id"], data=data)
             return task
+
+    def discard_task(
+        self, task_id: str, *, note: str, force_dirty: bool = False
+    ) -> dict[str, Any]:
+        """Throw away a task's unwanted work: its worktree and its branch.
+
+        Cleanup keeps work on purpose. It refuses a task waiting on approval,
+        and it never deletes a branch that is the only copy of its commits.
+        That is right while nobody has decided, and a dead end once somebody
+        has: an approved change the commander no longer wants could only be
+        removed by hand-editing state. This is that decision, made explicitly
+        and only at the root.
+
+        Before anything is deleted, the branch, its tip and how many of its
+        commits no remote holds are written to the task record and saved, so
+        a discard can always be undone from that sha while the reflog keeps
+        it. Nothing outside this one task's worktree, worker directories and
+        branch is touched.
+        """
+        authority = self.authority("discarding a task's work")
+        reason = _safe_text(note).strip()
+        if not reason:
+            raise HelmError("say why the work is being discarded with --note")
+        with self.store.locked() as data:
+            task = self._task(data, task_id)
+            project = self._project(data, task["project_id"])
+            status = task.get("status")
+            if status == "discarded":
+                raise HelmError(f"task {task_id} is already discarded")
+            if status in DELIVERED_TASK_STATES:
+                raise SafetyError(
+                    f"refusing discard of task {task_id}: it is {status}, so its work "
+                    "is already delivered and there is nothing to throw away"
+                )
+            # Read from the PR record as well as the status, for the reason
+            # `_live_work_refusal` gives: status is the word other paths
+            # overwrite, and a PR is a copy someone else is still reviewing.
+            delivery = task.get("delivery") or {}
+            url = str(delivery.get("url") or "").strip()
+            if status == "pr-open" or (url and delivery.get("state") not in {"pr-merged", "pr-closed"}):
+                raise SafetyError(
+                    f"refusing discard of task {task_id}: its pull request "
+                    f"{url or '(recorded as open)'} still exists. Close the PR first, "
+                    f"then record it with: helm task pr-sync {task_id}"
+                )
+            live = [
+                worker
+                for worker in self._task_workers(data, task_id)
+                if worker.get("status") == "running" or self._session_still_live(worker)
+            ]
+            if live:
+                raise SafetyError(
+                    f"refusing discard of task {task_id}: worker {live[0]['id']} is still "
+                    f"live; stop it first with helm worker stop {live[0]['id']}"
+                )
+            if task.get("role") == "foreman":
+                tasks = data.get("tasks", {})
+                driving = [
+                    worker
+                    for worker in data.get("workers", {}).values()
+                    if worker.get("status") == "running"
+                    and (tasks.get(worker.get("task_id")) or {}).get("created_by_task") == task_id
+                ]
+                if driving:
+                    raise SafetyError(
+                        f"refusing discard of lead task {task_id}: worker "
+                        f"{driving[0]['id']} it started is still running; settle it first"
+                    )
+            hold = self.task_hold(task)
+            if hold is not None and hold.get("status") == "in-flight":
+                raise SafetyError(
+                    f"refusing discard of task {task_id}: hold {hold['id']} is in flight, "
+                    f"so the authorized {hold.get('action')} may already be happening; "
+                    "its outcome has to be reported first"
+                )
+            checkout = task.get("role") not in WORKTREELESS_ROLES
+            workspace = canonical(task["workspace"]) if task.get("workspace") else None
+            present = (
+                workspace is not None
+                and not task.get("workspace_removed")
+                and workspace.exists()
+            )
+            if present:
+                workspace = self._verify_workspace_record(data, project, task)
+            dirt = ""
+            if present and checkout and not self._workspace_clean(workspace):
+                porcelain = _git(
+                    workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False
+                )
+                dirt = self._dirt_worth_keeping(porcelain) or "unresolved merge conflicts"
+                if not force_dirty:
+                    lines = dirt.splitlines()
+                    shown = "; ".join(line.strip() for line in lines[:10])
+                    more = f" and {len(lines) - 10} more" if len(lines) > 10 else ""
+                    raise SafetyError(
+                        f"refusing discard of task {task_id}: its worktree has uncommitted "
+                        f"changes ({shown}{more}); commit or remove them, or pass "
+                        "--force-dirty to throw them away too"
+                    )
+            # What is about to go is recorded, and saved, before anything goes.
+            root = canonical(project["root"])
+            branch = task.get("branch") if task_owns_branch(task) else None
+            tip: str | None = None
+            unpushed: int | None = None
+            if branch and _git(
+                root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+            ):
+                tip = _git(root, "rev-parse", f"refs/heads/{branch}", check=False).strip() or None
+                elsewhere = ["--remotes"]
+                base_ref = f"refs/heads/{task.get('base_branch')}"
+                if task.get("base_branch") and _git(
+                    root, "rev-parse", "--verify", "--quiet", base_ref, check=False
+                ):
+                    elsewhere.append(base_ref)
+                counted = _git(
+                    root, "rev-list", "--count", branch, "--not", *elsewhere, check=False
+                ).strip()
+                unpushed = int(counted) if counted.isdigit() else None
+            record = {
+                "at": now(),
+                "from_status": status,
+                "note": reason,
+                "branch": branch,
+                "tip": tip,
+                "unpushed_commits": unpushed,
+                "dirty_discarded": dirt.splitlines() if dirt else [],
+                "authority": authority.mode,
+            }
+            task["discard"] = record
+            recovery = ""
+            if tip:
+                counted_text = "an unknown number of" if unpushed is None else str(unpushed)
+                recovery = (
+                    f". Branch {branch} was at {tip} with {counted_text} commit(s) no "
+                    f"remote holds; recover it with: git branch {branch} {tip}"
+                )
+            self._message(
+                data, project, task, None, "status",
+                f"Commander discarded this task's work: {reason}{recovery}",
+                {"discard": record},
+            )
+            # Durable before the first deletion, so a failure part-way through
+            # still leaves the sha that recovers the branch.
+            self.store.save(data)
+            # An open approval is a question nobody is going to answer now.
+            if hold is not None:
+                self._move_hold(
+                    data, project, task, hold, "abandon",
+                    detail=f"Approval hold withdrawn: the commander discarded the task ({reason})",
+                    message_kind="approval-abandoned",
+                )
+            for worker in self._task_workers(data, task_id):
+                if self._escalation_awaiting(data, worker["id"]):
+                    self._message(
+                        data, project, task, worker, "answer",
+                        "Resolved by discard: the commander threw this task's work away, "
+                        "so its escalation is no longer awaiting an answer.",
+                        {"source": "discard"},
+                    )
+            if present:
+                if task.get("read_only"):
+                    self._set_workspace_writable(workspace, writable=True)
+                if checkout:
+                    _git(root, "worktree", "remove", "--force", str(workspace))
+                else:
+                    shutil.rmtree(workspace)
+            if not task.get("workspace_removed"):
+                task["workspace_removed"] = True
+                task["workspace_removed_at"] = now()
+            self._remove_worker_directories_locked(data, task)
+            if tip:
+                _git(root, "worktree", "prune", check=False)
+                _git(root, "branch", "-D", branch, check=False)
+                removed = not _git(
+                    root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+                )
+                task["branch_removed"] = removed
+                if removed:
+                    task["branch_removed_at"] = now()
+                    self._shed_adopted_refs(data, project, task, root)
+                else:
+                    self._message(
+                        data, project, task, None, "cleanup",
+                        f"Task branch {branch} could not be deleted; it may be checked out elsewhere",
+                        {"branch": branch},
+                    )
+            elif branch:
+                task["branch_removed"] = True
+            task["status"] = "discarded"
+            task["discarded_at"] = record["at"]
+            self._message(
+                data, project, task, None, "cleanup",
+                "Task discarded: worktree removed"
+                + (f", branch {branch} deleted" if branch and task.get("branch_removed") else ""),
+                {"discard": record},
+            )
+            self.resolve_delivery_decisions(project["id"], reason="discarded", data=data)
+            with contextlib.suppress(HelmError, OSError):
+                self.refresh_finalization_decisions(project["id"], data=data)
+            with contextlib.suppress(HelmError, OSError):
+                self.refresh_failure_decisions(project["id"], data=data)
+            result = dict(task)
+        if hold is not None:
+            with contextlib.suppress(HelmError, OSError):
+                self.resolve_project_action_items(project["id"], hold["id"])
+            self._settle_request_report(project["id"], task_id, "discarded")
+        return result

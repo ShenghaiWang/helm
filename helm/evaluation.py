@@ -452,7 +452,7 @@ class Evaluation:
 #: A task in one of these states has said its last word for the run.
 TERMINAL_TASK_STATUSES = frozenset({
     "completed", "blocked", "failed", "approval-needed", "approved",
-    "pr-open", "pr-merged", "merged",
+    "pr-open", "pr-merged", "merged", "discarded",
 })
 
 
