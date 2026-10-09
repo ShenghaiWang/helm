@@ -5250,11 +5250,20 @@ def _cmd_pending(ctx: _Context, args: argparse.Namespace) -> int | None:
         for untold in coordinator.untold_deaths():
             glyph = glyphs.get(untold.get("project_id"), "")
             what = "is unreachable" if untold["kind"] == "unreachable" else "died"
+            if untold.get("lead_turns"):
+                # A turns lead Helm could not reach has no runner, and an
+                # answer to it would strand exactly as these attempts did.
+                remedy = (
+                    "its runner will not start, so an answer would strand too: "
+                    "restart it with helm pending --heal, or stand the lead down with "
+                    f"helm worker stop {untold['lead_id']}"
+                )
+            else:
+                remedy = f"tell it with helm worker answer {untold['lead_id']}"
             line = (
                 f"{glyph} {untold['project_id']}: {untold['role']} {untold['worker_id']} "
                 f"{what} and its task lead {untold['lead_id']} was never told "
-                f"({untold.get('attempts')} attempts) -- tell it with helm worker answer "
-                f"{untold['lead_id']}"
+                f"({untold.get('attempts')} attempts) -- {remedy}"
             )
             stamp = untold.get("at") or ""
             entries.append((stamp, f"{_when_label(stamp)} {line}", line))

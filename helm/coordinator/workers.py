@@ -285,6 +285,12 @@ class WorkersMixin:
         inbox.mkdir(parents=True, exist_ok=True)
         os.chmod(inbox, 0o700)
         note = inbox / f"{note_id or new_id('m')}.md"
+        if note_id:
+            # A note already read stays read. Rewriting it under the same id
+            # put a message the worker had acted on back in front of it.
+            already = inbox / self.INBOX_READ_DIRNAME / note.name
+            if already.exists():
+                return already
         _write_private_text(note, text.rstrip("\n") + "\n")
         return note
 
@@ -1040,6 +1046,32 @@ class WorkersMixin:
             f"nothing else will tell you. {next_step}"
         )
 
+    def death_notice_arrived(self, notice: dict[str, Any]) -> str:
+        """Whether an earlier attempt of this death notice reached its lead after all.
+
+        A stranded attempt is not a lost one: its note sits in the lead's
+        inbox and its prompt in the lead's queue, and a runner restarted later
+        -- by anything -- takes the prompt and reads the note. A retry that
+        re-sent then delivered the notice twice. So before re-sending, look
+        for the earlier copy having landed: the note read, the queued prompt
+        taken, or the text in the turn the lead is running now. Returns how it
+        was seen, or "".
+        """
+        lead_id = notice["lead_id"]
+        answer_id = notice.get("answer_id")
+        if answer_id:
+            read = self._inbox_dir(lead_id) / self.INBOX_READ_DIRNAME / f"{answer_id}.md"
+            if read.exists():
+                return "an earlier attempt's note was read"
+        entry = notice.get("entry")
+        if entry and not self.turn_entry_queued(lead_id, entry):
+            return "an earlier attempt's prompt was taken by its runner"
+        text = str(notice.get("text") or "")
+        state = self.turn_state(lead_id)
+        if text and text in str(state.get("pending_prompt") or ""):
+            return "its turn in progress carries the earlier attempt"
+        return ""
+
     def record_death_notice(
         self, worker_id: str, outcome: str, *, entry: str | None = None
     ) -> dict[str, Any]:
@@ -1100,6 +1132,7 @@ class WorkersMixin:
                 "worker_id": worker["id"],
                 "project_id": worker.get("project_id"),
                 "lead_id": lead["id"],
+                "lead_turns": lead.get("execution_mode") == "turns",
                 "role": task.get("role") or "worker",
                 "kind": death.get("kind") or "died",
                 "attempts": notice.get("attempts"),
