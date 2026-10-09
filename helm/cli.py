@@ -43,6 +43,7 @@ from .core import (
     project_glyph,
     worker_environment,
 )
+from .paths import hold_turns_runner_lock, turn_queue_lock
 from . import doctor as doctor_module
 from . import evaluation as evaluation_module
 from . import models
@@ -2839,6 +2840,7 @@ def _worker_runner(config_path: str, presence: dict[str, str] | None = None) -> 
     env = worker_environment()
     env.update({key: str(value) for key, value in worker_env.items()})
     return_code = 127
+    duplicate_runner = False
     try:
         _private_file(log_path)
         # Appended, never truncated. The launcher created this log empty in a
@@ -2878,7 +2880,18 @@ def _worker_runner(config_path: str, presence: dict[str, str] | None = None) -> 
                 if config.get("turns"):
                     # Turn-based execution: the pane displays and is never
                     # typed into; each prompt is one non-interactive run.
-                    return_code = _run_turns(config, cwd, env, log, presence=pane_presence)
+                    try:
+                        return_code = _run_turns(config, cwd, env, log, presence=pane_presence)
+                    except _RunnerAlreadyRunning:
+                        # A restart that raced the live runner. That runner
+                        # owns the session and its exit record; this one
+                        # writes neither, or the worker would read as ended.
+                        duplicate_runner = True
+                        print(
+                            "[helm] another runner is already running this worker; "
+                            "this one leaves it to that runner.",
+                            flush=True,
+                        )
                 elif sys.stdout.isatty():
                     # In a Herdr pane, give the worker a real terminal so an
                     # interactive agent renders its session and the user can
@@ -2911,6 +2924,8 @@ def _worker_runner(config_path: str, presence: dict[str, str] | None = None) -> 
         os.chmod(log_path, 0o600)
     except OSError as exc:
         return _runner_failure(config_path, str(exc))
+    if duplicate_runner:
+        return 0
     try:
         _write_private_text(exit_path, json.dumps({"returncode": return_code}) + "\n")
     except OSError:
@@ -2956,6 +2971,11 @@ def _run_turns(
     state: dict[str, Any] = {"session_id": config.get("session_id"), "turn": 0, "history": []}
     with contextlib.suppress(OSError, ValueError):
         state.update(json.loads(state_path.read_text(encoding="utf-8")))
+    # One runner per worker, and the lock is how everyone else knows it is
+    # alive. Held until this process ends; a second runner -- a restart that
+    # raced a live one -- leaves without touching anything.
+    if hold_turns_runner_lock(turns_dir) is None:
+        raise _RunnerAlreadyRunning(str(turns_dir))
     _write_private_text(turns_dir / "runner.pid", f"{os.getpid()}\n")
     child: subprocess.Popen[str] | None = None
 
@@ -2969,26 +2989,19 @@ def _run_turns(
     _signal.signal(_signal.SIGTERM, _forward)
 
     def _next_prompt() -> str | None:
-        path = turns_dir / "next.json"
-        if not path.exists():
-            return None
-        try:
-            queued = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            queued = []
-        with contextlib.suppress(OSError):
-            path.unlink()
-        texts = [str(entry.get("text") or "") for entry in queued if isinstance(entry, dict)]
-        texts = [t for t in texts if t.strip()]
-        if not texts:
-            return None
-        if len(texts) == 1:
-            return texts[0]
-        return "Several messages arrived while you were away:\n\n" + "\n\n---\n\n".join(texts)
+        return _take_turn_prompt(turns_dir, state, state_path)
 
-    prompt: str | None = config.get("initial_prompt") if state["turn"] == 0 else _next_prompt()
-    if state["turn"] > 0 and prompt is None and state.get("pending_prompt"):
+    # A restarted runner first finishes the prompt it had taken: it is
+    # recorded as `pending_prompt` from the moment it left the queue, and a
+    # newer message waits in the queue for the turn after rather than
+    # displacing it.
+    prompt: str | None
+    if state["turn"] == 0:
+        prompt = config.get("initial_prompt")
+    elif state.get("pending_prompt"):
         prompt = str(state["pending_prompt"])
+    else:
+        prompt = _next_prompt()
     idle_since = time.time()
     return_code = 0
     while True:
@@ -3081,6 +3094,48 @@ def _run_turns(
         prompt = None
         idle_since = time.time()
     return return_code
+
+
+class _RunnerAlreadyRunning(Exception):
+    """Another runner holds this worker's runner lock; this one must not run."""
+
+
+def _take_turn_prompt(
+    turns_dir: Path, state: dict[str, Any], state_path: Path
+) -> str | None:
+    """Consume the queued prompts as the next turn's prompt, durably.
+
+    Under the queue lock, so a prompt Helm queues while this runs is either in
+    what is read here or still in the file after it -- never unlinked unread.
+    The prompt is written to the runner's state as `pending_prompt` before the
+    queue is removed, so a runner killed between the two resumes the prompt
+    on restart instead of losing it.
+    """
+    path = turns_dir / "next.json"
+    if not path.exists():
+        return None
+    with turn_queue_lock(turns_dir):
+        try:
+            queued = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            queued = []
+        if not isinstance(queued, list):
+            queued = []
+        texts = [str(entry.get("text") or "") for entry in queued if isinstance(entry, dict)]
+        texts = [t for t in texts if t.strip()]
+        prompt: str | None = None
+        if len(texts) == 1:
+            prompt = texts[0]
+        elif texts:
+            prompt = "Several messages arrived while you were away:\n\n" + "\n\n---\n\n".join(texts)
+        if prompt is not None:
+            state["pending_prompt"] = prompt
+            _write_private_text(state_path, json.dumps(state) + "\n")
+        with contextlib.suppress(OSError):
+            path.unlink()
+    return prompt
 
 
 def _runner_failure(config_path: str, detail: str) -> int:
@@ -3557,8 +3612,38 @@ _INBOX_DELIVERY_WORDS = {
     "unconfirmed": "in its inbox; a pointer line was typed but nothing took it -- "
                    "it prints on the worker's next helm command",
     "unreachable": "in its inbox only; no session reachable",
-    "turned": "queued as the prompt of its next turn; the runner starts it",
+    "turned": "queued as the prompt of its next turn",
+    "turn-stranded": "NOT started: it is in its inbox, but no turn will run it",
 }
+
+
+def _turn_delivery_words(delivery: dict[str, Any]) -> str:
+    """What happened to a message for a turns worker, as observed.
+
+    "Queued as the prompt of its next turn; the runner starts it" was printed
+    for every turns delivery, including one no runner was ever going to take,
+    and a lead sat idle for two hours behind it. Each line here names what
+    Helm saw: the runner taking the prompt, a turn in progress that will, a
+    live runner that has not yet, or nothing running at all.
+    """
+    state = delivery.get("state")
+    pid = delivery.get("pid")
+    runner = f"runner pid {pid}" if pid else "its runner"
+    if state == "started":
+        return f"delivered: turn started by {runner}"
+    if state == "queued":
+        return f"queued: the turn in progress ({runner}) takes it when it ends"
+    if state == "waiting":
+        return (
+            f"queued: {runner} is alive but has not taken it yet -- "
+            "`helm pending` names it if no turn starts"
+        )
+    if state == "stranded":
+        return (
+            "NOT started: it is in its inbox, but no turn will run it -- "
+            f"{delivery.get('detail') or 'no turns runner is running'}"
+        )
+    return _INBOX_DELIVERY_WORDS["turned"]
 
 
 def _format_inbox(worker_id: str, notes: list[dict]) -> str:
@@ -4559,14 +4644,21 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
             args.worker_id, args.text, note_id=recorded.get("id")
         )
         outcome = "unreachable"
+        delivery: dict[str, Any] = {}
         with contextlib.suppress(HelmError, OSError):
             adapter = HerdrAdapter(coordinator)
             adapter.answer_worker(args.worker_id, args.text, note=note)
             outcome = adapter.last_wake_outcome
-        print(
-            f"Answered worker {args.worker_id} for task {task['id']} "
-            f"[{_INBOX_DELIVERY_WORDS.get(outcome, _INBOX_DELIVERY_WORDS['unreachable'])}]"
+            delivery = dict(adapter.last_turn_delivery or {})
+        words = (
+            _turn_delivery_words(delivery) if delivery
+            else _INBOX_DELIVERY_WORDS.get(outcome, _INBOX_DELIVERY_WORDS["unreachable"])
         )
+        print(f"Answered worker {args.worker_id} for task {task['id']} [{words}]")
+        if delivery.get("state") == "stranded":
+            # The answer is recorded and in the inbox, but nothing will act on
+            # it. Exiting 0 here is how a stranded answer read as a sent one.
+            return 1
     return 0
 
 

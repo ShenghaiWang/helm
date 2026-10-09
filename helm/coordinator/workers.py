@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..paths import _write_private_text, _private_dir
+from ..paths import _write_private_text, _private_dir, turn_queue_lock
 from ..processes import _process_parents, _scan_worker_pid
 from ..values import _safe_text, new_id, now
 from .. import costs
@@ -100,20 +100,55 @@ class WorkersMixin:
         same whichever way the worker runs; the queue is what starts the
         turn. Several messages arriving between turns are delivered
         together, in order, as one prompt.
+
+        Written under the same lock the runner holds while it consumes the
+        queue: appended unlocked, a prompt written between the runner's read
+        and its unlink was deleted unread.
+        """
+        self.queue_turn_prompt(worker_id, text, kind=kind)
+        return self.turns_dir(worker_id) / "next.json"
+
+    def queue_turn_prompt(self, worker_id: str, text: str, *, kind: str = "note") -> str:
+        """`deliver_turn`, returning the id of the entry it queued.
+
+        The id is what lets a caller say afterwards whether the runner took
+        this prompt, rather than assuming it from having written it.
         """
         directory = self.turns_dir(worker_id)
         _private_dir(directory.parent)
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
         path = directory / "next.json"
-        queued: list[dict[str, Any]] = []
-        with contextlib.suppress(OSError, ValueError):
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, list):
-                queued = loaded
-        queued.append({"text": _safe_text(text), "kind": kind, "at": now()})
-        _write_private_text(path, json.dumps(queued) + "\n")
-        return path
+        entry_id = new_id("q")
+        with turn_queue_lock(directory):
+            queued: list[dict[str, Any]] = []
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    queued = loaded
+            queued.append({"id": entry_id, "text": _safe_text(text), "kind": kind, "at": now()})
+            _write_private_text(path, json.dumps(queued) + "\n")
+        return entry_id
+
+    def turn_entry_queued(self, worker_id: str, entry_id: str) -> bool:
+        """Whether a prompt `deliver_turn` queued is still waiting in the queue.
+
+        False once the runner has taken it -- which it does in the same locked
+        step that records it as the prompt of the turn it is starting.
+        """
+        directory = self.turns_dir(worker_id)
+        path = directory / "next.json"
+        if not path.exists():
+            return False
+        with turn_queue_lock(directory):
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    return any(
+                        isinstance(entry, dict) and entry.get("id") == entry_id
+                        for entry in loaded
+                    )
+        return False
 
     def queued_turn_queued_at(self, worker_id: str) -> float:
         """When the waiting prompt was queued, as an epoch float, or 0.

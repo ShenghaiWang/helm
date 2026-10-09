@@ -980,15 +980,24 @@ class GateDecisionDeliveryTests(HelmTestCase):
             data["workers"][worker["id"]]["execution_mode"] = "turns"
 
         from helm.herdr import HerdrAdapter
-        with mock.patch.object(HerdrAdapter, "ensure_turns_runner", return_value=True) as runner:
+        # A runner that says it is running and then takes the prompt, as a
+        # live idle one does on its next poll.
+        def take(worker_id: str) -> bool:
+            (self.coordinator.turns_dir(worker_id) / "next.json").rename(
+                self.coordinator.turns_dir(worker_id) / "taken.json"
+            )
+            return True
+
+        with mock.patch.object(HerdrAdapter, "ensure_turns_runner", side_effect=take) as runner:
             output = self._decide(foreman_task["id"])
 
         self.assertNotIn("NOT DELIVERED", output)
         runner.assert_called_once_with(worker["id"])
         queued = json.loads(
-            (self.coordinator.turns_dir(worker["id"]) / "next.json").read_text()
+            (self.coordinator.turns_dir(worker["id"]) / "taken.json").read_text()
         )
         self.assertIn("confirmed your requirement gate", queued[-1]["text"])
+        self.assertNotIn("Not delivered", output)
 
 
 class GatePairOwnershipTests(GateTests):

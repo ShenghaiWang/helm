@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
 from .naming import task_name, ticket_of
+from .paths import turns_runner_lock_held
 from .values import SAFE_TEXT_LIMIT, shape_check, shape_policy
 from .core import (
     Coordinator,
@@ -3752,19 +3753,10 @@ class HerdrAdapter:
         if note is None:
             with contextlib.suppress(HelmError, OSError):
                 note = self.coordinator.leave_inbox_note(worker_id, text)
+        self.last_turn_delivery = {}
         turns_worker = (self.coordinator.store.load().get("workers", {}).get(worker_id) or {})
         if turns_worker.get("execution_mode") == "turns":
-            # The message is the next turn's prompt. Nothing is typed; the
-            # runner starts the turn, and a runner that has died is restarted
-            # so the prompt is not left waiting on a process nobody watches.
-            self.coordinator.deliver_turn(worker_id, text)
-            if note is not None:
-                with contextlib.suppress(HelmError, OSError):
-                    self.coordinator.mark_inbox_read(worker_id, note)
-            with contextlib.suppress(HelmError, SafetyError, OSError):
-                self.ensure_turns_runner(worker_id)
-            self.last_wake_outcome = "turned"
-            return "turned"
+            return self._answer_turns_worker(worker_id, text, turns_worker, note)
         if not self.client.available():
             return ""
         send_text = getattr(self.client, "pane_send_text", None)
@@ -3824,14 +3816,113 @@ class HerdrAdapter:
         self.last_wake_outcome = "unconfirmed"
         return ""
 
+    #: How long `answer_worker` watches for an idle turns runner to take the
+    #: prompt it just queued. A live runner checks its queue every
+    #: `TURN_POLL_SECONDS` (2s); a restarted one needs an interpreter start
+    #: and its workspace probes first. Bounded, because a caller is waiting on
+    #: the answer -- but long enough that "turn started" is something seen,
+    #: not something assumed.
+    TURN_PICKUP_WAIT_SECONDS = 12.0
+    #: The detail behind the last turns delivery: `state` is `started`,
+    #: `queued` (behind a turn in progress), `waiting` (a live runner has not
+    #: taken it yet) or `stranded` (no runner is running and none could be
+    #: started); `pid` is the runner's when one is known.
+    last_turn_delivery: dict[str, Any] = {}
+    #: Why the last `ensure_turns_runner` could not leave a runner running.
+    last_runner_problem = ""
+
+    def _answer_turns_worker(
+        self, worker_id: str, text: str, worker: dict[str, Any], note: Path | None
+    ) -> str:
+        """Deliver to a turns worker and say what actually happened to it.
+
+        The message is the next turn's prompt; nothing is typed. This used to
+        queue it, try to restart a runner with every failure suppressed, and
+        report `turned` whatever followed -- so a lead whose runner was gone,
+        mis-identified, or about to exit was reported as having its answer
+        queued while no turn ever started. Now the outcome is observed: the
+        runner took the prompt (`started`), a turn in progress takes it when
+        it ends (`queued`), a live runner has not taken it yet (`waiting`), or
+        nothing is running it (`stranded`, returned as "").
+        """
+        if worker.get("status") != "running":
+            # Nothing will ever run a turn for a settled worker; queueing would
+            # be a message written where no reader is coming.
+            self.last_turn_delivery = {
+                "state": "stranded",
+                "detail": f"the worker is {worker.get('status')}, not running",
+            }
+            self.last_wake_outcome = "turn-stranded"
+            return ""
+        entry_id = self.coordinator.queue_turn_prompt(worker_id, text)
+        if note is not None:
+            # The inbox note is the same message; the queued prompt is how it
+            # reaches the session, so the note is not left to nag as unread.
+            with contextlib.suppress(HelmError, OSError):
+                self.coordinator.mark_inbox_read(worker_id, note)
+        failure = ""
+        try:
+            ensured = self.ensure_turns_runner(worker_id)
+        except (HelmError, SafetyError, OSError, subprocess.SubprocessError) as exc:
+            ensured, failure = False, str(exc)
+        deadline = time.monotonic() + self.TURN_PICKUP_WAIT_SECONDS
+        while True:
+            if not self.coordinator.turn_entry_queued(worker_id, entry_id):
+                state = "started"
+                break
+            alive = self.turns_runner_alive(worker_id)
+            if alive and self.coordinator.turn_state(worker_id).get("pending_prompt"):
+                # Mid-turn: the runner takes the queue the moment this turn ends.
+                state = "queued"
+                break
+            if not ensured and not alive:
+                state = "stranded"
+                break
+            if time.monotonic() >= deadline:
+                state = "waiting" if alive else "stranded"
+                break
+            time.sleep(0.2)
+        delivery: dict[str, Any] = {"state": state, "entry": entry_id}
+        pid = self._turns_runner_pid(worker_id)
+        if pid:
+            delivery["pid"] = pid
+        if state == "stranded":
+            delivery["detail"] = failure or self.last_runner_problem or (
+                "no turns runner is running for it and a restart did not take"
+            )
+        self.last_turn_delivery = delivery
+        if state == "stranded":
+            self.last_wake_outcome = "turn-stranded"
+            return ""
+        self.last_wake_outcome = "turned"
+        return "turned"
+
+    def _turns_runner_pid(self, worker_id: str) -> int | None:
+        """The live runner's own pid, or None when no runner is alive."""
+        if not self.turns_runner_alive(worker_id):
+            return None
+        with contextlib.suppress(OSError, ValueError):
+            return int((self.coordinator.turns_dir(worker_id) / "runner.pid").read_text().strip())
+        return None
+
     def turns_runner_alive(self, worker_id: str) -> bool:
-        """Whether the turns runner behind a worker is a live process."""
-        data = self.coordinator.store.load()
-        worker = data.get("workers", {}).get(worker_id) or {}
-        pid = worker.get("pid")
-        if not pid:
-            with contextlib.suppress(OSError, ValueError):
-                pid = int((self.coordinator.turns_dir(worker_id) / "runner.pid").read_text().strip())
+        """Whether a turns runner is alive for this worker.
+
+        The runner's lock answers this, because a pid cannot: the recorded pid
+        outlives its runner, and `adopt_worker_pid` takes the first process
+        whose command line names the worker's state directory -- which a
+        `tail -f` of the worker's log does. Either made a dead runner read as
+        alive, so nothing restarted it and a queued answer waited for good.
+        Only a runner from before the lock existed falls back to the pid it
+        wrote itself.
+        """
+        turns_dir = self.coordinator.turns_dir(worker_id)
+        held = turns_runner_lock_held(turns_dir)
+        if held is not None:
+            return held
+        pid = None
+        with contextlib.suppress(OSError, ValueError):
+            pid = int((turns_dir / "runner.pid").read_text().strip())
         return bool(pid) and self.coordinator._pid_alive(pid)
 
     def ensure_turns_runner(self, worker_id: str) -> bool:
@@ -3842,22 +3933,46 @@ class HerdrAdapter:
         reclaimed costs a restart, not the task. It goes back into the
         worker's own Herdr tab when that tab still exists, otherwise it runs
         as a detached process.
+
+        A restart into the pane is checked rather than assumed: text typed
+        into a pane that is not at a shell runs nothing, and that used to
+        count as a restart. When no runner takes the lock in time, a detached
+        one is started as well -- the lock lets only one of them run.
         """
+        self.last_runner_problem = ""
         data = self.coordinator.store.load()
         worker = data.get("workers", {}).get(worker_id)
         if worker is None or worker.get("status") != "running" or worker.get("execution_mode") != "turns":
+            self.last_runner_problem = "it is not a running turns worker"
             return False
         if self.turns_runner_alive(worker_id):
             return True
         command = list(worker.get("runner_command") or [])
         if not command:
+            self.last_runner_problem = "its record has no runner command to restart"
             return False
+        stop = self.coordinator.turns_dir(worker_id) / "stop"
+        if stop.exists():
+            # A stop left behind makes every restarted runner exit before it
+            # reads its queue. A fresh one is a stop in progress and wins; an
+            # old one beside a worker still recorded running is stale, and
+            # would strand every prompt sent to it.
+            try:
+                age = time.time() - stop.stat().st_mtime
+            except OSError:
+                age = 0.0
+            if age < 2 * self.coordinator.TURN_STOP_GRACE_SECONDS:
+                self.last_runner_problem = "a stop is in progress for it"
+                return False
+            with contextlib.suppress(OSError):
+                stop.unlink()
         layout = self._herdr_state(data)["workers"].get(worker_id)
         if layout and self.client.available():
             with contextlib.suppress(HerdrUnavailable, HerdrNotFound):
                 self.client.pane_run(layout["pane_id"], self._runner_command(worker))
-                self._note_restart(worker_id, "in its pane")
-                return True
+                if self._runner_came_up(worker_id):
+                    self._note_restart(worker_id, "in its pane")
+                    return True
         env = dict(os.environ)
         env["PYTHONPATH"] = str(worker.get("runner_pythonpath") or "")
         subprocess.Popen(
@@ -3867,6 +3982,18 @@ class HerdrAdapter:
         )
         self._note_restart(worker_id, "as a detached process")
         return True
+
+    #: How long a runner typed into a pane gets to take its lock before Helm
+    #: concludes the pane ran nothing and starts a detached one instead.
+    RUNNER_START_SECONDS = 5.0
+
+    def _runner_came_up(self, worker_id: str) -> bool:
+        deadline = time.monotonic() + self.RUNNER_START_SECONDS
+        while time.monotonic() < deadline:
+            if self.turns_runner_alive(worker_id):
+                return True
+            time.sleep(0.1)
+        return False
 
     def _note_restart(self, worker_id: str, where: str) -> None:
         with contextlib.suppress(HelmError, OSError):
