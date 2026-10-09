@@ -1194,8 +1194,10 @@ class TaskLifecycleTests(HelmTestCase):
         # file (a build artifact, an uncommitted `.helm/project.json`) is
         # deliberately not what this gate blocks on.
         (root / "README.txt").write_text("uncommitted edit\n", encoding="utf-8")
-        with self.assertRaisesRegex(HelmError, "dirty project checkout"):
+        with self.assertRaisesRegex(HelmError, "dirty project checkout") as refused:
             self.coordinator.create_task(project["id"], "work while the checkout is dirty")
+        # The refusal names the sanctioned way out, so nobody stashes by hand.
+        self.assertIn("--adopt-dirty-base", str(refused.exception))
         self.assertEqual(self.coordinator.store.load()["tasks"], {})
 
     def test_untracked_files_in_the_project_checkout_do_not_block_task_creation(self) -> None:
@@ -1760,3 +1762,156 @@ class AnOpenPullRequestCanTakeAnotherRoundTests(HelmTestCase):
         continued = self.coordinator.continue_task(task["id"], "make the diff smaller", read_only=False)
         self.assertEqual(continued["id"], task["id"])
         self.assertNotEqual(self.state.load()["tasks"][task["id"]]["status"], "pr-open")
+
+
+class AdoptDirtyBaseTests(HelmTestCase):
+    """A project's own tool wrote into its checkout; the task takes the change.
+
+    The dirty-checkout refusal blocked the very task that would commit what the
+    tool wrote, so the checkout got stashed by hand in the project root. The
+    sanctioned path moves the changes onto the new task's branch -- recorded,
+    reversible, and refused whenever anything would be lost.
+    """
+
+    def _dirty_project(self, name: str):
+        root = self.repo(name)
+        (root / "gone.txt").write_text("tracked, then deleted\n", encoding="utf-8")
+        (root / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        self._run_git(root, "add", "gone.txt", ".gitignore")
+        self._run_git(root, "commit", "-qm", "more tracked files")
+        project = self.coordinator.register_project(name.title(), str(root), project_id=name)
+        # What a project tool leaves behind: an edited tracked file, a deleted
+        # one, a new file in a new directory, and a staged new file.
+        (root / "README.txt").write_text("a result row the tool recorded\n", encoding="utf-8")
+        (root / "gone.txt").unlink()
+        (root / "results").mkdir()
+        (root / "results" / "row.csv").write_text("id,value\n1,2\n", encoding="utf-8")
+        (root / "staged.txt").write_text("staged and unchanged since\n", encoding="utf-8")
+        self._run_git(root, "add", "staged.txt")
+        # Neither of these is the task's: Helm's settings and an ignored file.
+        (root / ".helm").mkdir()
+        (root / ".helm" / "project.json").write_text(json.dumps({"label": "Kept"}))
+        (root / "build.log").write_text("ignored output\n", encoding="utf-8")
+        return root, project
+
+    def _status(self, root: Path) -> str:
+        return self._run_git(root, "status", "--porcelain=v1", "--untracked-files=all")
+
+    def test_the_changes_move_to_the_task_and_nothing_is_lost(self) -> None:
+        root, project = self._dirty_project("adopting")
+        head = self._run_git(root, "rev-parse", "HEAD")
+        task = self.coordinator.create_task(
+            project["id"], "commit what the tool wrote", adopt_dirty_base=True
+        )
+        # The checkout is back at HEAD; only what was never the task's remains.
+        self.assertEqual(self._run_git(root, "rev-parse", "HEAD"), head)
+        self.assertEqual(self._status(root), "?? .helm/project.json")
+        self.assertEqual((root / "README.txt").read_text(), "adopting")
+        self.assertTrue((root / "gone.txt").exists())
+        self.assertFalse((root / "results").exists())
+        self.assertFalse((root / "staged.txt").exists())
+        self.assertTrue((root / "build.log").exists())
+        # No stash: its one stack is shared with the user and every worktree.
+        self.assertEqual(self._run_git(root, "stash", "list"), "")
+
+        adopted = self.state.load()["tasks"][task["id"]]["adopted_base_changes"]
+        self.assertEqual(
+            sorted(adopted["paths"]),
+            ["README.txt", "gone.txt", "results/row.csv", "staged.txt"],
+        )
+        self.assertEqual(adopted["checkout_head"], head)
+        for ref in adopted["refs"]:
+            self.assertTrue(self._run_git(root, "rev-parse", "--verify", ref))
+
+        # The worktree starts with exactly what the checkout held.
+        self.coordinator.allocate_task(task["id"])
+        workspace = Path(task["workspace"])
+        self.assertEqual(self._run_git(workspace, "rev-parse", "HEAD^"), task["base_revision"])
+        self.assertEqual(self._status(workspace), "")
+        self.assertEqual(
+            (workspace / "README.txt").read_text(), "a result row the tool recorded\n"
+        )
+        self.assertFalse((workspace / "gone.txt").exists())
+        self.assertEqual((workspace / "results" / "row.csv").read_text(), "id,value\n1,2\n")
+        self.assertEqual((workspace / "staged.txt").read_text(), "staged and unchanged since\n")
+        self.assertFalse((workspace / ".helm").exists())
+
+        # And it is reversible: the recorded command puts the changes back.
+        subprocess.run(adopted["restore"], shell=True, check=True)
+        self.assertEqual((root / "README.txt").read_text(), "a result row the tool recorded\n")
+        self.assertFalse((root / "gone.txt").exists())
+        self.assertEqual((root / "results" / "row.csv").read_text(), "id,value\n1,2\n")
+        self.assertEqual((root / "staged.txt").read_text(), "staged and unchanged since\n")
+
+    def test_an_agent_cannot_adopt_the_commanders_checkout(self) -> None:
+        root, project = self._dirty_project("guardedadopt")
+        lead_task = self.coordinator.create_foreman_task(project["id"])
+        lead = self.coordinator.prepare_external_worker(
+            lead_task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        before = self._status(root)
+        tasks_before = set(self.state.load()["tasks"])
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": lead["id"]}):
+            with self.assertRaisesRegex(SafetyError, "adopting the project checkout"):
+                self.coordinator.create_task(
+                    project["id"], "take the commander's files", adopt_dirty_base=True
+                )
+        self.assertEqual(self._status(root), before)
+        self.assertEqual(set(self.state.load()["tasks"]), tasks_before)
+
+    def test_a_partly_staged_file_is_refused_and_nothing_moves(self) -> None:
+        root, project = self._dirty_project("partlystaged")
+        self._run_git(root, "add", "README.txt")
+        (root / "README.txt").write_text("edited again after staging\n", encoding="utf-8")
+        before = self._status(root)
+        with self.assertRaisesRegex(HelmError, "partly staged.*Nothing was changed"):
+            self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        self.assertEqual(self._status(root), before)
+        self.assertEqual(self.state.load()["tasks"], {})
+
+    def test_changes_that_do_not_reproduce_on_the_base_are_refused(self) -> None:
+        root = self.repo("offbase")
+        base = self._run_git(root, "rev-parse", "--abbrev-ref", "HEAD")
+        project = self.coordinator.register_project("Offbase", str(root), project_id="offbase")
+        self._run_git(root, "checkout", "-qb", "side")
+        (root / "README.txt").write_text("side branch line\n", encoding="utf-8")
+        self._run_git(root, "commit", "-qam", "side change")
+        # The checkout is on another branch; its edit builds on a line the
+        # task's base does not have.
+        (root / "README.txt").write_text("side branch line\nplus the tool's row\n", encoding="utf-8")
+        before = self._status(root)
+        with self.assertRaisesRegex(HelmError, "do not apply cleanly.*Nothing was changed"):
+            self.coordinator.create_task(
+                project["id"], "x", base=base, adopt_dirty_base=True
+            )
+        self.assertEqual(self._status(root), before)
+        # A change that does apply to the other base is adopted onto it.
+        self._run_git(root, "checkout", "--", "README.txt")
+        (root / "new.txt").write_text("independent of either branch\n", encoding="utf-8")
+        task = self.coordinator.create_task(project["id"], "x", base=base, adopt_dirty_base=True)
+        self.assertEqual(self._status(root), "")
+        self.coordinator.allocate_task(task["id"])
+        workspace = Path(task["workspace"])
+        self.assertEqual(self._run_git(workspace, "rev-parse", "HEAD^"), task["base_revision"])
+        self.assertEqual((workspace / "new.txt").read_text(), "independent of either branch\n")
+        self.assertEqual((workspace / "README.txt").read_text(), "offbase")
+
+    def test_the_cli_says_what_it_adopted_and_how_to_undo_it(self) -> None:
+        root, project = self._dirty_project("cliadopt")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli.main([
+                "--state-dir", str(self.state.directory), "task", "create",
+                "--project", project["id"], "--brief", "commit the row",
+                "--adopt-dirty-base",
+            ])
+        text = output.getvalue()
+        self.assertIn("Adopted 4 uncommitted path(s)", text)
+        self.assertIn("To put them back instead: git -C", text)
+        self.assertEqual(self._status(root), "?? .helm/project.json")
+
+    def test_a_clean_checkout_has_nothing_to_adopt(self) -> None:
+        root = self.repo("cleanadopt")
+        project = self.coordinator.register_project("CleanAdopt", str(root), project_id="cleanadopt")
+        with self.assertRaisesRegex(HelmError, "no uncommitted changes to adopt"):
+            self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)

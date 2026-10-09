@@ -63,6 +63,26 @@ only an explicit re-setting changes it. A single task can start from another
 branch with `helm task create --base <branch>`, for a fix that must sit on a
 release branch.
 
+## A dirty base checkout
+
+A task will not start from a project checkout with uncommitted changes to
+tracked files, or one in the middle of a merge or rebase. When those changes
+are themselves the work -- a project tool that records a result row in a
+tracked file by design -- the commander hands them to the new task instead of
+stashing in the project root: `helm task create ... --adopt-dirty-base`.
+
+Helm captures the checkout's working state, tracked and untracked (never
+ignored files, never `.helm/`), as commit objects without touching anything,
+builds the task's first commit from it on the task's own base, and proves
+every adopted path reproduces exactly. Only then does it anchor both commits
+under `refs/helm/adopted/<task>`, restore exactly the adopted paths to HEAD,
+and verify the checkout is clean. The task records the paths, both commits
+and a one-line restore command. It refuses, changing nothing, when something
+would be lost: a partly staged file, a conflict, a submodule, a change to
+`.helm/`, a change that does not apply to the base, or a checkout that moved
+while it was being captured. It never uses `git stash`, whose one stack is
+shared with the user and every worktree. Root only.
+
 ## One ticket, one worktree
 
 `helm task create --ticket X` refuses when the project already has a worker
