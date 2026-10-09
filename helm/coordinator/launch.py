@@ -36,6 +36,7 @@ from ..policy import CORE_SAFETY_RULES
 from ..learned import always_in_full, bound_learned_knowledge, domain_index
 from ..values import (
     CONTEXT_BASE_KNOWLEDGE_BUDGET_BYTES,
+    FINAL_TASK_STATES,
     REVIEW_DOMAINS,
     RUNTIME_DEFAULT_MODEL,
     WORKTREELESS_ROLES,
@@ -1745,6 +1746,10 @@ class LaunchMixin:
     ) -> None:
         # Worker output never has a path to approval, merge, publication, or
         # scope expansion. Those transitions are coordinator commands only.
+        if task.get("status") in FINAL_TASK_STATES:
+            # Delivered or discarded: a session that outlived the task can
+            # still report, and the report is kept, but it reopens nothing.
+            return
         if kind == "blocker":
             task["status"] = "blocked"
             return

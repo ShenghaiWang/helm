@@ -25,6 +25,7 @@ from ..values import (
     FOLLOW_UP_ACTION_KIND,
     WORKTREELESS_ROLES,
     _safe_text,
+    discard_residue_text,
     finalization_text,
     new_id,
     now,
@@ -530,10 +531,19 @@ class DecisionsMixin:
         for task in data.get("tasks", {}).values():
             if task.get("project_id") != project_id:
                 continue
-            if task.get("status") not in DELIVERED_TASK_STATES:
+            # A discarded task is as settled as a delivered one, and a discard
+            # that could not remove everything -- a branch checked out
+            # elsewhere, a worktree git would not let go of -- would otherwise
+            # be residue nothing names: its delivery decision closed with the
+            # discard, and no other gate looks at it.
+            discarded = task.get("status") == "discarded"
+            if task.get("status") not in DELIVERED_TASK_STATES and not discarded:
                 continue
             retained = self.task_retained_resources(task, data)
-            if retained:
+            if retained and discarded:
+                why = _safe_text(str((task.get("discard") or {}).get("incomplete") or "")).strip()
+                wanted[task["id"]] = discard_residue_text(task["id"], retained, why[:240])
+            elif retained:
                 wanted[task["id"]] = finalization_text(task["id"], retained)
         status = self._load_status(project_id)
         dirty = False

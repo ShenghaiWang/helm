@@ -184,6 +184,150 @@ class DiscardTests(HelmTestCase):
         self.assertIn(task["branch"], self._branches(root))
         self.assertEqual(self.state.load()["tasks"][task["id"]]["status"], "approved")
 
+    def _open_items(self, project_id: str, task_id: str) -> list[dict]:
+        status = self.coordinator.project_status(project_id)
+        return [item for item in status["action_items"] if item.get("task_id") == task_id]
+
+    def test_a_branch_checked_out_elsewhere_stays_named_until_a_rerun_finishes(self) -> None:
+        root, project, task = self._approved_task("checked-out")
+        base = task["base_branch"]
+        # The commander has the task branch checked out in the project itself.
+        self._run_git(root, "checkout", "-q", "--ignore-other-worktrees", task["branch"])
+
+        discarded = self.coordinator.discard_task(task["id"], note="not wanted")
+
+        self.assertEqual(discarded["status"], "discarded")
+        self.assertFalse(discarded["branch_removed"])
+        self.assertIn("could not be deleted", discarded["discard"]["incomplete"])
+        self.assertIn(task["branch"], self._branches(root))
+        self.assertFalse(Path(task["workspace"]).exists())
+        # It is not silent residue: a decision names the branch and why.
+        items = self._open_items(project["id"], task["id"])
+        self.assertEqual(len(items), 1)
+        self.assertIn("Discard incomplete", items[0]["text"])
+        self.assertIn(task["branch"], items[0]["text"])
+        self.assertIn("could not be deleted", items[0]["text"])
+        self.assertNotIn(task["id"], self.coordinator.archivable_task_ids())
+        released = self.coordinator.release_project(project["id"])
+        self.assertNotIn(task["id"], released["released"])
+        kept = {entry["task_id"]: entry["reason"] for entry in released["kept"]}
+        self.assertIn("still holds", kept[task["id"]])
+        out = io.StringIO()
+        self._run_git(root, "checkout", "-q", base)
+        self._run_git(root, "checkout", "-q", "--ignore-other-worktrees", task["branch"])
+        with contextlib.redirect_stdout(out):
+            cli.main([
+                "--state-dir", str(self.state.directory), "task", "discard", task["id"],
+                "--confirm", "--note", "again",
+            ])
+        self.assertIn("NOT finished", out.getvalue())
+
+        # Once the checkout moves away, running it again finishes the job.
+        self._run_git(root, "checkout", "-q", base)
+        finished = self.coordinator.discard_task(task["id"], note="finish it")
+
+        self.assertTrue(finished["branch_removed"])
+        self.assertIsNone(finished["discard"]["incomplete"])
+        self.assertEqual(finished["discard"]["note"], "not wanted")
+        self.assertEqual(len(finished["discard"]["finishes"]), 2)
+        self.assertNotIn(task["branch"], self._branches(root))
+        self.assertEqual(self._open_items(project["id"], task["id"]), [])
+        self.assertIn(task["id"], self.coordinator.archivable_task_ids())
+        with self.assertRaisesRegex(HelmError, "already discarded and holds nothing"):
+            self.coordinator.discard_task(task["id"], note="once more")
+
+    def test_cleanup_also_finishes_a_discard_whose_branch_was_kept(self) -> None:
+        root, _project, task = self._approved_task("cleanup-finishes")
+        self._run_git(root, "checkout", "-q", "--ignore-other-worktrees", task["branch"])
+        self.coordinator.discard_task(task["id"], note="not wanted")
+        self._run_git(root, "checkout", "-q", task["base_branch"])
+        # The branch is the only copy of its commit, which cleanup would
+        # normally keep; the recorded discard is the commander's decision.
+        cleaned = self.coordinator.cleanup_task(task["id"])
+        self.assertTrue(cleaned["branch_removed"])
+        self.assertNotIn(task["branch"], self._branches(root))
+
+    def test_a_late_report_does_not_reopen_a_discarded_task(self) -> None:
+        root = self.repo("late")
+        project = self.coordinator.register_project("Late", str(root), project_id="late")
+        task = self.coordinator.create_task(project["id"], "goes quiet")
+        # Settled by observing its exit, so a late terminal word is admitted.
+        worker = self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""])
+        self.coordinator.discard_task(task["id"], note="unwanted")
+        before = len(self.state.load()["messages"])
+        self.coordinator.record_worker_message(worker["id"], "failure", "late failure")
+        data = self.state.load()
+        self.assertGreater(len(data["messages"]), before)
+        self.assertEqual(data["tasks"][task["id"]]["status"], "discarded")
+        for kind, status in (("blocker", None), ("status", "failed"), ("result", None)):
+            with contextlib.suppress(HelmError, SafetyError):
+                self.coordinator.record_worker_message(worker["id"], kind, "late word", requested_status=status)
+            self.assertEqual(self.state.load()["tasks"][task["id"]]["status"], "discarded", kind)
+        # And directly, whatever the late-delivery policy lets through.
+        record = {"status": "discarded"}
+        for kind, status in (("failure", None), ("blocker", None), ("status", "blocked"), ("status", "failed")):
+            self.coordinator._transition_from_message(record, kind, status)
+            self.assertEqual(record["status"], "discarded")
+        with self.assertRaisesRegex(SafetyError, "discarded"):
+            self.coordinator.record_worker_message(
+                worker["id"], "approval-needed", "may I?", payload={"action": "publish"}
+            )
+
+    def test_a_failed_worktree_removal_still_lands_the_discard_and_a_rerun_finishes(self) -> None:
+        root = self.repo("stuck")
+        project = self.coordinator.register_project("Stuck", str(root), project_id="stuck")
+        task = self.coordinator.create_task(project["id"], "publish it", shape="small")
+        worker = self.coordinator.prepare_external_worker(
+            task["id"], [sys.executable, "-c", ""], execution="external"
+        )
+        self.commit_on_task_branch(task, "to publish")
+        self.coordinator.record_worker_message(
+            worker["id"], "approval-needed", "ready", payload={"action": "publish"}
+        )
+        self.coordinator.stop_worker(worker["id"], "stood down")
+        from helm.coordinator import protection
+
+        real = protection._git
+
+        def failing(cwd, *args, check=True):
+            if args[:2] == ("worktree", "remove"):
+                raise HelmError("simulated: worktree could not be removed")
+            return real(cwd, *args, check=check)
+
+        with mock.patch.object(protection, "_git", failing):
+            discarded = self.coordinator.discard_task(task["id"], note="will not publish")
+
+        self.assertEqual(discarded["status"], "discarded")
+        self.assertIn("simulated", discarded["discard"]["incomplete"])
+        self.assertFalse(discarded.get("workspace_removed"))
+        self.assertIsNone(self.coordinator.task_hold(self.state.load()["tasks"][task["id"]]))
+        items = self._open_items(project["id"], task["id"])
+        self.assertTrue(any("Discard incomplete" in item["text"] for item in items))
+        # Leave it half-removed, the way a failed removal can: git no longer
+        # calls it a worktree, so verification alone would refuse it forever.
+        (Path(task["workspace"]) / ".git").unlink()
+
+        finished = self.coordinator.discard_task(task["id"], note="finish it")
+
+        self.assertIsNone(finished["discard"]["incomplete"])
+        self.assertTrue(finished["workspace_removed"])
+        self.assertTrue(finished["branch_removed"])
+        self.assertFalse(Path(task["workspace"]).exists())
+        self.assertNotIn(task["branch"], self._branches(root))
+        self.assertEqual(
+            [i for i in self._open_items(project["id"], task["id"]) if "Discard" in i["text"]], []
+        )
+        self.assertIn(task["id"], self.coordinator.archivable_task_ids())
+
+    def test_a_task_that_never_ran_can_be_discarded(self) -> None:
+        root = self.repo("never")
+        project = self.coordinator.register_project("Never", str(root), project_id="never")
+        task = self.coordinator.create_task(project["id"], "never launched")
+        discarded = self.coordinator.discard_task(task["id"], note="not needed after all")
+        self.assertEqual(discarded["status"], "discarded")
+        self.assertNotIn(task["branch"], self._branches(root))
+        self.assertIn(task["id"], self.coordinator.archivable_task_ids())
+
     def test_a_note_is_required(self) -> None:
         _root, _project, task = self._approved_task("silent")
         with self.assertRaisesRegex(HelmError, "--note"):

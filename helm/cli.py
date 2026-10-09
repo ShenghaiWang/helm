@@ -4341,10 +4341,14 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
                     "  recover it while the reflog keeps it: "
                     f"git branch {record['branch']} {record['tip']}"
                 )
-            else:
-                print(f"  branch {record['branch']} could not be deleted; its task log says why")
         if record.get("dirty_discarded"):
             print(f"  uncommitted changes thrown away: {len(record['dirty_discarded'])} path(s)")
+        if record.get("incomplete"):
+            print(f"  NOT finished: {record['incomplete']}")
+            print(
+                "  Fix that, then run this command again to finish; until then it stays "
+                "on your list as a decision"
+            )
         _release_finished_space(coordinator, task)
         with contextlib.suppress(HelmError, OSError):
             if coordinator.archive_tasks([task["id"]])["archived"]:

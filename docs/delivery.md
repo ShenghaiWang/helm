@@ -248,8 +248,9 @@ task whose recorded pull request is not merged or closed, or that holds an
 open approval, whatever its status reads.
 
 Cleanup keeps work nobody has decided about. When the commander *has*
-decided -- an approved, completed, blocked or failed change that is no
-longer wanted -- `helm task discard <task> --confirm --note "why"` throws it
+decided -- a change that is no longer wanted, whether approved, completed,
+waiting on approval, blocked, failed, or created or allocated and never
+finished -- `helm task discard <task> --confirm --note "why"` throws it
 away. It is root-only, and it refuses a merged task, one with a pull request
 still open (close the PR, then `helm task pr-sync`), and one whose worker is
 still live (`helm worker stop` it first); a lead task is refused while a
@@ -260,7 +261,11 @@ It then removes the worktree (a dirty one is refused, naming the changes,
 unless `--force-dirty`), deletes the branch even when unpushed, withdraws
 any open approval hold, marks the task `discarded` -- terminal, holding
 nothing, with no delivery or cleanup decision left -- and archives it.
-Nothing outside that one task's worktree and branch is touched.
+Nothing outside that one task's worktree and branch is touched. If git will
+not let go of something -- the branch is checked out in another worktree,
+say -- the task is still `discarded`, a late worker report cannot reopen it,
+and a decision names what is left and why; fix the cause and run the same
+command again (or `helm task cleanup`) to finish.
 
 What it names is read from Helm's own record of what the task owns, not from
 a live look at the disk: `helm status` and `helm watch` run no git or

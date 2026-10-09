@@ -68,6 +68,7 @@ from .values import (
     _ROLE_DIRECTORY,
     _SKILL_STOPWORDS,
     DELIVERED_TASK_STATES,
+    FINAL_TASK_STATES,
     DELIVERY_DECISION_KIND,
     DELIVERY_DECISION_PROJECT_TEXT,
     DELIVERY_DECISION_TASK_TEXT,
@@ -569,6 +570,12 @@ class Coordinator(
         hold_event = ""
         if kind == "artifact":
             self._record_artifact(data, project, task, worker, payload)
+        elif kind == self.HOLD_MESSAGE_KIND and task.get("status") == "discarded":
+            # Nothing is left to act on, so there is nothing to authorize.
+            raise SafetyError(
+                f"task {task['id']} was discarded by the commander; there is no work "
+                "left to ask approval for"
+            )
         elif kind == self.HOLD_MESSAGE_KIND:
             hold = self._hold_request(data, project, task, worker, message, payload)
             hold_event = "request"
@@ -592,7 +599,7 @@ class Coordinator(
             # overrides the fallback outcome without rewriting the observation.
             worker["protocol_outcome"] = kind
             worker["outcome_source"] = "protocol"
-            if late:
+            if late and task.get("status") not in FINAL_TASK_STATES:
                 task["status"] = self._TERMINAL_MESSAGE_TASK_STATE[kind]
             self._exit_mismatch_evidence(data, project, task, worker, kind)
         if kind not in self._COORDINATOR_ORIGINATED_MESSAGE_KINDS:

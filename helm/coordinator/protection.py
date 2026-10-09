@@ -28,7 +28,7 @@ from typing import Any
 
 from ..errors import HelmError, SafetyError
 from ..git import _git, shed_adopted_refs
-from ..paths import _file_digest, canonical
+from ..paths import _file_digest, canonical, inside
 from ..values import (
     DELIVERED_TASK_STATES,
     HOLD_OPEN_STATUSES,
@@ -2327,6 +2327,25 @@ class ProtectionMixin:
         # A registration whose directory is already gone still makes git call
         # the branch checked out, which would refuse the delete below.
         _git(root, "worktree", "prune", check=False)
+        if task.get("status") == "discarded" and task.get("discard"):
+            # The commander already decided this work is unwanted, and the
+            # discard recorded the tip that recovers it. Keeping the branch as
+            # "the only copy" would undo that decision, so cleanup finishes
+            # what the discard could not.
+            _git(root, "branch", "-D", branch, check=False)
+            removed = not _git(root, "rev-parse", "--verify", "--quiet", ref, check=False)
+            task["branch_removed"] = removed
+            self._message(
+                data, project, task, None, "cleanup",
+                f"Discarded task branch {branch} deleted" if removed
+                else f"Discarded task branch {branch} could not be deleted; it may be checked out elsewhere",
+                {"branch": branch},
+            )
+            if removed:
+                task["branch_removed_at"] = now()
+                (task.get("discard") or {})["incomplete"] = None
+                self._shed_adopted_refs(data, project, task, root)
+            return
         # Forced or not, a branch that is the ONLY copy of its commits is never
         # deleted. --delete-branch used to skip even the base comparison below,
         # so a stopped PR task's branch went with commits no remote had. Only
@@ -2479,7 +2498,20 @@ class ProtectionMixin:
             return "waiting on a human decision"
         if task["status"] in {"created", "allocated", "running"}:
             return f"still {task['status']}"
-        if task["status"] in {"merged", "pr-merged", "discarded"}:
+        if task["status"] == "discarded":
+            # Settled, but only released once it actually holds nothing: a
+            # discard that could not delete its branch must not be reported
+            # as released while the branch is still there.
+            retained = self.task_retained_resources(task, data)
+            if not retained:
+                return None
+            why = (task.get("discard") or {}).get("incomplete")
+            return (
+                f"discarded, but still holds {', '.join(retained)}"
+                + (f" ({why})" if why else "")
+                + f"; finish it with helm task discard {task['id']} --confirm --note \"...\""
+            )
+        if task["status"] in {"merged", "pr-merged"}:
             return None
         if task["status"] == "pr-open":
             return "PR open; monitor comments/checks until it merges"
@@ -2846,8 +2878,13 @@ class ProtectionMixin:
             task = self._task(data, task_id)
             project = self._project(data, task["project_id"])
             status = task.get("status")
-            if status == "discarded":
-                raise HelmError(f"task {task_id} is already discarded")
+            # A discard that could not finish -- a branch checked out
+            # elsewhere, a worktree git would not remove -- is finished by
+            # running it again. The decision was already made and recorded,
+            # so the second run only removes what is left.
+            finishing = status == "discarded"
+            if finishing and not self.task_retained_resources(task, data):
+                raise HelmError(f"task {task_id} is already discarded and holds nothing")
             if status in DELIVERED_TASK_STATES:
                 raise SafetyError(
                     f"refusing discard of task {task_id}: it is {status}, so its work "
@@ -2867,7 +2904,10 @@ class ProtectionMixin:
             live = [
                 worker
                 for worker in self._task_workers(data, task_id)
-                if worker.get("status") == "running" or self._session_still_live(worker)
+                if worker.get("status") == "running"
+                # A removed directory took the exit record with it; it was
+                # only removed because the session had already ended.
+                or (not worker.get("directory_removed") and self._session_still_live(worker))
             ]
             if live:
                 raise SafetyError(
@@ -2901,15 +2941,34 @@ class ProtectionMixin:
                 and not task.get("workspace_removed")
                 and workspace.exists()
             )
+            verified = False
             if present:
-                workspace = self._verify_workspace_record(data, project, task)
+                try:
+                    workspace = self._verify_workspace_record(data, project, task)
+                    verified = True
+                except SafetyError:
+                    # A removal that failed part-way can leave a directory git
+                    # no longer calls a worktree, and verification then refuses
+                    # it forever. On a finishing run the commander's decision
+                    # already covers it -- but only inside Helm's own state,
+                    # where task worktrees are made; anything else is not ours
+                    # to delete.
+                    if (
+                        not finishing
+                        or not inside(workspace, self.store.directory)
+                        or workspace == canonical(project["root"])
+                    ):
+                        raise
+            previous = task.get("discard") or {}
             dirt = ""
-            if present and checkout and not self._workspace_clean(workspace):
+            if verified and checkout and not self._workspace_clean(workspace):
                 porcelain = _git(
                     workspace, "status", "--porcelain=v1", "--untracked-files=all", check=False
                 )
                 dirt = self._dirt_worth_keeping(porcelain) or "unresolved merge conflicts"
-                if not force_dirty:
+                # A finishing run does not ask again about changes the first
+                # run already agreed to throw away.
+                if not force_dirty and not previous.get("dirty_discarded"):
                     lines = dirt.splitlines()
                     shown = "; ".join(line.strip() for line in lines[:10])
                     more = f" and {len(lines) - 10} more" if len(lines) > 10 else ""
@@ -2937,28 +2996,47 @@ class ProtectionMixin:
                     root, "rev-list", "--count", branch, "--not", *elsewhere, check=False
                 ).strip()
                 unpushed = int(counted) if counted.isdigit() else None
-            record = {
+            attempt = {
                 "at": now(),
-                "from_status": status,
                 "note": reason,
-                "branch": branch,
                 "tip": tip,
                 "unpushed_commits": unpushed,
                 "dirty_discarded": dirt.splitlines() if dirt else [],
                 "authority": authority.mode,
             }
+            if finishing:
+                # The first run's record is the decision and keeps its tip; a
+                # finishing run is appended beside it, with the tip it saw in
+                # case the branch moved in between.
+                record = previous
+                record.setdefault("finishes", []).append(attempt)
+            else:
+                record = {
+                    "at": attempt["at"],
+                    "from_status": status,
+                    "note": reason,
+                    "branch": branch,
+                    "tip": tip,
+                    "unpushed_commits": unpushed,
+                    "dirty_discarded": attempt["dirty_discarded"],
+                    "authority": authority.mode,
+                }
             task["discard"] = record
             recovery = ""
             if tip:
                 counted_text = "an unknown number of" if unpushed is None else str(unpushed)
                 recovery = (
-                    f". Branch {branch} was at {tip} with {counted_text} commit(s) no "
+                    f". Branch {branch} is at {tip} with {counted_text} commit(s) no "
                     f"remote holds; recover it with: git branch {branch} {tip}"
                 )
             self._message(
                 data, project, task, None, "status",
-                f"Commander discarded this task's work: {reason}{recovery}",
-                {"discard": record},
+                (
+                    f"Commander is finishing the discard of this task: {reason}{recovery}"
+                    if finishing
+                    else f"Commander discarded this task's work: {reason}{recovery}"
+                ),
+                {"discard": attempt if finishing else record},
             )
             # Durable before the first deletion, so a failure part-way through
             # still leaves the sha that recovers the branch.
@@ -2978,20 +3056,43 @@ class ProtectionMixin:
                         "so its escalation is no longer awaiting an answer.",
                         {"source": "discard"},
                     )
+            # From here a failure is recorded, never raised. Raising would roll
+            # back the hold withdrawal and the status with it, and a worktree
+            # git half-removed would then be refused by verification forever.
+            # Recorded, the task is `discarded`, the leftover is named in a
+            # commander decision, and running discard again finishes it.
+            problems: list[str] = []
             if present:
-                if task.get("read_only"):
-                    self._set_workspace_writable(workspace, writable=True)
-                if checkout:
-                    _git(root, "worktree", "remove", "--force", str(workspace))
-                else:
-                    shutil.rmtree(workspace)
-            if not task.get("workspace_removed"):
+                try:
+                    if task.get("read_only"):
+                        self._set_workspace_writable(workspace, writable=True)
+                    if checkout and verified:
+                        _git(root, "worktree", "remove", "--force", str(workspace))
+                    else:
+                        # A plain Helm-owned directory, or a checkout git no
+                        # longer recognises, both confirmed above to sit
+                        # inside Helm's own state.
+                        shutil.rmtree(workspace)
+                        if checkout:
+                            _git(root, "worktree", "prune", check=False)
+                    present = False
+                except (HelmError, OSError) as exc:
+                    problems.append(
+                        f"its worktree could not be removed: {_safe_text(str(exc)).strip()[:200]}"
+                    )
+            if not present and not task.get("workspace_removed"):
                 task["workspace_removed"] = True
                 task["workspace_removed_at"] = now()
             self._remove_worker_directories_locked(data, task)
             if tip:
                 _git(root, "worktree", "prune", check=False)
-                _git(root, "branch", "-D", branch, check=False)
+                try:
+                    _git(root, "branch", "-D", branch)
+                except HelmError as exc:
+                    problems.append(
+                        f"branch {branch} could not be deleted: "
+                        f"{_safe_text(str(exc)).strip()[:200]}"
+                    )
                 removed = not _git(
                     root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
                 )
@@ -2999,22 +3100,27 @@ class ProtectionMixin:
                 if removed:
                     task["branch_removed_at"] = now()
                     self._shed_adopted_refs(data, project, task, root)
-                else:
-                    self._message(
-                        data, project, task, None, "cleanup",
-                        f"Task branch {branch} could not be deleted; it may be checked out elsewhere",
-                        {"branch": branch},
-                    )
+                elif not any(problem.startswith(f"branch {branch}") for problem in problems):
+                    problems.append(f"branch {branch} is still there after deletion")
             elif branch:
                 task["branch_removed"] = True
+            record["incomplete"] = "; ".join(problems) if problems else None
             task["status"] = "discarded"
-            task["discarded_at"] = record["at"]
-            self._message(
-                data, project, task, None, "cleanup",
-                "Task discarded: worktree removed"
-                + (f", branch {branch} deleted" if branch and task.get("branch_removed") else ""),
-                {"discard": record},
-            )
+            task.setdefault("discarded_at", record["at"])
+            if problems:
+                self._message(
+                    data, project, task, None, "cleanup",
+                    f"Task discarded, but not everything could be removed: {record['incomplete']}. "
+                    f"Fix that, then run helm task discard {task_id} again to finish",
+                    {"discard": record},
+                )
+            else:
+                self._message(
+                    data, project, task, None, "cleanup",
+                    "Task discarded: worktree removed"
+                    + (f", branch {branch} deleted" if branch and task.get("branch_removed") else ""),
+                    {"discard": record},
+                )
             self.resolve_delivery_decisions(project["id"], reason="discarded", data=data)
             with contextlib.suppress(HelmError, OSError):
                 self.refresh_finalization_decisions(project["id"], data=data)

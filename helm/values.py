@@ -624,6 +624,11 @@ _TERMINAL_WORKER_TASK_STATES = {
 #: means the work exists on a branch nobody has decided anything about yet,
 #: and treating that as done is how finished-but-undelivered work disappears.
 DELIVERED_TASK_STATES = frozenset({"merged", "pr-merged"})
+#: States a task never leaves. The work was delivered or the commander threw
+#: it away, so a late report from a session that outlived it is recorded and
+#: moves nothing: a `failure` arriving after a discard once turned the task
+#: back into a failure decision about work that no longer exists.
+FINAL_TASK_STATES = DELIVERED_TASK_STATES | {"discarded"}
 #: Action items Helm raises itself and can answer itself, versus the free-text
 #: follow-up somebody wrote down. Only the first kind is auto-resolved: Helm
 #: knows when a delivery decision has been taken, and cannot know whether a
@@ -696,6 +701,24 @@ def finalization_text(task_id: str, retained: Sequence[str]) -> str:
         f"helm task cleanup {task_id} (add --delete-branch to discard the "
         "branch); unmerged commits, a dirty workspace or a live session are "
         "kept and reported instead."
+    )
+
+
+def discard_residue_text(task_id: str, retained: Sequence[str], why: str = "") -> str:
+    """The commander-facing line for a discard that could not finish.
+
+    The commander already decided to throw the work away, so this is not a
+    second question about the work; it names what is left, why the discard
+    could not remove it, and the command that finishes the job once that is
+    fixed.
+    """
+    return (
+        f"Discard incomplete: discarded task {task_id} still holds "
+        f"{', '.join(retained)}"
+        + (f" ({why})" if why else "")
+        + f". Fix that, then finish it with helm task discard {task_id} "
+        "--confirm --note \"...\" or helm task cleanup "
+        f"{task_id}."
     )
 
 
