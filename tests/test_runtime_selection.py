@@ -930,6 +930,61 @@ class RuntimeSelectionTests(HelmTestCase):
         self.assertEqual(bare.count("--add-dir"), 1)
         self.assertNotIn("", bare)
 
+    def test_codex_resume_turn_passes_only_flags_exec_resume_accepts(self) -> None:
+        # `codex exec resume` rejects --sandbox and --add-dir with exit 2, so
+        # every codex worker that needed a second turn was stranded. The
+        # options below are the ones `codex exec resume --help` lists
+        # (codex-cli 0.154.0); the sandbox boundary travels through -c.
+        accepted = {
+            "-c", "--config", "--last", "--all", "--enable", "--disable", "-i", "--image",
+            "--strict-config", "-m", "--model", "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust", "--worktree", "--thread-source",
+            "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+            "--output-schema", "--json", "-o", "--output-last-message",
+        }
+        takes_value = {"-c", "--config", "--enable", "--disable", "-i", "--image", "-m",
+                       "--model", "--thread-source", "--output-schema", "-o",
+                       "--output-last-message"}
+        codex = runtimes.builtin_runtime("codex")
+        assert codex is not None
+        # As the launch builds it: model and effort go in front of the subcommand.
+        template = codex.with_effort(
+            [codex.turn_resume[0], codex.model_flag, "gpt-x", *codex.turn_resume[1:]], "high"
+        )
+        argv = runtimes.apply_prompt(
+            template, "the answer", "/w", "/state", "/repo/.git",
+            session="0199-session",
+        )
+        start = argv.index("resume")
+        self.assertEqual(argv[start - 1], "exec")
+        tail = argv[start + 1:]
+        self.assertEqual(tail[-2:], ["0199-session", "the answer"])
+        options = tail[:-2]
+        index = 0
+        overrides: list[str] = []
+        while index < len(options):
+            flag = options[index]
+            self.assertIn(flag, accepted, f"codex exec resume does not accept {flag}")
+            if flag in takes_value:
+                if flag in ("-c", "--config"):
+                    overrides.append(options[index + 1])
+                index += 2
+            else:
+                index += 1
+        self.assertNotIn("--sandbox", argv)
+        self.assertNotIn("--add-dir", argv)
+        # The boundary the first turn set still holds on the second.
+        import tomllib
+        parsed = {}
+        for override in overrides:
+            key, _, value = override.partition("=")
+            parsed[key] = tomllib.loads(f"v = {value}")["v"]
+        self.assertEqual(parsed["sandbox_mode"], "workspace-write")
+        self.assertEqual(parsed["sandbox_workspace_write.writable_roots"], ["/state", "/repo/.git"])
+        # No Git directory known: it is left out, never written as "".
+        bare = runtimes.apply_prompt(codex.turn_resume, "p", "/w", "/state", session="s")
+        self.assertIn('sandbox_workspace_write.writable_roots=["/state"]', bare)
+
 
 class EffortCapabilityTests(HelmTestCase):
     """Effort is a property of the runtime, expressed four different ways.

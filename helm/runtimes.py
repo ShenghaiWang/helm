@@ -46,6 +46,10 @@ GIT_COMMON_DIR_PLACEHOLDER = "{git_common_dir}"
 # A per-worker settings file for runtimes that take one; empty when the
 # launch wrote none, and the flag in front of it goes with it.
 WORKER_SETTINGS_PLACEHOLDER = "{worker_settings}"
+# The state and Git directories as one TOML array, embedded inside a config
+# override (`key=<array>`) for a runtime that takes extra writable roots only
+# that way. An empty directory is left out of the array, never written as "".
+WRITABLE_ROOTS_TOML_PLACEHOLDER = "{writable_roots_toml}"
 
 #: Slot for the agent session a turn resumes. Turn-based execution runs a
 #: worker as a series of non-interactive invocations that share one
@@ -344,17 +348,20 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
             GIT_COMMON_DIR_PLACEHOLDER,
             PROMPT_PLACEHOLDER,
         ),
+        # `codex exec resume` takes neither --sandbox nor --add-dir: it exits
+        # 2 with "unexpected argument '--sandbox'", which stranded every codex
+        # worker that needed a second turn. It does take -c, so the same
+        # boundary travels as config overrides: workspace-write plus exactly
+        # the state and Git directories as extra writable roots.
         turn_resume=(
             "codex",
             "exec",
             "resume",
             "--json",
-            "--sandbox",
-            "workspace-write",
-            "--add-dir",
-            STATE_DIR_PLACEHOLDER,
-            "--add-dir",
-            GIT_COMMON_DIR_PLACEHOLDER,
+            "-c",
+            'sandbox_mode="workspace-write"',
+            "-c",
+            "sandbox_workspace_write.writable_roots=" + WRITABLE_ROOTS_TOML_PLACEHOLDER,
             SESSION_PLACEHOLDER,
             PROMPT_PLACEHOLDER,
         ),
@@ -770,8 +777,13 @@ def apply_prompt(
         WORKER_SETTINGS_PLACEHOLDER: worker_settings,
         SESSION_PLACEHOLDER: session,
     }
+    # JSON strings and arrays are valid TOML basic strings and inline arrays.
+    roots_toml = json.dumps([root for root in (state_dir, git_common_dir) if root])
     out: list[str] = []
     for part in command:
+        if WRITABLE_ROOTS_TOML_PLACEHOLDER in part:
+            out.append(part.replace(WRITABLE_ROOTS_TOML_PLACEHOLDER, roots_toml))
+            continue
         if part in filled and part != PROMPT_PLACEHOLDER and not filled[part]:
             if out and out[-1] in _PATH_FLAGS:
                 out.pop()
