@@ -1597,15 +1597,6 @@ def _build_parser() -> argparse.ArgumentParser:
     reshape.add_argument("task_id")
     reshape.add_argument("shape", choices=TASK_SHAPES)
     reshape.add_argument("--reason", default="", help="why; recorded with the old and new shape")
-    amend = task_commands.add_parser(
-        "amend",
-        help="commander: append to the contract a live task's reviewer judges, "
-             "when the scope widened after its gates were spent",
-    )
-    amend.add_argument("task_id")
-    amend.add_argument("--text", required=True, help="what the contract now also covers")
-    amend.add_argument("--confirm", action="store_true",
-        help="required: this is the commander's own scope decision")
     create.add_argument("--delivery", choices=("local", "pr"))
     create.add_argument("--domain", help="explicit domain override for ambiguous tasks")
     create.add_argument("--no-domain", action="store_true")
@@ -1634,6 +1625,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="pure investigation/status work that changes nothing; exempt from the "
         "requirement/solution confirmation gates. Never pass this for work that edits anything",
     )
+    amend = task_commands.add_parser(
+        "amend",
+        help="commander: append to the contract a live task's reviewer judges, "
+             "when the scope widened after its gates were spent",
+    )
+    amend.add_argument("task_id")
+    amend.add_argument("--text", required=True, help="what the contract now also covers")
+    amend.add_argument("--confirm", action="store_true",
+        help="required: this is the commander's own scope decision")
     for name in ("allocate", "inspect", "approve", "merge"):
         task_commands.add_parser(name).add_argument("task_id")
     provenance_cmd = task_commands.add_parser(
@@ -3606,6 +3606,53 @@ def _print_agent_inbox(coordinator: Coordinator, args: argparse.Namespace) -> No
             print(_format_inbox(marked, notes), end="", flush=True)
 
 
+def _deliver_contract_amendment(
+    coordinator: Coordinator, task: dict[str, Any], amendment: dict[str, Any], number: int
+) -> list[str]:
+    """Hand a recorded amendment to the task's live lead and author; say where it landed.
+
+    The same path `helm worker answer` takes: the message is recorded on the
+    task, the inbox note is the delivery, and the pane is only a wake. Live
+    sessions only, never one outside the task's project; with nothing live the
+    amendment still waits in the record for the next review round, and the
+    line says so rather than implying somebody was told.
+    """
+    text = coordinator.contract_amendment_message(task["id"], amendment, number)
+    lines: list[str] = []
+    for worker in coordinator.contract_amendment_recipients(task["id"]):
+        who = "lead" if worker.get("task_id") != task["id"] else "author"
+        try:
+            coordinator.require_same_project(worker["id"], "contract amendment")
+            if worker.get("project_id") != task.get("project_id"):
+                raise HelmError(
+                    f"worker {worker['id']} is not in project {task.get('project_id')}"
+                )
+            coordinator.record_worker_message(
+                worker["id"], "answer", text,
+                payload={"via": "contract-amendment", "task_id": task["id"], "sender": "root"},
+            )
+            recorded = coordinator.latest_answer(worker["id"]) or {}
+            note = coordinator.leave_inbox_note(worker["id"], text, note_id=recorded.get("id"))
+        except (HelmError, SafetyError, OSError) as exc:
+            lines.append(f"  {who} {worker['id']}: not delivered: {exc}")
+            continue
+        outcome = "unreachable"
+        with contextlib.suppress(HelmError, OSError):
+            adapter = HerdrAdapter(coordinator)
+            adapter.answer_worker(worker["id"], text, note=note)
+            outcome = adapter.last_wake_outcome
+        lines.append(
+            f"  {who} {worker['id']}: "
+            f"{_INBOX_DELIVERY_WORDS.get(outcome, _INBOX_DELIVERY_WORDS['unreachable'])}"
+        )
+    if not lines:
+        lines.append(
+            "  No live lead or author session on this task, so nobody was told; "
+            "the amendment waits in the record for its next review round."
+        )
+    return lines
+
+
 _ROOT_ONLY_COMMANDS = frozenset({
     ("init", None),
     # Starting arms spawns agents and the judge; scoring is the commander's
@@ -4055,11 +4102,13 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
         )
     elif args.task_command == "amend":
         amended = coordinator.amend_contract(args.task_id, args.text, confirm=args.confirm)
-        count = len(amended.get("contract_amendments") or [])
+        amendments = amended.get("contract_amendments") or []
         print(
-            f"Amended the contract for task {amended['id']} (amendment {count}); "
+            f"Amended the contract for task {amended['id']} (amendment {len(amendments)}); "
             "its next review round reads the original contract and every amendment in order."
         )
+        for line in _deliver_contract_amendment(coordinator, amended, amendments[-1], len(amendments)):
+            print(line)
     elif args.task_command == "cost":
         usage = coordinator.task_usage(args.task_id, with_reviews=not args.no_reviews)
         if args.as_json:

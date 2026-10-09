@@ -11,6 +11,7 @@ import contextlib
 import copy
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 from ..errors import HelmError, SafetyError
@@ -81,10 +82,23 @@ class GatesMixin:
                     f"task {task_id} is a {task.get('role')} task; a contract is amended "
                     "on the worker task its reviewer judges"
                 )
-            if task.get("status") in DELIVERED_TASK_STATES:
+            status = task.get("status")
+            if status in DELIVERED_TASK_STATES:
                 raise HelmError(
-                    f"task {task_id} is already {task['status']}; there is no review "
+                    f"task {task_id} is already {status}; there is no review "
                     "left for an amendment to reach"
+                )
+            if status in self._UNAMENDABLE_TASK_STATES:
+                raise HelmError(
+                    f"task {task_id} is {status} and cannot take another round, so no "
+                    f"review would read an amendment; run helm task reopen {task_id} "
+                    "first if the work goes on"
+                )
+            workspace = task.get("workspace")
+            if task.get("workspace_removed") or not workspace or not Path(workspace).is_dir():
+                raise HelmError(
+                    f"task {task_id} no longer has its workspace; it cannot take "
+                    "another round, so no review would read an amendment"
                 )
             amendment = {
                 "text": text,
@@ -100,6 +114,52 @@ class GatesMixin:
                 {"contract_amendment": len(task["contract_amendments"])},
             )
             return dict(task)
+
+    #: States from which a task takes no further round without a person
+    #: reopening it first, so an amendment recorded there would reach no review.
+    _UNAMENDABLE_TASK_STATES = frozenset({"failed", "blocked"})
+
+    def contract_amendment_recipients(self, task_id: str) -> list[dict[str, Any]]:
+        """The live sessions an amendment to this task must reach, lead first.
+
+        Recording an amendment is not delivering it: the lead driving the task
+        decides what the next round asks for, and an author mid-round is
+        building against the old scope. So it goes to the lead that owns the
+        task and to any author session still running on it -- live sessions
+        only, and never one outside the task's own project.
+        """
+        data = self.store.load()
+        task = self._task(data, task_id)
+        project_id = task.get("project_id")
+        recipients: list[dict[str, Any]] = []
+        # The lead the record names as this task's owner. The project-wide
+        # fallback is a guess at "some lead in this project", and handing a
+        # scope change to a lead driving other work is a second driver.
+        lead, how = self.driver_resolution(task_id, data=data)
+        candidates = [lead] if lead and how != "project" else []
+        candidates += sorted(
+            self._task_workers(data, task_id),
+            key=lambda worker: str(worker.get("started_at") or worker.get("created_at") or ""),
+        )
+        for worker in candidates:
+            if (
+                worker.get("status") != "running"
+                or worker.get("project_id") != project_id
+                or any(seen["id"] == worker.get("id") for seen in recipients)
+            ):
+                continue
+            recipients.append(dict(worker))
+        return recipients
+
+    @staticmethod
+    def contract_amendment_message(task_id: str, amendment: dict[str, Any], number: int) -> str:
+        """What a live lead or author is told when the commander amends a task."""
+        return (
+            f"The commander amended the contract for task {task_id} "
+            f"(amendment {number}, {amendment.get('at')}): {amendment['text']}\n"
+            "This is now in scope alongside the original requirement, and every "
+            "later review round of this task reads it."
+        )
 
     @staticmethod
     def contract_amendments_for(

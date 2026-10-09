@@ -244,6 +244,15 @@ labelled as the commander's. Like `gate decide`, it is refused for a task
 lead or a worker, because widening what a reviewer accepts is the
 commander's scope decision.
 
+Recording it is not delivering it. The command also hands the amendment to
+the live lead that owns the task and to any author session still running on
+it, by the same inbox-and-wake path as `helm worker answer`, and prints where
+each copy landed. Only live sessions in the task's own project get it. When
+nothing is live it says so, and the amendment waits in the record for the
+next review round. A merged, failed or blocked task, or one whose worktree
+is gone, takes no further round, so it is refused there; reopen a failed or
+blocked task first.
+
 ## The shape of the change sizes the ceremony
 
 Every task carries a shape, stated by whoever creates it with a one-line

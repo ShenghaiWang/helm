@@ -1204,6 +1204,79 @@ class ReviewTests(HelmTestCase):
         self.assertIn("also update the changelog", brief)
         self.assertNotIn("Requirement:", brief.split("FIRST WORD")[0])
 
+    def test_an_amendment_survives_a_contract_that_overflows_to_its_file(self) -> None:
+        limit = 20_000
+        requirement = "goal: " + "r" * (limit - 30) + " REQUIREMENT-END"
+        solution = "approach: " + "s" * (limit - 30) + " SOLUTION-END"
+        task, _worker = self._gated_task("amendoverflow", requirement, solution)
+        self.commit_on_task_branch(task)
+        self.coordinator.amend_contract(task["id"], "also cover the AMENDMENT-END case", confirm=True)
+
+        brief = self._captured_reviewer_brief(task)
+
+        self.assertLessEqual(len(brief), limit)
+        contract_file = self.state.directory / "reviews" / task["id"] / "contract.md"
+        self.assertIn(str(contract_file), brief)
+        written = contract_file.read_text(encoding="utf-8")
+        # The whole contract, amendment last and labelled, is in the file.
+        self.assertLess(written.index("SOLUTION-END"), written.index("COMMANDER AMENDMENTS"))
+        self.assertIn("Commander amendment 1 (", written)
+        self.assertIn("also cover the AMENDMENT-END case", written)
+
+    def test_an_amendment_is_refused_on_a_task_that_takes_no_further_round(self) -> None:
+        task, _worker = self._gated_task("amendterminal")
+        for status in ("merged", "pr-merged", "failed", "blocked"):
+            with self.coordinator.store.locked() as data:
+                data["tasks"][task["id"]]["status"] = status
+            with self.assertRaisesRegex(HelmError, f"{task['id']} is (already )?{status}"):
+                self.coordinator.amend_contract(task["id"], "also more", confirm=True)
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["status"] = "completed"
+            data["tasks"][task["id"]]["workspace_removed"] = True
+        with self.assertRaisesRegex(HelmError, "no longer has its workspace"):
+            self.coordinator.amend_contract(task["id"], "also more", confirm=True)
+        stored = self.coordinator.store.load()["tasks"][task["id"]]
+        self.assertEqual(stored.get("contract_amendments") or [], [])
+
+    def test_an_amendment_is_delivered_to_the_live_lead_and_author(self) -> None:
+        """Recorded but never delivered, an amendment reached nobody until a review."""
+        task, worker = self._gated_task("amenddelivered")
+        data = self.coordinator.store.load()
+        lead_id = next(
+            worker_id for worker_id, entry in data["workers"].items()
+            if data["tasks"][entry["task_id"]].get("role") == "foreman"
+            and entry["project_id"] == task["project_id"]
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main([
+                "--state-dir", str(self.coordinator.store.directory),
+                "task", "amend", task["id"], "--text", "also bump the version", "--confirm",
+            ])
+        output = stdout.getvalue()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"lead {lead_id}: in its inbox", output)
+        self.assertIn(f"author {worker['id']}: in its inbox", output)
+        for recipient in (lead_id, worker["id"]):
+            notes = self.coordinator.inbox_notes(recipient)
+            self.assertEqual(len(notes), 1, recipient)
+            self.assertIn("The commander amended the contract", notes[0]["text"])
+            self.assertIn("also bump the version", notes[0]["text"])
+
+        # A dead session is skipped, and with nobody live the output says so.
+        with self.coordinator.store.locked() as data:
+            for entry in data["workers"].values():
+                entry["status"] = "exited"
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main([
+                "--state-dir", str(self.coordinator.store.directory),
+                "task", "amend", task["id"], "--text", "also tag the release", "--confirm",
+            ])
+        self.assertEqual(code, 0, stdout.getvalue())
+        self.assertIn("No live lead or author session", stdout.getvalue())
+        self.assertEqual(len(self.coordinator.inbox_notes(lead_id)), 1)
+
     def test_only_the_commander_can_amend_a_contract(self) -> None:
         task, worker = self._gated_task("amendrefused")
         data = self.coordinator.store.load()

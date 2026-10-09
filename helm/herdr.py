@@ -2821,7 +2821,7 @@ class HerdrAdapter:
         )
 
     _CONTRACT_HEADER = (
-        "THE CONFIRMED CONTRACT. The commander confirmed this requirement for "
+        "THE CONFIRMED CONTRACT. The commander confirmed what follows for "
         "the change you are reviewing. Judge the change against it: work that "
         "is correct but does not meet it, or does more than it, is a finding.\n"
     )
