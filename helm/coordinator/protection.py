@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import HelmError, SafetyError
-from ..git import _git
+from ..git import _git, shed_adopted_refs
 from ..paths import _file_digest, canonical
 from ..values import (
     DELIVERED_TASK_STATES,
@@ -2322,6 +2322,7 @@ class ProtectionMixin:
         ref = f"refs/heads/{branch}"
         if not _git(root, "rev-parse", "--verify", "--quiet", ref, check=False):
             task["branch_removed"] = True
+            self._shed_adopted_refs(data, project, task, root)
             return
         # A registration whose directory is already gone still makes git call
         # the branch checked out, which would refuse the delete below.
@@ -2393,6 +2394,41 @@ class ProtectionMixin:
             else f"Task branch {branch} could not be deleted; it may be checked out elsewhere",
             {"branch": branch, "unmerged": unmerged},
         )
+        if removed:
+            self._shed_adopted_refs(data, project, task, root)
+    def _shed_adopted_refs(
+        self,
+        data: dict[str, Any],
+        project: dict[str, Any],
+        task: dict[str, Any],
+        root: Path,
+    ) -> None:
+        """Let go of the refs `--adopt-dirty-base` anchored, with the branch.
+
+        Only once the task's first commit -- the adopted changes -- is on a
+        remote, the base branch or a merged pull request's head. Until then
+        the refs may be the only copy, so they stay and are named as held.
+        """
+        adopted = task.get("adopted_base_changes")
+        if not adopted or adopted.get("refs_removed"):
+            return
+        elsewhere = ["--remotes"]
+        base_ref = f"refs/heads/{task['base_branch']}"
+        if _git(root, "rev-parse", "--verify", "--quiet", base_ref, check=False):
+            elsewhere.append(base_ref)
+        merged_head = self._merged_pr_head(root, task)
+        if merged_head:
+            elsewhere.append(merged_head)
+        kept = shed_adopted_refs(root, adopted, elsewhere)
+        if kept:
+            self._message(
+                data, project, task, None, "cleanup",
+                f"Adopted-changes refs kept: {kept}",
+                {"refs": list(adopted.get("refs") or [])},
+            )
+            return
+        adopted["refs_removed"] = True
+        adopted["refs_removed_at"] = now()
     def _merged_pr_head(self, root: Path, task: dict[str, Any]) -> str | None:
         """The PR head commit the forge confirmed it merged, if this checkout has it."""
         delivery = task.get("delivery") or {}

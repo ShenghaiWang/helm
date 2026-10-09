@@ -3916,7 +3916,7 @@ def _cmd_task(ctx: _Context, args: argparse.Namespace) -> int | None:
                 f"checkout as the branch's first commit {adopted['start_commit'][:12]}; "
                 "the checkout is back at HEAD."
             )
-            print(f"  To put them back instead: {adopted['restore']}")
+            print(f"  To put them back instead (they return unstaged): {adopted['restore']}")
     elif args.task_command == "allocate":
         task = coordinator.allocate_task(args.task_id)
         print(f"Allocated {task['id']} workspace={task['workspace']} branch={task['branch']}")

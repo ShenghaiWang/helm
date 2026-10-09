@@ -137,8 +137,13 @@ publish the branch its worker is already waiting to publish, or the other way
 round -- is refused, naming that hold, its task and the worker that raised
 it, because releasing both would perform the action twice. The target is the
 branch the request binds (a worker's own, or the lead's `--subject`); a
-lead's request with no branch to bind matches only itself. Withdraw the
-existing hold first to move the request.
+lead's request with no branch to bind matches only itself. So a lead and its
+worker are deduplicated for `push` and `publish`, the actions a lead must
+bind to a branch; a lead's `delete` or `external` without `--subject` is not
+compared with its worker's. Withdraw the existing hold first to move the
+request -- including a stale hold left open by a lead or worker that has
+since died, which blocks its replacement until it is withdrawn or repaired
+(`helm approval repair <task>`).
 
 A `push` or `publish` of a `standard` or `critical` task's branch also needs an
 independent review that approved that exact tip. Each reviewer task is pinned

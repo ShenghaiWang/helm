@@ -1907,8 +1907,89 @@ class AdoptDirtyBaseTests(HelmTestCase):
             ])
         text = output.getvalue()
         self.assertIn("Adopted 4 uncommitted path(s)", text)
-        self.assertIn("To put them back instead: git -C", text)
+        self.assertIn("To put them back instead (they return unstaged): git -C", text)
         self.assertEqual(self._status(root), "?? .helm/project.json")
+
+    def test_skip_worktree_and_sparse_checkouts_are_refused(self) -> None:
+        """A fresh capture index has no skip bits, so a hidden path reads as deleted."""
+        root, project = self._dirty_project("skipworktree")
+        (root / "d").mkdir()
+        (root / "d" / "keep.txt").write_text("outside the cone\n", encoding="utf-8")
+        self._run_git(root, "add", "d/keep.txt")
+        self._run_git(root, "commit", "-qm", "a file to hide", "--", "d/keep.txt")
+        self._run_git(root, "update-index", "--skip-worktree", "d/keep.txt")
+        (root / "d" / "keep.txt").unlink()
+        before = self._status(root)
+        with self.assertRaisesRegex(HelmError, "d/keep.txt is marked skip-worktree.*Nothing was changed"):
+            self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        self.assertEqual(self._status(root), before)
+        self.assertEqual(self._run_git(root, "for-each-ref", "refs/helm/adopted"), "")
+
+        self._run_git(root, "update-index", "--no-skip-worktree", "d/keep.txt")
+        self._run_git(root, "checkout", "--", "d/keep.txt")
+        self._run_git(root, "update-index", "--assume-unchanged", "d/keep.txt")
+        with self.assertRaisesRegex(HelmError, "assume-unchanged"):
+            self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        self._run_git(root, "update-index", "--no-assume-unchanged", "d/keep.txt")
+
+        self._run_git(root, "config", "core.sparseCheckout", "true")
+        with self.assertRaisesRegex(HelmError, "the checkout is sparse"):
+            self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        self.assertEqual(self.state.load()["tasks"], {})
+
+    def test_a_failure_mid_restore_names_where_the_changes_are(self) -> None:
+        root, project = self._dirty_project("midrestore")
+        with mock.patch(
+            "helm.git._restore_adopted_paths", side_effect=OSError("disk went away")
+        ):
+            with self.assertRaises(HelmError) as failed:
+                self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        message = str(failed.exception)
+        self.assertIn("disk went away", message)
+        refs = self._run_git(root, "for-each-ref", "--format=%(refname)", "refs/helm/adopted").split()
+        self.assertEqual(len(refs), 2)
+        for ref in refs:
+            self.assertIn(ref, message)
+        self.assertIn("| git -C", message)
+        self.assertEqual(self.state.load()["tasks"], {})
+
+    def test_the_undo_survives_a_root_with_a_space_and_lists_what_was_staged(self) -> None:
+        root = self.repo("with space")
+        project = self.coordinator.register_project("Spaced", str(root), project_id="spaced")
+        (root / "README.txt").write_text("edited\n", encoding="utf-8")
+        (root / "staged.txt").write_text("staged\n", encoding="utf-8")
+        self._run_git(root, "add", "staged.txt")
+        task = self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        adopted = self.state.load()["tasks"][task["id"]]["adopted_base_changes"]
+        self.assertEqual(adopted["staged_paths"], ["staged.txt"])
+        self.assertEqual(self._status(root), "")
+        subprocess.run(adopted["restore"], shell=True, check=True)
+        self.assertEqual((root / "README.txt").read_text(), "edited\n")
+        self.assertEqual((root / "staged.txt").read_text(), "staged\n")
+        # Back unstaged, as the record and the CLI say.
+        self.assertEqual(self._run_git(root, "diff", "--cached", "--name-only"), "")
+
+    def test_cleanup_sheds_the_refs_only_once_the_changes_are_delivered(self) -> None:
+        root, project = self._dirty_project("shedrefs")
+        task = self.coordinator.create_task(project["id"], "x", adopt_dirty_base=True)
+        self.coordinator.allocate_task(task["id"])
+        refs = self.state.load()["tasks"][task["id"]]["adopted_base_changes"]["refs"]
+
+        def held() -> list[str]:
+            data = self.state.load()
+            return self.coordinator.task_retained_resources(data["tasks"][task["id"]], data)
+
+        self.assertTrue(any("adopted-changes refs" in item for item in held()))
+        # Undelivered: the branch is kept, and so are the refs.
+        self.coordinator.cleanup_task(task["id"])
+        self.assertTrue(any("adopted-changes refs" in item for item in held()))
+        for ref in refs:
+            self.assertTrue(self._run_git(root, "rev-parse", "--verify", ref))
+        # Delivered into the base: the branch goes, and the refs with it.
+        self._run_git(root, "merge", "-q", "--ff-only", task["branch"])
+        self.coordinator.cleanup_task(task["id"])
+        self.assertFalse(any("adopted-changes refs" in item for item in held()))
+        self.assertEqual(self._run_git(root, "for-each-ref", "refs/helm/adopted"), "")
 
     def test_a_clean_checkout_has_nothing_to_adopt(self) -> None:
         root = self.repo("cleanadopt")

@@ -934,17 +934,28 @@ class LifecycleMixin:
                         paths = list(captured["paths"])
                         task["adopted_base_changes"] = {
                             "adopted_at": now(),
-                            # The checkout's state exactly as it was, on the
-                            # HEAD it was found on -- kept for reversal.
+                            # The checkout's state as git would commit it --
+                            # through its clean filters, so line endings may be
+                            # normalised -- on the HEAD it was found on. Kept
+                            # for reversal.
                             "checkout_head": captured["head"],
                             "checkout_commit": captured["commit"],
                             # The same changes as the task's first commit,
                             # on its own base; the branch starts here.
                             "start_commit": adopted_start["commit"],
                             "start_tree": adopted_start["tree"],
+                            # Resources this task owns: cleanup sheds them
+                            # with the branch, once the first commit is on
+                            # a remote or the base; see `_remove_task_branch`.
                             "refs": [f"{ref_prefix}/checkout", f"{ref_prefix}/task"],
+                            "refs_removed": False,
                             "path_count": len(paths),
                             "paths": paths[: git.ADOPT_RECORDED_PATHS],
+                            # The undo brings every change back unstaged;
+                            # these were staged, for whoever re-adds them.
+                            "staged_paths": list(captured.get("staged") or [])[
+                                : git.ADOPT_RECORDED_PATHS
+                            ],
                             "restore": git.adoption_restore_command(root, captured),
                         }
                     data["tasks"][task_id] = task

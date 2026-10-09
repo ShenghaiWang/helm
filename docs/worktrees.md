@@ -76,12 +76,21 @@ ignored files, never `.helm/`), as commit objects without touching anything,
 builds the task's first commit from it on the task's own base, and proves
 every adopted path reproduces exactly. Only then does it anchor both commits
 under `refs/helm/adopted/<task>`, restore exactly the adopted paths to HEAD,
-and verify the checkout is clean. The task records the paths, both commits
-and a one-line restore command. It refuses, changing nothing, when something
-would be lost: a partly staged file, a conflict, a submodule, a change to
-`.helm/`, a change that does not apply to the base, or a checkout that moved
-while it was being captured. It never uses `git stash`, whose one stack is
-shared with the user and every worktree. Root only.
+and verify the checkout is clean. The task records the paths, both commits,
+which paths were staged, and a one-line restore command; the restore brings
+every change back unstaged. Content is captured as `git add` stores it, so
+line endings a `.gitattributes` filter normalises come back normalised. It
+refuses, changing nothing, when something would be lost: a partly staged
+file, a conflict, a submodule, a sparse checkout, a skip-worktree or
+assume-unchanged path, a change to `.helm/`, a change that does not apply to
+the base, or a checkout that moved while it was being captured. If restoring
+the checkout fails part-way, the error names both refs and the restore
+command. It never uses `git stash`, whose one stack is shared with the user
+and every worktree. Root only.
+
+The refs are the task's own resources: `helm task cleanup` sheds them with
+the task branch, once the task's first commit is on a remote or the base
+branch, and until then the cleanup decision names them as held.
 
 ## One ticket, one worktree
 

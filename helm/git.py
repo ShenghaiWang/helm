@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -742,7 +743,21 @@ def _working_state_tree(root: Path) -> str:
 
 def _adoption_refusal(root: Path, head: str, tree: str, changed: list[str]) -> str | None:
     """Why this checkout's changes cannot be moved without losing something."""
-    status = _git_run(root, "status", "--porcelain=v1", "-z", "--untracked-files=no").stdout
+    sparse = _git_run(root, "config", "--bool", "core.sparseCheckout", check=False)
+    if sparse.stdout.decode().strip() == "true":
+        # A capture index is built fresh from HEAD, with none of the sparse
+        # bits; every path outside the cone would read as deleted.
+        return "the checkout is sparse, so paths outside it would read as deleted"
+    for entry in _nul_list(_git_run(root, "ls-files", "-v", "-z").stdout):
+        tag, _, path = entry.partition(" ")
+        if tag == "S" or (tag.isalpha() and tag.islower()):
+            # Skip-worktree or assume-unchanged: git is told not to look at
+            # the file, so its absence or edit is not what the user did.
+            return (
+                f"{path} is marked skip-worktree or assume-unchanged, so what the "
+                "checkout shows for it is not its real state"
+            )
+    status =_git_run(root, "status", "--porcelain=v1", "-z", "--untracked-files=no").stdout
     skip = False
     for entry in status.split(b"\0"):
         if skip:
@@ -788,7 +803,12 @@ def capture_checkout_changes(root: Path) -> dict[str, Any] | None:
 
     Writes git objects and nothing else: no ref, no index, no working-tree
     change. None when there is nothing to adopt. Raises when moving the state
-    would lose something -- a partly staged file, a conflict, a submodule.
+    would lose something -- a partly staged file, a conflict, a submodule, a
+    sparse checkout or a skip-worktree/assume-unchanged path.
+
+    The capture is what `git add` stores, so content passes through the
+    repository's clean filters: line endings normalised by `.gitattributes`
+    come back as git would check them out, not byte for byte.
     """
     head = _git(root, "rev-parse", "--verify", "HEAD")
     tree = _working_state_tree(root)
@@ -807,7 +827,14 @@ def capture_checkout_changes(root: Path) -> dict[str, Any] | None:
             f"refusing to adopt the project checkout's changes: {refusal}. "
             "Nothing was changed."
         )
-    return {"head": head, "tree": tree, "commit": commit, "paths": changed}
+    # Staged paths, kept so the record can say which ones were: the undo
+    # brings every change back unstaged, and these are the ones to re-add.
+    staged = _nul_list(
+        _git_run(root, "diff", "--cached", "--name-only", "--no-renames", "-z", head).stdout
+    )
+    return {
+        "head": head, "tree": tree, "commit": commit, "paths": changed, "staged": staged,
+    }
 
 
 def build_adopted_start(
@@ -858,10 +885,16 @@ def build_adopted_start(
 
 
 def adoption_restore_command(root: Path, captured: dict[str, Any]) -> str:
-    """The one line that puts adopted changes back into the checkout."""
+    """The one line that puts adopted changes back into the checkout.
+
+    They come back as unstaged changes. Restaging with `apply --index` would
+    be wrong whenever only some paths had been staged, so the record lists the
+    staged ones instead (`staged_paths`) for whoever wants them re-added.
+    """
+    quoted = shlex.quote(str(root))
     return (
-        f"git -C {root} diff --binary {captured['head']} {captured['commit']} "
-        f"| git -C {root} apply"
+        f"git -C {quoted} diff --binary {captured['head']} {captured['commit']} "
+        f"| git -C {quoted} apply"
     )
 
 
@@ -876,6 +909,14 @@ def restore_checkout_after_adoption(
     again and compared before touching it: anything written since the first
     capture is refused rather than discarded. Only adopted paths are restored
     -- never a blanket reset -- and the result is verified.
+
+    One window remains: a write landing between that re-capture and the
+    restore below, a few milliseconds, is not seen. Git offers no lock over
+    a working tree to close it. What such a write touched in an adopted path
+    is overwritten by HEAD's content; anything else is left alone, and the
+    final check reports the checkout unclean if it touched tracked files.
+    Any failure after the refs are written names them and the undo, so a
+    half-finished restore never leaves the changes without a pointer.
     """
     if _git(root, "rev-parse", "--verify", "HEAD") != captured["head"] or (
         _working_state_tree(root) != captured["tree"]
@@ -886,6 +927,19 @@ def restore_checkout_after_adoption(
         )
     _git(root, "update-ref", f"{ref_prefix}/checkout", captured["commit"])
     _git(root, "update-ref", f"{ref_prefix}/task", start["commit"])
+    try:
+        _restore_adopted_paths(root, captured)
+    except (HelmError, OSError) as exc:
+        raise HelmError(
+            f"adopting the project checkout's changes did not finish: {exc}. Nothing "
+            f"is lost -- they are kept at {ref_prefix}/checkout (the checkout's own "
+            f"state) and {ref_prefix}/task (as the task's first commit), and no task "
+            "was recorded. Put them back with: "
+            f"{adoption_restore_command(root, captured)}"
+        ) from exc
+
+
+def _restore_adopted_paths(root: Path, captured: dict[str, Any]) -> None:
     in_head = set(_tree_entries(root, captured["head"]))
     added = [path for path in captured["paths"] if path not in in_head]
     existing = [path for path in captured["paths"] if path in in_head]
@@ -914,8 +968,30 @@ def restore_checkout_after_adoption(
     adopted = set(captured["paths"])
     still_there = [entry for entry in leftover if entry[3:] in adopted]
     if still_there or _project_checkout_conflict(root):
-        raise HelmError(
-            "the project checkout is not clean after adopting its changes; nothing "
-            f"is lost -- they are at {ref_prefix}/checkout. Restore them with: "
-            f"{adoption_restore_command(root, captured)}"
-        )
+        raise HelmError("the checkout is not clean after restoring the adopted paths")
+
+
+def shed_adopted_refs(root: Path, adopted: dict[str, Any], elsewhere: list[str]) -> str | None:
+    """Delete a task's adopted-changes refs once its start lives elsewhere.
+
+    `elsewhere` is what counts as another copy -- `--remotes`, the base
+    branch, a merged pull request's head. While the task's first commit is
+    reachable from none of them the refs may be the only copy, so they stay
+    and the reason is returned. None once they are gone.
+    """
+    start = adopted.get("start_commit") or ""
+    if _git(root, "rev-parse", "--verify", "--quiet", f"{start}^{{commit}}", check=False):
+        only_here = _git(
+            root, "rev-list", "--count", start, "--not", *elsewhere, check=False
+        ).strip()
+        if only_here != "0":
+            return (
+                f"the adopted changes' commit {start[:12]} is not on any remote or "
+                "the base branch, so its refs are kept"
+            )
+    for ref in adopted.get("refs") or []:
+        if _git(root, "rev-parse", "--verify", "--quiet", ref, check=False):
+            note = _delete_ref(root, ref)
+            if note:
+                return note
+    return None
