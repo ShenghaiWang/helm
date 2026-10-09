@@ -439,9 +439,10 @@ def _scheduler_path() -> str:
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry and entry not in seen:
             seen.append(entry)
-    interpreter = str(Path(sys.executable).parent)
-    if interpreter not in seen:
-        seen.append(interpreter)
+    if sys.executable:
+        interpreter = str(Path(sys.executable).parent)
+        if interpreter not in seen:
+            seen.append(interpreter)
     return os.pathsep.join(seen)
 
 
@@ -491,7 +492,9 @@ def _systemd_units(
     executable = sys.executable
     heal_flag = "" if heal else " --no-heal"
     def quoted(value: str) -> str:
-        return value.replace(chr(34), chr(92) + chr(34))
+        # systemd expands `%` specifiers and backslash escapes inside a quoted
+        # Environment= value, so both are doubled before the quote is escaped.
+        return value.replace("\\", "\\\\").replace("%", "%%").replace('"', '\\"')
 
     environment = f'Environment="PATH={quoted(_scheduler_path())}"\n' + (
         f'Environment="{NOTIFY_ENV}={quoted(notify_command)}"\n'

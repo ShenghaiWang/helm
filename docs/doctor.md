@@ -195,6 +195,7 @@ iteration, filesystem order, or wall-clock time.
 | `root.domains` | `domains/` is a symlink, or a domain manifest, `extends` chain, or manifest link is invalid | a domain directory has no readable `knowledge.md` |
 | `root.profiles` | `agents/` or an agent configuration file is a symlink, a profile is malformed, or a profile's launch **or availability-check** executable is missing, or `HELM_WORKER_COMMAND` names one that is not available | `HELM_AGENTS_FILE` redirects profiles away from the root |
 | `root.runtimes` | a runtime this root *names* has no executable on `PATH`, the runtime a task would actually resolve to is excluded, or the launch Helm would actually perform is one it would refuse to start | no built-in runtime at all is launchable, nothing is pinned/configured/detectable, or a preferences redirect means the restrictions could not be read |
+| `root.watchdog.path` | — | the installed launchd watchdog entry has no `PATH`, so tools outside the system directories (`gh`, for the pull-request watch) read as not installed; rerun `helm watchdog install` |
 | `root.herdr` | `HERDR_ENV=1` but the `herdr` executable is not on `PATH` | — |
 | `root.authority` | — | — (always `ok`; reports whether a capability is configured) |
 

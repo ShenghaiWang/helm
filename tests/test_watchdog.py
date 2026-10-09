@@ -271,3 +271,14 @@ class WatchdogTests(HelmTestCase):
              mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
             self.assertEqual(watchdog.heal_pass(None, memory), [])
         self.assertEqual(appointed, [])
+
+    def test_the_systemd_unit_escapes_specifiers_backslashes_and_quotes(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": '/a%h/b\\c/"d"'}, clear=True):
+            service, _timer = watchdog._systemd_units(Path("/root"), 20, notify_command='say "100%"')
+        self.assertIn('Environment="PATH=/a%%h/b\\\\c/\\"d\\"', service)
+        self.assertIn('Environment="HELM_WATCHDOG_NOTIFY=say \\"100%%\\""', service)
+
+    def test_no_interpreter_directory_is_added_when_the_executable_is_unknown(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=True), \
+             mock.patch.object(watchdog.sys, "executable", ""):
+            self.assertEqual(watchdog._scheduler_path(), "/usr/bin")

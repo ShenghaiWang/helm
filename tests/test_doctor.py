@@ -229,6 +229,26 @@ class RootChecksTests(DoctorTestCase):
         self.assertIn("no watchdog scheduler entry", finding.message)
         self.assertIn("helm watchdog install", finding.remediation)
 
+    def test_a_watchdog_plist_without_a_path_is_a_warning_to_reinstall(self) -> None:
+        """launchd gives an entry without PATH the bare system one, hiding gh."""
+        helm_root, _ = self.sound_root("pathless")
+        home = Path(self.temp.name) / "pathless-home"
+        agents = home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        entry = agents / "com.helm.watchdog.plist"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), \
+             mock.patch("platform.system", return_value="Darwin"):
+            entry.write_text("<plist><dict></dict></plist>", encoding="utf-8")
+            finding = self.finding(self.report(helm_root), "root.watchdog.path")
+            self.assertEqual(finding.severity, doctor.WARNING)
+            self.assertIn("helm watchdog install", finding.remediation)
+            entry.write_text(
+                "<plist><dict><key>PATH</key><string>/usr/bin</string></dict></plist>",
+                encoding="utf-8",
+            )
+            report = self.report(helm_root)
+            self.assertFalse(any(f.id == "root.watchdog.path" for f in report.findings))
+
     def test_the_shipped_domain_pack_loads_cleanly(self) -> None:
         """Guards the repository's own domains, not a fixture's."""
         helm_root, _ = self.sound_root()
