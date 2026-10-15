@@ -20,6 +20,17 @@ from ..paths import _private_dir, _write_private_text
 from ..processes import _process_parents
 from ..values import _safe_text
 
+# A worker record that has reached one of these has no process of its own any
+# more, whatever pid it still carries.
+_ENDED_WORKER_STATUSES = frozenset({"completed", "failed", "stopped"})
+
+
+def _worker_is_live(worker: dict[str, Any]) -> bool:
+    """Whether a worker record still describes a process Helm is running."""
+    if worker.get("ended_at"):
+        return False
+    return worker.get("status") not in _ENDED_WORKER_STATUSES
+
 
 class CallerMixin:
     def caller_identity(self) -> dict[str, str]:
@@ -78,10 +89,17 @@ class CallerMixin:
         lead's command is that worker, not the lead. The process group comes
         last, as the weakest of the three witnesses.
         """
+        # Only a worker whose process is still Helm's can be the one this
+        # command runs under. A worker that has ended keeps its pid on the
+        # record as history, and the OS hands that number out again: three
+        # weeks later a new agent inherited a finished worker's pid, matched
+        # this table first, and every command it ran was refused as a forgery
+        # of itself. A record with an ending is evidence about the past, not a
+        # witness to the present, so it never identifies a live caller.
         recorded = {
             worker["pid"]: worker_id
             for worker_id, worker in data.get("workers", {}).items()
-            if isinstance(worker.get("pid"), int)
+            if isinstance(worker.get("pid"), int) and _worker_is_live(worker)
         }
         if not recorded:
             # Only pay for the process table when there is something to match:

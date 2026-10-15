@@ -81,3 +81,33 @@ class RootOnlyBoundaryTests(HelmTestCase):
             self.coordinator.configure_authority("z" * 40)
         with mock.patch.dict(os.environ, {"HELM_AUTHORITY": "y" * 40}):
             self.coordinator.configure_authority("z" * 40)
+
+
+class LineageIdentityTests(HelmTestCase):
+    def test_a_finished_workers_recycled_pid_does_not_identify_a_live_caller(self) -> None:
+        # The OS reuses pids. A worker that ended weeks ago still carries the pid
+        # it ran under, and a later agent that inherits that number must not be
+        # read as the dead worker: the lineage check once matched the stale
+        # record first and refused the live lead's every command as a forgery
+        # of itself.
+        root = self.repo("recycled")
+        project = self.coordinator.register_project("Recycled", str(root), project_id="recycled")
+        dead_task = self.coordinator.create_task(project["id"], "finished long ago")
+        dead = self.coordinator.launch_worker(dead_task["id"], ["true"], wait=True)
+        live_task = self.coordinator.create_task(project["id"], "running now")
+        live = self.coordinator.launch_worker(live_task["id"], ["sleep", "30"], wait=False)
+        try:
+            data = self.coordinator.store.load()
+            self.assertIn(data["workers"][dead["id"]]["status"], {"completed", "failed"})
+            # Give the dead record this very process's pid, as the OS might.
+            data["workers"][dead["id"]]["pid"] = os.getpid()
+            self.coordinator.store.save(data)
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": live["id"]}):
+                identity = self.coordinator.caller_identity()
+            self.assertEqual(identity["worker_id"], live["id"])
+            # And with no marker at all, the dead record still proves nothing.
+            with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
+                identity = self.coordinator.caller_identity()
+            self.assertEqual(identity["role"], "root")
+        finally:
+            self.coordinator.stop_worker(live["id"], reason="test over")
