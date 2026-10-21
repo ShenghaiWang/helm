@@ -484,6 +484,45 @@ BUILTIN_RUNTIMES: tuple[AgentRuntime, ...] = (
         ),
         detect_env=("OMPCODE",),
     ),
+    AgentRuntime(
+        id="devin",
+        name="Devin CLI",
+        # Same reason as every runtime above: nobody is watching this pane, so
+        # an approval prompt is a deadlock rather than a gate. Devin's
+        # permission modes were probed one by one in print mode: `auto`
+        # approves reads only, `accept-edits` and `smart` both rejected a write
+        # to an absolute path outside the working directory with "rejected a
+        # tool call that requires confirmation ... Use --permission-mode
+        # dangerous", so only `dangerous` lets `helm worker message` land in
+        # Helm's state. That is the same bar `--force` and `--auto` clear for
+        # cursor and opencode.
+        #
+        # A fresh worktree is an untrusted workspace to Devin and print mode
+        # refuses it outright ("Refusing to run in an untrusted workspace"),
+        # so trust enforcement is switched off per launch; every Helm worktree
+        # is one Helm made.
+        #
+        # Interactive takes the prompt after `--` (a bare positional opens
+        # Devin Desktop instead); `-p` is the non-interactive form and takes
+        # the prompt as its own value. `--model` is a global option, which is
+        # what `with_model` needs since it inserts directly after argv[0].
+        interactive=(
+            "devin", "--respect-workspace-trust", "false",
+            "--permission-mode", "dangerous", "--", PROMPT_PLACEHOLDER,
+        ),
+        noninteractive=(
+            "devin", "--respect-workspace-trust", "false",
+            "--permission-mode", "dangerous", "-p", PROMPT_PLACEHOLDER,
+        ),
+        # Auth is a login stored under HOME (`devin auth status` says where),
+        # which survives the worker scrub; nothing is forwarded by name.
+        env_passthrough=(),
+        detect_env=(),
+        # Like opencode, effort lives inside the model id (`swe-2-low`,
+        # `gpt-6-astra-high`, ...): no flag of its own, so a stated level is
+        # refused until a root teaches the level -> model map with
+        # `effort.runtimes.devin = model::high=<id>,low=<id>`, exactly as pi.
+    ),
 )
 
 _BY_ID = {runtime.id: runtime for runtime in BUILTIN_RUNTIMES}

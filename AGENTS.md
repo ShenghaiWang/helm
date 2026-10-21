@@ -565,7 +565,8 @@ record, not a reason to carry more context.
 ## Choosing the worker's agent runtime
 
 A worker is an agent CLI. Helm ships built-in launch definitions for `claude`
-(Claude Code), `codex` (Codex CLI), `pi`, `opencode`, and `omp`, so delegation
+(Claude Code), `codex` (Codex CLI), `pi`, `opencode`, `cursor`, `omp`, and
+`devin` (Devin CLI), so delegation
 needs no provider configuration. Resolve the runtime in this order and stop at the first hit —
 most specific wins, and anything stated outranks anything inferred:
 
@@ -602,7 +603,7 @@ cost. The `model-selection` domain carries the detail.
 Two bounds that do not bend: an agent is available only when its **executable is
 on `PATH`** — Herdr integrating an agent means Herdr can recognize or control it
 once running, not that Helm has a safe launch recipe, and Helm ships launch
-definitions for six built-ins — and an agent the root **excludes** is excluded
+definitions for seven built-ins — and an agent the root **excludes** is excluded
 whatever its fit, because that is the commander's cost decision made in advance
 and recorded in the root's own `agent.exclude` preference, not a question
 fitness reasoning may reopen. A newly installed Herdr integration

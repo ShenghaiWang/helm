@@ -296,7 +296,8 @@ appears to span projects is stopped and clarified rather than merged.
 
 A worker is an agent CLI. Helm ships launch definitions for `claude` (Claude
 Code), `codex` (Codex CLI), `pi`, `opencode`, `cursor` (whose executable is
-`cursor-agent`) and `omp` (Oh My Pi) in [`helm/runtimes.py`](helm/runtimes.py);
+`cursor-agent`), `omp` (Oh My Pi) and `devin` (Devin CLI) in
+[`helm/runtimes.py`](helm/runtimes.py);
 a runtime is available when its executable is on `PATH`, and a name alone
 never makes one available. A worker runs in its interactive form inside a
 Herdr pane and in its print form on the process fallback.

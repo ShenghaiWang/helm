@@ -150,6 +150,37 @@ class RuntimeSelectionTests(HelmTestCase):
         self.assertIn("CURSOR_API_KEY", runtime.env_passthrough)
         self.assertNotIn("CURSOR_MODEL", runtime.env_passthrough)
 
+    def test_devin_runtime_auto_approves_and_keeps_the_prompt_last(self) -> None:
+        """`--permission-mode dangerous` is what makes Devin usable as a worker.
+
+        Its permission modes were probed one by one in print mode: `auto`,
+        `accept-edits` and `smart` all rejected a write to an absolute path
+        outside the working directory with "rejected a tool call that requires
+        confirmation", and Devin's own warning names `dangerous` as the mode
+        for non-interactive runs. Print mode also refuses an untrusted
+        workspace outright, and every Helm worktree is a fresh directory, so
+        trust enforcement is switched off per launch.
+        """
+        runtime = runtimes.builtin_runtime("devin")
+        assert runtime is not None
+        self.assertEqual(runtime.name, "Devin CLI")
+        base = ["devin", "--respect-workspace-trust", "false", "--permission-mode", "dangerous"]
+        # Interactive takes the prompt after `--`; a bare positional would open
+        # Devin Desktop instead of a session.
+        self.assertEqual(
+            runtime.command(interactive=True), [*base, "--", runtimes.PROMPT_PLACEHOLDER]
+        )
+        self.assertEqual(
+            runtime.command(interactive=False), [*base, "-p", runtimes.PROMPT_PLACEHOLDER]
+        )
+        prompt = "assignment prompt"
+        self.assertEqual(
+            runtimes.apply_prompt(runtime.with_model("swe-2-high", interactive=False), prompt),
+            ["devin", "--model", "swe-2-high", *base[1:], "-p", prompt],
+        )
+        # Auth is a login under HOME; no model name is ever forwarded.
+        self.assertEqual(runtime.env_passthrough, ())
+
     def test_opencode_runtime_auto_approves_and_keeps_the_prompt_last(self) -> None:
         """A reviewer that cannot report is worse than no reviewer.
 
@@ -763,7 +794,7 @@ class RuntimeSelectionTests(HelmTestCase):
         with mock.patch.dict(os.environ, env):
             report = {entry["id"]: entry for entry in coordinator.agent_availability()}
         self.assertEqual(
-            set(report), {"claude", "codex", "pi", "opencode", "omp", "cursor"}
+            set(report), {"claude", "codex", "pi", "opencode", "omp", "cursor", "devin"}
         )
         self.assertTrue(report["claude"]["available"])
         self.assertTrue(report["claude"]["detected"])
@@ -1011,7 +1042,7 @@ class EffortCapabilityTests(HelmTestCase):
         # OpenAI's vocabulary, not Claude Code's.
         self.assertIn("minimal", codex.effort_levels)
         self.assertNotIn("xhigh", codex.effort_levels)
-        for runtime_id in ("pi", "opencode", "omp", "cursor"):
+        for runtime_id in ("pi", "opencode", "omp", "cursor", "devin"):
             runtime = runtimes.builtin_runtime(runtime_id)
             self.assertEqual(
                 runtime.effort_mechanism, runtimes.EFFORT_UNSUPPORTED, runtime_id

@@ -51,6 +51,22 @@ def _pi_output() -> str:
     )
 
 
+def _devin_output() -> str:
+    """devin groups rows under family headers; only indented rows are ids."""
+    return (
+        "Available models (2 families)\n"
+        "\n"
+        "Example family (example-fam)\n"
+        "  aliases: ex\n"
+        "  example-fam-low      Example Low  [262K context, $0.5 / 1M Input]\n"
+        "  example-fam-high     Example High  [262K context, $0.5 / 1M Input]\n"
+        "\n"
+        "Other family (other-fam)\n"
+        "  other-fam-medium     Other Medium  [1M context, $10 / 1M Input]\n"
+        "  example-fam-low      repeated row\n"
+    )
+
+
 def _opencode_output() -> str:
     """opencode prints one `provider/model` per line, no header."""
     return (
@@ -102,6 +118,11 @@ class CatalogueParsingTests(HelmTestCase):
                 "example-tiny-free",
             ],
         )
+
+    def test_devin_rows_parse_into_exact_model_ids(self) -> None:
+        """Family headers and alias lines are what a human types, not ids."""
+        ids = models.parse_devin_catalogue(_devin_output())
+        self.assertEqual(ids, ["example-fam-low", "example-fam-high", "other-fam-medium"])
 
     def test_opencode_lines_parse_into_exact_model_ids(self) -> None:
         ids = models.parse_opencode_catalogue(_opencode_output())
@@ -636,7 +657,7 @@ class SelectionContextTests(HelmTestCase):
             evidence = coordinator.model_selection_evidence()
         self.assertEqual(
             launchable_requested[-1],
-            {"claude", "codex", "omp", "cursor"},
+            {"claude", "codex", "omp", "cursor", "devin"},
             "exclusions prune first",
         )
         self.assertEqual(evidence["free_evidence"], [])

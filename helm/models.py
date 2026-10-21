@@ -51,6 +51,7 @@ CATALOGUE_TIMEOUT = 8
 CATALOGUE_COMMANDS: dict[str, tuple[str, ...]] = {
     "pi": ("pi", "--list-models"),
     "opencode": ("opencode", "models"),
+    "devin": ("devin", "models", "list"),
 }
 
 
@@ -157,9 +158,33 @@ def parse_opencode_catalogue(output: str) -> list[str]:
     return list(dict.fromkeys(models))
 
 
+def parse_devin_catalogue(output: str) -> list[str]:
+    """Parse ``devin models list`` into exact model ids, once each.
+
+    The listing is grouped by family: an unindented header such as
+    ``SWE-2 (swe-2)``, an optional indented ``aliases:`` line, then one
+    indented row per model whose first field is the exact id and whose rest
+    is display text and pricing. Only those rows are ids; the header's
+    parenthesised family name and the aliases are what a human types, not
+    what ``--model`` is given, so they are left out.
+    """
+    models: list[str] = []
+    for raw in output.splitlines():
+        if not raw.startswith((" ", "\t")):
+            continue
+        fields = _WHITESPACE.split(raw.strip())
+        if not fields or fields[0] in ("aliases:", ""):
+            continue
+        model = fields[0]
+        if _MODEL_ID.fullmatch(model):
+            models.append(model)
+    return list(dict.fromkeys(models))
+
+
 PARSERS: dict[str, "callable[[str], list[str]]"] = {
     "pi": parse_pi_catalogue,
     "opencode": parse_opencode_catalogue,
+    "devin": parse_devin_catalogue,
 }
 
 

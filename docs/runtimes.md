@@ -8,7 +8,7 @@ own answers to those questions live.
 
 Helm ships launch definitions for `claude` (Claude Code), `codex` (Codex
 CLI), `pi`, `opencode`, `cursor` (Cursor CLI, whose executable is
-`cursor-agent`), and `omp` (Oh My Pi); each contributes only an executable,
+`cursor-agent`), `omp` (Oh My Pi), and `devin` (Devin CLI); each contributes only an executable,
 the argv that hands it one prompt, and the credential variables that runtime
 reads. See [`helm/runtimes.py`](../helm/runtimes.py) for the table. A runtime
 is available when its executable is actually on `PATH` — a name alone never
