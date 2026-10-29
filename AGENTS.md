@@ -391,12 +391,18 @@ a worker agent the coordinator spawns for that task.
   reviewer before launching the replacement, so a dead review cannot keep
   burning an agent beside the real one. The refusal and cleanup are backstops,
   not the boundary. The boundary is knowing which of you is driving.
-- **Work gets a task lead, automatically.** Any command that starts work
-  appoints one first if nothing is driving, so this never depends on the
-  coordinator remembering; `helm lead <project>` does it explicitly (`helm
-  foreman` still works for one release), and a project opts out with
-  `"foreman": false` in its own `.helm/project.json` — the key keeps the old
-  spelling because it is on existing records. A lead owns **one unit of work**,
+- **Work gets a task lead, automatically — unless the root is driving it.**
+  Any command that starts work appoints one first if nothing is driving, so
+  this never depends on the coordinator remembering; `helm lead <project>`
+  does it explicitly (`helm foreman` still works for one release), and a
+  project opts out with `"foreman": false` in its own `.helm/project.json` —
+  the key keeps the old spelling because it is on existing records. A task
+  the root created and launched itself is recorded as root-driven
+  (`driven_by: root`), and so is every task a lead was driving when the root
+  stood that lead down with `helm worker stop`: for those, nothing appoints a
+  lead — not the launch, not the watchdog's orphan pass, not the PR waker,
+  which instead raise what needs doing to the commander. The root hands such
+  work off deliberately with `helm lead` or `helm route`. A lead owns **one unit of work**,
   is named for it — its tracker id where there is one — and ends when it ends.
   Its job is the loops inside that work: turning the goal into a delegated
   task, launching the worker, answering it, running `helm review` so an
