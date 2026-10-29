@@ -239,12 +239,33 @@ class WatchdogTests(HelmTestCase):
         self.assertEqual(self.coordinator.driver_of_task(task["id"])["id"], appointed[0])
 
     def test_a_project_with_running_workers_and_no_foreman_is_re_driven(self) -> None:
+        """Only work whose driver is GONE is re-driven; the root's own is not.
+
+        A task the root created and launched is the root's to drive, so the
+        watchdog leaves it alone. A task a lead created, whose lead then
+        died, has nobody, and gets a replacement.
+        """
         import sys
 
         root = self.repo("driverless")
         project = self.coordinator.register_project("Driverless", str(root), project_id="driverless")
-        task = self.coordinator.create_task(project["id"], "work")
+        own = self.coordinator.create_task(project["id"], "the root's own work")
+        self.coordinator.prepare_external_worker(own["id"], [sys.executable, "-c", ""])
+        dead_lead_task = self.coordinator.create_foreman_task(project["id"])
+        dead_lead = self.coordinator.prepare_external_worker(
+            dead_lead_task["id"], [sys.executable, "-c", ""]
+        )
+        with mock.patch.dict("os.environ", {"HELM_WORKER_ID": dead_lead["id"]}):
+            for kind, text in (
+                ("requirement", "goal: a unit; Done means: X; Out of scope: Y"),
+                ("solution", "approach: one; verification: tests"),
+            ):
+                self.coordinator.propose_gate(dead_lead_task["id"], kind, text)
+                with mock.patch.dict("os.environ", {"HELM_WORKER_ID": ""}):
+                    self.coordinator.decide_gate(dead_lead_task["id"], kind, confirm=True, skip=False)
+            task = self.coordinator.create_task(project["id"], "work")
         worker = self.coordinator.prepare_external_worker(task["id"], [sys.executable, "-c", ""])
+        self.coordinator.stop_worker(dead_lead["id"], reason="its session ended")
         self.assertEqual(self.state.load()["workers"][worker["id"]]["status"], "running")
         appointed: list[str] = []
         from helm import cli
@@ -260,6 +281,7 @@ class WatchdogTests(HelmTestCase):
              mock.patch.dict("os.environ", {"HELM_STATE_DIR": str(self.state.directory)}):
             reports = watchdog.heal_pass(None, memory)
         self.assertEqual(appointed, [project["id"]])
+        self.assertIn("had 1 running worker(s) with no driver", reports[0])
         self.assertIn("appointed w-new-foreman", reports[0])
         # A project that declined a foreman is left alone.
         with self.state.locked() as data:

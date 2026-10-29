@@ -544,6 +544,8 @@ def _pr_event_lead(
     task = data["tasks"][event["task_id"]]
     project_id = task["project_id"]
     driver, how = coordinator.driver_resolution(task["id"], data=data)
+    if how == "root":
+        return None, "root"
     if driver is not None and how != "project":
         return driver, how
     ticket = ticket_of(task)
@@ -619,6 +621,17 @@ def _deliver_pr_watch_events(
                         surface=True, task_id=task_id,
                     )
                     outcome = "recorded for the commander"
+                elif how == "root":
+                    # The root drives this task: the event is its to act on,
+                    # and a lead appointed beside it would be a second driver.
+                    if event.get("actionable"):
+                        coordinator.record_situation(
+                            project_id,
+                            f"PR watch for task {task_id}: {headline} ({event.get('url')}); "
+                            "you drive this task, so it is yours to act on",
+                            surface=True, task_id=task_id,
+                        )
+                    outcome = "the root drives this task; recorded for the commander"
                 else:
                     outcome = "no live lead; nothing to fix, so none appointed"
                 coordinator.mark_pr_watch_event(task_id, ids, outcome=outcome)
@@ -3193,6 +3206,7 @@ def _start_foreman(
     effort: str | None = None,
     request: str | None = None,
     ticket: str | None = None,
+    hand_off: bool = False,
 ) -> dict[str, Any]:
     task = coordinator.create_foreman_task(
         project_id, agent=agent, model=model, effort=effort, request=request,
@@ -3202,6 +3216,12 @@ def _start_foreman(
         worker = HerdrAdapter(coordinator).launch_task(task["id"], command, wait=False)
     else:
         worker = coordinator.launch_worker(task["id"], command, wait=False)
+    # Only an appointment the root asked for by name hands it the root's
+    # work on that ticket. A recovery appointment -- the watchdog replacing a
+    # dead lead, the PR waker -- is for the orphan, and the root's own task
+    # on the same ticket stays the root's.
+    if ticket and hand_off:
+        coordinator.hand_root_work_to_lead(worker["id"], ticket=ticket)
     return {"task": task, "worker": worker}
 
 
@@ -3324,8 +3344,14 @@ def _ensure_foreman(
     model: str | None = None,
     request: str | None = None,
     ticket: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Appoint a declared project's foreman if it has none.
+
+    Not for work the root drives: a task the root created and launched is the
+    root's own, and a lead appointed beside it is the second driver the
+    one-driver rule forbids. The root appoints one deliberately with
+    `helm lead` or `helm route` when it wants to hand the work off.
 
     The project states this once in its own file, so the coordinator does not
     have to remember it at each request -- which is the same failure mode as
@@ -3339,6 +3365,8 @@ def _ensure_foreman(
         if not coordinator.project_wants_foreman(project_id):
             return None
         if coordinator.foreman_for(project_id) is not None:
+            return None
+        if task_id and coordinator.driver_resolution(task_id)[1] == "root":
             return None
         started = _start_foreman(
             coordinator, project_id, herdr=herdr, command=command, agent=agent,
@@ -3983,7 +4011,8 @@ def _cmd_run(ctx: _Context, args: argparse.Namespace) -> int | None:
         )
         mode = "process (--no-herdr)"
     _ensure_foreman(
-        coordinator, project["id"], herdr=args.herdr, ticket=ticket_of(task) or None
+        coordinator, project["id"], herdr=args.herdr, ticket=ticket_of(task) or None,
+        task_id=task["id"],
     )
     print(
         f"Ran {_project_label(project)} task={task['id']} "
@@ -4411,6 +4440,7 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
         _ensure_foreman(
             coordinator, worker["project_id"], herdr=args.herdr,
             ticket=_ticket_of_task(coordinator, worker.get("task_id")),
+            task_id=worker.get("task_id"),
         )
         print(
             f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
@@ -4661,6 +4691,11 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
         stopped = HerdrAdapter(coordinator).stop_worker(
             args.worker_id, args.reason
         )
+        # A root standing a lead down takes its work over; said on the
+        # record, or the work reads as orphaned and gets another lead.
+        handed: list[str] = []
+        if coordinator.caller_role() == "root":
+            handed = coordinator.hand_lead_work_to_root(stopped["id"])
         where = []
         if stopped.get("signalled"):
             where.append("process signalled")
@@ -4675,6 +4710,11 @@ def _cmd_worker(ctx: _Context, args: argparse.Namespace) -> int | None:
             "  Its log and worktree are kept as evidence; remove them with "
             f"helm task cleanup {stopped['task_id']}"
         )
+        if handed:
+            print(
+                f"  You now drive {', '.join(handed)}; no lead will be appointed for "
+                "that work until you hand it off with helm lead or helm route"
+            )
         with contextlib.suppress(HelmError, OSError):
             if HerdrAdapter(coordinator).close_project_space_if_finished(
                 stopped["project_id"]
@@ -4948,6 +4988,7 @@ def _cmd_herdr(ctx: _Context, args: argparse.Namespace) -> int | None:
         _ensure_foreman(
             coordinator, worker["project_id"],
             ticket=_ticket_of_task(coordinator, worker.get("task_id")),
+            task_id=worker.get("task_id"),
         )
         print(
             f"Worker {worker['id']} [{worker['status']}] task={worker['task_id']} "
@@ -5759,6 +5800,10 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
     started = None
     if named is not None:
         foreman = named
+        # A follow-up to the lead named for this ticket hands it whatever
+        # the root was driving on the ticket as well; a request routed to a
+        # lead for work that still resolves to the root would report past it.
+        coordinator.hand_root_work_to_lead(named["id"], ticket=addressed)
     elif args.new_lead or addressed:
         # A request that names its work and finds no driver for it is a NEW
         # unit of work, exactly as `--new` says outright. Falling through to
@@ -5774,6 +5819,7 @@ def _cmd_route(ctx: _Context, args: argparse.Namespace) -> int | None:
             coordinator, args.project_id, herdr=args.herdr,
             command=args.worker_command_text, agent=args.agent,
             model=args.model, request=args.text, ticket=addressed or None,
+            hand_off=True,
         )
         foreman = started["worker"]
     else:
@@ -5914,6 +5960,13 @@ def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
                 f"helm worker stop {existing['id']} --reason \"...\" "
                 f"&& helm lead {args.project_id}"
             )
+        # Asked by ticket, and the lead already here is the one named for
+        # it: the root's work on that ticket is handed to it all the same.
+        named = coordinator.driver_named(args.project_id, args.ticket) if args.ticket else None
+        if named is not None:
+            handed = coordinator.hand_root_work_to_lead(named["id"], ticket=args.ticket)
+            if handed:
+                print(f"  It now drives {', '.join(handed)}, which you were driving yourself")
         return 0
     task = coordinator.create_foreman_task(
         args.project_id, agent=args.agent, model=args.model, effort=args.effort,
@@ -5933,12 +5986,20 @@ def _cmd_foreman(ctx: _Context, args: argparse.Namespace) -> int | None:
             task["id"], args.worker_command_text, wait=False
         )
         mode = "process (--no-herdr)"
+    # Named for a ticket, it drives the root's work on that ticket from now
+    # on: this command is the deliberate hand-off.
+    handed = (
+        coordinator.hand_root_work_to_lead(worker["id"], ticket=args.ticket)
+        if args.ticket else []
+    )
     print(
         f"{_glyph_for(coordinator, args.project_id)} {args.project_id} task lead "
         f"{task_name(task, fallback=worker['id'])} ({worker['id']}) "
         f"[{worker['status']}] task={task['id']} mode={mode} "
         f"agent={worker.get('agent_id', 'default')}"
     )
+    if handed:
+        print(f"  It now drives {', '.join(handed)}, which you were driving yourself")
     if not coordinator.project_wants_foreman(args.project_id):
         # Started by hand for a project that has not declared one:
         # say so, because nothing will reappoint it after it exits.

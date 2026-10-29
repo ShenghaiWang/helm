@@ -19,6 +19,9 @@ from ..naming import task_name, ticket_of, title_of
 from ..paths import canonical
 from ..values import FOREMAN_DOMAIN, FOREMAN_RULES, _TERMINAL_WORKER_TASK_STATES, now
 
+#: Work past the point of needing a driver: delivered, or dropped on purpose.
+_DELIVERED_OR_DROPPED = {"merged", "pr-merged", "discarded"}
+
 
 class ForemenMixin:
     def driver_of_task(
@@ -76,7 +79,26 @@ class ForemenMixin:
         if task is None:
             return None, "none"
         workers = data.get("workers", {})
-        # A lead appointed to take this task over is its driver from then on,
+        driver, how = self._lead_evidence(task_id, task, data, workers, _depth)
+        # The root drives a task it created, and one it took over from a lead
+        # it stood down. It is not a worker record, so it answers with no
+        # session and the kind `root`. A live lead named by evidence on the
+        # task still outranks it -- the one that adopted or created it -- but
+        # a dead lead's claim and the project-level guess do not: those are
+        # exactly what made the root's own work read as orphaned.
+        if task.get("driven_by") == "root" and (driver is None or how == "project"):
+            return None, "root"
+        return driver, how
+
+    def _lead_evidence(
+        self,
+        task_id: str,
+        task: dict[str, Any],
+        data: dict[str, Any],
+        workers: dict[str, Any],
+        _depth: int,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """`driver_resolution` before the root was a driver: lead evidence only."""
         # whatever created it: the watchdog records the hand-over, and
         # without the record the same orphan read as driverless again on
         # every pass and was handed to a new lead each time.
@@ -101,11 +123,17 @@ class ForemenMixin:
                 driver, how = self.driver_resolution(
                     creator_task["id"], data=data, _depth=_depth + 1
                 )
+                # The root's work stays the root's one hop down: read as
+                # "creator" it would be a driverless task to the watchdog.
+                if how == "root":
+                    return None, "root"
                 if how != "project":
                     return driver, "creator"
         reviewed = str(task.get("reviews") or "")
         if reviewed and reviewed != task_id and _depth < 3:
             driver, how = self.driver_resolution(reviewed, data=data, _depth=_depth + 1)
+            if how == "root":
+                return None, "root"
             if how != "project":
                 return driver, "reviewed"
         project_id = task.get("project_id")
@@ -124,6 +152,86 @@ class ForemenMixin:
             return None, "gate"
         fallback = self.foreman_for(project_id or "", data=data)
         return fallback, ("project" if fallback is not None else "none")
+
+    def hand_lead_work_to_root(self, lead_worker_id: str) -> list[str]:
+        """Record that the root now drives what this lead was driving.
+
+        Standing a lead down is how the root takes a unit of work over, and
+        the record has to say so: otherwise every task the lead was driving
+        resolves to no driver the moment it stops, the watchdog reads them
+        as orphaned, and appoints another lead -- which the root stops, and
+        round again. Returns the ids of the tasks handed over.
+        """
+        handed: list[str] = []
+        with self.store.locked() as data:
+            lead = data.get("workers", {}).get(lead_worker_id) or {}
+            lead_task_id = str(lead.get("task_id") or "")
+            lead_task = data.get("tasks", {}).get(lead_task_id) or {}
+            if lead_task.get("role") != "foreman":
+                return handed
+            gates = lead_task.get("gates") or {}
+            bound = {gates.get("bound_task_id")} | set((gates.get("spent") or {}).keys())
+            for task in data.get("tasks", {}).values():
+                if task.get("role") == "foreman" or task.get("project_id") != lead_task.get("project_id"):
+                    continue
+                # Delivered or discarded work needs no driver. Everything
+                # else does, an open PR and a held approval included: those
+                # are what the PR waker and the release act on next.
+                if task.get("status") in _DELIVERED_OR_DROPPED:
+                    continue
+                adopter = str(task.get("adopted_by") or "")
+                # The adopter is this lead when it is any session of this
+                # lead's TASK: a continued lead keeps its id on the record
+                # while its session id changes, and judging by session alone
+                # read a replacement session's adopted work as somebody else's.
+                adopter_task = str((data.get("workers", {}).get(adopter) or {}).get("task_id") or "")
+                same_lead = bool(adopter) and (adopter == lead_worker_id or adopter_task == lead_task_id)
+                # Adoption by another lead outranks this lead's history, as
+                # it does in `driver_resolution`; that work stays that lead's.
+                if adopter and not same_lead:
+                    continue
+                mine = (
+                    same_lead
+                    or task.get("created_by") == lead_worker_id
+                    or task.get("created_by_task") == lead_task_id
+                    or task.get("id") in bound
+                )
+                if not mine:
+                    continue
+                task["driven_by"] = "root"
+                task["adopted_by"] = None
+                handed.append(task["id"])
+        return handed
+
+    def hand_root_work_to_lead(
+        self, lead_worker_id: str, *, ticket: str | None = None, task_ids: list[str] | None = None
+    ) -> list[str]:
+        """Record that a lead now drives root-driven work: `helm lead` and
+        `helm route` are the deliberate hand-off, and the record must say so
+        or every report and PR event keeps resolving to the root. Named work
+        only -- by ticket, or by task id -- never the whole project. Returns
+        the ids handed over.
+        """
+        wanted = (ticket or "").strip().lower()
+        chosen = set(task_ids or [])
+        if not wanted and not chosen:
+            return []
+        handed: list[str] = []
+        with self.store.locked() as data:
+            lead = data.get("workers", {}).get(lead_worker_id) or {}
+            lead_task = data.get("tasks", {}).get(str(lead.get("task_id") or "")) or {}
+            if lead_task.get("role") != "foreman":
+                return handed
+            for task in data.get("tasks", {}).values():
+                if task.get("role") == "foreman" or task.get("project_id") != lead_task.get("project_id"):
+                    continue
+                if task.get("driven_by") != "root" or task.get("status") in _DELIVERED_OR_DROPPED:
+                    continue
+                if task.get("id") not in chosen and (ticket_of(task) or "").lower() != wanted:
+                    continue
+                task["adopted_by"] = lead_worker_id
+                handed.append(task["id"])
+        return handed
 
     @staticmethod
     def _live_session_of(

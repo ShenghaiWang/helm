@@ -114,8 +114,18 @@ agent cross-checks the change, and reporting the outcome upward.
 
 **Every project gets one automatically.** Any command that starts work —
 `helm run`, `helm worker launch`, `helm herdr launch` — appoints the project's
-task lead first if nothing is driving. A project that wants none says so in its
-own file, and that is the whole of what a project may say on the subject:
+task lead first if nothing is driving. Work the root drives itself is the
+exception: a task the root created and launched is recorded `driven_by: root`,
+and `driver_resolution` answers `root` for it rather than falling through to
+"the project's lead", so neither the launch, nor the watchdog's orphan pass,
+nor the PR waker appoints a lead beside the root. The same happens to every
+task a lead was driving when the root stands that lead down with
+`helm worker stop`: standing the lead down is how the root takes the work
+over, and the record says so, or the watchdog would read the work as orphaned
+and appoint another lead on every pass. A root that wants to hand such work
+off does it with `helm lead` or `helm route`. A project that wants no lead at
+all says so in its own file, and that is the whole of what a project may say
+on the subject:
 
 ```json
 { "foreman": false }
@@ -150,7 +160,8 @@ Sessions die — the laptop sleeps, the OS reclaims memory, a provider
 returns errors for an hour. The watchdog settles a worker that reads as
 provably dead on two checks a minute apart, replaces a dead lead with one
 that reads the project record and carries on, and appoints a task lead to a
-project whose workers are running with nobody to answer them. Nothing acts
+project whose workers are running with nobody to answer them — nobody, not
+the root: root-driven work is never orphaned by a lead's absence. Nothing acts
 on a stall: a silent worker may be thinking, and killing it on a heuristic
 is how a healthy reviewer dies.
 

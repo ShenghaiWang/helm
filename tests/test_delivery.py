@@ -940,6 +940,8 @@ class DeliveryTests(HelmTestCase):
             foreman_task["id"], [sys.executable, "-c", ""], wait=False
         )
         driven = self.coordinator.create_task(second["id"], "write more")
+        with self.coordinator.store.locked() as data:
+            data["tasks"][driven["id"]]["adopted_by"] = foreman["id"]
         coder = adapter.launch_task(driven["id"], [sys.executable, "-c", ""], wait=False)
         self.coordinator.record_worker_message(coder["id"], "result", "done")
 
@@ -1061,6 +1063,9 @@ class DeliveryTests(HelmTestCase):
             foreman_task["id"], [sys.executable, "-c", ""]
         )
         task = self.coordinator.create_task(project["id"], "write the code")
+        # The lead's work: a task the root created would be the root's to drive.
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["adopted_by"] = foreman["id"]
         coder = self.coordinator.prepare_external_worker(
             task["id"], [sys.executable, "-c", ""]
         )

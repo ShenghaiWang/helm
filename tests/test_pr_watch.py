@@ -89,6 +89,14 @@ class PullRequestWatchTests(HelmTestCase):
         )
         lead_worker = self._lead(project["id"], ticket) if lead else None
         task = self.coordinator.create_task(project["id"], "ship the widget change", ticket=ticket)
+        # The work under watch is a lead's, not the root's: created here by
+        # the root for brevity, so hand it to the lead on the record, or
+        # mark it as a dead lead's when none is live. Root-driven work is
+        # its own case and has its own tests.
+        with self.coordinator.store.locked() as data:
+            data["tasks"][task["id"]]["driven_by"] = None
+            if lead_worker is not None:
+                data["tasks"][task["id"]]["adopted_by"] = lead_worker["id"]
         self.coordinator.launch_worker(task["id"], [sys.executable, "-c", _COMMIT])
         self.coordinator.record_pr_status(task["id"], state="open", url=URL)
         return project, task, lead_worker

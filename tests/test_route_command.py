@@ -458,10 +458,22 @@ class RouteCommandTests(HelmTestCase):
                 "--command", shlex.join([sys.executable, "-c", ""]),
             ])
         self.assertEqual(code, 0, out.getvalue())
+        # A run the root dispatches is the root's to drive: no lead is appointed
+        # beside it. The lead the root then appoints for the ticket is named
+        # for it and takes the work.
+        self.assertIsNone(coordinator.foreman_for(project["id"]))
+        with contextlib.redirect_stdout(out):
+            code = cli.main([
+                "--root", str(helm_root), "lead", project["id"], "--ticket", "TICKET-44",
+                "--no-herdr", "--command", shlex.join([sys.executable, "-c", ""]),
+            ])
+        self.assertEqual(code, 0, out.getvalue())
         lead = coordinator.foreman_for(project["id"])
         self.assertIsNotNone(lead)
         data = coordinator.store.load()
         self.assertEqual(task_name(data["tasks"][lead["task_id"]]), "TICKET-44")
+        run_task = next(t for t in data["tasks"].values() if t.get("role") == "worker")
+        self.assertEqual(run_task["adopted_by"], lead["id"])
 
     def test_a_run_launches_its_task_into_the_tab_its_lead_just_took(self) -> None:
         """The lead's tab was made the ticket's only after the child launched.
@@ -577,6 +589,9 @@ class RouteCommandTests(HelmTestCase):
         helm_root = self._helm_root("route-adopt-root")
         coordinator, project = self._project_root(helm_root, "route-adopt")
         orphan = coordinator.create_task(project["id"], "fix the export", ticket="TICKET-55")
+        # A dead lead's work, not the root's: root-driven work is never orphaned.
+        with coordinator.store.locked() as data:
+            data["tasks"][orphan["id"]]["driven_by"] = None
         worker = coordinator.launch_worker(
             orphan["id"], [sys.executable, "-c", "import time; time.sleep(30)"], wait=False
         )

@@ -408,7 +408,16 @@ class WorkerProtocolTests(HelmTestCase):
         foreman = self.coordinator.prepare_external_worker(
             foreman_task["id"], [sys.executable, "-c", ""]
         )
-        task = self.coordinator.create_task(project["id"], "write the code")
+        # The lead's own work: a task the root created would be the root's.
+        with mock.patch.dict(os.environ, {"HELM_WORKER_ID": foreman["id"]}):
+            for gate, body in (
+                ("requirement", "goal: a unit; Done means: X; Out of scope: Y"),
+                ("solution", "approach: one; verification: tests"),
+            ):
+                self.coordinator.propose_gate(foreman_task["id"], gate, body)
+                with mock.patch.dict(os.environ, {"HELM_WORKER_ID": ""}):
+                    self.coordinator.decide_gate(foreman_task["id"], gate, confirm=True, skip=False)
+            task = self.coordinator.create_task(project["id"], "write the code")
         coder = self.coordinator.prepare_external_worker(
             task["id"], [sys.executable, "-c", ""]
         )
@@ -630,20 +639,18 @@ class WorkerProtocolTests(HelmTestCase):
         self.assertIsNone(self.coordinator.driver_of_task(look["id"]))
         self.assertEqual(look["created_by_task"], second["task_id"])
 
-    def test_a_task_with_no_recorded_driver_says_where_its_report_went(self) -> None:
+    def test_the_roots_own_task_reports_to_no_lead_however_many_are_live(self) -> None:
+        """It used to go to the project's first live lead as a guess. The root
+        created it, so the root drives it; the report is the commander's."""
         project, _drivers = self._two_gated_leads("guessroute")
         stray = self.coordinator.create_task(project["id"], "root's own", read_only=True)
         coder = self.coordinator.prepare_external_worker(
             stray["id"], [sys.executable, "-c", ""]
         )
         self.coordinator.record_worker_message(coder["id"], "result", "done")
-        guess = self.coordinator.foreman_for(project["id"])
-
-        self.assertEqual([w for w, _ in self._delivered_to(coder["id"])], [guess["id"]])
-        status = self.coordinator.project_status(project["id"])
-        self.assertTrue(any(
-            "no driver is recorded" in entry["text"] for entry in status["situation"]
-        ))
+        self.assertIsNotNone(self.coordinator.foreman_for(project["id"]))
+        self.assertEqual(self.coordinator.driver_resolution(stray["id"]), (None, "root"))
+        self.assertEqual(self._delivered_to(coder["id"]), [])
 
     def test_a_lead_cannot_finish_while_its_own_work_is_still_running(self) -> None:
         """A lead IS its unit of work, so standing down orphans it.

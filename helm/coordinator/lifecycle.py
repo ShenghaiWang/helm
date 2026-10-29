@@ -832,6 +832,14 @@ class LifecycleMixin:
                         # gate, so nothing else names the lead that asked
                         # for it; see `driver_of_task`.
                         "created_by": creator_id,
+                        # Who drives it when no lead does. A task the root
+                        # created is the root's to drive until a lead takes
+                        # it on; without this the root's own work read as
+                        # orphaned and was handed a lead on every watchdog
+                        # pass. A lead task is nobody's charge but its own.
+                        "driven_by": (
+                            "root" if creator_id is None and role == "worker" else None
+                        ),
                         # And the task that agent was running. A lead task can
                         # be continued in a new session, and the work it
                         # created stays its own; see `driver_resolution`.

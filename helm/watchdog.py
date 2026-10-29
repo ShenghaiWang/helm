@@ -281,7 +281,7 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
             worker for worker in data.get("workers", {}).values()
             if worker.get("project_id") == project_id and worker.get("status") == "running"
             and (data.get("tasks", {}).get(worker.get("task_id")) or {}).get("role") != "foreman"
-            and coordinator.driver_of_task(str(worker.get("task_id") or ""), data=data) is None
+            and _driverless(coordinator, str(worker.get("task_id") or ""), data)
         ]
         if not running:
             continue
@@ -327,6 +327,12 @@ def heal_pass(root: Path | None, memory: Path) -> list[str]:
                     f"no driver; appointed {appointed['worker']['id']}"
                 )
     return reports
+
+
+def _driverless(coordinator: Any, task_id: str, data: dict[str, Any]) -> bool:
+    """Nobody drives this task: no live lead, and not the root either."""
+    driver, how = coordinator.driver_resolution(task_id, data=data)
+    return driver is None and how != "root"
 
 
 MINE_EVERY_SECONDS = 24 * 3600
