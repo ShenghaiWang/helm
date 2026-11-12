@@ -300,6 +300,302 @@ class SubprocessHerdrClient:
         return self._call(["workspace", "close", workspace_id])
 
 
+class HcHerdrClient:
+    """Present Helm's spaces through Herdr Core's `hc` terminals.
+
+    Newer Herdr releases ship the `hc` CLI in place of the session-scoped
+    `herdr` one. It has no workspaces, tabs or panes, only named terminals
+    carrying labels. So this client maps Helm's layout onto them: a
+    pane is one terminal, named with a Helm-minted id; a tab and a
+    workspace are Helm-minted ids stored as labels on their terminals.
+    Every id is generated here and persisted by the adapter before reuse,
+    so the label lookups below only ever resolve terminals this client
+    started. A terminal the user started has no `helm.owner` label and never
+    matches, so it cannot be adopted, renamed or closed.
+
+    Terminals start with `--no-parent --bg`: they outlive the session that
+    spawned them, type nothing into it, and never take focus. The user opens
+    one from the Herdr app or with `hc attach <pane id>`.
+    """
+
+    OWNER_LABEL = "helm.owner=helm"
+    #: Matches the env Herdr tabs get, for the same reason: see
+    #: `SubprocessHerdrClient.TAB_ENVIRONMENT`. `hc run` has no --env, so the
+    #: shell is started through env(1).
+    TAB_ENVIRONMENT = SubprocessHerdrClient.TAB_ENVIRONMENT
+    REPORT_TIMEOUT = SubprocessHerdrClient.REPORT_TIMEOUT
+    CALL_TIMEOUT = 30.0
+    drives_a_terminal = True
+    #: Herdr's key names, as `answer_worker` and `interrupt_worker` send them,
+    #: in hc's spelling.
+    KEY_NAMES = {"Enter": "enter", "Escape": "esc", "Tab": "tab", "C-c": "ctrl+c"}
+
+    def __init__(self, executable: str | Sequence[str] | None = None):
+        if executable is None:
+            executable = os.environ.get("HELM_HC_BIN") or "hc"
+        self.executable = list(executable) if not isinstance(executable, str) else [executable]
+        # Herdr types text and presses Enter as two calls; `hc send` does both
+        # at once. Text is held here until the Enter that submits it.
+        self._pending_text: dict[str, str] = {}
+
+    def available(self) -> bool:
+        """True when this session has opted into hc presentation.
+
+        `HELM_HC=1` opts in and `HELM_HC=0` opts out. Otherwise hc is used only
+        from inside an hc terminal (`HC_TERMINAL_ID`), which is where a
+        commander who wants to watch their workers runs Helm, the counterpart
+        of Herdr's `HERDR_ENV=1`. Being installed is never enough, so a test
+        suite or a background job on this machine cannot open terminals.
+        """
+        choice = os.environ.get("HELM_HC", "").strip()
+        if choice == "0":
+            return False
+        if choice != "1" and not os.environ.get("HC_TERMINAL_ID"):
+            return False
+        return shutil.which(self.executable[0]) is not None
+
+    def _call(
+        self, args: Sequence[str], *, timeout: float | None = None
+    ) -> dict[str, Any]:
+        if not self.available():
+            raise HerdrUnavailable("hc is unavailable; using Helm's terminal worker path")
+        # --json goes right after the subcommand: anything after `run`'s `--`
+        # belongs to the program being started.
+        command = [*self.executable, args[0], "--json", *args[1:]]
+        try:
+            proc = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout or self.CALL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HerdrUnavailable(f"hc did not answer within {timeout or self.CALL_TIMEOUT}s") from exc
+        except OSError as exc:
+            raise HerdrUnavailable(f"could not invoke hc: {exc}") from exc
+        parsed: Any = None
+        if proc.stdout.strip():
+            try:
+                parsed = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                parsed = None
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict):
+            detail = str(error.get("message") or error.get("kind") or "hc reported an error")
+            if error.get("kind") == "not_found":
+                raise HerdrNotFound(detail)
+            raise HerdrUnavailable(detail)
+        if proc.returncode != 0:
+            raise HerdrUnavailable(
+                proc.stderr.strip() or proc.stdout.strip() or "hc command failed"
+            )
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise HerdrUnavailable("hc returned an invalid JSON response")
+        return parsed
+
+    @staticmethod
+    def _mint(prefix: str) -> str:
+        # hc names are 1-32 of a-z 0-9 - _, unique among live terminals.
+        return f"{prefix}-{new_id('x')[-12:].lower()}"
+
+    def _shell_argv(self) -> list[str]:
+        shell = os.environ.get("SHELL") or "/bin/zsh"
+        env = [f"{key}={value}" for key, value in self.TAB_ENVIRONMENT]
+        return ["env", *env, shell, "-l"]
+
+    def _start(self, *, workspace_id: str, tab_id: str, label: str, cwd: str | None) -> str:
+        pane_id = self._mint("hp")
+        command = [
+            "run", "--bg", "--no-parent", "--name", pane_id,
+            "--label", self.OWNER_LABEL,
+            "--label", f"helm.workspace={workspace_id}",
+            "--label", f"helm.tab={tab_id}",
+            "--label", f"helm.label={label}",
+        ]
+        if cwd is not None:
+            command += ["--cwd", cwd]
+        self._call([*command, "--", *self._shell_argv()])
+        return pane_id
+
+    def _terminals(self, key: str, value: str, *, finished: bool = False) -> list[dict[str, Any]]:
+        command = ["ls", "--label", self.OWNER_LABEL, "--label", f"{key}={value}"]
+        if finished:
+            command.append("--all")
+        reply = self._call(command)
+        found = reply.get("terminals")
+        return [t for t in found if isinstance(t, dict)] if isinstance(found, list) else []
+
+    def _labels_of(self, pane_id: str) -> dict[str, str]:
+        reply = self._call(["get", pane_id])
+        labels = reply.get("labels")
+        labels = labels if isinstance(labels, dict) else {}
+        if labels.get("helm.owner") != "helm":
+            # Never act on a terminal Helm did not start, whatever its name.
+            raise HerdrNotFound(f"no Helm terminal {pane_id!r}")
+        return labels
+
+    def _remove(self, terminal: str) -> None:
+        with contextlib.suppress(HerdrNotFound):
+            self._call(["kill", terminal])
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                self._call(["rm", terminal])
+                return
+            except HerdrNotFound:
+                return
+            except HerdrUnavailable:
+                # rm refuses a terminal whose program has not finished yet.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
+
+    def _remove_group(self, key: str, value: str) -> dict[str, Any]:
+        terminals = self._terminals(key, value, finished=True)
+        if not terminals:
+            raise HerdrNotFound(f"no Helm terminals with {key}={value}")
+        for terminal in terminals:
+            self._remove(str(terminal.get("name") or terminal.get("address")))
+        return {}
+
+    def _relabel_group(self, key: str, value: str, label: str, setting: str) -> dict[str, Any]:
+        terminals = self._terminals(key, value)
+        if not terminals:
+            raise HerdrNotFound(f"no Helm terminals with {key}={value}")
+        for terminal in terminals:
+            self._call(["label", str(terminal.get("name") or terminal.get("address")),
+                        f"{setting}={label}"])
+        return {}
+
+    def workspace_get(self, workspace_id: str) -> dict[str, Any]:
+        terminals = self._terminals("helm.workspace", workspace_id)
+        if not terminals:
+            raise HerdrNotFound(f"no Helm workspace {workspace_id!r}")
+        return {"result": {"workspace": {"workspace_id": workspace_id}}}
+
+    def workspace_create(self, label: str, cwd: str | None = None) -> dict[str, Any]:
+        workspace_id, tab_id = self._mint("hw"), self._mint("ht")
+        pane_id = self._start(workspace_id=workspace_id, tab_id=tab_id, label=label, cwd=cwd)
+        return {
+            "result": {
+                "workspace": {"workspace_id": workspace_id, "label": label},
+                "tab": {"tab_id": tab_id},
+                "root_pane": {"pane_id": pane_id},
+            }
+        }
+
+    def tab_create(self, workspace_id: str, label: str, cwd: str) -> dict[str, Any]:
+        self.workspace_get(workspace_id)
+        tab_id = self._mint("ht")
+        pane_id = self._start(workspace_id=workspace_id, tab_id=tab_id, label=label, cwd=cwd)
+        return {
+            "result": {
+                "tab": {"tab_id": tab_id, "workspace_id": workspace_id},
+                "root_pane": {"pane_id": pane_id},
+            }
+        }
+
+    def pane_split(self, pane_id: str, direction: str, cwd: str) -> dict[str, Any]:
+        labels = self._labels_of(pane_id)
+        new_pane = self._start(
+            workspace_id=labels.get("helm.workspace", ""),
+            tab_id=labels.get("helm.tab", ""),
+            label=labels.get("helm.label", ""),
+            cwd=cwd,
+        )
+        return {"result": {"pane": {"pane_id": new_pane}}}
+
+    def workspace_rename(self, workspace_id: str, label: str) -> dict[str, Any]:
+        return self._relabel_group("helm.workspace", workspace_id, label, "helm.workspace_label")
+
+    def tab_rename(self, tab_id: str, label: str) -> dict[str, Any]:
+        return self._relabel_group("helm.tab", tab_id, label, "helm.label")
+
+    def pane_rename(self, pane_id: str, label: str) -> dict[str, Any]:
+        self._labels_of(pane_id)
+        return self._call(["label", pane_id, f"helm.pane_label={label}"])
+
+    def pane_run(self, pane_id: str, command: str) -> dict[str, Any]:
+        self._labels_of(pane_id)
+        return self._call(["send", pane_id, command])
+
+    def pane_send_text(self, pane_id: str, text: str) -> dict[str, Any]:
+        self._labels_of(pane_id)
+        self._pending_text[pane_id] = text
+        return {}
+
+    def pane_send_keys(self, pane_id: str, keys: str) -> dict[str, Any]:
+        self._labels_of(pane_id)
+        pending = self._pending_text.pop(pane_id, None)
+        if keys == "Enter" and pending is not None:
+            # Paste and Enter in one call, which is what `hc send` is.
+            return self._call(["send", pane_id, pending])
+        if pending is not None:
+            # Text typed but never submitted in Herdr stays in the input line.
+            # hc cannot type without submitting, so keep it for the next Enter.
+            self._pending_text[pane_id] = pending
+        name = self.KEY_NAMES.get(keys, keys.lower())
+        return self._call(["keys", pane_id, name])
+
+    def pane_status(self, pane_id: str) -> dict[str, Any]:
+        reply = self._call(["get", pane_id])
+        labels = reply.get("labels") if isinstance(reply.get("labels"), dict) else {}
+        if labels.get("helm.owner") != "helm":
+            raise HerdrNotFound(f"no Helm terminal {pane_id!r}")
+        alive = reply.get("state") == "live"
+        status = str(reply.get("status") or "").strip().lower()
+        pane: dict[str, Any] = {
+            "pane_id": pane_id,
+            "alive": alive,
+            "status": "running" if alive else "exited",
+        }
+        if status in {"idle", "working", "blocked"}:
+            pane["agent_status"] = status
+        return {"result": {"pane": pane}}
+
+    def tab_close(self, tab_id: str) -> dict[str, Any]:
+        return self._remove_group("helm.tab", tab_id)
+
+    def pane_close(self, pane_id: str) -> dict[str, Any]:
+        self._labels_of(pane_id)
+        self._remove(pane_id)
+        return {}
+
+    def workspace_close(self, workspace_id: str) -> dict[str, Any]:
+        return self._remove_group("helm.workspace", workspace_id)
+
+    # hc reads an agent's state from the terminal itself, so Herdr's
+    # agent-presence reports have nothing to update here.
+    def pane_report_agent(self, pane_id: str, **_: Any) -> dict[str, Any]:
+        return {}
+
+    def pane_release_agent(self, pane_id: str, **_: Any) -> dict[str, Any]:
+        return {}
+
+    def pane_report_metadata(self, pane_id: str, **_: Any) -> dict[str, Any]:
+        return {}
+
+
+def default_client() -> HerdrClient:
+    """The presentation client this session should use.
+
+    Herdr's session-scoped CLI wins when this session is inside it. hc is
+    used when this session opted into it. Otherwise the Herdr client is returned
+    unavailable, which is what sends delegation to the process launcher.
+    """
+    herdr = SubprocessHerdrClient()
+    if herdr.available():
+        return herdr
+    hc = HcHerdrClient()
+    if hc.available():
+        return hc
+    return herdr
+
+
 class PanePresence:
     """Keep one Herdr worker listed in Herdr's agents view, with its ticket and role.
 
@@ -545,7 +841,7 @@ class HerdrAdapter:
 
     def __init__(self, coordinator: Coordinator, client: HerdrClient | None = None):
         self.coordinator = coordinator
-        self.client = client or SubprocessHerdrClient()
+        self.client = client or default_client()
         self._layout_depth = threading.local()
 
     @contextlib.contextmanager

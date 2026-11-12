@@ -1142,6 +1142,14 @@ class LaunchMixin:
                 # one explicit per-assignment value rather than by widening the
                 # global allowlist.
                 **({"HERDR_ENV": "1"} if execution == "herdr" else {}),
+                # The same marker for a worker presented through hc rather than
+                # the session-scoped herdr CLI: a herdr-executed worker in a
+                # session that is not Herdr's was laid out by `HcHerdrClient`.
+                **(
+                    {"HELM_HC": "1"}
+                    if execution == "herdr" and os.environ.get("HERDR_ENV") != "1"
+                    else {}
+                ),
                 # An agent CLI cannot authenticate out of a scrubbed
                 # environment. Forward only the variables the selected runtime
                 # declares, for this one assignment; every other ambient

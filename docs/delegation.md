@@ -20,7 +20,8 @@ worker, which is replaced by a new worker for a new task, not finished by
 the coordinator.
 
 Herdr is detected only in a managed session (`HERDR_ENV=1` plus an available
-`herdr` executable). When it is unavailable, delegation still applies: the
+`herdr` executable), or, for Herdr Core, inside an hc terminal or with
+`HELM_HC=1` (see [herdr.md](herdr.md#herdr-core-hc)). When it is unavailable, delegation still applies: the
 worker is spawned through Helm's core process launcher into the same
 isolated task worktree, and only the presentation surface is lost. To spawn
 a worker the coordinator discovers runtime and tool capabilities from the

@@ -36,6 +36,32 @@ user resource, and never starts, stops, focuses, restarts, or deletes one.
 focus call, so starting a worker never switches what the commander is
 looking at.
 
+## Herdr Core (`hc`)
+
+Newer Herdr releases install `hc` (Herdr Core) and the Herdr desktop app
+in place of the session-scoped `herdr` CLI. `hc` has no workspaces, tabs or
+panes, only named terminals with labels, so `HcHerdrClient` maps Helm's
+layout onto them. Each pane is one terminal, named with a Helm-minted
+`hp-…` id. A tab (`ht-…`) and a workspace (`hw-…`) are ids carried as
+`helm.tab` and `helm.workspace` labels on their terminals. Every Helm
+terminal also carries `helm.owner=helm`, and the client refuses to type
+into, inspect or close a terminal without it, so a terminal the commander
+started is never adopted. Terminals start detached (`hc run --bg
+--no-parent`). They outlive the session that spawned them, type nothing
+into it, and never take focus.
+
+hc is used only on opt-in, never because it is installed: from inside an hc
+terminal (`HC_TERMINAL_ID` is set, the counterpart of `HERDR_ENV=1`), or
+with `HELM_HC=1`. `HELM_HC=0` turns it off, and `HELM_HC_BIN` names
+another executable. A session that is inside Herdr proper keeps the `herdr`
+client. To watch a worker, open it in the Herdr app, or run `hc ls --label
+helm.owner=helm` and then `hc attach <name>` (ctrl+\ detaches).
+
+hc reads an agent's idle, working or blocked state from the terminal
+itself, so Herdr's agent-presence reports are no-ops there. Herdr types
+text and presses Enter as two calls, while `hc send` does both at once, so
+the client holds typed text until the Enter that submits it.
+
 ## Labels and panes
 
 Labels are display only: Helm identifies every resource by opaque ID and

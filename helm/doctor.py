@@ -1622,10 +1622,32 @@ class _Doctor:
         if in_session:
             self.ok("root.herdr", "Herdr is available; workers get a project space")
             return
+        hc_choice = os.environ.get("HELM_HC", "").strip()
+        hc_opted = hc_choice == "1" or (hc_choice != "0" and bool(os.environ.get("HC_TERMINAL_ID")))
+        hc_bin = os.environ.get("HELM_HC_BIN") or "hc"
+        hc_present = shutil.which(hc_bin) is not None
+        if hc_opted and not hc_present:
+            self.error(
+                "root.herdr",
+                f"this session opted into hc presentation but no {hc_bin} executable is on PATH",
+                "add Herdr's ~/.local/bin to PATH, or set HELM_HC=0",
+            )
+            return
+        if hc_opted:
+            self.ok(
+                "root.herdr",
+                "Herdr Core (hc) is available; each worker gets its own terminal "
+                "(hc ls --label helm.owner=helm, then hc attach <name>)",
+            )
+            return
+        hint = ""
+        if executable:
+            hint = " (herdr is installed but HERDR_ENV is not set)"
+        elif hc_present:
+            hint = " (hc is installed: run Helm inside an hc terminal, or set HELM_HC=1)"
         self.ok(
             "root.herdr",
-            "Herdr is not in use here; workers start through the process launcher"
-            + ("" if not executable else " (herdr is installed but HERDR_ENV is not set)"),
+            "Herdr is not in use here; workers start through the process launcher" + hint,
         )
 
     def _check_authority(self) -> None:

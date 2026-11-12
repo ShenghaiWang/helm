@@ -198,7 +198,7 @@ class HelmTestCase(unittest.TestCase):
         # additionally stops runtime auto-detection from delegating a test task
         # to the real agent CLI this suite happens to be running under; the
         # tests that exercise selection set it themselves.
-        herdr_env = mock.patch.dict(os.environ, {"HERDR_ENV": "0", "HELM_AGENT": "none"})
+        herdr_env = mock.patch.dict(os.environ, {"HERDR_ENV": "0", "HELM_HC": "0", "HELM_AGENT": "none"})
         herdr_env.start()
         self.addCleanup(herdr_env.stop)
         self.temp = tempfile.TemporaryDirectory()
