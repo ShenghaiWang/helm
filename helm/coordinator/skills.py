@@ -679,6 +679,11 @@ class SkillsMixin:
         """
         if not model:
             return
+        # A spelling the runtime itself cannot start with is refused before
+        # anything launches, whatever this root's family preferences say.
+        problem = runtimes.runtime_model_problem(runtime_id, model)
+        if problem:
+            raise HelmError(problem)
         constraint = self.preferences().constraint_for(model)
         if constraint is None:
             return

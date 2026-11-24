@@ -2539,7 +2539,28 @@ class TheRootCanNameItsReviewerTests(HelmTestCase):
     def _prefer(self, runtime: str) -> None:
         self.write_preferences(review={"agent": runtime})
 
-    @needs_runtimes(2)
+    def setUp(self) -> None:
+        # Hermetic: the runtimes these tests reason about are stubs on a PATH
+        # the test controls. Gating them on whatever happens to be installed
+        # (`needs_runtimes`) meant CI, with no agent CLIs, skipped them all,
+        # while a laptop with codex/claude/pi but no cursor ran them and
+        # failed -- the preference was honoured correctly, the machine simply
+        # lacked the runtime the test assumed.
+        super().setUp()
+        import os
+        from pathlib import Path
+        from unittest import mock
+
+        bin_dir = Path(self.temp.name) / "review-bin"
+        bin_dir.mkdir(exist_ok=True)
+        for name in ("cursor-agent", "claude", "opencode"):
+            stub = bin_dir / name
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+        patcher = mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_the_preferred_runtime_is_chosen_over_the_automatic_search(self) -> None:
         self._prefer("cursor")
 
@@ -2549,7 +2570,6 @@ class TheRootCanNameItsReviewerTests(HelmTestCase):
         self.assertIn("review.agent", choice["reason"])
         self.assertEqual(choice["independence"], "different-runtime")
 
-    @needs_runtimes(2)
     def test_it_never_makes_the_author_review_itself(self) -> None:
         """The one case a convenience must lose."""
         self._prefer("cursor")

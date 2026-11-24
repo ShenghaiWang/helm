@@ -400,7 +400,13 @@ class RuntimeSelectionTests(HelmTestCase):
         helm_root = self._runtime_root("claudeok", prefs=self.CLAUDE_ONLY)
         ok = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
         project = ok.discover_project(helm_root, "claudeok")
-        for model in ("claude-opus-5", "anthropic/claude-opus-5", "sonnet-4-5"):
+        # Every spelling here is one Claude Code itself starts with: a full id,
+        # a provider-qualified id, and a bare alias. A versioned alias such as
+        # `sonnet-4-5` is still Claude to the family classifier (exercised by
+        # the HELM_MODEL `opus-4.1` case below), but Claude Code refuses it
+        # ("doesn't recognize the model ... Did you mean claude-sonnet-...?",
+        # probed 2026-11-24), so it is refused before launch instead.
+        for model in ("claude-opus-5", "anthropic/claude-opus-5", "sonnet"):
             task = ok.create_task(project["id"], "Port the parser", model=model)
             with mock.patch.dict(os.environ, env):
                 worker = ok.prepare_external_worker(
@@ -448,6 +454,38 @@ class RuntimeSelectionTests(HelmTestCase):
             os.environ, {**env, "HELM_MODEL": "opus-4.1"}
         ), self.assertRaisesRegex(HelmError, r"restrict to the claude runtime"):
             ambient.prepare_external_worker(ambient_task["id"], None, execution="herdr")
+
+    def test_claude_code_refuses_a_versioned_alias_before_launching(self) -> None:
+        """`sonnet-5-5` reads as Claude to the family classifier, but Claude Code
+        itself only takes `sonnet` or `claude-sonnet-5-5`. Launched anyway, the
+        session stops at a model error in an unwatched pane; a reviewer sat
+        there for fifteen minutes. It is refused at launch instead, with the
+        spelling that works, and the two spellings Claude Code does accept
+        still launch."""
+        from helm import runtimes
+
+        self.assertIn("claude-sonnet-5-5", runtimes.claude_code_model_problem("sonnet-5-5"))
+        self.assertIsNotNone(runtimes.claude_code_model_problem("opus-4.1"))
+        for ok in ("sonnet", "claude-sonnet-5-5", "anthropic/claude-opus-5",
+                   "us.anthropic.claude-sonnet-4-v1:0", "opus-magnum"):
+            self.assertIsNone(runtimes.claude_code_model_problem(ok), ok)
+        self.assertIsNone(runtimes.runtime_model_problem("pi", "sonnet-5-5"))
+
+        bin_dir = self._fake_agent_cli("claude")
+        env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HELM_MODEL": ""}
+        for model, refused in (("sonnet-5-5", True), ("claude-sonnet-5-5", False)):
+            helm_root = self._runtime_root(f"alias{int(refused)}")
+            coordinator = Coordinator(StateStore(helm_root / "state", helm_root=helm_root))
+            project = coordinator.discover_project(helm_root, f"alias{int(refused)}")
+            task = coordinator.create_task(
+                project["id"], "Review it", model=model, agent="claude"
+            )
+            with mock.patch.dict(os.environ, env):
+                if refused:
+                    with self.assertRaisesRegex(HelmError, r"does not accept the model name"):
+                        coordinator.prepare_external_worker(task["id"], None, execution="herdr")
+                else:
+                    coordinator.prepare_external_worker(task["id"], None, execution="herdr")
 
     def test_a_profile_inheriting_a_runtime_cannot_smuggle_a_restricted_model(self) -> None:
         """A profile is a name for a runtime, not a way around its pairing."""

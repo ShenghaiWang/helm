@@ -731,6 +731,52 @@ def family_pairing_error(
     )
 
 
+# A bare family alias carrying a version, with no ``claude-`` prefix and no
+# provider segment: ``sonnet-5-5``, ``opus-4.1``. The family classifier above
+# rightly reads these as Claude, but Claude Code itself accepts only the bare
+# alias (``sonnet``) or the full id (``claude-sonnet-5-5``). Launched with the
+# versioned alias, the session stops at "There's an issue with the selected
+# model" inside an unwatched pane, and the task stalls until someone looks: a
+# reviewer sat there for fifteen minutes before the watchdog's stall notice.
+_CLAUDE_CODE_VERSIONED_ALIAS = re.compile(
+    r"^(opus|sonnet|haiku|fable)[-._](\d[a-z0-9._-]*)$"
+)
+
+
+def claude_code_model_problem(model: str) -> str | None:
+    """Return why Claude Code cannot start with ``model``, or None if it can.
+
+    Only the one shape known to fail is refused, so a new model id, a gateway
+    spelling or a bare alias is never second-guessed.
+    """
+    match = _CLAUDE_CODE_VERSIONED_ALIAS.fullmatch(model.strip().lower())
+    if not match:
+        return None
+    family, version = match.groups()
+    return (
+        f"Claude Code does not accept the model name {model!r}: it takes a bare "
+        f"alias ({family!r}) or a full id (e.g. 'claude-{family}-{version}'). "
+        "Helm refuses it here rather than starting a session that stops at a "
+        "model error in an unwatched pane."
+    )
+
+
+# runtime id -> a check of the model spellings that runtime itself accepts.
+# Separate from the family classifier: that one says which vendor a name
+# belongs to, this one says whether a given CLI will actually start with it.
+_RUNTIME_MODEL_CHECKS: dict[str, "Callable[[str], str | None]"] = {
+    "claude": claude_code_model_problem,
+}
+
+
+def runtime_model_problem(runtime_id: str | None, model: str | None) -> str | None:
+    """Why ``runtime_id`` cannot start with ``model``, or None when it can (or is unknown)."""
+    if not runtime_id or not model:
+        return None
+    check = _RUNTIME_MODEL_CHECKS.get(runtime_id)
+    return check(model) if check else None
+
+
 def builtin_runtime(runtime_id: str | None) -> AgentRuntime | None:
     if not runtime_id:
         return None
