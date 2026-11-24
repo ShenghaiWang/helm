@@ -139,6 +139,15 @@ class CleanupGrantTests(HelmTestCase):
         self.coordinator.record_worker_message(worker["id"], "question", "which way?")
         # Nothing ever answered it; the worker finished anyway.
         self.coordinator.record_worker_message(worker["id"], "result", "done without an answer")
+        # Cleanup refuses while the session behind a settled worker may still
+        # run (`_session_still_live`), and an unwaited launch races it: on a
+        # slow-starting interpreter `python -c ""` is often not yet reaped.
+        # Wait for the runner's exit record, the signal that guard reads.
+        exit_file = Path(self.state.load()["workers"][worker["id"]]["exit_file"])
+        deadline = time.monotonic() + 30
+        while not exit_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(exit_file.exists(), "the worker's runner never recorded its exit")
 
         self.coordinator.cleanup_task(task["id"])
         answers = [
