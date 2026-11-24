@@ -510,7 +510,10 @@ THE COMMANDS THAT DO IT
   correctness cannot be seen (auth, money, data loss, concurrency,
   persistence -- three rounds, high effort, the full suite's exit recorded
   with `helm task evidence --cases N` before approval); standard for the rest. Helm
-  sizes the review and the effort from it.
+  sizes the review and the effort from it. A round that only runs the suite to
+  record evidence is still `--state-changing`: a `--read-only` round
+  write-locks the worktree, and a suite that writes temp files then fails with
+  permission errors instead of on the change.
 - `helm worker launch <task-id>` -- one worker, one task, one worktree.
 - `helm watch`, then `helm worker answer <worker-id> --text "..."`.
 - `helm review <task-id>` -- Helm picks a reviewer that is not the author and

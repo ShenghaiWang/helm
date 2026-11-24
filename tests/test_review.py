@@ -2309,6 +2309,33 @@ class ReviewerTicketTests(HelmTestCase):
         self.assertEqual(len(reviewer_tasks), 1)
         self.assertEqual(reviewer_tasks[0].get("model"), "openai/gpt-5.5")
 
+    def test_a_read_only_round_cannot_record_a_failing_suite(self) -> None:
+        """A read-only round write-locks the worktree, so a suite that writes
+        temp files fails on EACCES, not on the change. Recording that as
+        evidence cost a round and a manual chmod twice in one day; it is now
+        refused with the cause and the fix named, and a green run is still
+        accepted."""
+        import sys
+
+        root = self.repo("lockedevidence")
+        project = self.coordinator.register_project(
+            "Locked", str(root), project_id="lockedevidence"
+        )
+        task = self.coordinator.create_task(
+            project["id"], "check the suite", read_only=True
+        )
+        self.coordinator.launch_worker(task["id"], [sys.executable, "-c", ""], wait=False)
+        tip = self.coordinator._evidence_head(
+            self.coordinator.store.load()["tasks"][task["id"]]
+        )
+        with self.assertRaisesRegex(HelmError, r"read-only round.*--state-changing"):
+            self.coordinator.record_task_evidence(
+                task["id"], tip=tip, command="python -m unittest", exit_code=1, cases=10
+            )
+        self.coordinator.record_task_evidence(
+            task["id"], tip=tip, command="python -m unittest", exit_code=0, cases=10
+        )
+
     def test_task_evidence_is_read_as_the_reviewers_full_suite_report(self) -> None:
         """The review pipeline reads one structured field, and prose produces
         no evidence at all. `helm task evidence` builds the shape so a worker

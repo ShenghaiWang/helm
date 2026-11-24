@@ -946,6 +946,27 @@ class Coordinator(
                     f"tip and record that -- git rev-parse HEAD, then the suite, "
                     "then this command, in that order"
                 )
+            # A READ-ONLY ROUND CANNOT PRODUCE SUITE EVIDENCE.
+            #
+            # A read-only round strips the write bit from the whole worktree
+            # (`_set_workspace_writable`) -- deliberately, it is the
+            # enforcement. Most suites write temp files, caches or fixtures
+            # inside the checkout, so a suite run there fails with EACCES and
+            # reads as a broken change rather than a locked directory. Leads
+            # kept opening "evidence only" rounds as --read-only because no
+            # edit was intended, and twice in one day that cost a round and a
+            # manual chmod. A failing result from a locked round is therefore
+            # refused with the cause named; a green one is still accepted,
+            # since a suite that writes nothing proves what it proves.
+            if task.get("read_only") and int(exit_code) != 0:
+                raise HelmError(
+                    f"{task_id} is in a read-only round, so its worktree is "
+                    "write-locked and a suite that writes temp files fails with "
+                    "permission errors (EACCES) rather than on the change. Run "
+                    "evidence as its own round: helm task continue "
+                    f"{task_id} --state-changing --brief \"evidence only, no "
+                    "edits: run the suite at the tip and record it\""
+                )
             workers = sorted(
                 self._task_workers(data, task_id),
                 key=lambda w: (w.get("started_at") or "", w.get("id") or ""),
